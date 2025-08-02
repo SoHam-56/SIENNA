@@ -1,0 +1,6 @@
+[submodule "GNAE"]
+	path = GNAE
+	url = git@github.com:SoHam-56/GNAE.git
+[submodule "SystolicArray"]
+	path = SystolicArray
+	url = git@github.com:SoHam-56/SystolicArray.git

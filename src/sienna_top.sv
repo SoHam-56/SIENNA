@@ -2,13 +2,24 @@
 
 module sienna_top #(
     // Systolic Array Parameters
-    parameter N = 32,                    // Matrix size (N x N)
-    parameter DATA_WIDTH = 32,           // Data width for both modules
-    parameter SRAM_DEPTH = N * N,        // Output SRAM depth
+    parameter N = 32,                   // Matrix size (N x N)
+    parameter DATA_WIDTH = 32,          // Data width for all modules
+    parameter SRAM_DEPTH = N * N,       // Output SRAM depth
     
     // GPNAE Parameters  
-    parameter ADDR_LINES = 5,            // Address lines for GPNAE (2^5 = 32 max terms)
-    parameter CONTROL_WIDTH = 2,         // Control word width for activation functions
+    parameter ADDR_LINES = 5,           // Address lines for GPNAE (2^5 = 32 max terms)
+    parameter CONTROL_WIDTH = 2,        // Control word width for activation functions
+    
+    // Maxpool Parameters
+    parameter IN_ROWS = 5,
+    parameter IN_COLS = 5,
+    parameter POOL_H = 2,
+    parameter POOL_W = 2,
+    parameter PADDING = 1,
+    
+    // Dropout Parameters
+    parameter DROPOUT_P = 0.5,
+    parameter LFSR_WIDTH = 32,
     
     // Memory Parameters
     parameter INPUT_A_FILE = "matrixA.mem",
@@ -33,6 +44,10 @@ module sienna_top #(
     input  logic [DATA_WIDTH-1:0] west_write_data_i,
     input  logic west_write_reset_i,
     
+    // Maxpool SRAM Interface (if needed for input)
+    input  logic [DATA_WIDTH-1:0] maxpool_input_data_i,
+    input  logic maxpool_input_valid_i,
+    
     // Final Output Interface
     output logic [DATA_WIDTH-1:0] final_result_o,
     output logic pipeline_complete_o,
@@ -41,6 +56,8 @@ module sienna_top #(
     // Status Outputs
     output logic systolic_busy_o,
     output logic gpnae_busy_o,
+    output logic maxpool_busy_o,
+    output logic dropout_busy_o,
     output logic intermediate_buffer_full_o,
     output logic intermediate_buffer_empty_o,
     
@@ -51,11 +68,15 @@ module sienna_top #(
 );
 
     // Internal State Machine
-    typedef enum logic [2:0] {
+    typedef enum logic [3:0] {
         IDLE,
         SYSTOLIC_PROCESSING,
-        BUFFER_TRANSFER,
+        BUFFER_TRANSFER_1,
         GPNAE_PROCESSING,
+        BUFFER_TRANSFER_2,
+        MAXPOOL_PROCESSING,
+        BUFFER_TRANSFER_3,
+        DROPOUT_PROCESSING,
         PIPELINE_COMPLETE
     } pipeline_state_t;
     
@@ -72,14 +93,14 @@ module sienna_top #(
     logic systolic_read_valid;
     logic north_queue_empty, west_queue_empty;
     
-    // Intermediate Buffer Signals
-    logic intermediate_wr_en;
-    logic intermediate_rd_en;
-    logic [DATA_WIDTH-1:0] intermediate_wr_data;
-    logic [DATA_WIDTH-1:0] intermediate_rd_data;
-    logic intermediate_full;
-    logic intermediate_empty;
-    logic [$clog2(INTERMEDIATE_BUFFER_DEPTH)-1:0] intermediate_count;
+    // Intermediate Buffer Signals (FIFO between Systolic and GPNAE)
+    logic buffer1_wr_en;
+    logic buffer1_rd_en;
+    logic [DATA_WIDTH-1:0] buffer1_wr_data;
+    logic [DATA_WIDTH-1:0] buffer1_rd_data;
+    logic buffer1_full;
+    logic buffer1_empty;
+    logic [$clog2(INTERMEDIATE_BUFFER_DEPTH)-1:0] buffer1_count;
     
     // GPNAE Signals
     logic gpnae_signal_wr_en;
@@ -92,13 +113,58 @@ module sienna_top #(
     logic gpnae_done;
     logic [DATA_WIDTH-1:0] gpnae_final_result;
     
+    // Buffer between GPNAE and Maxpool
+    logic buffer2_wr_en;
+    logic buffer2_rd_en;
+    logic [DATA_WIDTH-1:0] buffer2_wr_data;
+    logic [DATA_WIDTH-1:0] buffer2_rd_data;
+    logic buffer2_full;
+    logic buffer2_empty;
+    logic [$clog2(INTERMEDIATE_BUFFER_DEPTH)-1:0] buffer2_count;
+    
+    // Maxpool Signals
+    logic maxpool_start;
+    logic maxpool_done;
+    logic maxpool_out_valid;
+    logic [DATA_WIDTH-1:0] maxpool_out_data;
+    logic maxpool_in_rd_en;
+    logic [$clog2(IN_ROWS*IN_COLS)-1:0] maxpool_in_addr;
+    
+    // Buffer between Maxpool and Dropout
+    logic buffer3_wr_en;
+    logic buffer3_rd_en;
+    logic [DATA_WIDTH-1:0] buffer3_wr_data;
+    logic [DATA_WIDTH-1:0] buffer3_rd_data;
+    logic buffer3_full;
+    logic buffer3_empty;
+    logic [$clog2(INTERMEDIATE_BUFFER_DEPTH)-1:0] buffer3_count;
+    
+    // Dropout Signals
+    logic dropout_en;
+    logic dropout_training_mode;
+    logic dropout_valid_out;
+    logic [(2*DATA_WIDTH)-1:0] dropout_data_out;
+    
+    // Final Output Buffer
+    logic buffer4_wr_en;
+    logic buffer4_rd_en;
+    logic [(2*DATA_WIDTH)-1:0] buffer4_wr_data;
+    logic [(2*DATA_WIDTH)-1:0] buffer4_rd_data;
+    logic buffer4_full;
+    logic buffer4_empty;
+    logic [$clog2(INTERMEDIATE_BUFFER_DEPTH)-1:0] buffer4_count;
+    
     // Internal Counters and Control
     logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_counter;
     logic [$clog2(SRAM_DEPTH)-1:0] gpnae_write_counter;
     logic [$clog2(SRAM_DEPTH)-1:0] total_elements;
     logic transfer_active;
-    logic all_data_transferred;
-    logic all_data_processed;
+    logic all_data_transferred_1;
+    logic all_data_processed_gpnae;
+    logic all_data_transferred_2;
+    logic maxpool_processing_complete;
+    logic all_data_transferred_3;
+    logic dropout_processing_complete;
     
     // Instantiate Systolic Array
     SystolicArray #(
@@ -137,20 +203,20 @@ module sienna_top #(
         .collection_active_o(systolic_collection_active)
     );
     
-    // Intermediate Buffer (FIFO) - Stores results from Systolic Array for GPNAE
+    // Buffer 1: Systolic Array -> GPNAE
     fifo_buffer #(
         .DATA_WIDTH(DATA_WIDTH),
         .DEPTH(INTERMEDIATE_BUFFER_DEPTH)
-    ) intermediate_buffer_inst (
+    ) buffer1_inst (
         .clk_i(clk_i),
         .rstn_i(rstn_i),
-        .wr_en_i(intermediate_wr_en),
-        .wr_data_i(intermediate_wr_data),
-        .rd_en_i(intermediate_rd_en),
-        .rd_data_o(intermediate_rd_data),
-        .full_o(intermediate_full),
-        .empty_o(intermediate_empty),
-        .count_o(intermediate_count)
+        .wr_en_i(buffer1_wr_en),
+        .wr_data_i(buffer1_wr_data),
+        .rd_en_i(buffer1_rd_en),
+        .rd_data_o(buffer1_rd_data),
+        .full_o(buffer1_full),
+        .empty_o(buffer1_empty),
+        .count_o(buffer1_count)
     );
     
     // Instantiate GPNAE
@@ -163,7 +229,7 @@ module sienna_top #(
         .rstn_i(rstn_i),
         .signal_i(gpnae_signal_data),
         .wr_en_i(gpnae_signal_wr_en),
-        .last_i(gpnae_start),  // Use start signal as last signal trigger
+        .last_i(gpnae_start),
         .terms_i(num_terms_i),
         .control_word_i(activation_function_i),
         .full_o(gpnae_full),
@@ -171,6 +237,89 @@ module sienna_top #(
         .idle_o(gpnae_idle),
         .final_result_o(gpnae_final_result),
         .done_o(gpnae_done)
+    );
+    
+    // Buffer 2: GPNAE -> Maxpool
+    fifo_buffer #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .DEPTH(INTERMEDIATE_BUFFER_DEPTH)
+    ) buffer2_inst (
+        .clk_i(clk_i),
+        .rstn_i(rstn_i),
+        .wr_en_i(buffer2_wr_en),
+        .wr_data_i(buffer2_wr_data),
+        .rd_en_i(buffer2_rd_en),
+        .rd_data_o(buffer2_rd_data),
+        .full_o(buffer2_full),
+        .empty_o(buffer2_empty),
+        .count_o(buffer2_count)
+    );
+    
+    // Instantiate Maxpool
+    Maxpool_2D #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .IN_ROWS(IN_ROWS),
+        .IN_COLS(IN_COLS),
+        .POOL_H(POOL_H),
+        .POOL_W(POOL_W),
+        .PADDING(PADDING)
+    ) maxpool_inst (
+        .clk(clk_i),
+        .rst_n(rstn_i),
+        .start(maxpool_start),
+        .done(maxpool_done),
+        .in_addr(maxpool_in_addr),
+        .in_data(maxpool_input_data_i),  // External input or from buffer
+        .in_rd_en(maxpool_in_rd_en),
+        .out_data(maxpool_out_data),
+        .out_valid(maxpool_out_valid)
+    );
+    
+    // Buffer 3: Maxpool -> Dropout
+    fifo_buffer #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .DEPTH(INTERMEDIATE_BUFFER_DEPTH)
+    ) buffer3_inst (
+        .clk_i(clk_i),
+        .rstn_i(rstn_i),
+        .wr_en_i(buffer3_wr_en),
+        .wr_data_i(buffer3_wr_data),
+        .rd_en_i(buffer3_rd_en),
+        .rd_data_o(buffer3_rd_data),
+        .full_o(buffer3_full),
+        .empty_o(buffer3_empty),
+        .count_o(buffer3_count)
+    );
+    
+    // Instantiate Dropout
+    dropout_module #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .DROPOUT_P(DROPOUT_P),
+        .LFSR_WIDTH(LFSR_WIDTH)
+    ) dropout_inst (
+        .clk(clk_i),
+        .rst_n(rstn_i),
+        .en(dropout_en),
+        .training_mode(dropout_training_mode),
+        .data_in(buffer3_rd_data),
+        .data_out(dropout_data_out),
+        .valid_out(dropout_valid_out)
+    );
+    
+    // Buffer 4: Dropout -> Final Output
+    fifo_buffer #(
+        .DATA_WIDTH(2*DATA_WIDTH),  // Dropout output is 2x width
+        .DEPTH(INTERMEDIATE_BUFFER_DEPTH)
+    ) buffer4_inst (
+        .clk_i(clk_i),
+        .rstn_i(rstn_i),
+        .wr_en_i(buffer4_wr_en),
+        .wr_data_i(buffer4_wr_data),
+        .rd_en_i(buffer4_rd_en),
+        .rd_data_o(buffer4_rd_data),
+        .full_o(buffer4_full),
+        .empty_o(buffer4_empty),
+        .count_o(buffer4_count)
     );
     
     // State Machine - Sequential Logic
@@ -195,18 +344,42 @@ module sienna_top #(
             
             SYSTOLIC_PROCESSING: begin
                 if (systolic_collection_complete) begin
-                    next_state = BUFFER_TRANSFER;
+                    next_state = BUFFER_TRANSFER_1;
                 end
             end
             
-            BUFFER_TRANSFER: begin
-                if (all_data_transferred) begin
+            BUFFER_TRANSFER_1: begin
+                if (all_data_transferred_1) begin
                     next_state = GPNAE_PROCESSING;
                 end
             end
             
             GPNAE_PROCESSING: begin
-                if (all_data_processed) begin
+                if (all_data_processed_gpnae) begin
+                    next_state = BUFFER_TRANSFER_2;
+                end
+            end
+            
+            BUFFER_TRANSFER_2: begin
+                if (all_data_transferred_2) begin
+                    next_state = MAXPOOL_PROCESSING;
+                end
+            end
+            
+            MAXPOOL_PROCESSING: begin
+                if (maxpool_processing_complete) begin
+                    next_state = BUFFER_TRANSFER_3;
+                end
+            end
+            
+            BUFFER_TRANSFER_3: begin
+                if (all_data_transferred_3) begin
+                    next_state = DROPOUT_PROCESSING;
+                end
+            end
+            
+            DROPOUT_PROCESSING: begin
+                if (dropout_processing_complete) begin
                     next_state = PIPELINE_COMPLETE;
                 end
             end
@@ -224,89 +397,155 @@ module sienna_top #(
     // Control Logic
     always_ff @(posedge clk_i or negedge rstn_i) begin
         if (!rstn_i) begin
+            // Reset all control signals
             systolic_start_matrix_mult <= 1'b0;
             systolic_read_enable <= 1'b0;
             systolic_read_addr <= '0;
             systolic_read_counter <= '0;
             
-            intermediate_wr_en <= 1'b0;
-            intermediate_rd_en <= 1'b0;
+            buffer1_wr_en <= 1'b0;
+            buffer1_rd_en <= 1'b0;
+            buffer2_wr_en <= 1'b0;
+            buffer2_rd_en <= 1'b0;
+            buffer3_wr_en <= 1'b0;
+            buffer3_rd_en <= 1'b0;
+            buffer4_wr_en <= 1'b0;
+            buffer4_rd_en <= 1'b0;
             
             gpnae_signal_wr_en <= 1'b0;
             gpnae_last <= 1'b0;
             gpnae_start <= 1'b0;
             gpnae_write_counter <= '0;
             
+            maxpool_start <= 1'b0;
+            dropout_en <= 1'b0;
+            dropout_training_mode <= 1'b0;
+            
             total_elements <= N * N;
             transfer_active <= 1'b0;
-            all_data_transferred <= 1'b0;
-            all_data_processed <= 1'b0;
+            all_data_transferred_1 <= 1'b0;
+            all_data_processed_gpnae <= 1'b0;
+            all_data_transferred_2 <= 1'b0;
+            maxpool_processing_complete <= 1'b0;
+            all_data_transferred_3 <= 1'b0;
+            dropout_processing_complete <= 1'b0;
             
         end else begin
             // Default values
             systolic_start_matrix_mult <= 1'b0;
             systolic_read_enable <= 1'b0;
-            intermediate_wr_en <= 1'b0;
-            intermediate_rd_en <= 1'b0;
+            buffer1_wr_en <= 1'b0;
+            buffer1_rd_en <= 1'b0;
+            buffer2_wr_en <= 1'b0;
+            buffer2_rd_en <= 1'b0;
+            buffer3_wr_en <= 1'b0;
+            buffer3_rd_en <= 1'b0;
+            buffer4_wr_en <= 1'b0;
+            buffer4_rd_en <= 1'b0;
             gpnae_signal_wr_en <= 1'b0;
             gpnae_last <= 1'b0;
             gpnae_start <= 1'b0;
+            maxpool_start <= 1'b0;
+            dropout_en <= 1'b0;
             
             case (current_state)
                 IDLE: begin
                     systolic_read_counter <= '0;
                     gpnae_write_counter <= '0;
                     transfer_active <= 1'b0;
-                    all_data_transferred <= 1'b0;
-                    all_data_processed <= 1'b0;
-                end
+                    all_data_transferred_1 <= 1'b0;
+                    all_data_processed_gpnae <= 1'b0;
+                    all_data_transferred_2 <= 1'b0;
+                    maxpool_processing_complete <= 1'b0;
+                    all_data_transferred_3 <= 1'b0;
+                    dropout_processing_complete <= 1'b0;
+                }
                 
                 SYSTOLIC_PROCESSING: begin
-                    if (current_state != next_state) begin // Just entered this state
+                    if (current_state != next_state) begin
                         systolic_start_matrix_mult <= 1'b1;
                     end
-                end
+                }
                 
-                BUFFER_TRANSFER: begin
+                BUFFER_TRANSFER_1: begin
                     if (!transfer_active) begin
                         transfer_active <= 1'b1;
                     end
                     
-                    // Read from systolic array and write to intermediate buffer
-                    if (systolic_read_counter < total_elements && !intermediate_full) begin
+                    // Read from systolic array and write to buffer1
+                    if (systolic_read_counter < total_elements && !buffer1_full) begin
                         systolic_read_enable <= 1'b1;
                         systolic_read_addr <= systolic_read_counter;
                         
                         if (systolic_read_valid) begin
-                            intermediate_wr_en <= 1'b1;
+                            buffer1_wr_en <= 1'b1;
                             systolic_read_counter <= systolic_read_counter + 1;
                             
                             if (systolic_read_counter == total_elements - 1) begin
-                                all_data_transferred <= 1'b1;
+                                all_data_transferred_1 <= 1'b1;
                             end
                         end
                     end
-                end
+                }
                 
                 GPNAE_PROCESSING: begin
-                    // Read from intermediate buffer and write to GPNAE
-                    if (!intermediate_empty && gpnae_idle && !gpnae_full) begin
-                        intermediate_rd_en <= 1'b1;
+                    // Read from buffer1 and write to GPNAE
+                    if (!buffer1_empty && gpnae_idle && !gpnae_full) begin
+                        buffer1_rd_en <= 1'b1;
                         gpnae_signal_wr_en <= 1'b1;
                         gpnae_write_counter <= gpnae_write_counter + 1;
                         
-                        // Check if this is the last element
                         if (gpnae_write_counter == num_terms_i - 1) begin
                             gpnae_last <= 1'b1;
                             gpnae_start <= 1'b1;
-                            all_data_processed <= 1'b1;
+                            all_data_processed_gpnae <= 1'b1;
                         end
                     end
-                end
+                }
+                
+                BUFFER_TRANSFER_2: begin
+                    // Write GPNAE results to buffer2
+                    if (gpnae_done && !buffer2_full) begin
+                        buffer2_wr_en <= 1'b1;
+                        all_data_transferred_2 <= 1'b1;
+                    end
+                }
+                
+                MAXPOOL_PROCESSING: begin
+                    if (current_state != next_state) begin
+                        maxpool_start <= 1'b1;
+                    end
+                    
+                    if (maxpool_done) begin
+                        maxpool_processing_complete <= 1'b1;
+                    end
+                }
+                
+                BUFFER_TRANSFER_3: begin
+                    // Write maxpool results to buffer3
+                    if (maxpool_out_valid && !buffer3_full) begin
+                        buffer3_wr_en <= 1'b1;
+                        all_data_transferred_3 <= 1'b1;
+                    end
+                }
+                
+                DROPOUT_PROCESSING: begin
+                    // Read from buffer3, process through dropout, write to buffer4
+                    if (!buffer3_empty && !buffer4_full) begin
+                        buffer3_rd_en <= 1'b1;
+                        dropout_en <= 1'b1;
+                        dropout_training_mode <= 1'b0;  // Set to 0 for inference mode
+                        
+                        if (dropout_valid_out) begin
+                            buffer4_wr_en <= 1'b1;
+                            dropout_processing_complete <= 1'b1;
+                        end
+                    end
+                }
                 
                 PIPELINE_COMPLETE: begin
-                    // Hold in this state until start signal is deasserted
-                end
+                    // Hold final result in buffer4
+                }
                 
             endcase
         end
@@ -314,82 +553,31 @@ module sienna_top #(
     
     // Data Path Connections
     always_comb begin
-        // Intermediate buffer write data comes from systolic array
-        intermediate_wr_data = systolic_read_data;
-        
-        // GPNAE signal data comes from intermediate buffer
-        gpnae_signal_data = intermediate_rd_data;
+        // Buffer connections
+        buffer1_wr_data = systolic_read_data;
+        gpnae_signal_data = buffer1_rd_data;
+        buffer2_wr_data = gpnae_final_result;
+        buffer3_wr_data = maxpool_out_data;
+        buffer4_wr_data = dropout_data_out;
         
         // Output assignments
-        final_result_o = gpnae_final_result;
+        final_result_o = buffer4_rd_data;
         pipeline_complete_o = (current_state == PIPELINE_COMPLETE);
         gpnae_done_o = gpnae_done;
         
         // Status outputs
         systolic_busy_o = (current_state == SYSTOLIC_PROCESSING) || 
-                         (current_state == BUFFER_TRANSFER);
+                         (current_state == BUFFER_TRANSFER_1);
         gpnae_busy_o = (current_state == GPNAE_PROCESSING);
-        intermediate_buffer_full_o = intermediate_full;
-        intermediate_buffer_empty_o = intermediate_empty;
+        maxpool_busy_o = (current_state == MAXPOOL_PROCESSING);
+        dropout_busy_o = (current_state == DROPOUT_PROCESSING);
+        intermediate_buffer_full_o = buffer1_full;
+        intermediate_buffer_empty_o = buffer1_empty;
         
         // Debug outputs
         systolic_result_debug_o = systolic_read_data;
         systolic_complete_debug_o = systolic_collection_complete;
-        buffer_count_debug_o = intermediate_count;
+        buffer_count_debug_o = buffer1_count;
     end
-
-endmodule
-
-// Simple FIFO Buffer Module
-module fifo_buffer #(
-    parameter DATA_WIDTH = 32,
-    parameter DEPTH = 1024
-)(
-    input  logic clk_i,
-    input  logic rstn_i,
-    input  logic wr_en_i,
-    input  logic [DATA_WIDTH-1:0] wr_data_i,
-    input  logic rd_en_i,
-    output logic [DATA_WIDTH-1:0] rd_data_o,
-    output logic full_o,
-    output logic empty_o,
-    output logic [$clog2(DEPTH)-1:0] count_o
-);
-
-    logic [DATA_WIDTH-1:0] buffer_mem [0:DEPTH-1];
-    logic [$clog2(DEPTH)-1:0] wr_ptr, rd_ptr;
-    logic [$clog2(DEPTH)-1:0] count;
-    
-    always_ff @(posedge clk_i or negedge rstn_i) begin
-        if (!rstn_i) begin
-            wr_ptr <= '0;
-            rd_ptr <= '0;
-            count <= '0;
-        end else begin
-            // Write operation
-            if (wr_en_i && !full_o) begin
-                buffer_mem[wr_ptr] <= wr_data_i;
-                wr_ptr <= (wr_ptr == DEPTH-1) ? '0 : wr_ptr + 1;
-            end
-            
-            // Read operation  
-            if (rd_en_i && !empty_o) begin
-                rd_ptr <= (rd_ptr == DEPTH-1) ? '0 : rd_ptr + 1;
-            end
-            
-            // Count update
-            if (wr_en_i && !rd_en_i && !full_o) begin
-                count <= count + 1;
-            end else if (!wr_en_i && rd_en_i && !empty_o) begin
-                count <= count - 1;
-            end
-        end
-    end
-    
-    // Output assignments
-    assign rd_data_o = buffer_mem[rd_ptr];
-    assign full_o = (count == DEPTH);
-    assign empty_o = (count == 0);
-    assign count_o = count;
 
 endmodule

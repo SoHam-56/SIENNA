@@ -280,7 +280,7 @@ def main():
         "--dropout-p", type=float, default=0.5, help="Dropout probability"
     )
     parser.add_argument(
-        "--output-dir", type=str, default="testbench", help="Output directory"
+        "--output-dir", type=str, default="testbenches", help="Output directory"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(

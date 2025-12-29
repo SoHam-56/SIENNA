@@ -1,3 +1,6 @@
+# Use bash for slightly nicer loops/tests
+SHELL := /bin/bash
+
 # Project Structure
 PRJ_DIR = $(shell pwd)
 SRC_DIR = $(PRJ_DIR)/src
@@ -55,41 +58,55 @@ GNAE_FILES = \
 
 # Sumit_Anish Design Files (CNN Components)
 SUMIT_FILES = \
-	CNN2/dropout_module.v \
-	CNN2/Maxpool_2D.v \
-	CNN2/SRAM.v
-
-# FP16 Converter/Deconverter Files (if needed)
-# Uncomment if these are required by the top module
-# FP16_FILES = \
-# 	FP16_Converter/topModule.v \
-# 	FP16_Deconverter/topModule.v
+	Dropout/dropout.sv \
+	Maxpool/Maxpool_2D.sv
 
 # Combined Design Files
 DESIGN_FILES = \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
 	$(addprefix $(SA_DIR)/,$(SA_FILES)) \
 	$(addprefix $(GNAE_DIR)/,$(GNAE_FILES)) \
-	$(addprefix $(SUMIT_DIR)/,$(SUMIT_FILES))
+	$(SUMIT_FILES)
 
 # Testbench Configuration
 TESTBENCH = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 
-# Alternative testbench configurations:
-# For Systolic Array only:
-# TESTBENCH = TB_SystolicArray.sv
-# TOP_MODULE = TB_SystolicArray
-# TB_DIR = $(PRJ_DIR)/SystolicArray/testbenches
-
-# For GNAE only:
-# TESTBENCH = TB_gpnae.sv
-# TOP_MODULE = TB_gpnae
-# TB_DIR = $(PRJ_DIR)/GNAE/testbenches
-
 # Directories
 VERILATOR_DIR = $(PRJ_DIR)/Verilator
 VCS_DIR = $(PRJ_DIR)/VCS
+
+# -------- Memory/config file collection --------
+# Patterns to collect (add/remove as needed)
+MEM_PATTERNS := *.mem *.mif *.hex
+
+# Directories to search for memory/config files
+MEM_DIRS := \
+	$(PRJ_DIR) \
+	$(SRC_DIR) \
+	$(TB_DIR) \
+	$(SA_DIR) \
+	$(GNAE_DIR) \
+	$(GNAE_DIR)/TYTAN/Memory \
+	$(SUMIT_DIR)
+
+# Helper macro: copy MEM_PATTERNS from MEM_DIRS into a destination directory
+define copy_mem_files
+	@echo "-- Copying memory/config files into $(1)"
+	@mkdir -p $(1)
+	@copied=0; \
+	for d in $(MEM_DIRS); do \
+		for p in $(MEM_PATTERNS); do \
+			if ls $$d/$$p 1>/dev/null 2>&1; then \
+				cp -u $$d/$$p $(1)/; \
+				echo "   Copied $$p from $$d"; \
+				copied=1; \
+			fi; \
+		done; \
+	done; \
+	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.mif/*.hex found)"; fi
+endef
+# ----------------------------------------------
 
 # Verilator Flags
 VERILATOR_FLAGS = \
@@ -113,7 +130,8 @@ VERILATOR_FLAGS = \
 	--Wno-MODDUP \
 	--Wno-SELRANGE \
 	--Wno-LATCH \
-	--Wno-REALCVT
+	--Wno-REALCVT \
+	--Wno-SHORTREAL
 
 # VCS Flags
 VCS_FLAGS = \
@@ -140,22 +158,22 @@ help:
 	@echo "=== SIENNA Hardware Simulation Makefile ==="
 	@echo ""
 	@echo "Simulation Targets:"
-	@echo "  make verilator    - Simulate using Verilator"
-	@echo "  make vcs          - Simulate using Synopsys VCS"
+	@echo "  make verilator       - Simulate using Verilator"
+	@echo "  make vcs             - Simulate using Synopsys VCS"
 	@echo ""
 	@echo "Individual Module Targets:"
-	@echo "  make sa-verilator - Simulate Systolic Array only"
-	@echo "  make gnae-verilator - Simulate GNAE only"
+	@echo "  make sa-verilator    - Simulate Systolic Array only"
+	@echo "  make gnae-verilator  - Simulate GNAE only"
 	@echo ""
 	@echo "Analysis Targets:"
-	@echo "  make lint         - Run Verilator lint check"
-	@echo "  make debug        - Build with debug information"
-	@echo "  make perf         - Build with performance profiling"
+	@echo "  make lint            - Run Verilator lint check"
+	@echo "  make debug           - Build with debug information"
+	@echo "  make perf            - Build with performance profiling"
 	@echo ""
 	@echo "Utility Targets:"
-	@echo "  make wave         - View waveforms"
-	@echo "  make clean        - Remove all simulation artifacts"
-	@echo "  make clean-all    - Clean all including subprojects"
+	@echo "  make wave            - View waveforms"
+	@echo "  make clean           - Remove all simulation artifacts"
+	@echo "  make clean-all       - Clean all including subprojects"
 	@echo ""
 	@echo "Current Configuration:"
 	@echo "  TOP_MODULE: $(TOP_MODULE)"
@@ -166,6 +184,10 @@ help:
 	@echo "  GNAE:           $(words $(GNAE_FILES)) files"
 	@echo "  CNN (Sumit):    $(words $(SUMIT_FILES)) files"
 	@echo "  Total:          $(words $(DESIGN_FILES)) files"
+	@echo ""
+	@echo "Memory/config copies:"
+	@echo "  Patterns: $(MEM_PATTERNS)"
+	@echo "  From:     $(MEM_DIRS)"
 
 # Verilator Simulation - SIENNA Top
 verilator:
@@ -178,19 +200,7 @@ verilator:
 		-o $(TOP_MODULE)_sim
 	@echo "-- Compiling Verilator simulation"
 	make -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
-	@echo "-- Copying memory files"
-	@if ls $(SA_DIR)/*.mem 1> /dev/null 2>&1; then \
-		cp $(SA_DIR)/*.mem $(VERILATOR_DIR)/; \
-		echo "   Copied Systolic Array .mem files"; \
-	fi
-	@if ls $(GNAE_DIR)/TYTAN/Memory/*.mem 1> /dev/null 2>&1; then \
-		cp $(GNAE_DIR)/TYTAN/Memory/*.mem $(VERILATOR_DIR)/; \
-		echo "   Copied GNAE/TYTAN .mem files"; \
-	fi
-	@if ls $(TB_DIR)/*.mem 1> /dev/null 2>&1; then \
-		cp $(TB_DIR)/*.mem $(VERILATOR_DIR)/; \
-		echo "   Copied testbench .mem files"; \
-	fi
+	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running Verilator simulation"
 	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim
 	@echo "-- Verilator simulation complete"
@@ -214,15 +224,7 @@ vcs:
 		-o $(VCS_DIR)/$(TOP_MODULE)_sim \
 		$(DESIGN_FILES) \
 		$(TB_DIR)/$(TESTBENCH)
-	@echo "-- Copying memory files"
-	@if ls $(SA_DIR)/*.mem 1> /dev/null 2>&1; then \
-		cp $(SA_DIR)/*.mem $(VCS_DIR)/; \
-		echo "   Copied Systolic Array .mem files"; \
-	fi
-	@if ls $(GNAE_DIR)/TYTAN/Memory/*.mem 1> /dev/null 2>&1; then \
-		cp $(GNAE_DIR)/TYTAN/Memory/*.mem $(VCS_DIR)/; \
-		echo "   Copied GNAE/TYTAN .mem files"; \
-	fi
+	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running VCS simulation"
 	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim
 	@echo "-- VCS simulation complete"
@@ -232,7 +234,7 @@ wave:
 	@if [ -f $(VERILATOR_DIR)/dump.vcd ]; then \
 		echo "-- Opening Verilator waveform"; \
 		$(WAVE) $(VERILATOR_DIR)/dump.vcd; \
-	elif [ -f $(VCS_DIR)/*.vpd ]; then \
+	elif compgen -G "$(VCS_DIR)/*.vpd" > /dev/null; then \
 		echo "-- Opening VCS waveform"; \
 		$(WAVE) $(VCS_DIR)/*.vpd; \
 	else \

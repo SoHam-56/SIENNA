@@ -20,7 +20,7 @@ module sienna_top #(
     parameter PADDING = 1,
 
     // Dropout Parameters
-    parameter real DROPOUT_P = 0.5,
+    parameter DROPOUT_P_PERCENT = 50,
     parameter LFSR_WIDTH = 32,
 
     // Memory Parameters
@@ -44,10 +44,6 @@ module sienna_top #(
     input logic west_write_enable_i,
     input logic [DATA_WIDTH-1:0] west_write_data_i,
     input logic west_write_reset_i,
-
-    // Maxpool SRAM Interface (backward compatibility)
-    input logic [DATA_WIDTH-1:0] maxpool_input_data_i,
-    input logic maxpool_input_valid_i,
 
     // Final Output Interface
     output logic [DATA_WIDTH-1:0] final_result_o,
@@ -89,7 +85,7 @@ module sienna_top #(
     FEED_GPNAE,
     GPNAE_PROCESSING,
     COLLECT_GPNAE,
-    FILL_MAXPOOL_SRAM,
+    FEED_MAXPOOL,
     MAXPOOL_PROCESSING,
     COLLECT_MAXPOOL,
     DROPOUT_PROCESSING,
@@ -132,7 +128,7 @@ module sienna_top #(
   logic gpnae_processing_done;
 
   // ============================================================
-  // FIFO 2: GPNAE → Maxpool SRAM Interface
+  // FIFO 2: GPNAE → Maxpool Interface
   // ============================================================
   logic fifo2_wr_en, fifo2_rd_en;
   logic [DATA_WIDTH-1:0] fifo2_wr_data, fifo2_rd_data;
@@ -140,24 +136,18 @@ module sienna_top #(
   logic [$clog2(FIFO_DEPTH+1)-1:0] fifo2_count;
 
   // ============================================================
-  // Maxpool SRAM & Signals
+  // Maxpool Signals
   // ============================================================
-  logic [$clog2(MAXPOOL_IN_SIZE)-1:0] maxpool_sram_addr;
-  logic [DATA_WIDTH-1:0] maxpool_sram_wdata;
-  logic maxpool_sram_wr_en;
-  logic [DATA_WIDTH-1:0] maxpool_sram_rdata;
-  logic maxpool_sram_rd_en;
-
-  logic [$clog2(MAXPOOL_IN_SIZE)-1:0] maxpool_in_addr;
-  logic [DATA_WIDTH-1:0] maxpool_in_data;
-  logic maxpool_in_rd_en;
+  logic [DATA_WIDTH-1:0] maxpool_data_in;
+  logic maxpool_valid_in;
   logic maxpool_start;
   logic maxpool_done;
   logic [DATA_WIDTH-1:0] maxpool_out_data;
   logic maxpool_out_valid;
 
-  logic [$clog2(MAXPOOL_IN_SIZE+1)-1:0] sram_write_counter;
-  logic sram_fill_complete;
+  logic [$clog2(MAXPOOL_IN_SIZE+1)-1:0] maxpool_feed_counter;
+  logic maxpool_feed_complete;
+  logic [$clog2(MAXPOOL_OUT_SIZE+1)-1:0] maxpool_output_counter;
 
   // ============================================================
   // FIFO 3: Maxpool → Dropout Interface
@@ -260,7 +250,7 @@ module sienna_top #(
   );
 
   // ============================================================
-  // FIFO 2: GPNAE → Maxpool SRAM
+  // FIFO 2: GPNAE → Maxpool
   // ============================================================
   fifo_buffer #(
       .DATA_WIDTH(DATA_WIDTH),
@@ -278,40 +268,7 @@ module sienna_top #(
   );
 
   // ============================================================
-  // Maxpool Input SRAM
-  // ============================================================
-  SRAM #(
-      .ADDR_WIDTH($clog2(MAXPOOL_IN_SIZE)),
-      .DATA_WIDTH(DATA_WIDTH)
-  ) maxpool_input_sram (
-      .clk  (clk_i),
-      .rst_n(rstn_i),
-      .addr (maxpool_sram_addr),
-      .wdata(maxpool_sram_wdata),
-      .wr_en(maxpool_sram_wr_en),
-      .rd_en(maxpool_sram_rd_en),
-      .rdata(maxpool_sram_rdata)
-  );
-
-  // Maxpool SRAM arbitration
-  always_comb begin
-    if (current_state == MAXPOOL_PROCESSING) begin
-      maxpool_sram_addr = maxpool_in_addr;
-      maxpool_sram_rd_en = maxpool_in_rd_en;
-      maxpool_in_data = maxpool_sram_rdata;
-      maxpool_sram_wr_en = 1'b0;
-      maxpool_sram_wdata = '0;
-    end else begin
-      maxpool_sram_addr = sram_write_counter[$clog2(MAXPOOL_IN_SIZE)-1:0];
-      maxpool_sram_rd_en = 1'b0;
-      maxpool_in_data = '0;
-      maxpool_sram_wr_en = (current_state == FILL_MAXPOOL_SRAM) && !fifo2_empty;
-      maxpool_sram_wdata = fifo2_rd_data;
-    end
-  end
-
-  // ============================================================
-  // Maxpool Instantiation (using fixed version)
+  // Maxpool Instantiation (streaming interface)
   // ============================================================
   Maxpool_2D #(
       .DATA_WIDTH(DATA_WIDTH),
@@ -327,15 +284,14 @@ module sienna_top #(
       .rst_n(rstn_i),
       .start(maxpool_start),
       .done(maxpool_done),
-      .in_addr(maxpool_in_addr),
-      .in_data(maxpool_in_data),
-      .in_rd_en(maxpool_in_rd_en),
+      .data_in(maxpool_data_in),
+      .valid_in(maxpool_valid_in),
       .out_data(maxpool_out_data),
       .out_valid(maxpool_out_valid)
   );
 
   // ============================================================
-  // FIFO 3: Maxpool → Dropout
+  // FIFO 3: Maxpool → Dropout Interface
   // ============================================================
   fifo_buffer #(
       .DATA_WIDTH(DATA_WIDTH),
@@ -353,11 +309,11 @@ module sienna_top #(
   );
 
   // ============================================================
-  // Dropout Instantiation (using fixed version)
+  // Dropout Instantiation
   // ============================================================
   dropout #(
       .DATA_WIDTH(DATA_WIDTH),
-      .DROPOUT_P (DROPOUT_P),
+      .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
       .LFSR_WIDTH(LFSR_WIDTH)
   ) dropout_inst (
       .clk(clk_i),
@@ -416,24 +372,26 @@ module sienna_top #(
 
       COLLECT_GPNAE: begin
         if (!fifo2_empty) begin
-          next_state = FILL_MAXPOOL_SRAM;
+          next_state = FEED_MAXPOOL;
         end
       end
 
-      FILL_MAXPOOL_SRAM: begin
-        if (sram_fill_complete) begin
+      FEED_MAXPOOL: begin
+        if (maxpool_feed_complete) begin
           next_state = MAXPOOL_PROCESSING;
         end
       end
 
       MAXPOOL_PROCESSING: begin
-        if (maxpool_done) begin
+        // Wait until maxpool is done AND we've collected all outputs
+        if (maxpool_done && (maxpool_output_counter >= MAXPOOL_OUT_SIZE)) begin
           next_state = COLLECT_MAXPOOL;
         end
       end
 
       COLLECT_MAXPOOL: begin
-        if (fifo3_empty && maxpool_done) begin
+        // Transition when FIFO3 has data to process
+        if (!fifo3_empty) begin
           next_state = DROPOUT_PROCESSING;
         end
       end
@@ -485,9 +443,12 @@ module sienna_top #(
       gpnae_processing_done <= 1'b0;
 
       // Maxpool control
-      sram_write_counter <= '0;
-      sram_fill_complete <= 1'b0;
+      maxpool_feed_counter <= '0;
+      maxpool_feed_complete <= 1'b0;
+      maxpool_output_counter <= '0;
       maxpool_start <= 1'b0;
+      maxpool_data_in <= '0;
+      maxpool_valid_in <= 1'b0;
 
       // Dropout control
       dropout_en <= 1'b0;
@@ -512,6 +473,7 @@ module sienna_top #(
       gpnae_wr_en <= 1'b0;
       gpnae_last <= 1'b0;
       maxpool_start <= 1'b0;
+      maxpool_valid_in <= 1'b0;
       dropout_en <= 1'b0;
 
       case (current_state)
@@ -521,8 +483,9 @@ module sienna_top #(
           systolic_transfer_complete <= 1'b0;
           gpnae_input_counter <= '0;
           gpnae_processing_done <= 1'b0;
-          sram_write_counter <= '0;
-          sram_fill_complete <= 1'b0;
+          maxpool_feed_counter <= '0;
+          maxpool_feed_complete <= 1'b0;
+          maxpool_output_counter <= '0;
           dropout_output_counter <= '0;
           all_outputs_collected <= 1'b0;
           dropout_training_mode <= 1'b0;
@@ -577,27 +540,38 @@ module sienna_top #(
           end
         end
 
-        FILL_MAXPOOL_SRAM: begin
-          if (!fifo2_empty && sram_write_counter < MAXPOOL_IN_SIZE) begin
-            fifo2_rd_en <= 1'b1;
-            sram_write_counter <= sram_write_counter + 1'b1;
+        FEED_MAXPOOL: begin
+          if (state_entered) begin
+            maxpool_start <= 1'b1;
+          end
 
-            if (sram_write_counter + 1'b1 >= MAXPOOL_IN_SIZE) begin
-              sram_fill_complete <= 1'b1;
+          if (!fifo2_empty && maxpool_feed_counter < MAXPOOL_IN_SIZE) begin
+            fifo2_rd_en <= 1'b1;
+            maxpool_valid_in <= 1'b1;
+            maxpool_data_in <= fifo2_rd_data;
+            maxpool_feed_counter <= maxpool_feed_counter + 1'b1;
+
+            if (maxpool_feed_counter + 1'b1 >= MAXPOOL_IN_SIZE) begin
+              maxpool_feed_complete <= 1'b1;
             end
           end
         end
 
         MAXPOOL_PROCESSING: begin
-          if (state_entered) begin
-            maxpool_start <= 1'b1;
+          // FIX 2: Collect maxpool outputs as they're produced (streaming)
+          if (maxpool_out_valid && !fifo3_full) begin
+            fifo3_wr_en   <= 1'b1;
+            fifo3_wr_data <= maxpool_out_data;
+            maxpool_output_counter <= maxpool_output_counter + 1'b1;
           end
         end
 
         COLLECT_MAXPOOL: begin
+          // Continue collecting any remaining outputs
           if (maxpool_out_valid && !fifo3_full) begin
             fifo3_wr_en   <= 1'b1;
             fifo3_wr_data <= maxpool_out_data;
+            maxpool_output_counter <= maxpool_output_counter + 1'b1;
           end
         end
 
@@ -636,7 +610,7 @@ module sienna_top #(
 
   assign systolic_busy_o = (current_state == SYSTOLIC_PROCESSING) || (current_state == FEED_GPNAE);
   assign gpnae_busy_o = (current_state == GPNAE_PROCESSING) || (current_state == COLLECT_GPNAE);
-  assign maxpool_busy_o = (current_state == FILL_MAXPOOL_SRAM) ||
+  assign maxpool_busy_o = (current_state == FEED_MAXPOOL) ||
                           (current_state == MAXPOOL_PROCESSING) ||
                           (current_state == COLLECT_MAXPOOL);
   assign dropout_busy_o = (current_state == DROPOUT_PROCESSING);
@@ -727,19 +701,5 @@ module fifo_buffer #(
   assign empty_o = (count == '0);
   assign full_o  = (count == DEPTH[ADDR_WIDTH:0]);
   assign count_o = count;
-
-  // Synthesis-off assertions
-  // synthesis translate_off
-  // always_ff @(posedge clk_i) begin
-  //   if (rstn_i) begin
-  //     if (wr_en_i && full_o) begin
-  //       $error("Time %0t: FIFO write overflow!", $time);
-  //     end
-  //     if (rd_en_i && empty_o) begin
-  //       $error("Time %0t: FIFO read underflow!", $time);
-  //     end
-  //   end
-  // end
-  // synthesis translate_on
 
 endmodule

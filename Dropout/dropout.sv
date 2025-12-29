@@ -1,8 +1,7 @@
 `timescale 1ns / 1ps
-
 module dropout #(
     parameter DATA_WIDTH = 8,
-    parameter real DROPOUT_P = 0.5,
+    parameter integer DROPOUT_P_PERCENT = 50,  // Dropout probability as percentage (0-100)
     parameter LFSR_WIDTH = 32
 ) (
     input  logic clk,
@@ -13,19 +12,27 @@ module dropout #(
     output logic [DATA_WIDTH-1:0] data_out,
     output logic valid_out
 );
-
     // LFSR state registers
     logic [LFSR_WIDTH-1:0] lfsr_state;
     logic [LFSR_WIDTH-1:0] lfsr_next_state;
 
     // Fixed-point parameters
-    localparam int FRACTIONAL_BITS = DATA_WIDTH;
-    localparam int SCALING_FACTOR_FIXED_POINT = ((1.0 - DROPOUT_P) < 1e-6) ? 0 :
-                                                 int'((1.0 / (1.0 - DROPOUT_P)) * (1 << FRACTIONAL_BITS));
-    localparam int INTERMEDIATE_WIDTH = 2 * DATA_WIDTH;
+    localparam integer FRACTIONAL_BITS = DATA_WIDTH;
+
+    // Calculate scaling factor: (1 / (1 - DROPOUT_P)) in fixed-point
+    // Scale = 100 / (100 - DROPOUT_P_PERCENT)
+    localparam integer SCALING_NUMERATOR = 100;
+    localparam integer SCALING_DENOMINATOR = (100 - DROPOUT_P_PERCENT) > 0 ? (100 - DROPOUT_P_PERCENT) : 1;
+    localparam integer SCALING_FACTOR_FIXED_POINT = (SCALING_NUMERATOR * (1 << FRACTIONAL_BITS)) / SCALING_DENOMINATOR;
+
+    localparam integer INTERMEDIATE_WIDTH = 2 * DATA_WIDTH;
 
     // Dropout threshold for LFSR comparison
-    localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = LFSR_WIDTH'(DROPOUT_P * real'((1 << LFSR_WIDTH) - 1));
+    // THRESHOLD = (DROPOUT_P_PERCENT / 100) * (2^LFSR_WIDTH - 1)
+    // Use logic types for all bit vector operations
+    localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
+    localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
+    localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
 
     // LFSR next state logic (combinational)
     always_comb begin
@@ -85,5 +92,4 @@ module dropout #(
             valid_out <= en;
         end
     end
-
 endmodule

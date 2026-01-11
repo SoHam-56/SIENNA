@@ -1,4 +1,3 @@
-# Use bash for slightly nicer loops/tests
 SHELL := /bin/bash
 
 # Project Structure

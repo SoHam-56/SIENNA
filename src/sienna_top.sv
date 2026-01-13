@@ -130,9 +130,6 @@ module sienna_top #(
   logic [DATA_WIDTH-1:0] dropout_data_in, dropout_data_in_next;
   logic [DATA_WIDTH-1:0] final_output_reg, final_output_reg_next;
 
-  // 4. HACK Flags
-  logic gpnae_seen_reg; // Flag to track if first pulse occurred
-
 
   // ============================================================
   // Module Instantiations
@@ -383,18 +380,10 @@ module sienna_top #(
       end
 
       COLLECT_GPNAE: begin
-        /* ORIGINAL CODE:
         if (gpnae_done_signal) begin
           fifo2_wr_en_next = 1;
-          if ((fifo2_wr_en == 1'b1) && (items_expected_back > 0)) items_expected_back_next = items_expected_back - 1;
-        end
-        */
-
-        // HACK: IGNORE FIRST GPNAE PULSE
-        // We only trigger logic if signal is present AND we have seen it before (flag set)
-        if (gpnae_done_signal && gpnae_seen_reg) begin
-          fifo2_wr_en_next = 1;
-          if ((fifo2_wr_en == 1'b1) && (items_expected_back > 0)) items_expected_back_next = items_expected_back - 1;
+          if ((fifo2_wr_en == 1'b1) && (items_expected_back > 0))
+            items_expected_back_next = items_expected_back - 1;
         end
       end
 
@@ -422,21 +411,6 @@ module sienna_top #(
     endcase
   end
 
-  // ============================================================
-  // HACK LOGIC: First Pulse Skipper Sequential Block
-  // ============================================================
-  always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) begin
-      gpnae_seen_reg <= 1'b0;
-    end else begin
-      // Reset the flag whenever we are NOT in the state, so it resets for every new run
-      if (current_state != COLLECT_GPNAE) 
-        gpnae_seen_reg <= 1'b0;
-      // If we see the signal while in the state, mark it as seen
-      else if (gpnae_done_signal) 
-        gpnae_seen_reg <= 1'b1;
-    end
-  end
 
   // ============================================================
   // FSM Process 3b: DATAPATH REGISTERS (Sequential)

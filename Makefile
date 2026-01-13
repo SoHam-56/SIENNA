@@ -5,7 +5,7 @@ PRJ_DIR = $(shell pwd)
 SRC_DIR = $(PRJ_DIR)/src
 TB_DIR = $(PRJ_DIR)/testbenches
 SA_DIR = $(PRJ_DIR)/SystolicArray/src
-GNAE_DIR = $(PRJ_DIR)/GNAE/src
+GPNAE_DIR = $(PRJ_DIR)/GPNAE/src
 SUMIT_DIR = $(PRJ_DIR)/Sumit_Anish
 
 # Toolchain
@@ -32,8 +32,8 @@ SA_FILES = \
 	MAC/UnSig_R4Booth.sv \
 	MAC/MAC.sv
 
-# GNAE Design Files
-GNAE_FILES = \
+# GPNAE Design Files
+GPNAE_FILES = \
 	gpnae.sv \
 	UpDown.sv \
 	Down.sv \
@@ -64,7 +64,7 @@ SUMIT_FILES = \
 DESIGN_FILES = \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
 	$(addprefix $(SA_DIR)/,$(SA_FILES)) \
-	$(addprefix $(GNAE_DIR)/,$(GNAE_FILES)) \
+	$(addprefix $(GPNAE_DIR)/,$(GPNAE_FILES)) \
 	$(SUMIT_FILES)
 
 # Testbench Configuration
@@ -85,8 +85,8 @@ MEM_DIRS := \
 	$(SRC_DIR) \
 	$(TB_DIR) \
 	$(SA_DIR) \
-	$(GNAE_DIR) \
-	$(GNAE_DIR)/TYTAN/Memory \
+	$(GPNAE_DIR) \
+	$(GPNAE_DIR)/TYTAN/Memory \
 	$(SUMIT_DIR)
 
 # Helper macro: copy MEM_PATTERNS from MEM_DIRS into a destination directory
@@ -117,7 +117,7 @@ VERILATOR_FLAGS = \
 	-I$(SRC_DIR) \
 	-I$(TB_DIR) \
 	-I$(SA_DIR) \
-	-I$(GNAE_DIR) \
+	-I$(GPNAE_DIR) \
 	-I$(SUMIT_DIR)/CNN2 \
 	-I$(SUMIT_DIR)/FP16_Converter \
 	-I$(SUMIT_DIR)/FP16_Deconverter \
@@ -143,7 +143,7 @@ VCS_FLAGS = \
 	+incdir+$(SRC_DIR) \
 	+incdir+$(TB_DIR) \
 	+incdir+$(SA_DIR) \
-	+incdir+$(GNAE_DIR) \
+	+incdir+$(GPNAE_DIR) \
 	+incdir+$(SUMIT_DIR)/CNN2 \
 	+incdir+$(SUMIT_DIR)/FP16_Converter \
 	+incdir+$(SUMIT_DIR)/FP16_Deconverter \
@@ -162,7 +162,7 @@ help:
 	@echo ""
 	@echo "Individual Module Targets:"
 	@echo "  make sa-verilator    - Simulate Systolic Array only"
-	@echo "  make gnae-verilator  - Simulate GNAE only"
+	@echo "  make gpnae-verilator  - Simulate GPNAE only"
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint            - Run Verilator lint check"
@@ -180,7 +180,7 @@ help:
 	@echo ""
 	@echo "Design Files:"
 	@echo "  Systolic Array: $(words $(SA_FILES)) files"
-	@echo "  GNAE:           $(words $(GNAE_FILES)) files"
+	@echo "  GPNAE:           $(words $(GPNAE_FILES)) files"
 	@echo "  CNN (Sumit):    $(words $(SUMIT_FILES)) files"
 	@echo "  Total:          $(words $(DESIGN_FILES)) files"
 	@echo ""
@@ -210,10 +210,10 @@ sa-verilator:
 	@echo "=== Building Systolic Array only ==="
 	$(MAKE) -C SystolicArray verilator
 
-# Verilator Simulation - GNAE Only
-gnae-verilator:
-	@echo "=== Building GNAE only ==="
-	$(MAKE) -C GNAE verilator
+# Verilator Simulation - GPNAE Only
+gpnae-verilator:
+	@echo "=== Building GPNAE only ==="
+	$(MAKE) -C GPNAE verilator
 
 # VCS Simulation
 vcs:
@@ -268,8 +268,8 @@ list-files:
 	@echo "Systolic Array ($(SA_DIR)):"
 	@for file in $(SA_FILES); do echo "  - $$file"; done
 	@echo ""
-	@echo "GNAE ($(GNAE_DIR)):"
-	@for file in $(GNAE_FILES); do echo "  - $$file"; done
+	@echo "GPNAE ($(GPNAE_DIR)):"
+	@for file in $(GPNAE_FILES); do echo "  - $$file"; done
 	@echo ""
 	@echo "CNN Components ($(SUMIT_DIR)):"
 	@for file in $(SUMIT_FILES); do echo "  - $$file"; done
@@ -306,8 +306,8 @@ clean:
 clean-all: clean
 	@echo "-- Cleaning subprojects"
 	-$(MAKE) -C SystolicArray clean 2>/dev/null || true
-	-$(MAKE) -C GNAE clean 2>/dev/null || true
+	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
 # Phony targets
-.PHONY: default help verilator vcs sa-verilator gnae-verilator wave lint debug perf list-files check-files clean clean-all
+.PHONY: default help verilator vcs sa-verilator gpnae-verilator wave lint debug perf list-files check-files clean clean-all

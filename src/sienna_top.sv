@@ -56,6 +56,7 @@ module sienna_top #(
     DRAIN_FIFO_TO_GPNAE,
     COLLECT_GPNAE,
     PREP_MAXPOOL,
+    FEED_VALID,
     FEED_MAXPOOL,
     MAXPOOL_PROCESSING,
     COLLECT_MAXPOOL,
@@ -111,7 +112,7 @@ module sienna_top #(
   logic maxpool_start, maxpool_start_next;
   logic maxpool_valid_in, maxpool_valid_in_next;
   logic fifo3_rd_en, fifo3_rd_en_next;
-  logic dropout_en, dropout_en_next;
+  logic dropout_in_valid, dropout_in_valid_next;
 
   logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_addr, systolic_read_addr_next;
   logic [$clog2(FIFO_DEPTH+1)-1:0] items_left_to_process, items_left_to_process_next;
@@ -237,7 +238,7 @@ module sienna_top #(
   ) dropout_inst (
       .clk(clk_i),
       .rst_n(rstn_i),
-      .en(dropout_en),
+      .in_valid(dropout_in_valid),
       .training_mode(1'b0),
       .data_in(dropout_data_in),
       .data_out(dropout_data_out),
@@ -306,8 +307,11 @@ module sienna_top #(
 
       COLLECT_GPNAE: if (items_expected_back == 0 && gpnae_done_signal) next_state = PREP_MAXPOOL;
 
-      PREP_MAXPOOL:       next_state = FEED_MAXPOOL;
-      FEED_MAXPOOL:       if (items_left_to_process == 0) next_state = MAXPOOL_PROCESSING;
+      PREP_MAXPOOL: next_state = FEED_VALID;
+      FEED_VALID:
+      if (items_left_to_process == 0) next_state = MAXPOOL_PROCESSING;
+      else next_state = FEED_MAXPOOL;
+      FEED_MAXPOOL: next_state = FEED_VALID;
       MAXPOOL_PROCESSING: if (maxpool_done_signal) next_state = COLLECT_MAXPOOL;
 
       COLLECT_MAXPOOL:    if (fifo3_usage >= 1) next_state = DROPOUT_PROCESSING;
@@ -331,7 +335,7 @@ module sienna_top #(
       maxpool_valid_in      <= 0;
       maxpool_data_in       <= 0;
       fifo3_rd_en           <= 0;
-      dropout_en            <= 0;
+      dropout_in_valid      <= 0;
       dropout_data_in       <= 0;
       final_output_reg      <= 0;
       items_left_to_process <= 0;
@@ -349,7 +353,7 @@ module sienna_top #(
       maxpool_valid_in      <= maxpool_valid_in_next;
       maxpool_data_in       <= maxpool_data_in_next;
       fifo3_rd_en           <= fifo3_rd_en_next;
-      dropout_en            <= dropout_en_next;
+      dropout_in_valid      <= dropout_in_valid_next;
       dropout_data_in       <= dropout_data_in_next;
       final_output_reg      <= final_output_reg_next;
       items_left_to_process <= items_left_to_process_next;
@@ -374,7 +378,7 @@ module sienna_top #(
     maxpool_start_next         = 0;
     maxpool_valid_in_next      = 0;
     fifo3_rd_en_next           = 0;
-    dropout_en_next            = 0;
+    dropout_in_valid_next      = 0;
 
     systolic_read_addr_next    = systolic_read_addr;
     items_left_to_process_next = items_left_to_process;
@@ -433,19 +437,20 @@ module sienna_top #(
         maxpool_start_next = 1;
       end
 
+      FEED_VALID: begin
+        if ((fifo2_usage > 0) && items_left_to_process > 0) fifo2_rd_en_next = 1;
+      end
+
       FEED_MAXPOOL: begin
-        if ((fifo2_usage > 0) && items_left_to_process > 0) begin
-          fifo2_rd_en_next = 1;
-          maxpool_valid_in_next = 1;
-          maxpool_data_in_next = fifo2_rd_data;
-          items_left_to_process_next = items_left_to_process - 1;
-        end
+        maxpool_valid_in_next = 1;
+        maxpool_data_in_next = fifo2_rd_data;
+        items_left_to_process_next = items_left_to_process - 1;
       end
 
       DROPOUT_PROCESSING: begin
         if (fifo3_usage > 0) begin
           fifo3_rd_en_next = 1;
-          dropout_en_next = 1;
+          dropout_in_valid_next = 1;
           dropout_data_in_next = fifo3_rd_data;
         end
       end

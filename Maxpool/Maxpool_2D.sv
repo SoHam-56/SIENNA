@@ -15,11 +15,9 @@ module Maxpool_2D #(
     input  logic start,
     output logic done,
 
-    // Streaming input interface
     input logic [DATA_WIDTH-1:0] data_in,
     input logic valid_in,
 
-    // Streaming output interface
     output logic [DATA_WIDTH-1:0] out_data,
     output logic out_valid
 );
@@ -34,7 +32,6 @@ module Maxpool_2D #(
   localparam int OUT_SIZE = OUT_ROWS * OUT_COLS;
   localparam int IN_SIZE = IN_ROWS * IN_COLS;
 
-  // FSM states
   typedef enum logic [2:0] {
     IDLE,
     COLLECT_INPUT,
@@ -45,21 +42,17 @@ module Maxpool_2D #(
 
   state_t state, next_state;
 
-  // Input buffer to store entire input feature map
   logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
   logic [$clog2(IN_SIZE+1)-1:0] input_count;
   logic input_collection_done;
 
-  // Output buffer to store pooling results
   logic [DATA_WIDTH-1:0] output_buffer[0:OUT_SIZE-1];
   logic [$clog2(OUT_SIZE+1)-1:0] output_count;
   logic processing_done;
 
-  // Processing counters
   logic [$clog2(OUT_ROWS+1)-1:0] out_r;
   logic [$clog2(OUT_COLS+1)-1:0] out_c;
 
-  // FSM State register
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       state <= IDLE;
@@ -68,7 +61,6 @@ module Maxpool_2D #(
     end
   end
 
-  // FSM next state logic
   always_comb begin
     next_state = state;
 
@@ -97,7 +89,6 @@ module Maxpool_2D #(
     endcase
   end
 
-  // Input collection logic
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       input_count <= '0;
@@ -131,8 +122,6 @@ module Maxpool_2D #(
     end
   end
 
-  // Processing logic
-  // --- THIS IS THE SECTION WITH THE CRITICAL FIXES ---
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       out_r <= '0;
@@ -150,17 +139,17 @@ module Maxpool_2D #(
         end
 
         PROCESS: begin
-          // 1. Logic variable declarations inside the block
+          // Logic variable declarations inside the block
           logic [DATA_WIDTH-1:0] max_val;
           logic signed [31:0] in_row;  // Use 32-bit signed for safe index math
           logic signed [31:0] in_col;
           logic in_bounds;
           logic [DATA_WIDTH-1:0] current_val;
 
-          // 2. Initialize max to 0 (Unsigned Min) always
+          // Initialize max to 0 (Unsigned Min) always
           max_val = '0;
 
-          // 3. Find max in the pooling window
+          // Find max in the pooling window
           for (int sr = 0; sr < SEG_ROWS; sr++) begin
             for (int sc = 0; sc < SEG_COLS; sc++) begin
 
@@ -189,7 +178,6 @@ module Maxpool_2D #(
             end
           end
 
-          // Store result
           output_buffer[out_r*OUT_COLS+out_c] <= max_val;
 
           // Move to next output position
@@ -210,7 +198,6 @@ module Maxpool_2D #(
     end
   end
 
-  // Output logic
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       out_data <= '0;
@@ -240,7 +227,6 @@ module Maxpool_2D #(
     end
   end
 
-  // Done signal
   assign done = (state == FINISH);
 
 endmodule

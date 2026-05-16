@@ -3,4 +3,7 @@
 	url = git@github.com:SoHam-56/GPNAE.git
 [submodule "SystolicArray"]
 	path = SystolicArray
-	url = git@github.com:SoHam-56/SystolicArray.git
+	url = git@github.com:SoHam-56/SystolicMesh.git
+[submodule "SystolicMesh"]
+	path = SystolicMesh
+	url = git@github.com:SoHam-56/SystolicMesh.git

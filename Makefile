@@ -1,95 +1,147 @@
 SHELL := /bin/bash
 
 # Project Structure
-PRJ_DIR = $(shell pwd)
-SRC_DIR = $(PRJ_DIR)/src
-TB_DIR = $(PRJ_DIR)/testbenches
-SA_DIR = $(PRJ_DIR)/SystolicArray/src
-GPNAE_DIR = $(PRJ_DIR)/GPNAE/src
-SUMIT_DIR = $(PRJ_DIR)/Sumit_Anish
+PRJ_DIR     = $(shell pwd)
+SRC_DIR     = $(PRJ_DIR)/src
+TB_DIR      = $(PRJ_DIR)/testbenches
+SM_DIR      = $(PRJ_DIR)/SystolicMesh/src
+SM_LIB_DIR  = $(PRJ_DIR)/SystolicMesh/ArithmeticLibrary
+GPNAE_DIR   = $(PRJ_DIR)/GPNAE/src
+GPNAE_LIB_DIR = $(PRJ_DIR)/GPNAE/ArithmeticLibrary
+MAXPOOL_DIR = $(PRJ_DIR)/Maxpool
+DROPOUT_DIR = $(PRJ_DIR)/Dropout
 
 # Toolchain
 VERILATOR = verilator
-VCS = vcs
-WAVE = surfer
+VCS       = vcs
+WAVE      = surfer
 
-# SIENNA Top Level
+TEST ?=
+
 TOP_FILES = \
 	sienna_top.sv
 
-# Systolic Array Design Files
-SA_FILES = \
-	SystolicArray.sv \
-	RowInputQueue.sv \
-	ColumnInputQueue.sv \
-	Mesh.sv \
-	OutputSram.sv \
-	ProcessingElement.sv \
-	MAC/Adder_FP32.sv \
-	MAC/LZC.sv \
-	MAC/Multiplier_FP32.sv \
-	MAC/UnSig_Karatsuba.sv \
-	MAC/UnSig_R4Booth.sv \
-	MAC/MAC.sv
+SM_FILES = \
+	top/SystolicMesh.sv \
+	top/SystolicArray.sv \
+	mem/RowInputQueue.sv \
+	mem/ColumnInputQueue.sv \
+	mem/OutputSram.sv \
+	mem/MeshOutputSram.sv \
+	engine/PEMesh.sv \
+	engine/ProcessingElement.sv \
+	engine/AccumulationUnit.sv \
+	engine/MAC.sv
 
-# GPNAE Design Files
+SM_LIB_FILES = \
+	Multipliers/Radix4Booth/src/R4Booth.sv \
+	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
+	Multipliers/FP32/src/fp32Multiplier.sv \
+	Adders/FP32/src/LZC.sv \
+	Adders/FP32/src/fp32Adder.sv
+
 GPNAE_FILES = \
-	gpnae.sv \
-	UpDown.sv \
-	Down.sv \
-	SeLu.sv \
-	sigtan.sv \
-	Divider/Divider_FP32.sv \
-	Divider/divu.sv \
-	TYTAN/Adder_FP32.v \
-	TYTAN/controller.sv \
-	TYTAN/datapath.v \
-	TYTAN/LZC.v \
-	TYTAN/MAC.sv \
-	TYTAN/Multiplier_FP32.sv \
-	TYTAN/UnSig_Karatsuba.sv \
-	TYTAN/UnSig_R4Booth.v \
 	TYTAN/Memory/CoeffROM.v \
 	TYTAN/Memory/InputFIFO.v \
 	TYTAN/Memory/PE5B.v \
 	TYTAN/Memory/RAM.v \
-	TYTAN/Memory/ROM.v
+	TYTAN/Memory/ROM.v \
+	TYTAN/controller.sv \
+	TYTAN/datapath.v \
+	TYTAN/LZC.v \
+	TYTAN/mac.sv \
+	fp32_down.sv \
+	fp32_up_down.sv \
+	SeLu.sv \
+	sigtan.sv \
+	gpnae.sv
 
-# Sumit_Anish Design Files (CNN Components)
-SUMIT_FILES = \
-	Dropout/dropout.sv \
-	Maxpool/Maxpool_2D.sv
+GPNAE_LIB_FILES = \
+	Adders/FP32/src/fp32Adder.sv \
+	Adders/FP32/src/LZC.sv \
+	Multipliers/Radix4Booth/src/R4Booth.sv \
+	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
+	Multipliers/FP32/src/fp32Multiplier.sv \
+	Divider/FP32/src/fp32Divider.sv \
+	Divider/FP32/src/divu.sv
 
-# Combined Design Files
+MAXPOOL_FILES = \
+	Maxpool_2D.sv
+
+DROPOUT_FILES = \
+	dropout.sv
+
 DESIGN_FILES = \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
-	$(addprefix $(SA_DIR)/,$(SA_FILES)) \
+	$(addprefix $(SM_DIR)/,$(SM_FILES)) \
+	$(addprefix $(SM_LIB_DIR)/,$(SM_LIB_FILES)) \
 	$(addprefix $(GPNAE_DIR)/,$(GPNAE_FILES)) \
-	$(SUMIT_FILES)
+	$(addprefix $(GPNAE_LIB_DIR)/,$(GPNAE_LIB_FILES)) \
+	$(addprefix $(MAXPOOL_DIR)/,$(MAXPOOL_FILES)) \
+	$(addprefix $(DROPOUT_DIR)/,$(DROPOUT_FILES))
 
-# Testbench Configuration
-TESTBENCH = TB_sienna_top.sv
+# Testbench
+TESTBENCH  = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 
-# Directories
 VERILATOR_DIR = $(PRJ_DIR)/Verilator
-VCS_DIR = $(PRJ_DIR)/VCS
+VCS_DIR       = $(PRJ_DIR)/VCS
 
-# -------- Memory/config file collection --------
-# Patterns to collect (add/remove as needed)
-MEM_PATTERNS := *.mem *.mif *.hex
+# ─────────────────────────────────────────────────────────────────────────────
+# Tracing — OFF by default to prevent the Verilator directory from ballooning
+# to 100 GB+.  Enable only when waveforms are actually needed, and pick the
+# format explicitly:
+#   make verilator TRACE=fst   → small, compressed waveform (recommended)
+#   make verilator TRACE=vcd   → plain VCD (larger, but universally supported)
+#   make vcs       TRACE=fst
+#   make vcs       TRACE=vcd
+#
+# When TRACE=0 (default):
+#   • No --trace flag is passed to Verilator → no waveform file generated.
+#   • The `ifdef ENABLE_TRACE guard in the TB means $dumpfile/$dumpvars are
+#     never executed, so there is zero disk overhead.
+#
+# When TRACE=fst:
+#   • Verilator is built with --trace-fst and -DENABLE_TRACE -DTRACE_FST.
+#   • The TB writes TB_sienna_top.fst into $(VERILATOR_DIR).
+#   • FST is recommended for this project — VCD dumps balloon in size fast.
+#
+# When TRACE=vcd:
+#   • Verilator is built with --trace and -DENABLE_TRACE.
+#   • The TB writes TB_sienna_top.vcd into $(VERILATOR_DIR).
+#
+# `make wave` auto-detects whichever trace file exists and opens it.
+# ─────────────────────────────────────────────────────────────────────────────
+TRACE ?= 0
 
-# Directories to search for memory/config files
+ifeq ($(filter $(TRACE),0 vcd fst),)
+$(error Invalid TRACE=$(TRACE) — must be one of: 0, vcd, fst)
+endif
+
+ifeq ($(TRACE),fst)
+TRACE_FILE = TB_sienna_top.fst
+else ifeq ($(TRACE),vcd)
+TRACE_FILE = TB_sienna_top.vcd
+else
+TRACE_FILE =
+endif
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Memory / config file patterns
+# .mif removed — the project now uses .mem exclusively.
+# ─────────────────────────────────────────────────────────────────────────────
+MEM_PATTERNS := *.mem *.hex
+
 MEM_DIRS := \
 	$(PRJ_DIR) \
 	$(SRC_DIR) \
 	$(TB_DIR) \
-	$(SA_DIR) \
+	$(SM_DIR) \
 	$(GPNAE_DIR) \
 	$(GPNAE_DIR)/TYTAN/Memory \
-	$(SUMIT_DIR)
+	$(MAXPOOL_DIR) \
+	$(DROPOUT_DIR)
 
-# Helper macro: copy MEM_PATTERNS from MEM_DIRS into a destination directory
 define copy_mem_files
 	@echo "-- Copying memory/config files into $(1)"
 	@mkdir -p $(1)
@@ -103,24 +155,25 @@ define copy_mem_files
 			fi; \
 		done; \
 	done; \
-	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.mif/*.hex found)"; fi
+	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.hex found)"; fi
 endef
-# ----------------------------------------------
 
-# Verilator Flags
+# ─────────────────────────────────────────────────────────────────────────────
+# Verilator flags — base set (no trace)
+# ─────────────────────────────────────────────────────────────────────────────
 VERILATOR_FLAGS = \
-	--trace \
 	--timing \
 	--top-module $(TOP_MODULE) \
 	--threads $(shell nproc) \
 	--sv \
 	-I$(SRC_DIR) \
 	-I$(TB_DIR) \
-	-I$(SA_DIR) \
+	-I$(SM_DIR) \
+	-I$(SM_LIB_DIR) \
 	-I$(GPNAE_DIR) \
-	-I$(SUMIT_DIR)/CNN2 \
-	-I$(SUMIT_DIR)/FP16_Converter \
-	-I$(SUMIT_DIR)/FP16_Deconverter \
+	-I$(GPNAE_LIB_DIR) \
+	-I$(MAXPOOL_DIR) \
+	-I$(DROPOUT_DIR) \
 	--Mdir $(VERILATOR_DIR) \
 	--Wno-WIDTHTRUNC \
 	--Wno-WIDTHEXPAND \
@@ -130,184 +183,258 @@ VERILATOR_FLAGS = \
 	--Wno-SELRANGE \
 	--Wno-LATCH \
 	--Wno-REALCVT \
-	--Wno-SHORTREAL
+	--Wno-SHORTREAL \
+	--Wno-TIMESCALEMOD
 
-# VCS Flags
+# Conditionally append trace flags, format-specific
+ifeq ($(TRACE),fst)
+VERILATOR_FLAGS += --trace-fst --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE -DTRACE_FST
+else ifeq ($(TRACE),vcd)
+VERILATOR_FLAGS += --trace --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE
+endif
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VCS flags
+# ─────────────────────────────────────────────────────────────────────────────
 VCS_FLAGS = \
 	-full64 \
 	-sverilog \
-	-debug_all \
-	-timescale=1ns/1ps \
+	-timescale=1ns/100ps \
 	-Mdir=$(VCS_DIR) \
 	+v2k \
 	+incdir+$(SRC_DIR) \
 	+incdir+$(TB_DIR) \
-	+incdir+$(SA_DIR) \
+	+incdir+$(SM_DIR) \
+	+incdir+$(SM_LIB_DIR) \
 	+incdir+$(GPNAE_DIR) \
-	+incdir+$(SUMIT_DIR)/CNN2 \
-	+incdir+$(SUMIT_DIR)/FP16_Converter \
-	+incdir+$(SUMIT_DIR)/FP16_Deconverter \
+	+incdir+$(GPNAE_LIB_DIR) \
+	+incdir+$(MAXPOOL_DIR) \
+	+incdir+$(DROPOUT_DIR) \
 	+define+VCS
 
+ifeq ($(TRACE),vcd)
+VCS_FLAGS += -debug_all +define+ENABLE_TRACE
+else ifeq ($(TRACE),fst)
+# NOTE: plain $dumpvars on VCS only ever produces VCD (FST/FSDB requires
+# Verdi's $fsdbDumpvars, which this TB does not call). So TRACE=fst under
+# `make vcs` still dumps VCD — see the warning printed in the vcs: target.
+VCS_FLAGS += -debug_all +define+ENABLE_TRACE
+endif
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Default target
+# ─────────────────────────────────────────────────────────────────────────────
 default: help
 
-# Help message
 help:
 	@echo "=== SIENNA Hardware Simulation Makefile ==="
 	@echo ""
 	@echo "Simulation Targets:"
-	@echo "  make verilator       - Simulate using Verilator"
-	@echo "  make vcs             - Simulate using Synopsys VCS"
+	@echo "  make verilator           - Simulate using Verilator (no waveform)"
+	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
+	@echo "  make verilator TRACE=vcd - Simulate + write VCD waveform (larger)"
+	@echo "  make vcs                 - Simulate using Synopsys VCS (no waveform)"
+	@echo "  make vcs       TRACE=vcd - Simulate + write VCD waveform"
+	@echo "  make vcs       TRACE=fst - VCS has no native FST dump; still writes VCD"
 	@echo ""
 	@echo "Individual Module Targets:"
-	@echo "  make sa-verilator    - Simulate Systolic Array only"
-	@echo "  make gpnae-verilator  - Simulate GPNAE only"
+	@echo "  make sm-verilator      - Simulate Systolic Mesh only"
+	@echo "  make gpnae-verilator   - Simulate GPNAE only"
 	@echo ""
 	@echo "Analysis Targets:"
-	@echo "  make lint            - Run Verilator lint check"
-	@echo "  make debug           - Build with debug information"
-	@echo "  make perf            - Build with performance profiling"
+	@echo "  make lint              - Run Verilator lint check"
+	@echo "  make debug             - Build with GDB back-trace"
+	@echo "  make perf              - Build with performance profiling"
 	@echo ""
 	@echo "Utility Targets:"
-	@echo "  make wave            - View waveforms"
-	@echo "  make clean           - Remove all simulation artifacts"
-	@echo "  make clean-all       - Clean all including subprojects"
+	@echo "  make wave              - View waveforms (requires prior TRACE=vcd|fst run)"
+	@echo "  make gen-matmul        - Generate matmul stimulus (N=16 default)"
+	@echo "  make gen-conv          - Generate conv stimulus   (N=16 default)"
+	@echo "  make clean             - Remove all simulation artifacts"
+	@echo "  make clean-all         - Clean all including subprojects"
+	@echo ""
+	@echo "Disk usage note:"
+	@echo "  TRACE=0   (default) → no waveform written; Verilator dir stays small."
+	@echo "  TRACE=fst           → compact waveform, recommended for this project."
+	@echo "  TRACE=vcd           → can be very large for complex designs."
 	@echo ""
 	@echo "Current Configuration:"
-	@echo "  TOP_MODULE: $(TOP_MODULE)"
-	@echo "  TESTBENCH:  $(TESTBENCH)"
+	@echo "  TOP_MODULE : $(TOP_MODULE)"
+	@echo "  TESTBENCH  : $(TESTBENCH)"
+	@echo "  TRACE      : $(TRACE)"
 	@echo ""
 	@echo "Design Files:"
-	@echo "  Systolic Array: $(words $(SA_FILES)) files"
-	@echo "  GPNAE:           $(words $(GPNAE_FILES)) files"
-	@echo "  CNN (Sumit):    $(words $(SUMIT_FILES)) files"
-	@echo "  Total:          $(words $(DESIGN_FILES)) files"
-	@echo ""
-	@echo "Memory/config copies:"
-	@echo "  Patterns: $(MEM_PATTERNS)"
-	@echo "  From:     $(MEM_DIRS)"
+	@echo "  Systolic Mesh : $(words $(SM_FILES)) files  |  SM Lib: $(words $(SM_LIB_FILES)) files"
+	@echo "  GPNAE         : $(words $(GPNAE_FILES)) files  |  GPNAE Lib: $(words $(GPNAE_LIB_FILES)) files"
+	@echo "  Maxpool       : $(words $(MAXPOOL_FILES)) files"
+	@echo "  Dropout       : $(words $(DROPOUT_FILES)) files"
+	@echo "  Total         : $(words $(DESIGN_FILES)) files"
 
-# Verilator Simulation - SIENNA Top
+# ─────────────────────────────────────────────────────────────────────────────
+# Vector generation convenience targets
+# Override N and TILE on the command line:  make gen-conv N=64 TILE=8
+# ─────────────────────────────────────────────────────────────────────────────
+N    ?= 16
+TILE ?= 4
+
+gen-matmul:
+	@echo "=== Generating matmul stimulus (N=$(N), tile=$(TILE)) ==="
+	python3 regression.py \
+		--mode matmul \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--output-dir $(TB_DIR)
+
+gen-conv:
+	@echo "=== Generating conv stimulus (N=$(N), tile=$(TILE)) ==="
+	python3 regression.py \
+		--mode conv \
+		--conv-type basic \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--output-dir $(TB_DIR)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Verilator — SIENNA Top
+# ─────────────────────────────────────────────────────────────────────────────
 verilator:
-	@echo "=== Verilator simulation for $(TOP_MODULE) ==="
+	@echo "=== Verilator simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --binary \
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
 		$(TB_DIR)/$(TESTBENCH) \
 		-o $(TOP_MODULE)_sim
-	@echo "-- Compiling Verilator simulation"
-	make -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
+	@echo "-- Compiling Verilator C++ model"
+	$(MAKE) -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
 	$(call copy_mem_files,$(VERILATOR_DIR))
-	@echo "-- Running Verilator simulation"
+	@echo "-- Running simulation"
 	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim
-	@echo "-- Verilator simulation complete"
-	@echo "-- Trace file: $(VERILATOR_DIR)/dump.vcd"
+	@echo "-- Done"
+ifneq ($(TRACE),0)
+	@echo "-- Trace ($(TRACE)) : $(VERILATOR_DIR)/$(TRACE_FILE)"
+endif
 
-# Verilator Simulation - Systolic Array Only
-sa-verilator:
-	@echo "=== Building Systolic Array only ==="
-	$(MAKE) -C SystolicArray verilator
+# ─────────────────────────────────────────────────────────────────────────────
+# Sub-module targets
+# ─────────────────────────────────────────────────────────────────────────────
+sm-verilator:
+	@echo "=== Building Systolic Mesh only ==="
+	$(MAKE) -C SystolicMesh verilator
 
-# Verilator Simulation - GPNAE Only
 gpnae-verilator:
 	@echo "=== Building GPNAE only ==="
 	$(MAKE) -C GPNAE verilator
 
-# VCS Simulation
+# ─────────────────────────────────────────────────────────────────────────────
+# VCS
+# ─────────────────────────────────────────────────────────────────────────────
 vcs:
-	@echo "=== VCS simulation for $(TOP_MODULE) ==="
+	@echo "=== VCS simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
+ifeq ($(TRACE),fst)
+	@echo "-- WARNING: VCS's \$$dumpvars only produces VCD; this run will write"
+	@echo "            TB_sienna_top.vcd, not FST (need \$$fsdbDumpvars/Verdi for FST)."
+endif
 	@mkdir -p $(VCS_DIR)
 	$(VCS) $(VCS_FLAGS) \
 		-o $(VCS_DIR)/$(TOP_MODULE)_sim \
 		$(DESIGN_FILES) \
 		$(TB_DIR)/$(TESTBENCH)
 	$(call copy_mem_files,$(VCS_DIR))
-	@echo "-- Running VCS simulation"
+	@echo "-- Running simulation"
 	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim
 	@echo "-- VCS simulation complete"
 
-# View Waveforms
+# ─────────────────────────────────────────────────────────────────────────────
+# Waveform viewer
+# ─────────────────────────────────────────────────────────────────────────────
 wave:
-	@if [ -f $(VERILATOR_DIR)/dump.vcd ]; then \
-		echo "-- Opening Verilator waveform"; \
-		$(WAVE) $(VERILATOR_DIR)/dump.vcd; \
+	@if [ -f $(VERILATOR_DIR)/TB_sienna_top.fst ]; then \
+		echo "-- Opening Verilator waveform (FST)"; \
+		$(WAVE) $(VERILATOR_DIR)/TB_sienna_top.fst; \
+	elif [ -f $(VERILATOR_DIR)/TB_sienna_top.vcd ]; then \
+		echo "-- Opening Verilator waveform (VCD)"; \
+		$(WAVE) $(VERILATOR_DIR)/TB_sienna_top.vcd; \
 	elif compgen -G "$(VCS_DIR)/*.vpd" > /dev/null; then \
 		echo "-- Opening VCS waveform"; \
 		$(WAVE) $(VCS_DIR)/*.vpd; \
 	else \
-		echo "-- No waveform dumps found"; \
+		echo "-- No waveform found. Run with TRACE=fst or TRACE=vcd first."; \
 	fi
 
-# Lint check with Verilator (no simulation)
+# ─────────────────────────────────────────────────────────────────────────────
+# Lint / debug / perf
+# ─────────────────────────────────────────────────────────────────────────────
 lint:
-	@echo "=== Linting $(TOP_MODULE) with Verilator ==="
+	@echo "=== Linting $(TOP_MODULE) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --lint-only \
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
 		$(TB_DIR)/$(TESTBENCH)
-	@echo "-- Lint check complete"
+	@echo "-- Lint complete"
 
-# Debug build with extra information
 debug: VERILATOR_FLAGS += --debug --gdbbt
 debug: verilator
 
-# Performance analysis
 perf: VERILATOR_FLAGS += --stats --profile-cfuncs
 perf: verilator
 
-# List all design files (useful for verification)
+# ─────────────────────────────────────────────────────────────────────────────
+# File listing / checking
+# ─────────────────────────────────────────────────────────────────────────────
 list-files:
 	@echo "=== Design Files ==="
-	@echo ""
-	@echo "Top Level:"
-	@for file in $(TOP_FILES); do echo "  - $$file"; done
-	@echo ""
-	@echo "Systolic Array ($(SA_DIR)):"
-	@for file in $(SA_FILES); do echo "  - $$file"; done
-	@echo ""
-	@echo "GPNAE ($(GPNAE_DIR)):"
-	@for file in $(GPNAE_FILES); do echo "  - $$file"; done
-	@echo ""
-	@echo "CNN Components ($(SUMIT_DIR)):"
-	@for file in $(SUMIT_FILES); do echo "  - $$file"; done
-	@echo ""
+	@echo "Top Level ($(SRC_DIR)):"; \
+	for f in $(TOP_FILES); do echo "  - $$f"; done
+	@echo "Systolic Mesh ($(SM_DIR)):"; \
+	for f in $(SM_FILES); do echo "  - $$f"; done
+	@echo "SM ArithmeticLibrary ($(SM_LIB_DIR)):"; \
+	for f in $(SM_LIB_FILES); do echo "  - $$f"; done
+	@echo "GPNAE ($(GPNAE_DIR)):"; \
+	for f in $(GPNAE_FILES); do echo "  - $$f"; done
+	@echo "GPNAE ArithmeticLibrary ($(GPNAE_LIB_DIR)):"; \
+	for f in $(GPNAE_LIB_FILES); do echo "  - $$f"; done
+	@echo "Maxpool ($(MAXPOOL_DIR)):"; \
+	for f in $(MAXPOOL_FILES); do echo "  - $$f"; done
+	@echo "Dropout ($(DROPOUT_DIR)):"; \
+	for f in $(DROPOUT_FILES); do echo "  - $$f"; done
 	@echo "Total: $(words $(DESIGN_FILES)) files"
 
-# Check if all source files exist
 check-files:
-	@echo "=== Checking if all source files exist ==="
+	@echo "=== Checking source files exist ==="
 	@missing=0; \
-	for file in $(DESIGN_FILES); do \
-		if [ ! -f "$$file" ]; then \
-			echo "  MISSING: $$file"; \
-			missing=$$((missing + 1)); \
+	for f in $(DESIGN_FILES); do \
+		if [ ! -f "$$f" ]; then \
+			echo "  MISSING: $$f"; missing=$$((missing+1)); \
 		fi; \
 	done; \
 	if [ $$missing -eq 0 ]; then \
-		echo "  All $(words $(DESIGN_FILES)) files found!"; \
+		echo "  All $(words $(DESIGN_FILES)) files present."; \
 	else \
-		echo "  $$missing file(s) missing!"; \
-		exit 1; \
+		echo "  $$missing file(s) missing!"; exit 1; \
 	fi
 
-# Clean all simulation artifacts
+regression:
+	@echo "=== Running Sienna Pipeline Regression ==="
+	python3 regression.py --matrix-size $(N) --tile-size $(TILE) $(if $(TEST),--test $(TEST))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clean
+# ─────────────────────────────────────────────────────────────────────────────
 clean:
 	@echo "-- Cleaning simulation artifacts"
 	-rm -rf $(VERILATOR_DIR) $(VCS_DIR)
 	-rm -f *.vpd *.vcd *.wlf *.log
-	-rm -f csrc simv simv.daidir
-	-rm -f *.key DVEfiles
+	-rm -f csrc simv simv.daidir *.key DVEfiles
 	@echo "-- Clean complete"
 
-# Clean all including subprojects
 clean-all: clean
 	@echo "-- Cleaning subprojects"
-	-$(MAKE) -C SystolicArray clean 2>/dev/null || true
+	-$(MAKE) -C SystolicMesh clean 2>/dev/null || true
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-# Phony targets
-.PHONY: default help verilator vcs sa-verilator gpnae-verilator wave lint debug perf list-files check-files clean clean-all
+.PHONY: default help verilator vcs sm-verilator gpnae-verilator \
+        wave lint debug perf list-files check-files clean clean-all \
+        gen-matmul gen-conv

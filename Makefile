@@ -1,5 +1,12 @@
 SHELL := /bin/bash
 
+# =========================================================================
+# SIENNA VERIFICATION MAKEFILE CONFIGURATION
+# =========================================================================
+LIMIT_RANGE ?= 0
+N    ?= 16
+TILE ?= 4
+
 # Project Structure
 PRJ_DIR     = $(shell pwd)
 SRC_DIR     = $(PRJ_DIR)/src
@@ -17,6 +24,7 @@ VCS       = vcs
 WAVE      = surfer
 
 TEST ?=
+ACTIVATION ?= tanh
 
 TOP_FILES = \
 	sienna_top.sv
@@ -87,31 +95,6 @@ TOP_MODULE = TB_sienna_top
 VERILATOR_DIR = $(PRJ_DIR)/Verilator
 VCS_DIR       = $(PRJ_DIR)/VCS
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tracing — OFF by default to prevent the Verilator directory from ballooning
-# to 100 GB+.  Enable only when waveforms are actually needed, and pick the
-# format explicitly:
-#   make verilator TRACE=fst   → small, compressed waveform (recommended)
-#   make verilator TRACE=vcd   → plain VCD (larger, but universally supported)
-#   make vcs       TRACE=fst
-#   make vcs       TRACE=vcd
-#
-# When TRACE=0 (default):
-#   • No --trace flag is passed to Verilator → no waveform file generated.
-#   • The `ifdef ENABLE_TRACE guard in the TB means $dumpfile/$dumpvars are
-#     never executed, so there is zero disk overhead.
-#
-# When TRACE=fst:
-#   • Verilator is built with --trace-fst and -DENABLE_TRACE -DTRACE_FST.
-#   • The TB writes TB_sienna_top.fst into $(VERILATOR_DIR).
-#   • FST is recommended for this project — VCD dumps balloon in size fast.
-#
-# When TRACE=vcd:
-#   • Verilator is built with --trace and -DENABLE_TRACE.
-#   • The TB writes TB_sienna_top.vcd into $(VERILATOR_DIR).
-#
-# `make wave` auto-detects whichever trace file exists and opens it.
-# ─────────────────────────────────────────────────────────────────────────────
 TRACE ?= 0
 
 ifeq ($(filter $(TRACE),0 vcd fst),)
@@ -126,10 +109,6 @@ else
 TRACE_FILE =
 endif
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Memory / config file patterns
-# .mif removed — the project now uses .mem exclusively.
-# ─────────────────────────────────────────────────────────────────────────────
 MEM_PATTERNS := *.mem *.hex
 
 MEM_DIRS := \
@@ -158,9 +137,6 @@ define copy_mem_files
 	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.hex found)"; fi
 endef
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Verilator flags — base set (no trace)
-# ─────────────────────────────────────────────────────────────────────────────
 VERILATOR_FLAGS = \
 	--timing \
 	--top-module $(TOP_MODULE) \
@@ -184,18 +160,15 @@ VERILATOR_FLAGS = \
 	--Wno-LATCH \
 	--Wno-REALCVT \
 	--Wno-SHORTREAL \
-	--Wno-TIMESCALEMOD
+	--Wno-TIMESCALEMOD \
+	--Wno-UNSIGNED
 
-# Conditionally append trace flags, format-specific
 ifeq ($(TRACE),fst)
 VERILATOR_FLAGS += --trace-fst --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE -DTRACE_FST
 else ifeq ($(TRACE),vcd)
 VERILATOR_FLAGS += --trace --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE
 endif
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VCS flags
-# ─────────────────────────────────────────────────────────────────────────────
 VCS_FLAGS = \
 	-full64 \
 	-sverilog \
@@ -215,15 +188,9 @@ VCS_FLAGS = \
 ifeq ($(TRACE),vcd)
 VCS_FLAGS += -debug_all +define+ENABLE_TRACE
 else ifeq ($(TRACE),fst)
-# NOTE: plain $dumpvars on VCS only ever produces VCD (FST/FSDB requires
-# Verdi's $fsdbDumpvars, which this TB does not call). So TRACE=fst under
-# `make vcs` still dumps VCD — see the warning printed in the vcs: target.
 VCS_FLAGS += -debug_all +define+ENABLE_TRACE
 endif
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default target
-# ─────────────────────────────────────────────────────────────────────────────
 default: help
 
 help:
@@ -272,27 +239,26 @@ help:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vector generation convenience targets
-# Override N and TILE on the command line:  make gen-conv N=64 TILE=8
 # ─────────────────────────────────────────────────────────────────────────────
-N    ?= 16
-TILE ?= 4
 
 gen-matmul:
 	@echo "=== Generating matmul stimulus (N=$(N), tile=$(TILE)) ==="
 	python3 regression.py \
+		--action gen \
 		--mode matmul \
 		--n $(N) \
 		--tile-size $(TILE) \
-		--output-dir $(TB_DIR)
+		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
 
 gen-conv:
 	@echo "=== Generating conv stimulus (N=$(N), tile=$(TILE)) ==="
 	python3 regression.py \
+		--action gen \
 		--mode conv \
 		--conv-type basic \
 		--n $(N) \
 		--tile-size $(TILE) \
-		--output-dir $(TB_DIR)
+		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
@@ -417,7 +383,12 @@ check-files:
 
 regression:
 	@echo "=== Running Sienna Pipeline Regression ==="
-	python3 regression.py --matrix-size $(N) --tile-size $(TILE) $(if $(TEST),--test $(TEST))
+	python3 regression.py \
+		--matrix-size $(N) \
+		--tile-size $(TILE) \
+		--activation $(ACTIVATION) \
+		$(if $(TEST),--test $(TEST)) \
+		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
@@ -437,4 +408,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv
+        gen-matmul gen-conv regression

@@ -2,23 +2,6 @@
 
 import test_config_pkg::*;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// TB_sienna_top
-// ─────────────────────────────────────────────────────────────────────────────
-// Progress reporting added:
-//   • Stage banners  : reset, load, start, wait, verify
-//   • Heartbeat      : prints every HEARTBEAT_CYCLES while waiting for complete
-//   • Status signals : systolic_busy, gpnae_busy, maxpool_busy, dropout_busy
-//                      printed on every heartbeat so you can see which stage
-//                      the DUT is stuck in without needing a waveform
-//   • Timeout        : TIMEOUT_CYCLES (default 2M) with a clear fatal message
-//
-// Tracing opt-in:
-//   make verilator             → no waveform
-//   make verilator TRACE=fst   → FST waveform (compact, recommended)
-//   make verilator TRACE=vcd   → VCD waveform (larger)
-// ─────────────────────────────────────────────────────────────────────────────
-
 module TB_sienna_top;
 
   // ── Localparams from generated SV package ─────────────────────────────
@@ -30,10 +13,8 @@ module TB_sienna_top;
   localparam int NUM_LANES = 8;
 
   // ── Timeout / heartbeat ───────────────────────────────────────────────
-  // Both expressed in clock cycles (10 ns each).
-  // N=8 should finish in well under 10k cycles; 2M is a very safe ceiling.
   localparam int TIMEOUT_CYCLES = 200_000;
-  localparam int HEARTBEAT_CYCLES = 5_000;  // print status every 50k cycles
+  localparam int HEARTBEAT_CYCLES = 5_000;
 
   // ── Tolerance ─────────────────────────────────────────────────────────
   localparam string TOLERANCE_MODE = "RELATIVE";
@@ -92,8 +73,6 @@ module TB_sienna_top;
       .PADDING          (PADDING),
       .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
       .LFSR_WIDTH       (LFSR_WIDTH),
-      // .INPUT_A_FILE     (),
-      // .INPUT_B_FILE     (),
       .FIFO_DEPTH       (FIFO_DEPTH)
   ) dut (
       .clk_i                      (clk_i),
@@ -120,8 +99,6 @@ module TB_sienna_top;
   // ── Tolerance check ───────────────────────────────────────────────────
   function automatic logic check_tolerance(input [DATA_WIDTH-1:0] expected, actual,
                                            output string info);
-    // Store in shortreal first so $bitstoshortreal reinterprets 32 bits
-    // correctly without 64-bit promotion swallowing the mantissa.
     shortreal exp_sr, act_sr, abs_sr;
     real abs_d, rel_d;
 
@@ -134,7 +111,6 @@ module TB_sienna_top;
       rel_d = abs_d / real'((exp_sr > shortreal'(0.0)) ? exp_sr : -exp_sr);
     else rel_d = (act_sr == shortreal'(0.0)) ? 0.0 : 1.0;
 
-    // Show decoded float values so mismatches are human-readable
     info = $sformatf(
         "exp=%f act=%f abs=%.5f (lim %.4f) rel=%.3f%% (lim %.1f%%)",
         real'(exp_sr),
@@ -230,16 +206,28 @@ module TB_sienna_top;
     $display("  Load complete @ %0t  (%0d cycles)", $time, cycle_count);
   endtask
 
+  // =========================================================================
+  // ON-THE-FLY STREAMING CAPTURE
+  // =========================================================================
+  always_ff @(posedge clk_i) begin
+    if (rstn_i && !pipeline_complete_o) begin
+      for (int lane = 0; lane < NUM_LANES; lane++) begin
+        if (dut.dropout_valid_out[lane]) begin
+          actual_results.push_back(dut.dropout_data_out[lane]);
+        end
+      end
+    end
+  end
+
   // ── Collect outputs — with heartbeat ─────────────────────────────────
   task automatic collect_outputs();
     automatic int waited = 0;
-    actual_results.delete();
 
     $display("\n[STAGE] Waiting for pipeline_complete_o");
     $display("  (heartbeat every %0d cycles, timeout at %0d cycles)", HEARTBEAT_CYCLES,
              TIMEOUT_CYCLES);
 
-    // ── Wait loop with heartbeat ──────────────────────────────────────
+    // Wait loop with heartbeat
     while (!pipeline_complete_o) begin
       @(posedge clk_i);
       waited++;
@@ -251,27 +239,15 @@ module TB_sienna_top;
         $display("[FATAL] Timeout after %0d cycles - pipeline_complete_o never asserted.", waited);
         $display("  Last known state:");
         print_status("at timeout");
-        $display("  Likely causes:");
-        $display("    * FSM stuck - check which busy signal is still high");
-        $display("    * num_terms_i or activation_function_i mismatch");
-        $display("    * FIFO never drained (check buf_empty above)");
+        if (lane_fd) $fclose(lane_fd);
         $finish;
       end
     end
 
     $display("  pipeline_complete_o asserted @ %0t  (%0d cycles)", $time, waited);
     print_status("at completion");
-
-    // ── Capture output words ──────────────────────────────────────────
-    $display("\n[STAGE] Capturing output (%0d expected words)", expected_results.size());
-    begin
-      for (int lane = 0; lane < NUM_LANES; lane++) begin
-        actual_results.push_back(final_result_o[lane]);
-
-        if (actual_results.size() >= expected_results.size()) break;
-      end
-    end
-    $display("  Captured %0d words", actual_results.size());
+    $display("  Captured %0d words out of %0d expected", actual_results.size(),
+             expected_results.size());
   endtask
 
   // ── Verify ───────────────────────────────────────────────────────────
@@ -306,11 +282,10 @@ module TB_sienna_top;
     end
   endtask
 
-  // ── Intermediate Value Monitor (File Output) ──────────────────────────
+  // ── File and Console Output Monitors ──────────────────────────────────
   integer trace_fd;
 
   initial begin
-    // Open the file in the testbenches directory
     trace_fd = $fopen("../testbenches/hardware_trace.txt", "w");
     if (!trace_fd) begin
       $display("[ERROR] Could not open hardware_trace.txt for writing.");
@@ -322,23 +297,30 @@ module TB_sienna_top;
   end
 
   always @(posedge clk_i) begin
+    if (rstn_i) begin
+      // Console Print: Dispatcher data entering Maxpool
+      for (int lane = 0; lane < NUM_LANES; lane++) begin
+        if (dut.fifo2_wr_valid[lane]) begin
+          $display("[DEBUG %0t] Dispatcher -> Maxpool (Lane %0d) : dec=%.4f  hex=%08x", $time, lane,
+                   real'($bitstoshortreal(dut.fifo2_wr_data[lane])), dut.fifo2_wr_data[lane]);
+        end
+      end
+      // Console Print: Data exiting Dropout to final Output
+      for (int lane = 0; lane < NUM_LANES; lane++) begin
+        if (dut.dropout_valid_out[lane]) begin
+          $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%.4f  hex=%08x", $time, lane,
+                   real'($bitstoshortreal(dut.dropout_data_out[lane])), dut.dropout_data_out[lane]);
+        end
+      end
+    end
+  end
+
+  always @(posedge clk_i) begin
     if (rstn_i && trace_fd) begin
-      // Monitor FIFO 1 (Systolic Array -> GPNAE)
-      // NOTE: fifo1 now exposes a ready/valid interface (fwft rework), so
-      // the old dut.fifo1_rd_en / !dut.fifo1_empty pairing no longer
-      // exists on the DUT. A transfer fires exactly when rd_ready and
-      // rd_valid are both high on the same edge, same as the old
-      // rd_en && !empty condition.
       if (dut.fifo1_rd_ready && dut.fifo1_rd_valid) begin
         $fdisplay(trace_fd, "[%0t] Systolic -> GPNAE   : dec=%.6f  hex=%08x", $time,
                   real'($bitstoshortreal(dut.fifo1_rd_data)), dut.fifo1_rd_data);
       end
-
-      // Monitor FIFO2 (GPNAE -> Maxpool), one instance per lane. A transfer
-      // fires exactly when rd_ready and rd_valid are both high on the same
-      // edge, same convention as the FIFO1 monitor above. Each line is
-      // tagged with lane=<idx> so the Python trace dumper can split the
-      // capture back out per lane.
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.fifo2_rd_ready[lane] && dut.fifo2_rd_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] GPNAE -> Maxpool    lane=%0d : dec=%.6f  hex=%08x", $time,
@@ -346,14 +328,72 @@ module TB_sienna_top;
                     dut.fifo2_rd_data[lane]);
         end
       end
-
-      // Monitor FIFO3 (Maxpool -> Dropout), one instance per lane.
       for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.fifo3_rd_ready[lane] && dut.fifo3_rd_valid[lane]) begin
+        if (dut.dropout_in_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] Maxpool -> Dropout  lane=%0d : dec=%.6f  hex=%08x", $time,
-                    lane, real'($bitstoshortreal(dut.fifo3_rd_data[lane])),
-                    dut.fifo3_rd_data[lane]);
+                    lane, real'($bitstoshortreal(dut.dropout_data_in[lane])),
+                    dut.dropout_data_in[lane]);
         end
+      end
+    end
+  end
+
+  integer       lane_fd;
+  logic   [1:0] prev_mp_state      [NUM_LANES];
+  logic   [3:0] prev_current_state;
+  logic         lane_log_init_done;
+
+  initial begin
+    lane_fd = $fopen("../testbenches/pipeline_lane_status.txt", "w");
+    if (!lane_fd) begin
+      $display("[ERROR] Could not open pipeline_lane_status.txt for writing.");
+    end else begin
+      $fdisplay(lane_fd, "==============================================");
+      $fdisplay(lane_fd, " SIENNA Per-Lane Streaming Status");
+      $fdisplay(lane_fd, " mp_state key: 0=MP_IDLE 1=MP_FEED 2=MP_WAIT_DONE 3=MP_DONE");
+      $fdisplay(lane_fd, "==============================================\n");
+    end
+    lane_log_init_done = 1'b0;
+  end
+
+  task automatic print_lane_status(input string reason);
+    if (!lane_fd) return;
+    $fdisplay(lane_fd,
+              "---- %0t  (%s)  current_state=%0d  all_collected=%0b  streaming_complete=%0b ----",
+              $time, reason, dut.current_state, dut.all_collected, dut.streaming_complete);
+    // Note: mp_real_consumed explicitly removed to sync with current top-level architecture
+    for (int lane = 0; lane < NUM_LANES; lane++) begin
+      $fdisplay(
+          lane_fd,
+          "  lane=%0d fill_count=%0d done_count=%0d load_finalized=%0b lane_collected=%0b | mp_state=%0d mp_window_fed=%0d mp_windows_done=%0d lane_windows_total=%0d | dropout_out_count=%0d",
+          lane, dut.fill_count[lane], dut.done_count[lane], dut.load_finalized[lane],
+          dut.lane_collected[lane], dut.mp_state[lane], dut.mp_window_fed[lane],
+          dut.mp_windows_done[lane], dut.lane_windows_total[lane], dut.dropout_out_count[lane]);
+    end
+  endtask
+
+  always @(posedge clk_i) begin
+    if (rstn_i && lane_fd) begin
+      if (!lane_log_init_done) begin
+        for (int lane = 0; lane < NUM_LANES; lane++) prev_mp_state[lane] <= dut.mp_state[lane];
+        prev_current_state <= dut.current_state;
+        lane_log_init_done <= 1'b1;
+      end else begin
+        automatic logic any_mp_state_changed = 1'b0;
+        for (int lane = 0; lane < NUM_LANES; lane++) begin
+          if (dut.mp_state[lane] != prev_mp_state[lane]) any_mp_state_changed = 1'b1;
+          prev_mp_state[lane] <= dut.mp_state[lane];
+        end
+
+        if (dut.current_state != prev_current_state) begin
+          print_lane_status("current_state changed");
+        end else if (any_mp_state_changed) begin
+          print_lane_status("mp_state changed");
+        end else if (cycle_count % HEARTBEAT_CYCLES == 0) begin
+          print_lane_status("heartbeat");
+        end
+
+        prev_current_state <= dut.current_state;
       end
     end
   end
@@ -372,7 +412,6 @@ module TB_sienna_top;
              HEARTBEAT_CYCLES);
     $display("==============================================");
 
-    // ── Load files ───────────────────────────────────────────────────
     $display("\n[STAGE] Reading .mem files");
     read_mem_file(WEST_INPUT_FILE, west_data_queue);
     read_mem_file(NORTH_INPUT_FILE, north_data_queue);
@@ -381,8 +420,11 @@ module TB_sienna_top;
     $display("  West=%0d  North=%0d  Expected=%0d words", west_data_queue.size(),
              north_data_queue.size(), expected_results.size());
 
-    // ── Reset → Load → Start ─────────────────────────────────────────
     reset();
+
+    // Clear array right before run so streaming block cleanly builds it
+    // actual_results.delete();
+
     load_inputs();
     repeat (5) @(posedge clk_i);
 
@@ -395,12 +437,11 @@ module TB_sienna_top;
     start_pipeline_i = 0;
     $display("  start pulse sent @ %0t", $time);
     print_status("immediately after start");
+    print_lane_status("immediately after start");
 
-    // ── Wait → Capture → Verify ──────────────────────────────────────
     collect_outputs();
     verify_outputs();
 
-    // ── Final report ─────────────────────────────────────────────────
     $display("\n==============================================");
     $display(" RESULT SUMMARY");
     $display("==============================================");
@@ -413,8 +454,8 @@ module TB_sienna_top;
     else $display(" RESULT: FAILED (%0d mismatches)", failed);
     $display("==============================================");
 
-    // Add this to close the trace file safely
     if (trace_fd) $fclose(trace_fd);
+    if (lane_fd) $fclose(lane_fd);
 
     #100 $finish;
   end

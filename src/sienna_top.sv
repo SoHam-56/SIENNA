@@ -5,8 +5,6 @@ module sienna_top #(
     parameter int    N                 = 32,
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
-    // Note: FIFO_DEPTH is no longer used to blindly size all FIFOs.
-    // Each FIFO is now uniquely sized to its exact maximum bounds below.
     parameter int    FIFO_DEPTH        = 32,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
     parameter int    CONTROL_WIDTH     = 2,
@@ -57,21 +55,13 @@ module sienna_top #(
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
   localparam int RND_W = $clog2(ROUND_CAPACITY + 1);
 
-  // -------------------------------------------------------------------------
-  // EXACT SIZING FOR FIFOS
-  // -------------------------------------------------------------------------
-  // FIFO1: Must hold the ENTIRE read-out from the Systolic Mesh (N*N)
   localparam int FIFO1_DEPTH = SRAM_DEPTH;
+  localparam int FIFO2_DEPTH = 16;
 
-  // FIFO2: Must hold exactly 1 result per lane per GPNAE round.
-  localparam int MAX_ROUNDS = (SRAM_DEPTH + ROUND_CAPACITY - 1) / ROUND_CAPACITY;
-  localparam int FIFO2_DEPTH = (MAX_ROUNDS < 2) ? 2 : MAX_ROUNDS;
-
-  // FIFO3: Must hold the exact number of pooled outputs one lane produces.
+  localparam int MAXPOOL_IN_COUNT = IN_ROWS * IN_COLS;
   localparam int POOL_OUT_ROWS = (IN_ROWS + 2 * PADDING - POOL_H) / STRIDE_ROWS + 1;
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
   localparam int MAXPOOL_OUT_COUNT = POOL_OUT_ROWS * POOL_OUT_COLS;
-  localparam int FIFO3_DEPTH = (MAXPOOL_OUT_COUNT < 2) ? 2 : MAXPOOL_OUT_COUNT;
 
   typedef enum logic [3:0] {
     IDLE,
@@ -80,11 +70,8 @@ module sienna_top #(
     FEED_GPNAE_FIFO,
     LATCH_GPNAE_COUNT,
     GPNAE_ROUND,
-    PREP_MAXPOOL,
-    FEED_MAXPOOL,
-    MAXPOOL_PROCESSING,
-    COLLECT_MAXPOOL,
-    DROPOUT_PROCESSING,
+    DISPATCH_WINDOWS,
+    WAIT_DOWNSTREAM,
     PIPELINE_COMPLETE
   } pipeline_state_t;
 
@@ -99,7 +86,9 @@ module sienna_top #(
 
   fill_state_t fill_state, fill_state_n;
 
-  // FIFO interfaces (wr_ready removed/ignored because upstream just writes)
+  // Intermediate Memory Buffer
+  logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:SRAM_DEPTH-1];
+
   logic                  fifo1_rd_ready;
   logic [DATA_WIDTH-1:0] fifo1_rd_data;
   logic                  fifo1_rd_valid;
@@ -140,17 +129,11 @@ module sienna_top #(
   logic                        maxpool_out_valid  [NUM_LANES];
   logic                        maxpool_done_signal[NUM_LANES];
 
-  logic                        fifo3_wr_valid     [NUM_LANES];
-  logic                        fifo3_rd_ready     [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] fifo3_rd_data      [NUM_LANES];
-  logic                        fifo3_rd_valid     [NUM_LANES];
-
   logic                        dropout_in_valid   [NUM_LANES];
   logic [      DATA_WIDTH-1:0] dropout_data_in    [NUM_LANES];
   logic [      DATA_WIDTH-1:0] dropout_data_out   [NUM_LANES];
   logic                        dropout_valid_out  [NUM_LANES];
 
-  // Bookkeeping
   logic [          FCNT_W-1:0] fill_count         [NUM_LANES];
   logic [          FCNT_W-1:0] done_count         [NUM_LANES];
   logic                        load_finalized     [NUM_LANES];
@@ -160,7 +143,6 @@ module sienna_top #(
   logic [           PTR_W-1:0] fill_ptr;
   logic [           TOT_W-1:0] total_elements;
   logic [           TOT_W-1:0] filled_total;
-  logic [           TOT_W-1:0] transfer_count     [NUM_LANES];
   logic [           RND_W-1:0] fill_round_total;
 
   logic [          FCNT_W-1:0] fill_count_n       [NUM_LANES];
@@ -171,14 +153,18 @@ module sienna_top #(
   logic [      DATA_WIDTH-1:0] gpnae_signal_n     [NUM_LANES];
   logic [           PTR_W-1:0] fill_ptr_n;
   logic [           TOT_W-1:0] filled_total_n;
-  logic [           TOT_W-1:0] transfer_count_n   [NUM_LANES];
   logic [           RND_W-1:0] fill_round_total_n;
 
   logic                        round_done;
+  logic [15:0] round_number, round_number_n;
+  logic [$clog2(FIFO2_DEPTH):0] fifo2_count[NUM_LANES];
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) total_elements <= 0;
-    else begin
+    if (!rstn_i) begin
+      total_elements <= 0;
+      round_number   <= 0;
+    end else begin
+      round_number <= round_number_n;
       if (current_state == IDLE) total_elements <= 0;
       else if (current_state == LATCH_GPNAE_COUNT) total_elements <= SRAM_DEPTH[TOT_W-1:0];
     end
@@ -193,30 +179,6 @@ module sienna_top #(
 
   logic all_collected;
   assign all_collected = (filled_total >= total_elements) && round_done && (total_elements > 0);
-
-  logic [TOT_W-1:0] items_left_to_process[NUM_LANES];
-  logic [$clog2(
-FIFO_DEPTH+1
-)-1:0] dropout_inflight_count[NUM_LANES];  // Just for safe empty tracking
-  logic [NUM_LANES-1:0] maxpool_done_latched;
-
-  logic all_items_zero, all_maxpool_done, all_dropout_clear;
-  always_comb begin
-    all_items_zero    = 1'b1;
-    all_maxpool_done  = 1'b1;
-    all_dropout_clear = 1'b1;
-
-    for (int i = 0; i < NUM_LANES; i++) begin
-      if (items_left_to_process[i] != 0) all_items_zero = 1'b0;
-      if (!maxpool_done_latched[i]) all_maxpool_done = 1'b0;
-      if (fifo3_rd_valid[i] || dropout_inflight_count[i] != 0 || dropout_valid_out[i])
-        all_dropout_clear = 1'b0;
-    end
-  end
-
-  // =========================================================================
-  // MODULE INSTANTIATIONS
-  // =========================================================================
 
   SystolicMesh #(
       .MATRIX_SIZE(N),
@@ -243,8 +205,6 @@ FIFO_DEPTH+1
       .collection_active_o   ()
   );
 
-  // FIFO1: Now circular and perfectly sized to SRAM_DEPTH. 
-  // It acts as a massive sink for the entire systolic array output.
   fwft #(
       .DATA_WIDTH(DATA_WIDTH),
       .FIFO_DEPTH(FIFO1_DEPTH)
@@ -253,7 +213,7 @@ FIFO_DEPTH+1
       .rstn_i    (rstn_i),
       .wr_valid_i(systolic_read_valid),
       .wr_data_i (systolic_read_data),
-      .wr_ready_o(),                     // Ignored: producer just writes
+      .wr_ready_o(),
       .rd_ready_i(fifo1_rd_ready),
       .rd_data_o (fifo1_rd_data),
       .rd_valid_o(fifo1_rd_valid),
@@ -283,7 +243,6 @@ FIFO_DEPTH+1
           .done_o        (gpnae_done[g])
       );
 
-      // FIFO2: Circular and perfectly sized to max possible rounds.
       fwft #(
           .DATA_WIDTH(DATA_WIDTH),
           .FIFO_DEPTH(FIFO2_DEPTH)
@@ -292,22 +251,22 @@ FIFO_DEPTH+1
           .rstn_i    (rstn_i),
           .wr_valid_i(fifo2_wr_valid[g]),
           .wr_data_i (fifo2_wr_data[g]),
-          .wr_ready_o(),                   // Ignored
+          .wr_ready_o(),
           .rd_ready_i(fifo2_rd_ready[g]),
           .rd_data_o (fifo2_rd_data[g]),
           .rd_valid_o(fifo2_rd_valid[g]),
-          .count_o   ()
+          .count_o   (fifo2_count[g])
       );
 
       Maxpool_2D #(
           .DATA_WIDTH (DATA_WIDTH),
-          .IN_ROWS    (IN_ROWS),
-          .IN_COLS    (IN_COLS),
+          .IN_ROWS    (POOL_H),
+          .IN_COLS    (POOL_W),
           .SEG_ROWS   (POOL_H),
           .SEG_COLS   (POOL_W),
-          .STRIDE_ROWS(STRIDE_ROWS),
-          .STRIDE_COLS(STRIDE_COLS),
-          .PADDING    (PADDING),
+          .STRIDE_ROWS(POOL_H),
+          .STRIDE_COLS(POOL_W),
+          .PADDING    (0),
           .IS_FP32    (1)
       ) maxpool_inst (
           .clk      (clk_i),
@@ -318,22 +277,6 @@ FIFO_DEPTH+1
           .valid_in (maxpool_valid_in[g]),
           .out_data (maxpool_out_data[g]),
           .out_valid(maxpool_out_valid[g])
-      );
-
-      // FIFO3: Circular and perfectly sized to max pool outputs.
-      fwft #(
-          .DATA_WIDTH(DATA_WIDTH),
-          .FIFO_DEPTH(FIFO3_DEPTH)
-      ) fifo3_inst (
-          .clk_i     (clk_i),
-          .rstn_i    (rstn_i),
-          .wr_valid_i(fifo3_wr_valid[g]),
-          .wr_data_i (maxpool_out_data[g]),
-          .wr_ready_o(),                     // Ignored
-          .rd_ready_i(fifo3_rd_ready[g]),
-          .rd_data_o (fifo3_rd_data[g]),
-          .rd_valid_o(fifo3_rd_valid[g]),
-          .count_o   ()
       );
 
       dropout #(
@@ -352,24 +295,95 @@ FIFO_DEPTH+1
     end
   endgenerate
 
-  // =========================================================================
-  // COMBINATIONAL ROUTING
-  // =========================================================================
   always_comb begin
     for (int i = 0; i < NUM_LANES; i++) begin
+      dropout_in_valid[i] = maxpool_out_valid[i];
+      dropout_data_in[i] = maxpool_out_data[i];
       gpnae_terms[i] = num_terms_i[GPNAE_ADDR_LINES-1:0];
       gpnae_ctrl[i] = activation_function_i;
+    end
+  end
 
-      // Upstream purely writes when valid. No wr_ready checking.
-      // fifo2_wr_valid[i] = (current_state == GPNAE_ROUND) && load_finalized[i] && gpnae_done[i] && !lane_collected[i];
-      fifo2_wr_valid[i] = (current_state == GPNAE_ROUND) && load_finalized[i] && gpnae_done[i] && !lane_collected[i] && ((done_count[i] + 1'b1) == fill_count[i]);
-      fifo2_wr_data[i] = gpnae_result[i];
+  // =========================================================================
+  // GPNAE TO CENTRAL BUFFER WRITE LOGIC
+  // =========================================================================
+  always_ff @(posedge clk_i) begin
+    if (current_state == GPNAE_ROUND) begin
+      for (int i = 0; i < NUM_LANES; i++) begin
+        if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
+          // RESTORED: This is the mathematically perfect chunked indexing!
+          gpnae_out_mem[round_number * ROUND_CAPACITY + i * GPNAE_FIFO_DEPTH + done_count[i]] <= gpnae_result[i];
+        end
+      end
+    end
+  end
 
-      fifo3_wr_valid[i] = maxpool_out_valid[i];
+  // =========================================================================
+  // WINDOW DISPATCHER FSM
+  // =========================================================================
+  logic [    $clog2(POOL_OUT_ROWS+1)-1:0] disp_r;
+  logic [    $clog2(POOL_OUT_COLS+1)-1:0] disp_c;
+  logic [           $clog2(POOL_H+1)-1:0] disp_pr;
+  logic [           $clog2(POOL_W+1)-1:0] disp_pc;
+  logic                                   disp_done;
+  logic [$clog2(MAXPOOL_OUT_COUNT+1)-1:0] window_idx;
 
-      // Downstream perfectly pulls when it's ready and data is valid
-      fifo2_rd_ready[i] = (current_state == FEED_MAXPOOL) && fifo2_rd_valid[i] && (items_left_to_process[i] > 0);
-      fifo3_rd_ready[i] = (current_state == DROPOUT_PROCESSING) && fifo3_rd_valid[i];
+  logic [          $clog2(NUM_LANES)-1:0] target_lane;
+  assign target_lane = window_idx % NUM_LANES;
+
+  logic signed [31:0] in_row, in_col;
+  logic in_bounds;
+  logic [DATA_WIDTH-1:0] disp_val;
+
+  assign in_row = signed'(disp_r * STRIDE_ROWS + disp_pr) - signed'(PADDING);
+  assign in_col = signed'(disp_c * STRIDE_COLS + disp_pc) - signed'(PADDING);
+  assign in_bounds = (in_row >= 0) && (in_row < IN_ROWS) && (in_col >= 0) && (in_col < IN_COLS);
+
+  // RESTORED: Standard Row-Major indexing
+  assign disp_val = in_bounds ? gpnae_out_mem[in_row*IN_COLS+in_col] : 32'hFF800000;
+
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i || current_state == IDLE) begin
+      disp_r <= '0;
+      disp_c <= '0;
+      disp_pr <= '0;
+      disp_pc <= '0;
+      window_idx <= '0;
+      disp_done <= '0;
+      for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
+    end else if (current_state == DISPATCH_WINDOWS) begin
+      for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
+
+      if (!disp_done) begin
+        if (fifo2_count[target_lane] <= (FIFO2_DEPTH - 4)) begin
+          fifo2_wr_data[target_lane]  <= disp_val;
+          fifo2_wr_valid[target_lane] <= 1'b1;
+
+          if (disp_pc < POOL_W - 1) begin
+            disp_pc <= disp_pc + 1;
+          end else begin
+            disp_pc <= '0;
+            if (disp_pr < POOL_H - 1) begin
+              disp_pr <= disp_pr + 1;
+            end else begin
+              disp_pr <= '0;
+              if (window_idx < MAXPOOL_OUT_COUNT - 1) window_idx <= window_idx + 1;
+              if (disp_c < POOL_OUT_COLS - 1) begin
+                disp_c <= disp_c + 1;
+              end else begin
+                disp_c <= '0;
+                if (disp_r < POOL_OUT_ROWS - 1) begin
+                  disp_r <= disp_r + 1;
+                end else begin
+                  disp_done <= 1'b1;
+                end
+              end
+            end
+          end
+        end
+      end
+    end else begin
+      for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
     end
   end
 
@@ -381,6 +395,7 @@ FIFO_DEPTH+1
     else current_state <= next_state;
   end
 
+  logic streaming_complete;
   always_comb begin
     next_state = current_state;
     case (current_state)
@@ -391,19 +406,16 @@ FIFO_DEPTH+1
       SYSTOLIC_PROCESSING: if (systolic_collection_complete) next_state = FEED_GPNAE_FIFO;
       FEED_GPNAE_FIFO: next_state = LATCH_GPNAE_COUNT;
       LATCH_GPNAE_COUNT: next_state = GPNAE_ROUND;
-      GPNAE_ROUND: if (all_collected) next_state = PREP_MAXPOOL;
-      PREP_MAXPOOL: next_state = FEED_MAXPOOL;
-      FEED_MAXPOOL: if (all_items_zero) next_state = MAXPOOL_PROCESSING;
-      MAXPOOL_PROCESSING: if (all_maxpool_done) next_state = COLLECT_MAXPOOL;
-      COLLECT_MAXPOOL: next_state = DROPOUT_PROCESSING;
-      DROPOUT_PROCESSING: if (all_dropout_clear) next_state = PIPELINE_COMPLETE;
+      GPNAE_ROUND: if (all_collected) next_state = DISPATCH_WINDOWS;
+      DISPATCH_WINDOWS: if (disp_done) next_state = WAIT_DOWNSTREAM;
+      WAIT_DOWNSTREAM: if (streaming_complete) next_state = PIPELINE_COMPLETE;
       PIPELINE_COMPLETE: if (!start_pipeline_i) next_state = IDLE;
       default: next_state = IDLE;
     endcase
   end
 
   // =========================================================================
-  // SYSTOLIC READ-INTO-FIFO1 (Un-gated blast)
+  // SYSTOLIC READ-INTO-FIFO1
   // =========================================================================
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
@@ -422,54 +434,44 @@ FIFO_DEPTH+1
   always_comb begin
     systolic_read_enable_next = systolic_read_enable;
     systolic_read_addr_next   = systolic_read_addr;
-    systolic_reading_next     = systolic_reading;  // default hold
+    systolic_reading_next     = systolic_reading;
 
     if (current_state == IDLE) begin
       systolic_read_enable_next = 0;
       systolic_read_addr_next   = 0;
       systolic_reading_next     = 0;
     end else begin
-      // Latch "reading" the instant we enter FEED_GPNAE_FIFO. Unlike the old
-      // current_state range check, this flag is NOT tied to staying in
-      // FEED_GPNAE_FIFO/LATCH_GPNAE_COUNT — it persists across the FSM moving
-      // on into GPNAE_ROUND, since draining SRAM_DEPTH elements takes far
-      // longer than those two single-cycle states.
       if (current_state == FEED_GPNAE_FIFO) systolic_reading_next = 1;
-
       if (systolic_reading) begin
         systolic_read_enable_next = 1;
         if (systolic_read_enable) begin
-          if (systolic_read_addr < N * N - 1) begin
-            systolic_read_addr_next = systolic_read_addr + 1;
-          end else begin
+          if (systolic_read_addr < N * N - 1) systolic_read_addr_next = systolic_read_addr + 1;
+          else begin
             systolic_read_enable_next = 0;
-            systolic_reading_next     = 0;  // fully drained SRAM into FIFO1
+            systolic_reading_next     = 0;
           end
         end
-      end else begin
-        systolic_read_enable_next = 0;
-      end
+      end else systolic_read_enable_next = 0;
     end
   end
 
   // =========================================================================
-  // GPNAE_ROUND — Independent Fill & Drain
+  // GPNAE_ROUND — Independent Fill FSM
   // =========================================================================
   always_comb begin
     fill_state_n       = fill_state;
     fill_ptr_n         = fill_ptr;
     filled_total_n     = filled_total;
     fill_round_total_n = fill_round_total;
+    round_number_n     = round_number;
 
     for (int i = 0; i < NUM_LANES; i++) begin
       fill_count_n[i]     = fill_count[i];
       done_count_n[i]     = done_count[i];
       load_finalized_n[i] = load_finalized[i];
-      gpnae_start_n[i]    = 1'b0;  // default-clear every cycle: last_i must be a one-shot pulse,
-                                   // not a sticky level (matches how TB_gpnae drives/clears last_i)
+      gpnae_start_n[i]    = 1'b0;
       gpnae_wr_en_n[i]    = 1'b0;
       gpnae_signal_n[i]   = gpnae_signal_i[i];
-      transfer_count_n[i] = transfer_count[i];
       lane_collected_n[i] = lane_collected[i];
     end
 
@@ -478,12 +480,12 @@ FIFO_DEPTH+1
       fill_ptr_n         = '0;
       filled_total_n     = '0;
       fill_round_total_n = '0;
+      round_number_n     = '0;
       for (int i = 0; i < NUM_LANES; i++) begin
         fill_count_n[i]     = '0;
         done_count_n[i]     = '0;
         load_finalized_n[i] = 1'b0;
         gpnae_start_n[i]    = 1'b0;
-        transfer_count_n[i] = '0;
         lane_collected_n[i] = 1'b0;
       end
     end else if (current_state == GPNAE_ROUND) begin
@@ -508,7 +510,7 @@ FIFO_DEPTH+1
         F_PULSE: begin
           gpnae_start_n[fill_ptr]    = 1'b1;
           load_finalized_n[fill_ptr] = 1'b1;
-          if (fifo1_rd_valid && (filled_total < total_elements) && 
+          if (fifo1_rd_valid && (filled_total < total_elements) &&
              (fill_round_total < ROUND_CAPACITY[RND_W-1:0]) && (fill_ptr < NUM_LANES[PTR_W:0] - 1)) begin
             fill_ptr_n   = fill_ptr + 1'b1;
             fill_state_n = F_WRITE;
@@ -518,23 +520,10 @@ FIFO_DEPTH+1
         default: fill_state_n = F_WRITE;
       endcase
 
-      // for (int i = 0; i < NUM_LANES; i++) begin
-      //   if (load_finalized[i] && gpnae_done[i] && !lane_collected[i]) begin
-      //     done_count_n[i]     = done_count[i] + 1'b1;
-      //     transfer_count_n[i] = transfer_count[i] + 1'b1;
-      //     lane_collected_n[i] = 1'b1;
-      //   end
-      // end
-
       for (int i = 0; i < NUM_LANES; i++) begin
-        if (load_finalized[i] && gpnae_done[i] && !lane_collected[i]) begin
+        if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           done_count_n[i] = done_count[i] + 1'b1;
-          // Only the pulse that brings done_count up to fill_count is the TRUE final result —
-          // every earlier pulse is an intermediate per-term completion, not the lane's answer.
-          if ((done_count[i] + 1'b1) == fill_count[i]) begin
-            transfer_count_n[i] = transfer_count[i] + 1'b1;
-            lane_collected_n[i] = 1'b1;
-          end
+          if ((done_count[i] + 1'b1) == fill_count[i]) lane_collected_n[i] = 1'b1;
         end
       end
 
@@ -542,6 +531,7 @@ FIFO_DEPTH+1
         fill_state_n       = F_WRITE;
         fill_ptr_n         = '0;
         fill_round_total_n = '0;
+        round_number_n     = round_number + 1'b1;
         for (int i = 0; i < NUM_LANES; i++) begin
           fill_count_n[i]     = '0;
           done_count_n[i]     = '0;
@@ -568,7 +558,6 @@ FIFO_DEPTH+1
         gpnae_wr_en[i]    <= 1'b0;
         gpnae_start[i]    <= 1'b0;
         gpnae_signal_i[i] <= '0;
-        transfer_count[i] <= '0;
         lane_collected[i] <= 1'b0;
       end
     end else begin
@@ -583,95 +572,147 @@ FIFO_DEPTH+1
         gpnae_wr_en[i]    <= gpnae_wr_en_n[i];
         gpnae_start[i]    <= gpnae_start_n[i];
         gpnae_signal_i[i] <= gpnae_signal_n[i];
-        transfer_count[i] <= transfer_count_n[i];
         lane_collected[i] <= lane_collected_n[i];
       end
     end
   end
 
   assign fifo1_rd_ready = (current_state == GPNAE_ROUND) && (fill_state == F_WRITE) && fifo1_rd_valid &&
-                          (filled_total < total_elements) && (fill_round_total < ROUND_CAPACITY[RND_W-1:0]);
+                          !gpnae_full[fill_ptr] && (filled_total < total_elements) && (fill_round_total < ROUND_CAPACITY[RND_W-1:0]);
 
   // =========================================================================
-  // MAXPOOL & DROPOUT LOCKSTEP DATAPATH
+  // STREAMING MAXPOOL FEEDER (Pre-Packaged Window Receiver)
   // =========================================================================
-  always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) begin
-      for (int i = 0; i < NUM_LANES; i++) dropout_inflight_count[i] <= 0;
-    end else begin
-      if (current_state == IDLE) begin
-        for (int i = 0; i < NUM_LANES; i++) dropout_inflight_count[i] <= 0;
-      end else begin
-        for (int i = 0; i < NUM_LANES; i++) begin
-          case ({
-            fifo3_rd_ready[i], dropout_valid_out[i]
-          })
-            2'b10:   dropout_inflight_count[i] <= dropout_inflight_count[i] + 1;
-            2'b01:   dropout_inflight_count[i] <= dropout_inflight_count[i] - 1;
-            default: dropout_inflight_count[i] <= dropout_inflight_count[i];
-          endcase
-        end
-      end
+  localparam int MPW_W = $clog2(POOL_H * POOL_W + 1);
+
+  typedef enum logic [1:0] {
+    MP_IDLE,
+    MP_FEED,
+    MP_WAIT_DONE,
+    MP_DONE
+  } mp_state_t;
+
+  mp_state_t mp_state[NUM_LANES], mp_state_n[NUM_LANES];
+
+  logic [MPW_W-1:0] mp_window_fed[NUM_LANES], mp_window_fed_n[NUM_LANES];
+  logic [TOT_W-1:0] mp_windows_done[NUM_LANES], mp_windows_done_n[NUM_LANES];
+  logic [TOT_W-1:0] lane_windows_total[NUM_LANES];
+  logic [TOT_W-1:0] dropout_out_count[NUM_LANES], dropout_out_count_n[NUM_LANES];
+
+  always_comb begin
+    for (int i = 0; i < NUM_LANES; i++) begin
+      lane_windows_total[i] = (MAXPOOL_OUT_COUNT[TOT_W-1:0] / NUM_LANES) + 
+                              ((i < (MAXPOOL_OUT_COUNT % NUM_LANES)) ? 1'b1 : 1'b0);
     end
   end
 
-  always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) begin
-      maxpool_done_latched <= '0;
-      for (int i = 0; i < NUM_LANES; i++) begin
-        maxpool_start[i]         <= 0;
-        maxpool_valid_in[i]      <= 0;
-        maxpool_data_in[i]       <= 0;
-        dropout_in_valid[i]      <= 0;
-        dropout_data_in[i]       <= 0;
-        final_result_o[i]        <= 0;
-        items_left_to_process[i] <= 0;
-      end
-    end else begin
-      for (int i = 0; i < NUM_LANES; i++) begin
-        maxpool_start[i]    <= 0;
-        maxpool_valid_in[i] <= 0;
-        dropout_in_valid[i] <= 0;
+  always_comb begin
+    for (int i = 0; i < NUM_LANES; i++) begin
+      mp_state_n[i]        = mp_state[i];
+      mp_window_fed_n[i]   = mp_window_fed[i];
+      mp_windows_done_n[i] = mp_windows_done[i];
 
-        if (dropout_valid_out[i]) final_result_o[i] <= dropout_data_out[i];
-      end
+      maxpool_start[i]     = 1'b0;
+      maxpool_valid_in[i]  = 1'b0;
+      maxpool_data_in[i]   = '0;
+      fifo2_rd_ready[i]    = 1'b0;
 
-      if (current_state == PREP_MAXPOOL) maxpool_done_latched <= '0;
-      else begin
-        for (int i = 0; i < NUM_LANES; i++)
-        if (maxpool_done_signal[i]) maxpool_done_latched[i] <= 1'b1;
-      end
-
-      case (current_state)
-        PREP_MAXPOOL: begin
-          for (int i = 0; i < NUM_LANES; i++) begin
-            items_left_to_process[i] <= transfer_count[i];
-            maxpool_start[i]         <= 1;
+      case (mp_state[i])
+        MP_IDLE: begin
+          if (mp_windows_done[i] < lane_windows_total[i]) begin
+            mp_state_n[i] = MP_FEED;
+            maxpool_start[i] = 1'b1;
+          end else if (current_state == WAIT_DOWNSTREAM || current_state == PIPELINE_COMPLETE) begin
+            mp_state_n[i] = MP_DONE;
           end
         end
-        FEED_MAXPOOL: begin
-          for (int i = 0; i < NUM_LANES; i++) begin
-            if (fifo2_rd_ready[i]) begin
-              maxpool_valid_in[i]      <= 1;
-              maxpool_data_in[i]       <= fifo2_rd_data[i];
-              items_left_to_process[i] <= items_left_to_process[i] - 1;
+
+        MP_FEED: begin
+          maxpool_start[i] = 1'b1;
+          if (mp_window_fed[i] < (POOL_H * POOL_W)) begin
+            if (fifo2_rd_valid[i]) begin
+              maxpool_valid_in[i] = 1'b1;
+              maxpool_data_in[i]  = fifo2_rd_data[i];
+              fifo2_rd_ready[i]   = 1'b1;
+              mp_window_fed_n[i]  = mp_window_fed[i] + 1'b1;
             end
           end
-        end
-        DROPOUT_PROCESSING: begin
-          for (int i = 0; i < NUM_LANES; i++) begin
-            if (fifo3_rd_ready[i]) begin
-              dropout_in_valid[i] <= 1;
-              dropout_data_in[i]  <= fifo3_rd_data[i];
-            end
+          if (mp_window_fed_n[i] == (POOL_H * POOL_W)) begin
+            mp_state_n[i] = MP_WAIT_DONE;
           end
         end
-        default: ;
+
+        MP_WAIT_DONE: begin
+          maxpool_start[i] = 1'b1;
+          if (maxpool_done_signal[i]) begin
+            maxpool_start[i] = 1'b0;
+            mp_window_fed_n[i] = '0;
+            mp_windows_done_n[i] = mp_windows_done[i] + 1'b1;
+            mp_state_n[i] = MP_IDLE;
+          end
+        end
+
+        MP_DONE: maxpool_start[i] = 1'b0;
+        default: mp_state_n[i] = MP_IDLE;
       endcase
     end
   end
 
-  // Tie status outputs
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) begin
+      for (int i = 0; i < NUM_LANES; i++) begin
+        mp_state[i]        <= MP_IDLE;
+        mp_window_fed[i]   <= '0;
+        mp_windows_done[i] <= '0;
+      end
+    end else if (current_state == IDLE) begin
+      for (int i = 0; i < NUM_LANES; i++) begin
+        mp_state[i]        <= MP_IDLE;
+        mp_window_fed[i]   <= '0;
+        mp_windows_done[i] <= '0;
+      end
+    end else begin
+      for (int i = 0; i < NUM_LANES; i++) begin
+        mp_state[i]        <= mp_state_n[i];
+        mp_window_fed[i]   <= mp_window_fed_n[i];
+        mp_windows_done[i] <= mp_windows_done_n[i];
+      end
+    end
+  end
+
+  always_comb begin
+    for (int i = 0; i < NUM_LANES; i++) begin
+      dropout_out_count_n[i] = dropout_valid_out[i] ? dropout_out_count[i] + 1'b1 : dropout_out_count[i];
+    end
+  end
+
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) begin
+      for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= '0;
+    end else if (current_state == IDLE) begin
+      for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= '0;
+    end else begin
+      for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= dropout_out_count_n[i];
+    end
+  end
+
+  always_comb begin
+    streaming_complete = 1'b1;
+    for (int i = 0; i < NUM_LANES; i++) begin
+      if (dropout_out_count[i] != lane_windows_total[i]) streaming_complete = 1'b0;
+    end
+  end
+
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) begin
+      for (int i = 0; i < NUM_LANES; i++) final_result_o[i] <= '0;
+    end else begin
+      for (int i = 0; i < NUM_LANES; i++) begin
+        if (dropout_valid_out[i]) final_result_o[i] <= dropout_data_out[i];
+      end
+    end
+  end
+
   assign pipeline_complete_o = (current_state == PIPELINE_COMPLETE);
   assign intermediate_buffer_full_o = (fifo1_count == SRAM_DEPTH[TOT_W-1:0]);
   assign intermediate_buffer_empty_o = (fifo1_count == 0);
@@ -680,10 +721,20 @@ FIFO_DEPTH+1
                             current_state == SYSTOLIC_PROCESSING  ||
                             current_state == FEED_GPNAE_FIFO);
   assign gpnae_busy_o = (current_state == LATCH_GPNAE_COUNT || current_state == GPNAE_ROUND);
-  assign maxpool_busy_o  = (current_state == PREP_MAXPOOL       ||
-                            current_state == FEED_MAXPOOL       ||
-                            current_state == MAXPOOL_PROCESSING ||
-                            current_state == COLLECT_MAXPOOL);
-  assign dropout_busy_o = (current_state == DROPOUT_PROCESSING);
+
+  logic any_mp_active;
+  always_comb begin
+    any_mp_active = 1'b0;
+    for (int i = 0; i < NUM_LANES; i++)
+    if (mp_state[i] != MP_DONE && mp_state[i] != MP_IDLE) any_mp_active = 1'b1;
+  end
+  assign maxpool_busy_o = (current_state == DISPATCH_WINDOWS || current_state == WAIT_DOWNSTREAM) && any_mp_active;
+
+  logic any_dropout_active;
+  always_comb begin
+    any_dropout_active = 1'b0;
+    for (int i = 0; i < NUM_LANES; i++) if (dropout_valid_out[i]) any_dropout_active = 1'b1;
+  end
+  assign dropout_busy_o = any_dropout_active;
 
 endmodule

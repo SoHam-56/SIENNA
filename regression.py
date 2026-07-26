@@ -177,7 +177,6 @@ def generate_vectors(cfg: dict) -> None:
         cfg.get("tile_size", 4),
         cfg.get("mode", "matmul"),
     )
-    # act_type, seed = cfg.get("activation", "idle"), cfg.get("seed", 42)
     act_type, seed = cfg.get("activation", cfg.get("act", "idle")), cfg.get("seed", 42)
     test_name = cfg.get("name", "manual_gen")
 
@@ -195,8 +194,13 @@ def generate_vectors(cfg: dict) -> None:
         elif m_type == "small_exact":
             A = B = np.random.randint(-3, 4, (N, N)).astype(np.float32)
         else:
-            A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
-            B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+            # === LIMIT RANGE HYPOTHESIS TEST ===
+            if cfg.get("limit_range", False):
+                A = np.random.uniform(-0.25, 0.25, (N, N)).astype(np.float32)
+                B = np.random.uniform(-0.25, 0.25, (N, N)).astype(np.float32)
+            else:
+                A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+                B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
 
     # Software Golden Model Execution
     C = _ref_matmul(A, B)
@@ -260,17 +264,7 @@ def dump_hardware_trace(
     padding=1,
     print_to_console=False,
 ):
-    """Parses raw HW stream and writes a lane-aware flow log unconditionally.
-
-    FIFO1 (Systolic -> GPNAE) is still a single shared FIFO feeding all
-    lanes, so it's captured as one flat stream.
-
-    FIFO2 (GPNAE -> Maxpool) and FIFO3 (Maxpool -> Dropout) are per-lane
-    instances (one per NUM_LANES), so each captured line is tagged
-    'lane=<idx>' by the testbench and grouped back out here per lane —
-    this is exactly the "check FIFO values before jumping into waves"
-    check the multi-lane rework needs.
-    """
+    """Parses raw HW stream and writes a lane-aware flow log unconditionally."""
     in_path = os.path.join(TB_DIR, "hardware_trace.txt")
     out_path = os.path.join(RESULTS_DIR, f"{test_name}_data_flow.txt")
     if not os.path.exists(in_path):
@@ -331,9 +325,6 @@ def dump_hardware_trace(
                 f.write("  [ No data emerged from this stage ]\n\n")
                 return
 
-            # Per-lane count consistency check — surfaces exactly the class
-            # of bug we've been chasing (e.g. one lane finalizing early/late
-            # and ending up with a different element count than its peers).
             distinct = set(counts.values())
             if len(distinct) > 1:
                 f.write(f"  *** WARNING: lane element counts differ: {counts} ***\n\n")
@@ -384,7 +375,6 @@ def dump_hardware_trace(
 # =============================================================================
 
 PIPELINE_TESTS = [
-    # Plumbing / Baseline Tests
     {
         "name": "matmul_ones_idle",
         "mode": "matmul",
@@ -397,7 +387,6 @@ PIPELINE_TESTS = [
         "matrix_type": "small_exact",
         "act": "idle",
     },
-    # GPNAE Math Engine Tests
     {
         "name": "matmul_ident_selu",
         "mode": "matmul",
@@ -416,7 +405,6 @@ PIPELINE_TESTS = [
         "matrix_type": "random",
         "act": "tanh",
     },
-    # CNN Payload Tests
     {"name": "conv_basic_selu", "mode": "conv", "conv_type": "basic", "act": "selu"},
     {"name": "conv_basic_tanh", "mode": "conv", "conv_type": "basic", "act": "tanh"},
 ]
@@ -471,7 +459,7 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def run_regression(N: int, T: int, target_test: str = None):
+def run_regression(N: int, T: int, target_test: str = None, limit_range: bool = False):
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
 
@@ -480,6 +468,11 @@ def run_regression(N: int, T: int, target_test: str = None):
         if not tests_to_run:
             print(f"  {_R}[ERROR] No tests found containing '{target_test}'{_X}")
             return
+
+    if limit_range:
+        print(
+            f"  {_Y}[WARNING] Global LIMIT_RANGE is active. Math constrained to prevent divergence.{_X}"
+        )
 
     print(
         f"  Matrix size : {N}×{N}\n  Tile size   : {T}×{T}\n  Total tests : {len(tests_to_run)}\n"
@@ -495,7 +488,7 @@ def run_regression(N: int, T: int, target_test: str = None):
         )
 
         # 1. Generate Vectors & Dump Expected Traces
-        cfg = {"n": N, "tile_size": T, **t}
+        cfg = {"n": N, "tile_size": T, "limit_range": limit_range, **t}
         generate_vectors(cfg)
 
         # 2. Run Verilator (Streams live status)
@@ -555,10 +548,15 @@ if __name__ == "__main__":
     p.add_argument(
         "--test", type=str, default=None, help="Run a specific test by name substring"
     )
+    p.add_argument(
+        "--limit-range",
+        action="store_true",
+        help="Limit FP range to [-0.25, 0.25] to prevent GPNAE Taylor Series divergence",
+    )
     args, unknown = p.parse_known_args()
 
     if args.action == "regression":
-        run_regression(args.matrix_size, args.tile_size, args.test)
+        run_regression(args.matrix_size, args.tile_size, args.test, args.limit_range)
     elif args.action == "gen":
         generate_vectors(
             {
@@ -567,6 +565,7 @@ if __name__ == "__main__":
                 "mode": args.mode,
                 "conv_type": args.conv_type,
                 "activation": args.activation,
+                "limit_range": args.limit_range,
                 "name": "manual_gen",
             }
         )

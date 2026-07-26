@@ -1,2 +1,8 @@
 VIVADO/
 Verilator/
+testbenches/results/
+testbenches/*.txt
+testbenches*.log
+testbenches/*.mem
+testbenches/*.mif
+*.ron

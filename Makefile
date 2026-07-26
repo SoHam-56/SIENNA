@@ -3,7 +3,6 @@ SHELL := /bin/bash
 # =========================================================================
 # SIENNA VERIFICATION MAKEFILE CONFIGURATION
 # =========================================================================
-LIMIT_RANGE ?= 0
 N    ?= 16
 TILE ?= 4
 
@@ -247,8 +246,7 @@ gen-matmul:
 		--action gen \
 		--mode matmul \
 		--n $(N) \
-		--tile-size $(TILE) \
-		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
+		--tile-size $(TILE)
 
 gen-conv:
 	@echo "=== Generating conv stimulus (N=$(N), tile=$(TILE)) ==="
@@ -257,8 +255,7 @@ gen-conv:
 		--mode conv \
 		--conv-type basic \
 		--n $(N) \
-		--tile-size $(TILE) \
-		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
+		--tile-size $(TILE)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
@@ -386,9 +383,7 @@ regression:
 	python3 regression.py \
 		--matrix-size $(N) \
 		--tile-size $(TILE) \
-		--activation $(ACTIVATION) \
-		$(if $(TEST),--test $(TEST)) \
-		$(if $(filter 1,$(LIMIT_RANGE)),--limit-range)
+		$(if $(TEST),--test $(TEST))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean

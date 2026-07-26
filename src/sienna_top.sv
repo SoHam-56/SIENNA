@@ -2,14 +2,14 @@
 
 module sienna_top #(
     parameter int    NUM_LANES         = 8,
-    parameter int    N                 = 32,
+    parameter int    N                 = 16,
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
-    parameter int    FIFO_DEPTH        = 32,
+    parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
     parameter int    CONTROL_WIDTH     = 2,
-    parameter int    IN_ROWS           = 5,
-    parameter int    IN_COLS           = 5,
+    parameter int    IN_ROWS           = 16,
+    parameter int    IN_COLS           = 16,
     parameter int    POOL_H            = 2,
     parameter int    POOL_W            = 2,
     parameter int    STRIDE_ROWS       = 2,

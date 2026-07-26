@@ -3,7 +3,7 @@
 regression.py — SIENNA Full Pipeline Unified Regression Suite
 =============================================================
 Contains:
-  1. Golden Model & Vector Generator (Now with Expected Traces)
+  1. Golden Model & Vector Generator
   2. Live Status Streamer
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
@@ -194,13 +194,8 @@ def generate_vectors(cfg: dict) -> None:
         elif m_type == "small_exact":
             A = B = np.random.randint(-3, 4, (N, N)).astype(np.float32)
         else:
-            # === LIMIT RANGE HYPOTHESIS TEST ===
-            if cfg.get("limit_range", False):
-                A = np.random.uniform(-0.25, 0.25, (N, N)).astype(np.float32)
-                B = np.random.uniform(-0.25, 0.25, (N, N)).astype(np.float32)
-            else:
-                A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
-                B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+            A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+            B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
 
     # Software Golden Model Execution
     C = _ref_matmul(A, B)
@@ -433,7 +428,7 @@ def _run_make_live(log_path: str) -> tuple:
 
 
 def _parse_log(raw: str) -> dict:
-    if "FATAL" in raw or "Timeout" in raw:
+    if "FATAL" in raw or "[FATAL] Timeout" in raw:
         return {
             "status": "TIMEOUT",
             "total": 0,
@@ -459,7 +454,7 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def run_regression(N: int, T: int, target_test: str = None, limit_range: bool = False):
+def run_regression(N: int, T: int, target_test: str = None):
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
 
@@ -468,11 +463,6 @@ def run_regression(N: int, T: int, target_test: str = None, limit_range: bool = 
         if not tests_to_run:
             print(f"  {_R}[ERROR] No tests found containing '{target_test}'{_X}")
             return
-
-    if limit_range:
-        print(
-            f"  {_Y}[WARNING] Global LIMIT_RANGE is active. Math constrained to prevent divergence.{_X}"
-        )
 
     print(
         f"  Matrix size : {N}×{N}\n  Tile size   : {T}×{T}\n  Total tests : {len(tests_to_run)}\n"
@@ -488,7 +478,7 @@ def run_regression(N: int, T: int, target_test: str = None, limit_range: bool = 
         )
 
         # 1. Generate Vectors & Dump Expected Traces
-        cfg = {"n": N, "tile_size": T, "limit_range": limit_range, **t}
+        cfg = {"n": N, "tile_size": T, **t}
         generate_vectors(cfg)
 
         # 2. Run Verilator (Streams live status)
@@ -548,15 +538,10 @@ if __name__ == "__main__":
     p.add_argument(
         "--test", type=str, default=None, help="Run a specific test by name substring"
     )
-    p.add_argument(
-        "--limit-range",
-        action="store_true",
-        help="Limit FP range to [-0.25, 0.25] to prevent GPNAE Taylor Series divergence",
-    )
     args, unknown = p.parse_known_args()
 
     if args.action == "regression":
-        run_regression(args.matrix_size, args.tile_size, args.test, args.limit_range)
+        run_regression(args.matrix_size, args.tile_size, args.test)
     elif args.action == "gen":
         generate_vectors(
             {
@@ -565,7 +550,6 @@ if __name__ == "__main__":
                 "mode": args.mode,
                 "conv_type": args.conv_type,
                 "activation": args.activation,
-                "limit_range": args.limit_range,
                 "name": "manual_gen",
             }
         )

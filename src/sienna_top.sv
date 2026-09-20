@@ -79,7 +79,6 @@ module sienna_top #(
 
   typedef enum logic [1:0] {
     F_WRITE,
-    F_GAP,
     F_PULSE,
     F_ROUND_IDLE
   } fill_state_t;
@@ -498,14 +497,16 @@ module sienna_top #(
             fill_count_n[fill_ptr]   = fill_count[fill_ptr] + 1'b1;
             filled_total_n           = filled_total + 1'b1;
             fill_round_total_n       = fill_round_total + 1'b1;
-            fill_state_n             = F_GAP;
-          end
-        end
-        F_GAP: begin
-          if ((fill_count[fill_ptr] >= GPNAE_FIFO_DEPTH[FCNT_W-1:0]) || !fifo1_rd_valid ||
-              (filled_total >= total_elements) || (fill_round_total >= ROUND_CAPACITY[RND_W-1:0])) begin
+            // Stop conditions evaluated from the post-write values, so no extra cycle.
+            if (((fill_count[fill_ptr] + 1'b1) >= GPNAE_FIFO_DEPTH[FCNT_W-1:0]) ||
+                ((filled_total + 1'b1) >= total_elements) ||
+                ((fill_round_total + 1'b1) >= ROUND_CAPACITY[RND_W-1:0]))
+              fill_state_n = F_PULSE;
+            else fill_state_n = F_WRITE;
+          end else if (fill_count[fill_ptr] != '0) begin
+            // Cannot write and the lane already holds data: release it, as F_GAP did.
             fill_state_n = F_PULSE;
-          end else fill_state_n = F_WRITE;
+          end
         end
         F_PULSE: begin
           gpnae_start_n[fill_ptr]    = 1'b1;

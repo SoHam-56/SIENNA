@@ -130,6 +130,30 @@ matmul-group logs are present from that run.
 GPNAE activations: PASS, 9/9 patterns, 0 failures across 6480 element checks.
 Measured cost per input: SELU 154 cycles, sigmoid 347, tanh 602.
 
+## Root-causing a numerical defect in this repo
+
+The method that actually worked on the SELU race, after three plausible-looking fixes failed:
+
+1. **Instrument, don't infer.** Put `$display` probes inside the RTL under an `ifdef`, print
+   one line per MAC term (operand, accumulator, coefficient) and one per FIFO pop. Enable
+   with `make verilator VERILATOR="verilator +define+YOUR_TAG"` — the Makefile has no define
+   hook, but overriding `$(VERILATOR)` appends to the command.
+2. **Shrink to a deterministic reproducer first.** Find the exact failing element from the
+   per-test log (`b0 i8 in c0600000 expected ... got ...`), then regenerate with a small
+   batch so the trace is readable. `act_edge` is deterministic and places ±range literally.
+3. **Replay the traced operands in Python and demand a bit-level match.** Feeding the exact
+   sequence the trace showed reproduced the RTL's output to 2 ULP. That is what turns a
+   hypothesis into a root cause — single-fault guesses (sign flip, skipped coefficient, early
+   termination) were all tested against the observed value first and none matched.
+4. **Count against reality, not expectation.** 75 MAC computations was briefly read as
+   confirming correct behaviour because it matched a plausible figure. Against 90 elements it
+   was the bug. Always divide by the number of elements.
+
+`gpnae_tests.py` is the reference for step 3: its series model quantises at every point the
+RTL produces a value, and `number_formats.py` supplies the truncating rounding mode the FP
+units actually use, so a correct hardware result matches it bit for bit rather than
+approximately.
+
 ## `run_real_model.py`
 
 Untracked helper that loads a PyTorch checkpoint, slices an `N×N` block out of the first suitable weight tensor, pairs it with a seeded random activation matrix, and pushes it through the same golden-model and simulation path as the regression suite under the name `real_model_test`. It forces `DROPOUT_P_PERCENT = 0` for determinism. The default `--model` path (`/home/admin/Downloads/Model/end2end.pt`) is from a different machine and needs overriding.

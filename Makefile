@@ -53,10 +53,8 @@ GPNAE_FILES = \
 	TYTAN/Memory/PE5B.v \
 	TYTAN/Memory/RAM.v \
 	TYTAN/Memory/ROM.v \
-	TYTAN/controller.sv \
-	TYTAN/datapath.v \
 	TYTAN/LZC.v \
-	TYTAN/mac.sv \
+	TYTAN/barrel_mac.sv \
 	fp32_down.sv \
 	fp32_up_down.sv \
 	SeLu.sv \

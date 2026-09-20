@@ -50,19 +50,30 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 # =============================================================================
 
 
+# GPNAE control words. 01/10/11 are the only modes the hardware decodes; anything else stalls the lane.
+# No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
+ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3}
+
+# Polynomial terms per activation, as passed to the TYTAN controller.
+ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30}
+
+
 def activation_to_code(act: str) -> int:
-    return {"idle": 0, "selu": 1, "sigmoid": 2, "tanh": 3}.get(act.lower(), 0)
+    key = act.lower()
+    if key not in ACTIVATION_CODES:
+        raise ValueError(
+            f"unsupported activation {act!r}: GPNAE implements only "
+            f"{sorted(ACTIVATION_CODES)}. Control word 0 is not a pass-through "
+            f"mode -- selecting it stalls the pipeline until timeout."
+        )
+    return ACTIVATION_CODES[key]
 
 
 def get_polynomial_terms(act: str) -> int:
-    act = act.lower()
-    if act == "selu":
-        return 14
-    if act == "sigmoid":
-        return 15
-    if act == "tanh":
-        return 30
-    return 1  # IDLE / pass-through
+    key = act.lower()
+    if key not in ACTIVATION_TERMS:
+        raise ValueError(f"unsupported activation {act!r}")
+    return ACTIVATION_TERMS[key]
 
 
 def apply_activation(x: np.ndarray, act: str) -> np.ndarray:
@@ -369,19 +380,10 @@ def dump_hardware_trace(
 # PART 3: REGRESSION ORCHESTRATOR
 # =============================================================================
 
+# Two tests here used "act": "idle", i.e. control word 0, which is not a mode the RTL implements -- they
+# could only ever time out. Removed rather than adding an RTL bypass, which would be a design change.
+# Their matrix types are still covered by mm_ones and mm_small_values in SystolicMesh/matmul_tests.py.
 PIPELINE_TESTS = [
-    {
-        "name": "matmul_ones_idle",
-        "mode": "matmul",
-        "matrix_type": "ones",
-        "act": "idle",
-    },
-    {
-        "name": "matmul_small_exact",
-        "mode": "matmul",
-        "matrix_type": "small_exact",
-        "act": "idle",
-    },
     {
         "name": "matmul_ident_selu",
         "mode": "matmul",

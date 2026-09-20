@@ -40,7 +40,26 @@ export PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 #   exec /opt/rh/gcc-toolset-13/root/usr/bin/g++ -fcoroutines "$@"
 ```
 
-`make lint` works without any of this, because it never compiles C++.
+`GPNAE/run_regression.sh` already does all three and execs `regression.py`, so use it
+rather than repeating the setup. `make lint` works without any of this, because it never
+compiles C++.
+
+**Verilator 5.035 here is unstable in specific, repeatable ways.** These cost hours if you
+meet them cold:
+
+- A variable written by a clocked `always` block and read from a timing coroutine (an
+  `initial` block, a task) is **not coherent** under `--threads`. A cycle counter read back
+  correctly on a 352-cycle run and as 0 on a 37,000-cycle one. Measure with `$time` inside
+  the coroutine instead.
+- Writing the same variable from two contexts crashes the threaded scheduler. Keep one writer.
+- `$dumpvars` over a whole testbench crashes `trace_init` when the TB has `real` or `string`
+  variables. Scope the dump to the DUT.
+- `$bitstoshortreal` silently maps to the 64-bit `$bitstoreal`, decoding every 32-bit pattern
+  as a denormal near zero, so every comparison built on it passes. Decode from the exponent
+  and mantissa widths by hand.
+- `--threads 1` with `--trace --timing` crashes in the stimulus coroutine, while the
+  Makefile's `--threads $(nproc)` default runs. `GPNAE/regression.py` has a `GPNAE_PIN=1`
+  escape hatch for the opposite failure (thread-pool assertion), off by default.
 
 If the build dies with `No rule to make target '/usr/share/verilator/...'` or
 `undefined reference to main`, the `Verilator/` directory holds stale dependency
@@ -65,6 +84,36 @@ make check-files                # verify every file in DESIGN_FILES exists
 ```
 
 `make` with no target prints help, including the current configuration and file counts. Submodules build standalone with `make sm-verilator` and `make gpnae-verilator`, or directly via `make -C SystolicMesh` / `make -C GPNAE`.
+
+## State as of 2026-09-20 — read this first
+
+GPNAE was overhauled and its regression is green: **PASS, 9/9 patterns, 0 failures across
+6480 element checks**, from 10 failures before. The fixes are in `known-issues.md` 5d and 9.
+
+**The SIENNA top-level pipeline has NOT been re-run since those GPNAE changes.** Verify it
+before trusting anything end to end. The changes altered GPNAE's control interface in ways
+the integration can feel:
+
+- The GPNAE FSM is now the sole owner of the input-FIFO read pointer — the MAC no longer pops.
+- The MAC starts only on an explicit per-element request; its credit counter is gone, so it
+  no longer free-runs off `wr_en_i`.
+- `InputFIFO` read latency changed: `regceb` is tied high, so `data_o` tracks `rd_ptr` with a
+  flat two-cycle latency instead of reloading only on a pop.
+- `done_delay` widened 3 -> 4 stages, so each element retires one cycle later.
+
+`sienna_top`'s `fill_state` machine pushes into lanes while they process, which is exactly the
+concurrent push/pop case that the old design got wrong, so this is worth actual measurement
+rather than assumption. Start with `make regression`.
+
+**Also open:** `src/sienna_top.sv` had the `SystolicMesh` parameter overrides
+(`MATRIX_SIZE`/`TILE_SIZE`/`DATA_WIDTH`) commented out, with `MATRIX_SIZE` hard-coded to 16
+in the module to compensate. Both were reverted to HEAD on 2026-09-19 as an unjustified
+workaround rather than a fix. If they were commented out to dodge a real problem, it will
+come back — find out what it was.
+
+Everything is committed and pushed across all three remotes. `GPNAE/tb_gpnae.vcd` is still a
+tracked 5 MB generated waveform that `make clean` deletes; `.gitignore` covers `*.vcd` but
+that does not apply to an already-tracked file, so it wants `git rm --cached` — ask first.
 
 ## Things that will bite you
 

@@ -88,6 +88,8 @@ DESIGN_FILES = \
 	$(addprefix $(DROPOUT_DIR)/,$(DROPOUT_FILES))
 
 # Testbench
+# TB_PKG_FILES compiles before TESTBENCH: a package must be declared before it is imported.
+TB_PKG_FILES = test_config_pkg.sv
 TESTBENCH  = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 
@@ -266,6 +268,7 @@ verilator:
 	$(VERILATOR) --binary \
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
+		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/$(TESTBENCH) \
 		-o $(TOP_MODULE)_sim
 	@echo "-- Compiling Verilator C++ model"
@@ -302,6 +305,7 @@ endif
 	$(VCS) $(VCS_FLAGS) \
 		-o $(VCS_DIR)/$(TOP_MODULE)_sim \
 		$(DESIGN_FILES) \
+		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/$(TESTBENCH)
 	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running simulation"
@@ -334,6 +338,7 @@ lint:
 	$(VERILATOR) --lint-only \
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
+		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/$(TESTBENCH)
 	@echo "-- Lint complete"
 

@@ -6,3 +6,9 @@ testbenches*.log
 testbenches/*.mem
 testbenches/*.mif
 *.ron
+
+# Python and simulation artifacts
+__pycache__/
+*.pyc
+*.vcd
+*.log

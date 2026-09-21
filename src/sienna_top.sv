@@ -55,7 +55,16 @@ module sienna_top #(
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;
   localparam int ROUND_CAPACITY = NUM_LANES * PER_LANE;
 
-  localparam int FCNT_W = $clog2(GPNAE_FIFO_DEPTH + 1);
+  // Lanes take contiguous blocks of PER_LANE elements, so the division has to be exact: a
+  // remainder would be dropped silently, and PER_LANE must fit a lane's input FIFO.
+  initial begin
+    if ((SRAM_DEPTH % NUM_LANES) != 0)
+      $error("sienna_top: NUM_LANES (%0d) must divide SRAM_DEPTH (%0d)", NUM_LANES, SRAM_DEPTH);
+    if (PER_LANE > GPNAE_FIFO_DEPTH)
+      $error("sienna_top: PER_LANE (%0d) exceeds GPNAE_FIFO_DEPTH (%0d)", PER_LANE, GPNAE_FIFO_DEPTH);
+  end
+
+  localparam int FCNT_W = $clog2(PER_LANE + 1);  // what fill_count/done_count actually range over
   localparam int PTR_W = $clog2(NUM_LANES);
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
   localparam int RND_W = $clog2(ROUND_CAPACITY + 1);

@@ -223,7 +223,7 @@ module sienna_top #(
     genvar g;
     for (g = 0; g < NUM_LANES; g++) begin : backend_lanes
 
-      gpnae #(
+      gpnae_poly #(
           .DATA_WIDTH   (GPNAE_DATA_WIDTH),
           .ADDR_LINES   (GPNAE_ADDR_LINES),
           .CONTROL_WIDTH(GPNAE_CTRL_WIDTH)
@@ -320,63 +320,92 @@ module sienna_top #(
   // =========================================================================
   // WINDOW DISPATCHER FSM
   // =========================================================================
-  logic [    $clog2(POOL_OUT_ROWS+1)-1:0] disp_r;
-  logic [    $clog2(POOL_OUT_COLS+1)-1:0] disp_c;
+  // Windows go to lanes round-robin, so NUM_LANES of them can be dispatched at once: lane L
+  // takes windows L, L+NUM_LANES, ... exactly as before, but all lanes are written in the same
+  // cycle instead of one per cycle. gpnae_out_mem is a register array, so the parallel reads
+  // are free. Row and column are carried per lane rather than divided out of a window index,
+  // which would cost NUM_LANES dividers by a non-power-of-two.
+  localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;
+
+  logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
   logic [           $clog2(POOL_H+1)-1:0] disp_pr;
   logic [           $clog2(POOL_W+1)-1:0] disp_pc;
   logic                                   disp_done;
-  logic [$clog2(MAXPOOL_OUT_COUNT+1)-1:0] window_idx;
 
-  logic [          $clog2(NUM_LANES)-1:0] target_lane;
-  assign target_lane = window_idx % NUM_LANES;
+  logic [    $clog2(POOL_OUT_ROWS+1)-1:0] lane_r     [NUM_LANES];
+  logic [    $clog2(POOL_OUT_COLS+1)-1:0] lane_c     [NUM_LANES];
+  logic [$clog2(MAXPOOL_OUT_COUNT+1)-1:0] lane_win   [NUM_LANES];
+  logic [                  NUM_LANES-1:0] lane_active;
 
-  logic signed [31:0] in_row, in_col;
-  logic in_bounds;
-  logic [DATA_WIDTH-1:0] disp_val;
+  logic [DATA_WIDTH-1:0] lane_val[NUM_LANES];
+  logic                  disp_can_write;
 
-  assign in_row = signed'(disp_r * STRIDE_ROWS + disp_pr) - signed'(PADDING);
-  assign in_col = signed'(disp_c * STRIDE_COLS + disp_pc) - signed'(PADDING);
-  assign in_bounds = (in_row >= 0) && (in_row < IN_ROWS) && (in_col >= 0) && (in_col < IN_COLS);
+  always_comb begin
+    for (int L = 0; L < NUM_LANES; L++) begin
+      automatic logic signed [31:0] ir = signed'(lane_r[L] * STRIDE_ROWS + disp_pr) - signed'(PADDING);
+      automatic logic signed [31:0] ic = signed'(lane_c[L] * STRIDE_COLS + disp_pc) - signed'(PADDING);
+      lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
+      lane_val[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS))
+                    ? gpnae_out_mem[ir*IN_COLS+ic] : 32'hFF800000;
+    end
+  end
 
-  // RESTORED: Standard Row-Major indexing
-  assign disp_val = in_bounds ? gpnae_out_mem[in_row*IN_COLS+in_col] : 32'hFF800000;
+  // One lane short of room stalls the whole group, which keeps every lane on the same element.
+  always_comb begin
+    disp_can_write = 1'b1;
+    for (int L = 0; L < NUM_LANES; L++)
+      if (lane_active[L] && (fifo2_count[L] > (FIFO2_DEPTH - 4))) disp_can_write = 1'b0;
+  end
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i || current_state == IDLE) begin
-      disp_r <= '0;
-      disp_c <= '0;
-      disp_pr <= '0;
-      disp_pc <= '0;
-      window_idx <= '0;
+      disp_g   <= '0;
+      disp_pr  <= '0;
+      disp_pc  <= '0;
       disp_done <= '0;
+      for (int L = 0; L < NUM_LANES; L++) begin
+        lane_win[L] <= L[$clog2(MAXPOOL_OUT_COUNT+1)-1:0];
+        lane_r[L]   <= (L / POOL_OUT_COLS);
+        lane_c[L]   <= (L % POOL_OUT_COLS);
+      end
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
     end else if (current_state == DISPATCH_WINDOWS) begin
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
 
-      if (!disp_done) begin
-        if (fifo2_count[target_lane] <= (FIFO2_DEPTH - 4)) begin
-          fifo2_wr_data[target_lane]  <= disp_val;
-          fifo2_wr_valid[target_lane] <= 1'b1;
+      if (!disp_done && disp_can_write) begin
+        for (int L = 0; L < NUM_LANES; L++) begin
+          if (lane_active[L]) begin
+            fifo2_wr_data[L]  <= lane_val[L];
+            fifo2_wr_valid[L] <= 1'b1;
+          end
+        end
 
-          if (disp_pc < POOL_W - 1) begin
-            disp_pc <= disp_pc + 1;
+        if (disp_pc < POOL_W - 1) begin
+          disp_pc <= disp_pc + 1;
+        end else begin
+          disp_pc <= '0;
+          if (disp_pr < POOL_H - 1) begin
+            disp_pr <= disp_pr + 1;
           end else begin
-            disp_pc <= '0;
-            if (disp_pr < POOL_H - 1) begin
-              disp_pr <= disp_pr + 1;
-            end else begin
-              disp_pr <= '0;
-              if (window_idx < MAXPOOL_OUT_COUNT - 1) window_idx <= window_idx + 1;
-              if (disp_c < POOL_OUT_COLS - 1) begin
-                disp_c <= disp_c + 1;
-              end else begin
-                disp_c <= '0;
-                if (disp_r < POOL_OUT_ROWS - 1) begin
-                  disp_r <= disp_r + 1;
-                end else begin
-                  disp_done <= 1'b1;
+            disp_pr <= '0;
+            if (disp_g < NUM_GROUPS - 1) begin
+              disp_g <= disp_g + 1;
+              // Advance every lane by NUM_LANES windows, carrying into the row.
+              for (int L = 0; L < NUM_LANES; L++) begin
+                automatic int c_tmp = lane_c[L] + NUM_LANES;
+                automatic int r_tmp = lane_r[L];
+                for (int k = 0; k < NUM_LANES; k++) begin
+                  if (c_tmp >= POOL_OUT_COLS) begin
+                    c_tmp = c_tmp - POOL_OUT_COLS;
+                    r_tmp = r_tmp + 1;
+                  end
                 end
+                lane_c[L]   <= c_tmp[$clog2(POOL_OUT_COLS+1)-1:0];
+                lane_r[L]   <= r_tmp[$clog2(POOL_OUT_ROWS+1)-1:0];
+                lane_win[L] <= lane_win[L] + NUM_LANES;
               end
+            end else begin
+              disp_done <= 1'b1;
             end
           end
         end

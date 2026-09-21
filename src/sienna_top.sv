@@ -1,7 +1,7 @@
 `timescale 1ns / 100ps
 
 module sienna_top #(
-    parameter int    NUM_LANES         = 8,
+    parameter int    NUM_LANES         = 16,
     parameter int    N                 = 16,
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
@@ -48,7 +48,12 @@ module sienna_top #(
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 2;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
-  localparam int ROUND_CAPACITY = NUM_LANES * GPNAE_FIFO_DEPTH;
+  // Work is split evenly across the lanes rather than filling each to its FIFO depth. With
+  // 8 lanes those coincide (256/8 = 32 = GPNAE_FIFO_DEPTH), which is why the old code could use
+  // the depth directly; at any other lane count it would leave the later lanes empty and index
+  // gpnae_out_mem past its end.
+  localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;
+  localparam int ROUND_CAPACITY = NUM_LANES * PER_LANE;
 
   localparam int FCNT_W = $clog2(GPNAE_FIFO_DEPTH + 1);
   localparam int PTR_W = $clog2(NUM_LANES);
@@ -311,7 +316,7 @@ module sienna_top #(
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           // RESTORED: This is the mathematically perfect chunked indexing!
-          gpnae_out_mem[round_number * ROUND_CAPACITY + i * GPNAE_FIFO_DEPTH + done_count[i]] <= gpnae_result[i];
+          gpnae_out_mem[round_number * ROUND_CAPACITY + i * PER_LANE + done_count[i]] <= gpnae_result[i];
         end
       end
     end
@@ -527,7 +532,7 @@ module sienna_top #(
             filled_total_n           = filled_total + 1'b1;
             fill_round_total_n       = fill_round_total + 1'b1;
             // Stop conditions evaluated from the post-write values, so no extra cycle.
-            if (((fill_count[fill_ptr] + 1'b1) >= GPNAE_FIFO_DEPTH[FCNT_W-1:0]) ||
+            if (((fill_count[fill_ptr] + 1'b1) >= PER_LANE[FCNT_W-1:0]) ||
                 ((filled_total + 1'b1) >= total_elements) ||
                 ((fill_round_total + 1'b1) >= ROUND_CAPACITY[RND_W-1:0]))
               fill_state_n = F_PULSE;

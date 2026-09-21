@@ -59,7 +59,8 @@ GPNAE_FILES = \
 	fp32_up_down.sv \
 	SeLu.sv \
 	sigtan.sv \
-	gpnae.sv
+	gpnae.sv \
+	gpnae_poly.sv
 
 GPNAE_LIB_FILES = \
 	Adders/FP32/src/fp32Adder.sv \

@@ -442,6 +442,43 @@ module TB_sienna_top;
     collect_outputs();
     verify_outputs();
 
+`ifdef BACK_TO_BACK
+    // Run a second, identical matrix WITHOUT asserting reset. Anything that carries state
+    // between matmuls shows up as a different result the second time, and the cycle delta is
+    // the real steady-state cost per matrix rather than an estimate.
+    begin
+      int unsigned t_second_start;
+      int unsigned pass1_failed;
+      pass1_failed = failed;
+
+      $display("\n[STAGE] BACK TO BACK: second matrix, no reset");
+      actual_results.delete();
+      total_elements = 0;
+      exact_passed   = 0;
+      tol_passed     = 0;
+      failed         = 0;
+
+      load_inputs();
+      repeat (5) @(posedge clk_i);
+      t_second_start = $time;
+
+      @(posedge clk_i);
+      start_pipeline_i = 1;
+      @(posedge clk_i);
+      start_pipeline_i = 0;
+
+      collect_outputs();
+      verify_outputs();
+
+      $display(" BACK_TO_BACK second-pass cycles : %0d", ($time - t_second_start) / 10000);
+      if (failed == 0 && pass1_failed == 0)
+        $display(" BACK_TO_BACK: PASSED (both matrices correct without an intervening reset)");
+      else
+        $display(" BACK_TO_BACK: FAILED (pass1 %0d, pass2 %0d mismatches)", pass1_failed, failed);
+      failed = failed + pass1_failed;
+    end
+`endif
+
     $display("\n==============================================");
     $display(" RESULT SUMMARY");
     $display("==============================================");

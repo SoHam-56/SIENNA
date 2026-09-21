@@ -164,6 +164,9 @@ VERILATOR_FLAGS = \
 	--Wno-TIMESCALEMOD \
 	--Wno-UNSIGNED
 
+# Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK
+VERILATOR_FLAGS += $(EXTRA_FLAGS)
+
 ifeq ($(TRACE),fst)
 VERILATOR_FLAGS += --trace-fst --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE -DTRACE_FST
 else ifeq ($(TRACE),vcd)

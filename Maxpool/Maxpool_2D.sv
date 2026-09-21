@@ -68,6 +68,63 @@ module Maxpool_2D #(
     end
   endfunction
 
+  // SIENNA instantiates this with SEG == IN and PADDING == 0, so the whole input is one segment
+  // and OUT_SIZE is 1: the window dispatcher already does the tiling and padding. That case is a
+  // running max, which accepts an element every cycle, whereas the batch FSM below collects,
+  // then processes, then emits, and cannot overlap consecutive windows.
+  localparam bit SINGLE_SEG = (OUT_SIZE == 1);
+
+  generate
+    if (SINGLE_SEG) begin : gen_stream
+      localparam logic [DATA_WIDTH-1:0] NEG_FLOOR = (IS_FP32 && DATA_WIDTH == 32)
+                                                    ? 32'hFF800000
+                                                    : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};
+
+      logic [DATA_WIDTH-1:0]        run_max;
+      logic [$clog2(IN_SIZE+1)-1:0] in_cnt;
+      logic                         busy;
+
+      // Folding the incoming element in combinationally lets the last one be emitted on the
+      // cycle it arrives rather than one later.
+      wire [DATA_WIDTH-1:0] nxt_max = is_greater(data_in, run_max) ? data_in : run_max;
+
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          run_max   <= NEG_FLOOR;
+          in_cnt    <= '0;
+          busy      <= 1'b0;
+          out_data  <= '0;
+          out_valid <= 1'b0;
+          done      <= 1'b0;
+        end else begin
+          out_valid <= 1'b0;
+
+          if (!start) begin
+            busy    <= 1'b0;
+            done    <= 1'b0;
+            in_cnt  <= '0;
+            run_max <= NEG_FLOOR;
+          end else if (!busy && !done) begin
+            busy    <= 1'b1;
+            in_cnt  <= '0;
+            run_max <= NEG_FLOOR;
+          end
+
+          if (busy && valid_in) begin
+            run_max <= nxt_max;
+            in_cnt  <= in_cnt + 1'b1;
+            if ((in_cnt + 1'b1) == IN_SIZE[$clog2(IN_SIZE+1)-1:0]) begin
+              out_data  <= nxt_max;
+              out_valid <= 1'b1;
+              done      <= 1'b1;
+              busy      <= 1'b0;
+            end
+          end
+        end
+      end
+    end else begin : gen_batch
+
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) state <= IDLE;
     else state <= next_state;
@@ -193,5 +250,8 @@ module Maxpool_2D #(
   end
 
   assign done = (state == FINISH);
+
+    end
+  endgenerate
 
 endmodule

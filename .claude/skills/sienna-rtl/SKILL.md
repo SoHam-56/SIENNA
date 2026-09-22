@@ -8,6 +8,9 @@ description: Working knowledge of the SIENNA SystemVerilog accelerator repo — 
 A Float32 neural-network accelerator pipeline in SystemVerilog, simulated with Verilator (primary) and VCS, synthesized with Vivado. One matrix flows end to end: matmul, then an activation function, then 2-D max pooling, then dropout.
 
 Read `references/architecture.md` before changing dataflow or FSMs, `references/verification.md` before touching a testbench or the regression scripts, and **`references/known-issues.md` before debugging anything** — several live defects are catalogued there with evidence, and re-deriving them costs hours. `references/file-map.md` says what every file is and, importantly, which ones are dead.
+For anything involving a second matrix or a stream of sets, read the `sienna-back-to-back`
+skill and known-issues #15 first — five completion flags in the mesh are cleared only by
+reset, and the obvious test passes anyway because it feeds the same matrix twice.
 
 ## The pipeline in one pass
 
@@ -39,6 +42,21 @@ export PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 #   #!/bin/bash
 #   exec /opt/rh/gcc-toolset-13/root/usr/bin/g++ -fcoroutines "$@"
 ```
+
+**Never build or simulate on the login node (wspd0).** It is shared by 400+ users and an
+admin flagged a Verilator build there on 2026-09-22. Submit through the Slurm farm with
+`blaunch`; farm nodes have no gcc-toolset-13, so take gcc 13.2 from `launch` instead:
+
+```bash
+blaunch --cpus 16 --mem 32 --time 01:00:00 --jobname vtb_mesh \
+  --output mesh.log --error mesh.log \
+  launch -c gnu/gcc@13.2 -- ./sim.sh TRACE=0      # sim.sh: VERILATOR_ROOT + -fcoroutines wrapper, then make
+squeue -j <jobid>                                   # poll until it leaves the queue
+```
+
+Keep job scripts and logs on `/proj`, not `/tmp`, which is node-local. Two concurrent jobs
+on the same tree must not share a build directory: pass `VERILATOR_DIR=<dir>` to the top
+Makefile. `launch -l` lists the available tool versions.
 
 `GPNAE/run_regression.sh` already does all three and execs `regression.py`, so use it
 rather than repeating the setup. `make lint` works without any of this, because it never

@@ -534,6 +534,60 @@ Adding an overflow sticky bit would make the whole class of problems observable.
 
 ---
 
+## 15. Back-to-back sets: the whole mesh completion chain is sticky — FIXED (serial re-arm)
+
+**Confirmed (reproduced)** on 2026-09-22, N=16, TILE=4, tanh, via
+`make verilator EXTRA_FLAGS=-DBACK_TO_BACK`.
+
+**Fixed 2026-09-22** in SystolicMesh `bdc8850` (OutputSram, and the `:189` gate), `c451717`
+(AccumulationUnit), `9b9b17a` (input queues), `7e1e9ac` (PEMesh), `1b1b176` (staging
+pointers). This makes sets run back-to-back *serially* without a reset; it does not overlap
+them. Evidence: `TB_SystolicMesh` in `B2B_MODE` passes 5/5 distinct sets with one reset and
+no write-reset pulses, and fails sets 1 and 3 on the empty-after-load check with the pointer
+fix reverted. `TB_sienna_top -DBACK_TO_BACK` passes 81/81 on both passes, and fails pass 2
+with 54 mismatches when the second west matrix is overwritten with 1.0, so the second pass
+really computes. Under Verilator the wrapped pointer writes still land in the right words;
+the false `queue_empty_o` was the only symptom, so element compares alone cannot see it.
+
+A second matrix run without an intervening reset first hangs, and once the hang
+is worked around, silently returns the first matrix's results. Five separate
+flags are cleared only by `rstn_i`:
+
+| Site | Defect |
+|---|---|
+| `SystolicMesh.sv:40,59` | `ptr_A`/`ptr_B` never rewound. They are `[$clog2(GLOBAL_ELEMENTS):0]` = 9 bits for N=16, so a second 256-word load runs 256 -> 512 and **wraps to 0**. `west_queue_empty_o = (ptr_A == 0)` then falsely reads "empty", `sienna_top.sv:445` rejects the start pulse, and since IDLE has no start latch the pulse is lost. |
+| `OutputSram.sv:90` | `COMPLETE` is a terminal state with **no exit transition at all**. `collection_complete_o` stays high until reset, so `tile_col_done` sticks and the mesh's `WAIT_TILES` falls straight through. |
+| `AccumulationUnit.sv:107` | `done_o = (r_curr == RDONE)` parks in `RDONE` until its next `start_i`, so `all_reducers_done` sticks and `WAIT_REDUCE` falls through. |
+| `Row`/`ColumnInputQueue.sv` | `pe_data_count` and `read_addr` are cleared only under `rstn_i`. On a second `start_i` the queue sets `queue_active` and `first_data_sent` but leaves `pe_data_count` at N, so `pe_data_count[i] < N` never fires and the read pointers never advance. |
+| `SystolicMesh.sv:189` | `collection_complete_o = all_reducers_done`, ungated, so `sienna_top`'s `SYSTOLIC_PROCESSING` sees "complete" before the mesh has run and spends one cycle there instead of waiting. |
+| `PEMesh.sv` done logic | `last_element_seen` and `done_o` are one-shot latches cleared only by reset. Left set, the last-element detect never fires again and `done_o` never falls, so `done_o & ~matrix_mult_done_ff` never sees another rising edge, `drain_pending` is never set and **the drain wave never runs for any later matmul**. This is the `last_element_seen` suspected on 2026-09-21. |
+
+Net effect: the second matmul traverses the entire mesh FSM in ~23 cycles
+without computing anything, and `sienna_top` reads the previous set's
+`MeshOutputSram` contents.
+
+**The measurement that proves it, and the reason the obvious test does not.**
+With only the pointer wrap worked around, the back-to-back test reports
+`RESULT: PASSED`, 81/81. That pass is hollow. The test feeds the *same* matrix
+twice, so it cannot distinguish a correct second matmul from a reused first one.
+Feeding a deliberately different second matrix produced **byte-identical results
+and an identical cycle count** — that is the real evidence. `mem_A` was verified
+to hold the new data, so the load is fine; the completion flags are the bug.
+
+Same lesson as issue 6, one level up: a stimulus that repeats cannot detect
+staleness. Any back-to-back test must use distinct data per set.
+
+**`ctrl_reset_all` already exists** and already means "re-arm for a new matmul".
+It is already wired to the input queues' `write_reset_i` and was simply never
+routed to the output side. Most of the fix is plumbing it the rest of the way.
+
+`TB_SystolicMesh` looks like it should have caught this — it has K-set support
+with per-set `matrixA_<k>.mem` files. It does not, because `execute_test_set()`
+calls `apply_reset()` before every set.
+
+See the `sienna-back-to-back` skill for the approved pipelining design that
+fixes these.
+
 ## Cross-reference: which issue explains which failure
 
 | Symptom | Issue |

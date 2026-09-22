@@ -470,7 +470,8 @@ module TB_sienna_top;
       collect_outputs();
       verify_outputs();
 
-      $display(" BACK_TO_BACK second-pass cycles : %0d", ($time - t_second_start) / 10000);
+      // $time evaluates in the 1ns timeunit (a 10ns clock is 10 units), even though %0t prints ps.
+      $display(" BACK_TO_BACK second-pass cycles : %0d", ($time - t_second_start) / 10);
       if (failed == 0 && pass1_failed == 0)
         $display(" BACK_TO_BACK: PASSED (both matrices correct without an intervening reset)");
       else

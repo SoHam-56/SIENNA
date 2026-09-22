@@ -149,6 +149,18 @@ module TB_sienna_top;
   endtask
 
   // ── Helper: print current DUT status signals ──────────────────────────
+  // Armed for the back-to-back pass only: every outer-FSM transition with its timestamp.
+  logic trace_states = 0;
+  int   prev_state = -1;
+  always @(posedge clk_i) begin
+    if (trace_states && dut.current_state !== prev_state) begin
+      $display("  [FSM] @%0t state %0d -> %0d  (coll_complete=%0b mult_complete=%0b)",
+               $time, prev_state, dut.current_state,
+               dut.systolic_collection_complete, dut.systolic_mult_complete);
+      prev_state = dut.current_state;
+    end
+  end
+
   task automatic print_status(input string stage_label);
     $display(
         "[STATUS @ %0t] sys_busy=%0b gpnae_busy=%0b max_busy=%0b drop_busy=%0b | full=%0b empty=%0b",
@@ -239,6 +251,19 @@ module TB_sienna_top;
         $display("[FATAL] Timeout after %0d cycles - pipeline_complete_o never asserted.", waited);
         $display("  Last known state:");
         print_status("at timeout");
+        // Which stage is stuck is the whole diagnosis; sys_busy alone does not say.
+        $display("  outer FSM current_state = %0d", dut.current_state);
+        $display("  fill_state=%0d  filled_total=%0d  total_elements=%0d  all_collected=%0b",
+                 dut.fill_state, dut.filled_total, dut.total_elements, dut.all_collected);
+        $display("  systolic_collection_complete=%0b  fifo1_count=%0d  disp_done=%0b",
+                 dut.systolic_collection_complete, dut.fifo1_count, dut.disp_done);
+        // IDLE only exits on start && both mesh queues non-empty; print that gate verbatim.
+        $display("  start gate: start_pipeline_i=%0b north_queue_empty=%0b west_queue_empty=%0b",
+                 start_pipeline_i, dut.north_queue_empty, dut.west_queue_empty);
+        for (int i = 0; i < 4; i++)
+          $display("  lane %0d: fill_count=%0d done_count=%0d load_finalized=%0b collected=%0b",
+                   i, dut.fill_count[i], dut.done_count[i], dut.load_finalized[i],
+                   dut.lane_collected[i]);
         if (lane_fd) $fclose(lane_fd);
         $finish;
       end
@@ -452,6 +477,7 @@ module TB_sienna_top;
       pass1_failed = failed;
 
       $display("\n[STAGE] BACK TO BACK: second matrix, no reset");
+      trace_states = 1;
       actual_results.delete();
       total_elements = 0;
       exact_passed   = 0;
@@ -464,8 +490,14 @@ module TB_sienna_top;
 
       @(posedge clk_i);
       start_pipeline_i = 1;
+      $display("  [B2B] gate before pulse: state=%0d north_empty=%0b west_empty=%0b",
+               dut.current_state, dut.north_queue_empty, dut.west_queue_empty);
       @(posedge clk_i);
+      $display("  [B2B] gate at pulse   : state=%0d north_empty=%0b west_empty=%0b",
+               dut.current_state, dut.north_queue_empty, dut.west_queue_empty);
       start_pipeline_i = 0;
+      @(posedge clk_i);
+      $display("  [B2B] state after pulse: %0d", dut.current_state);
 
       collect_outputs();
       verify_outputs();

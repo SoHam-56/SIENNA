@@ -181,6 +181,15 @@ def dump_golden_trace(
         write_matrix("Stage 3: Maxpool Output (Input to Dropout)", C_pooled)
 
 
+def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str) -> tuple:
+    C = _ref_matmul(A, B)
+    C_act = apply_activation(C, act_type)
+    C_pooled = apply_maxpool_2d(
+        C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
+    )
+    return C, C_act, C_pooled, apply_dropout(C_pooled, cfg.get("dropout_p", 0.5))
+
+
 def generate_vectors(cfg: dict) -> None:
     os.makedirs(TB_DIR, exist_ok=True)
     N, tile_size, mode = (
@@ -209,17 +218,27 @@ def generate_vectors(cfg: dict) -> None:
             B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
 
     # Software Golden Model Execution
-    C = _ref_matmul(A, B)
-    C_act = apply_activation(C, act_type)
-    C_pooled = apply_maxpool_2d(
-        C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
-    )
-    C_final = apply_dropout(C_pooled, cfg.get("dropout_p", 0.5))
+    C, C_act, C_pooled, C_final = _golden(A, B, cfg, act_type)
 
     # Write files for Verilator testbench
     write_mem(os.path.join(TB_DIR, "matrix_west.mem"), A)
     write_mem(os.path.join(TB_DIR, "matrix_north.mem"), B)
     write_mem(os.path.join(TB_DIR, "expected_output.mem"), C_final)
+
+    # Streamed sets: set 0 is the test's own pattern, the rest random and distinct, so a
+    # stage that replays the previous set cannot pass.
+    num_sets = cfg.get("num_sets", 4)
+    for k in range(num_sets):
+        if k == 0:
+            Ak, Bk, Fk = A, B, C_final
+        else:
+            rng = np.random.RandomState(seed + 1000 + k)
+            Ak = rng.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+            Bk = rng.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+            Fk = _golden(Ak, Bk, cfg, act_type)[3]
+        write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
+        write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
+        write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)
 
     # Dump the intermediate Golden Trace for debug comparisons
     dump_golden_trace(test_name, C, C_act, C_pooled)
@@ -244,6 +263,7 @@ def generate_vectors(cfg: dict) -> None:
         ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
         ("LFSR_WIDTH", 32, "int"),
         ("CONTROL_WIDTH", 2, "int"),
+        ("NUM_SETS", num_sets, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
     ]
     write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"), items)
@@ -507,8 +527,8 @@ def run_regression(N: int, T: int, target_test: str = None):
             f"      {sym}   exact {100*r['exact']/tot:5.1f}%  tol {100*r['tol']/tot:5.1f}%  fail {r['failed']:3d}  {r['cyc']:6d} cyc  {r['wall']:5.1f}s"
         )
 
-        if r["status"] == "FAIL":
-            print(f"  {_R}╚══  Sweep Aborted due to failure.{_X}")
+        if r["status"] != "PASS":
+            print(f"  {_R}╚══  Sweep Aborted: {r['status']}.{_X}")
             sys.exit(1)
 
     print(f"\n  ╚══  Sweep Complete")
@@ -522,6 +542,8 @@ def run_regression(N: int, T: int, target_test: str = None):
         )
     )
     print(hdr(f"{'═'*70}\n"))
+    if passed != len(results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -6,12 +6,35 @@ description: Use when making SIENNA process back-to-back or streamed matrix sets
 # SIENNA back-to-back sets
 
 Design for running a continuous stream of matrix sets through SIENNA with all
-stages overlapped. Status as of 2026-09-22: **phases 1 and 2 done.** Phase 1 fixed the six
-re-arm defects below. Phase 2 made the mesh stream: two staging banks and two
-result banks, so the host loads set i+1 and the consumer reads set i while the
-mesh computes. `sienna_top` is still one serial FSM; phases 3-4 (stage
-controllers, credits, full regression over K sets) are approved but not built.
-Plans: `implementation-plan.md` (phase 1), `phase2-plan.md` (phase 2).
+stages overlapped. Status as of 2026-09-22: **all four phases done.** Phase 1 fixed
+the six re-arm defects below. Phase 2 made the mesh stream: two staging banks and
+two result banks. Phase 3 replaced `sienna_top`'s single FSM with an activation
+stage and a pooling stage, banked `gpnae_out_mem`, and put a 3-credit interface in
+front. Phase 4 is the regression: every test streams 4 distinct sets.
+Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
+
+## Top-level interface after phase 3
+
+| Port | Meaning |
+|---|---|
+| `pipeline_ready_o` | a credit and a mesh staging bank are free; host may load a set and pulse start |
+| `start_pipeline_i` | pulse after loading; ignored while `pipeline_ready_o` is low |
+| `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
+| `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
+
+Measured at N=16, T=4, with 4 streamed sets per test (farm, 2026-09-22):
+
+| Test | Single set | 4 sets streamed | Mesh + activation busy | Activation + pooling busy |
+|---|---|---|---|---|
+| matmul_ident_selu | 750 | 2538 | 605 | 93 |
+| matmul_random_sigm | 718 | 2410 | 604 | 93 |
+| matmul_random_tanh | 776 | 2642 | 606 | 93 |
+| conv_basic_selu | 750 | 2538 | 605 | 93 |
+| conv_basic_tanh | 776 | 2642 | 606 | 93 |
+
+The same 4 tanh sets take 4150 cycles through the serial top. Streamed totals
+include the TB's 256-cycle host load per set; which stage limits steady-state
+throughput has not been measured. Up to 3 sets are in flight.
 
 ## Mesh interface after phase 2
 
@@ -125,8 +148,8 @@ Missing one reintroduces the stale-flag bug at the top level.
 |---|---|
 | 1 Mesh re-arm | `TB_SystolicMesh` K sets, no reset between, all pass — **done** |
 | 2 Mesh streaming | mesh accepts set i+1 during set i's broadcast — **done**: `TB_SystolicMesh` streams K sets, host and consumer both overlap the mesh |
-| 3 Top overlap | `TB_sienna_top` K sets + overlap assertion |
-| 4 Full | `make regression` green, all 5 tests x K sets |
+| 3 Top overlap | `TB_sienna_top` K sets + overlap assertion — **done** |
+| 4 Full | `make regression` green, all 5 tests x K sets — **done** |
 
 Submodule changes land first, per repo convention.
 
@@ -177,3 +200,14 @@ before a standalone run:
 `python3 -c "import matmul_tests as m; m.gen_mm_random('testbenches/stimulus', 16)"`.
 The conv tests also load fewer than N*N words and rely on the rest of the staging bank
 being zero, which holds only because each regression test is a fresh simulation.
+
+## Traps found in phase 3
+
+**`checker` is a SystemVerilog keyword.** A named block `begin : checker` is a syntax error.
+
+**A pass that starts in the previous pass's completion cycle records a phantom set
+boundary.** Every slice then shifts by one set. Wait for `pipeline_complete_o` to fall
+before arming a capture.
+
+**Set ids continue across passes.** The single-set and `BACK_TO_BACK` passes consume ids
+before the stream starts, so the stream's first id is 1 or 2, not 0.

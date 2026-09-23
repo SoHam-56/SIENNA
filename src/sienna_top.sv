@@ -115,6 +115,7 @@ module sienna_top #(
   logic                  systolic_mult_complete;
   logic                  systolic_collection_complete;
   logic systolic_reading, systolic_reading_next;
+  logic systolic_release;
   logic north_queue_empty, west_queue_empty;
 
   // Backend Arrays
@@ -215,7 +216,9 @@ module sienna_top #(
       .read_data_o           (systolic_read_data),
       .read_valid_o          (systolic_read_valid),
       .collection_complete_o (systolic_collection_complete),
-      .collection_active_o   ()
+      .collection_active_o   (),
+      .result_release_i      (systolic_release),
+      .input_ready_o         ()
   );
 
   fwft #(
@@ -465,11 +468,13 @@ module sienna_top #(
       systolic_read_enable <= 0;
       systolic_read_addr   <= 0;
       systolic_reading     <= 0;
+      systolic_release     <= 0;
     end else begin
       systolic_start       <= (current_state == SYSTOLIC_START_PULSE);
       systolic_read_enable <= systolic_read_enable_next;
       systolic_read_addr   <= systolic_read_addr_next;
       systolic_reading     <= systolic_reading_next;
+      systolic_release     <= systolic_read_enable && !systolic_read_enable_next;  // after the last read
     end
   end
 

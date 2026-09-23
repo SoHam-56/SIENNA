@@ -201,6 +201,33 @@ before a standalone run:
 The conv tests also load fewer than N*N words and rely on the rest of the staging bank
 being zero, which holds only because each regression test is a fresh simulation.
 
+## What the tests prove, and what they do not
+
+Added 2026-09-23. Every build now compiles with `--assert`. Handshake assertions sit at the
+end of `SystolicMesh.sv` and `sienna_top.sv` under `ifndef SYNTHESIS`, and
+`-DASSERT_SELFTEST` adds one that always fails, to prove they are live. Directed tests:
+
+- **Mesh staging overrun** (`staging_overrun_test`): no releases, so both result banks and
+  both staging banks fill. Then 256 writes and a start with `input_ready_o` low must be
+  ignored. The four queued sets must come out intact, and a later proper load must land cleanly.
+- **Top credit overrun** (second stream pass): with no credit free, the host loads 16 words
+  and pulses start. The mesh write pointer must stay at 16, the load resumes, and set 3 must
+  still be correct.
+- **Reset mid-stream** (`reset_mid_stream`): reset with two sets in flight. The pipeline must
+  go idle with all credits free and no output for 2000 cycles, and a clean 4-set stream must pass.
+- **Output port**: both captures read `final_result_o` qualified by the new `result_valid_o`,
+  never the internal dropout signals.
+
+Back-pressure: the mesh stalls on full result banks only in the credit-overrun pass
+(159-217 cycles). **The activation stage never stalls on full activation banks, in any
+test.** Pooling takes far less time than activation and has no output back-pressure, so
+that path cannot be reached in this configuration. Its handshake is covered only by the
+`a_act_bank_free` and `a_act_bank_full` assertions.
+
+Still not covered: functional coverage, formal, four-state (VCS) simulation, varied seeds,
+dropout training mode, any N other than 16 at the top level, and synthesis after the
+buffers doubled.
+
 ## Traps found in phase 3
 
 **`checker` is a SystemVerilog keyword.** A named block `begin : checker` is a syntax error.

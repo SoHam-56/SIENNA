@@ -604,6 +604,23 @@ calls `apply_reset()` before every set.
 See the `sienna-back-to-back` skill for the approved pipelining design that
 fixes these.
 
+## 16. GPNAE's `valid_done_signal` assertion cannot hold — OPEN, not changed
+
+**Confirmed (reproduced)** 2026-09-23. GPNAE's Makefile never passed `--assert`, so the
+assertions in `GPNAE/testbenches/TB_gpnae.sv` never ran. With `--assert` on, the regression
+stops at the first result:
+
+```
+%Error: TB_gpnae.sv:288: Assertion failed in TB_gpnae: Final result changed after done signal!
+```
+
+The property is `done_o |-> $stable(final_result_o)`, but `gpnae.sv:231-232` registers
+`final_result_o` and `done_o` on the same edge. On the cycle `done_o` rises, the result has
+just changed, so `$stable` is false by construction. The assertion looks wrong rather than
+the RTL; the intended property is probably that the result holds while `done_o` is high.
+GPNAE is published work, so neither the assertion nor the Makefile was changed. The
+SystolicMesh and top-level builds do compile with `--assert`.
+
 ## Cross-reference: which issue explains which failure
 
 | Symptom | Issue |

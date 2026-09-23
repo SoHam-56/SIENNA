@@ -79,19 +79,24 @@ module sienna_top #(
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
   localparam int MAXPOOL_OUT_COUNT = POOL_OUT_ROWS * POOL_OUT_COLS;
 
-  typedef enum logic [3:0] {
-    IDLE,
-    SYSTOLIC_START_PULSE,
-    SYSTOLIC_PROCESSING,
-    FEED_GPNAE_FIFO,
-    LATCH_GPNAE_COUNT,
-    GPNAE_ROUND,
-    DISPATCH_WINDOWS,
-    WAIT_DOWNSTREAM,
-    PIPELINE_COMPLETE
-  } pipeline_state_t;
+  localparam int MAX_SETS_IN_FLIGHT = 3;
 
-  pipeline_state_t current_state, next_state;
+  // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
+  typedef enum logic [1:0] {G_IDLE, G_FEED, G_LATCH, G_ROUND} g_state_t;
+  // Pooling stage: dispatch windows into FIFO2, then wait for maxpool and dropout to drain.
+  typedef enum logic [1:0] {P_IDLE, P_DISPATCH, P_WAIT} p_state_t;
+  g_state_t g_state;
+  p_state_t p_state;
+
+  logic mesh_input_ready, host_accept, g_accept, g_done, p_accept, p_release, pool_done;
+  logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
+  logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
+  int act_wr_base, act_rd_base;
+  logic [1:0] credits;  // sets the host may still start
+  logic [2:0] mesh_sets;  // accepted sets the activation stage has not taken yet
+  logic [1:0] g_next_id, g_set_id, p_next_id, p_set_id;
+  assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
+  assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
   typedef enum logic [1:0] {
     F_WRITE,
@@ -102,7 +107,7 @@ module sienna_top #(
   fill_state_t fill_state, fill_state_n;
 
   // Intermediate Memory Buffer
-  logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:SRAM_DEPTH-1];
+  logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:2*SRAM_DEPTH-1];
 
   logic                  fifo1_rd_ready;
   logic [DATA_WIDTH-1:0] fifo1_rd_data;
@@ -118,6 +123,7 @@ module sienna_top #(
   logic                  systolic_collection_complete;
   logic systolic_reading, systolic_reading_next;
   logic systolic_release;
+  assign systolic_start = host_accept;  // the mesh queues it in a staging bank
   logic north_queue_empty, west_queue_empty;
 
   // Backend Arrays
@@ -181,8 +187,8 @@ module sienna_top #(
       round_number   <= 0;
     end else begin
       round_number <= round_number_n;
-      if (current_state == IDLE) total_elements <= 0;
-      else if (current_state == LATCH_GPNAE_COUNT) total_elements <= SRAM_DEPTH[TOT_W-1:0];
+      if (g_state == G_IDLE) total_elements <= 0;
+      else if (g_state == G_LATCH) total_elements <= SRAM_DEPTH[TOT_W-1:0];
     end
   end
 
@@ -220,7 +226,7 @@ module sienna_top #(
       .collection_complete_o (systolic_collection_complete),
       .collection_active_o   (),
       .result_release_i      (systolic_release),
-      .input_ready_o         ()
+      .input_ready_o         (mesh_input_ready)
   );
 
   fwft #(
@@ -326,11 +332,11 @@ module sienna_top #(
   // GPNAE TO CENTRAL BUFFER WRITE LOGIC
   // =========================================================================
   always_ff @(posedge clk_i) begin
-    if (current_state == GPNAE_ROUND) begin
+    if (g_state == G_ROUND) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           // RESTORED: This is the mathematically perfect chunked indexing!
-          gpnae_out_mem[round_number * ROUND_CAPACITY + i * PER_LANE + done_count[i]] <= gpnae_result[i];
+          gpnae_out_mem[act_wr_base + round_number * ROUND_CAPACITY + i * PER_LANE + done_count[i]] <= gpnae_result[i];
         end
       end
     end
@@ -365,7 +371,7 @@ module sienna_top #(
       automatic logic signed [31:0] ic = signed'(lane_c[L] * STRIDE_COLS + disp_pc) - signed'(PADDING);
       lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
       lane_val[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS))
-                    ? gpnae_out_mem[ir*IN_COLS+ic] : 32'hFF800000;
+                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : 32'hFF800000;
     end
   end
 
@@ -377,7 +383,7 @@ module sienna_top #(
   end
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i || current_state == IDLE) begin
+    if (!rstn_i || p_state == P_IDLE) begin
       disp_g   <= '0;
       disp_pr  <= '0;
       disp_pc  <= '0;
@@ -388,7 +394,7 @@ module sienna_top #(
         lane_c[L]   <= (L % POOL_OUT_COLS);
       end
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
-    end else if (current_state == DISPATCH_WINDOWS) begin
+    end else if (p_state == P_DISPATCH) begin
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
 
       if (!disp_done && disp_can_write) begin
@@ -435,30 +441,66 @@ module sienna_top #(
   end
 
   // =========================================================================
-  // OUTER PIPELINE FSM
+  // STAGE CONTROLLERS: the mesh, activation (G) and pooling (P) each hold one set
   // =========================================================================
-  always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) current_state <= IDLE;
-    else current_state <= next_state;
-  end
-
   logic streaming_complete;
-  always_comb begin
-    next_state = current_state;
-    case (current_state)
-      IDLE:
-      if (start_pipeline_i && !north_queue_empty && !west_queue_empty)
-        next_state = SYSTOLIC_START_PULSE;
-      SYSTOLIC_START_PULSE: next_state = SYSTOLIC_PROCESSING;
-      SYSTOLIC_PROCESSING: if (systolic_collection_complete) next_state = FEED_GPNAE_FIFO;
-      FEED_GPNAE_FIFO: next_state = LATCH_GPNAE_COUNT;
-      LATCH_GPNAE_COUNT: next_state = GPNAE_ROUND;
-      GPNAE_ROUND: if (all_collected) next_state = DISPATCH_WINDOWS;
-      DISPATCH_WINDOWS: if (disp_done) next_state = WAIT_DOWNSTREAM;
-      WAIT_DOWNSTREAM: if (streaming_complete) next_state = PIPELINE_COMPLETE;
-      PIPELINE_COMPLETE: if (!start_pipeline_i) next_state = IDLE;
-      default: next_state = IDLE;
-    endcase
+
+  assign pipeline_ready_o = (credits != 0) && mesh_input_ready;
+  assign host_accept = start_pipeline_i && pipeline_ready_o && !north_queue_empty && !west_queue_empty;
+  // Not while the previous result's read or release is in flight: its bank flag may still read full.
+  assign g_accept = (g_state == G_IDLE) && systolic_collection_complete && !act_full[act_wr] &&
+                    !systolic_read_enable && !systolic_release;
+  assign g_done = (g_state == G_ROUND) && all_collected;
+  assign p_accept = (p_state == P_IDLE) && act_full[act_rd];
+  assign p_release = (p_state == P_DISPATCH) && disp_done;  // the bank is copied into FIFO2
+  assign pool_done = (p_state == P_WAIT) && streaming_complete;
+
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) begin
+      g_state   <= G_IDLE;
+      p_state   <= P_IDLE;
+      act_full  <= '0;
+      act_wr    <= 1'b0;
+      act_rd    <= 1'b0;
+      credits   <= MAX_SETS_IN_FLIGHT[1:0];
+      mesh_sets <= '0;
+      g_next_id <= '0;
+      g_set_id  <= '0;
+      p_next_id <= '0;
+      p_set_id  <= '0;
+    end else begin
+      case (g_state)
+        G_IDLE:  if (g_accept) g_state <= G_FEED;
+        G_FEED:  g_state <= G_LATCH;
+        G_LATCH: g_state <= G_ROUND;
+        G_ROUND: if (all_collected) g_state <= G_IDLE;
+        default: g_state <= G_IDLE;
+      endcase
+      case (p_state)
+        P_IDLE:     if (p_accept) p_state <= P_DISPATCH;
+        P_DISPATCH: if (disp_done) p_state <= P_WAIT;
+        P_WAIT:     if (streaming_complete) p_state <= P_IDLE;
+        default:    p_state <= P_IDLE;
+      endcase
+      if (g_done) begin
+        act_full[act_wr] <= 1'b1;
+        act_wr <= ~act_wr;
+      end
+      if (p_release) begin
+        act_full[act_rd] <= 1'b0;
+        act_rd <= ~act_rd;
+      end
+      credits   <= credits - {1'b0, host_accept} + {1'b0, pool_done};
+      mesh_sets <= mesh_sets + {2'b0, host_accept} - {2'b0, g_accept};
+      if (g_accept) begin
+        g_set_id  <= g_next_id;
+        g_next_id <= g_next_id + 1'b1;
+      end
+      if (p_accept) begin
+        p_set_id  <= p_next_id;
+        p_next_id <= p_next_id + 1'b1;
+      end
+    end
   end
 
   // =========================================================================
@@ -466,13 +508,11 @@ module sienna_top #(
   // =========================================================================
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
-      systolic_start       <= 0;
       systolic_read_enable <= 0;
       systolic_read_addr   <= 0;
       systolic_reading     <= 0;
       systolic_release     <= 0;
     end else begin
-      systolic_start       <= (current_state == SYSTOLIC_START_PULSE);
       systolic_read_enable <= systolic_read_enable_next;
       systolic_read_addr   <= systolic_read_addr_next;
       systolic_reading     <= systolic_reading_next;
@@ -485,12 +525,12 @@ module sienna_top #(
     systolic_read_addr_next   = systolic_read_addr;
     systolic_reading_next     = systolic_reading;
 
-    if (current_state == IDLE) begin
+    if (g_state == G_IDLE) begin
       systolic_read_enable_next = 0;
       systolic_read_addr_next   = 0;
       systolic_reading_next     = 0;
     end else begin
-      if (current_state == FEED_GPNAE_FIFO) systolic_reading_next = 1;
+      if (g_state == G_FEED) systolic_reading_next = 1;
       if (systolic_reading) begin
         systolic_read_enable_next = 1;
         if (systolic_read_enable) begin
@@ -524,7 +564,7 @@ module sienna_top #(
       lane_collected_n[i] = lane_collected[i];
     end
 
-    if (current_state == IDLE) begin
+    if (g_state == G_IDLE) begin
       fill_state_n       = F_WRITE;
       fill_ptr_n         = '0;
       filled_total_n     = '0;
@@ -537,7 +577,7 @@ module sienna_top #(
         gpnae_start_n[i]    = 1'b0;
         lane_collected_n[i] = 1'b0;
       end
-    end else if (current_state == GPNAE_ROUND) begin
+    end else if (g_state == G_ROUND) begin
 
       case (fill_state)
         F_WRITE: begin
@@ -628,7 +668,7 @@ module sienna_top #(
     end
   end
 
-  assign fifo1_rd_ready = (current_state == GPNAE_ROUND) && (fill_state == F_WRITE) && fifo1_rd_valid &&
+  assign fifo1_rd_ready = (g_state == G_ROUND) && (fill_state == F_WRITE) && fifo1_rd_valid &&
                           !gpnae_full[fill_ptr] && (filled_total < total_elements) && (fill_round_total < ROUND_CAPACITY[RND_W-1:0]);
 
   // =========================================================================
@@ -673,7 +713,7 @@ module sienna_top #(
           if (mp_windows_done[i] < lane_windows_total[i]) begin
             mp_state_n[i] = MP_FEED;
             maxpool_start[i] = 1'b1;
-          end else if (current_state == WAIT_DOWNSTREAM || current_state == PIPELINE_COMPLETE) begin
+          end else if (p_state == P_WAIT) begin
             mp_state_n[i] = MP_DONE;
           end
         end
@@ -716,7 +756,7 @@ module sienna_top #(
         mp_window_fed[i]   <= '0;
         mp_windows_done[i] <= '0;
       end
-    end else if (current_state == IDLE) begin
+    end else if (p_state == P_IDLE) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         mp_state[i]        <= MP_IDLE;
         mp_window_fed[i]   <= '0;
@@ -740,7 +780,7 @@ module sienna_top #(
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
       for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= '0;
-    end else if (current_state == IDLE) begin
+    end else if (p_state == P_IDLE) begin
       for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= '0;
     end else begin
       for (int i = 0; i < NUM_LANES; i++) dropout_out_count[i] <= dropout_out_count_n[i];
@@ -764,16 +804,13 @@ module sienna_top #(
     end
   end
 
-  assign pipeline_complete_o = (current_state == PIPELINE_COMPLETE);
-  assign pipeline_ready_o = (current_state == IDLE);  // stub until the stages overlap
-  assign done_set_id_o = '0;  // stub until the stages overlap
+  assign pipeline_complete_o = pool_done;  // one cycle per set, in issue order
+  assign done_set_id_o = p_set_id;
   assign intermediate_buffer_full_o = (fifo1_count == SRAM_DEPTH[TOT_W-1:0]);
   assign intermediate_buffer_empty_o = (fifo1_count == 0);
 
-  assign systolic_busy_o = (current_state == SYSTOLIC_START_PULSE ||
-                            current_state == SYSTOLIC_PROCESSING  ||
-                            current_state == FEED_GPNAE_FIFO);
-  assign gpnae_busy_o = (current_state == LATCH_GPNAE_COUNT || current_state == GPNAE_ROUND);
+  assign systolic_busy_o = (mesh_sets != 0);
+  assign gpnae_busy_o = (g_state != G_IDLE);
 
   logic any_mp_active;
   always_comb begin
@@ -781,7 +818,7 @@ module sienna_top #(
     for (int i = 0; i < NUM_LANES; i++)
     if (mp_state[i] != MP_DONE && mp_state[i] != MP_IDLE) any_mp_active = 1'b1;
   end
-  assign maxpool_busy_o = (current_state == DISPATCH_WINDOWS || current_state == WAIT_DOWNSTREAM) && any_mp_active;
+  assign maxpool_busy_o = (p_state != P_IDLE) && any_mp_active;
 
   logic any_dropout_active;
   always_comb begin

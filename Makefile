@@ -139,6 +139,7 @@ endef
 
 VERILATOR_FLAGS = \
 	--timing \
+	--assert \
 	--top-module $(TOP_MODULE) \
 	--threads $(shell nproc) \
 	--build-jobs $(shell nproc) \

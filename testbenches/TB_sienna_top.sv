@@ -96,25 +96,35 @@ module TB_sienna_top;
       .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
   );
 
+  // Manual binary32 decode. $signed() and $bitstoshortreal both leave the bit pattern as an integer
+  // under Verilator, which turns a 1% bound into roughly a factor of two.
+  function automatic real f32(input logic [31:0] b);
+    int  e;
+    real m, v;
+    e = int'(b[30:23]);
+    m = real'(longint'(b[22:0])) / 8388608.0;
+    if (e == 255) v = 1.0e38;                         // Inf / NaN, clamped so any finite compare fails
+    else if (e == 0) v = 0.0;                         // zero / flushed subnormal
+    else v = (1.0 + m) * (2.0 ** (e - 127));
+    return b[31] ? -v : v;
+  endfunction
+
   // ── Tolerance check ───────────────────────────────────────────────────
   function automatic logic check_tolerance(input [DATA_WIDTH-1:0] expected, actual,
                                            output string info);
-    shortreal exp_sr, act_sr, abs_sr;
-    real abs_d, rel_d;
+    real exp_r, act_r, abs_d, rel_d;
 
-    exp_sr = $bitstoshortreal(expected[31:0]);
-    act_sr = $bitstoshortreal(actual[31:0]);
-    abs_sr = (exp_sr > act_sr) ? (exp_sr - act_sr) : (act_sr - exp_sr);
-    abs_d  = real'(abs_sr);
+    exp_r = f32(expected[31:0]);
+    act_r = f32(actual[31:0]);
+    abs_d = (exp_r > act_r) ? (exp_r - act_r) : (act_r - exp_r);
 
-    if (exp_sr != shortreal'(0.0))
-      rel_d = abs_d / real'((exp_sr > shortreal'(0.0)) ? exp_sr : -exp_sr);
-    else rel_d = (act_sr == shortreal'(0.0)) ? 0.0 : 1.0;
+    if (exp_r != 0.0) rel_d = abs_d / ((exp_r > 0.0) ? exp_r : -exp_r);
+    else rel_d = (act_r == 0.0) ? 0.0 : 1.0;
 
     info = $sformatf(
-        "exp=%f act=%f abs=%.5f (lim %.4f) rel=%.3f%% (lim %.1f%%)",
-        real'(exp_sr),
-        real'(act_sr),
+        "exp=%g act=%g abs=%.3g (lim %.4f) rel=%.4f%% (lim %.1f%%)",
+        exp_r,
+        act_r,
         abs_d,
         ABS_TOL,
         rel_d * 100.0,
@@ -128,6 +138,19 @@ module TB_sienna_top;
       default:    return (abs_d <= ABS_TOL);
     endcase
   endfunction
+
+  // Checker self-test: a loose or broken compare must fail the run before any result is trusted.
+  initial begin
+    string st_info;
+    if (!check_tolerance(32'h3f800000, 32'h3f800003, st_info) ||   // 1.0 vs 1.0 + 3 ulp: pass
+        check_tolerance(32'h3f800000, 32'h40000000, st_info) ||    // 1.0 vs 2.0: fail
+        check_tolerance(32'h3f800000, 32'h3f7ae148, st_info) ||    // 1.0 vs 0.98: fail
+        check_tolerance(32'h3f800000, 32'hbf800000, st_info) ||    // 1.0 vs -1.0: fail
+        check_tolerance(32'hbf000000, 32'hbd4ccccd, st_info)) begin // -0.5 vs -0.05: fail
+      $display("[FAIL] Tolerance checker self-test failed; results cannot be trusted");
+      $finish;
+    end
+  end
 
   // ── .mem reader ───────────────────────────────────────────────────────
   task automatic read_mem_file(input string fn, output logic [DATA_WIDTH-1:0] q[$]);

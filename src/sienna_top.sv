@@ -58,7 +58,6 @@ module sienna_top #(
   // the depth directly; at any other lane count it would leave the later lanes empty and index
   // gpnae_out_mem past its end.
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;
-  localparam int ROUND_CAPACITY = NUM_LANES * PER_LANE;
 
   // Lanes take contiguous blocks of PER_LANE elements, so the division has to be exact: a
   // remainder would be dropped silently, and PER_LANE must fit a lane's input FIFO.
@@ -70,11 +69,8 @@ module sienna_top #(
   end
 
   localparam int FCNT_W = $clog2(PER_LANE + 1);  // what fill_count/done_count actually range over
-  localparam int PTR_W = $clog2(NUM_LANES);
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
-  localparam int RND_W = $clog2(ROUND_CAPACITY + 1);
 
-  localparam int FIFO1_DEPTH = SRAM_DEPTH;
   localparam int FIFO2_DEPTH = 16;
 
   localparam int MAXPOOL_IN_COUNT = IN_ROWS * IN_COLS;
@@ -104,30 +100,18 @@ module sienna_top #(
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
-  typedef enum logic [1:0] {
-    F_WRITE,
-    F_PULSE,
-    F_ROUND_IDLE
-  } fill_state_t;
-
-  fill_state_t fill_state, fill_state_n;
-
   // Intermediate Memory Buffer
   logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:2*SRAM_DEPTH-1];
 
-  logic                  fifo1_rd_ready;
-  logic [DATA_WIDTH-1:0] fifo1_rd_data;
-  logic                  fifo1_rd_valid;
-  logic [     TOT_W-1:0] fifo1_count;
 
   logic                  systolic_start;
-  logic systolic_read_enable, systolic_read_enable_next;
-  logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_addr, systolic_read_addr_next;
-  logic [DATA_WIDTH-1:0] systolic_read_data;
-  logic                  systolic_read_valid;
+  logic systolic_read_enable;
+  logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_addr;  // wide read index, 0 .. PER_LANE-1
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] wide_rd_data;  // element k of lane k's block
+  logic                                 wide_rd_valid;
   logic                  systolic_mult_complete;
   logic                  systolic_collection_complete;
-  logic systolic_reading, systolic_reading_next;
+  logic systolic_reading;
   logic systolic_release;
   assign systolic_start = host_accept;  // the mesh queues it in a staging bank
   logic north_queue_empty, west_queue_empty;
@@ -168,10 +152,8 @@ module sienna_top #(
   logic                        lane_collected     [NUM_LANES];
   logic                        lane_collected_n   [NUM_LANES];
 
-  logic [           PTR_W-1:0] fill_ptr;
   logic [           TOT_W-1:0] total_elements;
   logic [           TOT_W-1:0] filled_total;
-  logic [           RND_W-1:0] fill_round_total;
 
   logic [          FCNT_W-1:0] fill_count_n       [NUM_LANES];
   logic [          FCNT_W-1:0] done_count_n       [NUM_LANES];
@@ -179,39 +161,33 @@ module sienna_top #(
   logic                        gpnae_start_n      [NUM_LANES];
   logic                        gpnae_wr_en_n      [NUM_LANES];
   logic [      DATA_WIDTH-1:0] gpnae_signal_n     [NUM_LANES];
-  logic [           PTR_W-1:0] fill_ptr_n;
   logic [           TOT_W-1:0] filled_total_n;
-  logic [           RND_W-1:0] fill_round_total_n;
 
-  logic                        round_done;
-  logic [15:0] round_number, round_number_n;
   logic [$clog2(FIFO2_DEPTH):0] fifo2_count[NUM_LANES];
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
       total_elements <= 0;
-      round_number   <= 0;
     end else begin
-      round_number <= round_number_n;
       if (g_state == G_IDLE) total_elements <= 0;
       else if (g_state == G_LATCH) total_elements <= SRAM_DEPTH[TOT_W-1:0];
     end
   end
 
-  always_comb begin
-    round_done = 1'b1;
-    for (int i = 0; i < NUM_LANES; i++) begin
-      if (load_finalized[i] && !lane_collected[i]) round_done = 0;
-    end
-  end
-
   logic all_collected;
-  assign all_collected = (filled_total >= total_elements) && round_done && (total_elements > 0);
+  // Every lane gets PER_LANE elements, so a set is done only when every lane has returned all of them.
+  logic all_lanes_collected;
+  always_comb begin
+    all_lanes_collected = 1'b1;
+    for (int i = 0; i < NUM_LANES; i++) if (!lane_collected[i]) all_lanes_collected = 1'b0;
+  end
+  assign all_collected = (filled_total >= total_elements) && all_lanes_collected && (total_elements > 0);
 
   SystolicMesh #(
       .MATRIX_SIZE(N),
       .TILE_SIZE  (4),
-      .DATA_WIDTH (DATA_WIDTH)
+      .DATA_WIDTH (DATA_WIDTH),
+      .WIDE_READ  (NUM_LANES)
   ) systolic_array_inst (
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),
@@ -225,29 +201,18 @@ module sienna_top #(
       .north_queue_empty_o   (north_queue_empty),
       .west_queue_empty_o    (west_queue_empty),
       .matrix_mult_complete_o(systolic_mult_complete),
-      .read_enable_i         (systolic_read_enable),
-      .read_addr_i           (32'(systolic_read_addr)),
-      .read_data_o           (systolic_read_data),
-      .read_valid_o          (systolic_read_valid),
+      .read_enable_i         (1'b0),
+      .read_addr_i           ('0),
+      .read_data_o           (),
+      .read_valid_o          (),
+      .wide_read_enable_i    (systolic_read_enable),
+      .wide_read_index_i     (32'(systolic_read_addr)),
+      .wide_read_data_o      (wide_rd_data),
+      .wide_read_valid_o     (wide_rd_valid),
       .collection_complete_o (systolic_collection_complete),
       .collection_active_o   (),
       .result_release_i      (systolic_release),
       .input_ready_o         (mesh_input_ready)
-  );
-
-  fwft #(
-      .DATA_WIDTH(DATA_WIDTH),
-      .FIFO_DEPTH(FIFO1_DEPTH)
-  ) fifo1_inst (
-      .clk_i     (clk_i),
-      .rstn_i    (rstn_i),
-      .wr_valid_i(systolic_read_valid),
-      .wr_data_i (systolic_read_data),
-      .wr_ready_o(),
-      .rd_ready_i(fifo1_rd_ready),
-      .rd_data_o (fifo1_rd_data),
-      .rd_valid_o(fifo1_rd_valid),
-      .count_o   (fifo1_count)
   );
 
   generate
@@ -351,7 +316,7 @@ module sienna_top #(
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           // RESTORED: This is the mathematically perfect chunked indexing!
-          gpnae_out_mem[act_wr_base + round_number * ROUND_CAPACITY + i * PER_LANE + done_count[i]] <= gpnae_result[i];
+          gpnae_out_mem[act_wr_base + i * PER_LANE + done_count[i]] <= gpnae_result[i];
         end
       end
     end
@@ -529,56 +494,32 @@ module sienna_top #(
   end
 
   // =========================================================================
-  // SYSTOLIC READ-INTO-FIFO1
+  // PARALLEL LANE FILL: each wide read gives every lane its next element at once
   // =========================================================================
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
-      systolic_read_enable <= 0;
-      systolic_read_addr   <= 0;
-      systolic_reading     <= 0;
-      systolic_release     <= 0;
+      systolic_read_enable <= 1'b0;
+      systolic_read_addr   <= '0;
+      systolic_reading     <= 1'b0;
+      systolic_release     <= 1'b0;
     end else begin
-      systolic_read_enable <= systolic_read_enable_next;
-      systolic_read_addr   <= systolic_read_addr_next;
-      systolic_reading     <= systolic_reading_next;
-      systolic_release     <= systolic_read_enable && !systolic_read_enable_next;  // after the last read
+      systolic_release <= 1'b0;
+      if (g_state == G_FEED) begin
+        systolic_reading     <= 1'b1;
+        systolic_read_enable <= 1'b1;
+        systolic_read_addr   <= '0;
+      end else if (systolic_read_enable) begin
+        if (systolic_read_addr == PER_LANE[$clog2(SRAM_DEPTH)-1:0] - 1'b1) begin
+          systolic_read_enable <= 1'b0;
+          systolic_reading     <= 1'b0;
+          systolic_release     <= 1'b1;  // after the last read
+        end else systolic_read_addr <= systolic_read_addr + 1'b1;
+      end
     end
   end
 
   always_comb begin
-    systolic_read_enable_next = systolic_read_enable;
-    systolic_read_addr_next   = systolic_read_addr;
-    systolic_reading_next     = systolic_reading;
-
-    if (g_state == G_IDLE) begin
-      systolic_read_enable_next = 0;
-      systolic_read_addr_next   = 0;
-      systolic_reading_next     = 0;
-    end else begin
-      if (g_state == G_FEED) systolic_reading_next = 1;
-      if (systolic_reading) begin
-        systolic_read_enable_next = 1;
-        if (systolic_read_enable) begin
-          if (systolic_read_addr < N * N - 1) systolic_read_addr_next = systolic_read_addr + 1;
-          else begin
-            systolic_read_enable_next = 0;
-            systolic_reading_next     = 0;
-          end
-        end
-      end else systolic_read_enable_next = 0;
-    end
-  end
-
-  // =========================================================================
-  // GPNAE_ROUND — Independent Fill FSM
-  // =========================================================================
-  always_comb begin
-    fill_state_n       = fill_state;
-    fill_ptr_n         = fill_ptr;
-    filled_total_n     = filled_total;
-    fill_round_total_n = fill_round_total;
-    round_number_n     = round_number;
-
+    filled_total_n = filled_total;
     for (int i = 0; i < NUM_LANES; i++) begin
       fill_count_n[i]     = fill_count[i];
       done_count_n[i]     = done_count[i];
@@ -590,83 +531,43 @@ module sienna_top #(
     end
 
     if (g_state == G_IDLE) begin
-      fill_state_n       = F_WRITE;
-      fill_ptr_n         = '0;
-      filled_total_n     = '0;
-      fill_round_total_n = '0;
-      round_number_n     = '0;
+      filled_total_n = '0;
       for (int i = 0; i < NUM_LANES; i++) begin
         fill_count_n[i]     = '0;
         done_count_n[i]     = '0;
         load_finalized_n[i] = 1'b0;
-        gpnae_start_n[i]    = 1'b0;
         lane_collected_n[i] = 1'b0;
       end
-    end else if (g_state == G_ROUND) begin
-
-      case (fill_state)
-        F_WRITE: begin
-          if (fifo1_rd_valid && !gpnae_full[fill_ptr] && (filled_total < total_elements) && (fill_round_total < ROUND_CAPACITY[RND_W-1:0])) begin
-            gpnae_signal_n[fill_ptr] = fifo1_rd_data;
-            gpnae_wr_en_n[fill_ptr]  = 1'b1;
-            fill_count_n[fill_ptr]   = fill_count[fill_ptr] + 1'b1;
-            filled_total_n           = filled_total + 1'b1;
-            fill_round_total_n       = fill_round_total + 1'b1;
-            // Stop conditions evaluated from the post-write values, so no extra cycle.
-            if (((fill_count[fill_ptr] + 1'b1) >= PER_LANE[FCNT_W-1:0]) ||
-                ((filled_total + 1'b1) >= total_elements) ||
-                ((fill_round_total + 1'b1) >= ROUND_CAPACITY[RND_W-1:0]))
-              fill_state_n = F_PULSE;
-            else fill_state_n = F_WRITE;
-          end else if (fill_count[fill_ptr] != '0) begin
-            // Cannot write and the lane already holds data: release it, as F_GAP did.
-            fill_state_n = F_PULSE;
+    end else begin
+      if (wide_rd_valid) begin
+        filled_total_n = filled_total + NUM_LANES[TOT_W-1:0];
+        for (int i = 0; i < NUM_LANES; i++) begin
+          gpnae_signal_n[i] = wide_rd_data[i];
+          gpnae_wr_en_n[i]  = 1'b1;
+          fill_count_n[i]   = fill_count[i] + 1'b1;
+        end
+      end
+      // Start every lane together, the cycle after its last element is written.
+      for (int i = 0; i < NUM_LANES; i++) begin
+        if ((fill_count[i] == PER_LANE[FCNT_W-1:0]) && !load_finalized[i]) begin
+          gpnae_start_n[i]    = 1'b1;
+          load_finalized_n[i] = 1'b1;
+        end
+      end
+      if (g_state == G_ROUND) begin
+        for (int i = 0; i < NUM_LANES; i++) begin
+          if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
+            done_count_n[i] = done_count[i] + 1'b1;
+            if ((done_count[i] + 1'b1) == fill_count[i]) lane_collected_n[i] = 1'b1;
           end
         end
-        F_PULSE: begin
-          gpnae_start_n[fill_ptr]    = 1'b1;
-          load_finalized_n[fill_ptr] = 1'b1;
-          if (fifo1_rd_valid && (filled_total < total_elements) &&
-             (fill_round_total < ROUND_CAPACITY[RND_W-1:0]) && (fill_ptr < NUM_LANES[PTR_W:0] - 1)) begin
-            fill_ptr_n   = fill_ptr + 1'b1;
-            fill_state_n = F_WRITE;
-          end else fill_state_n = F_ROUND_IDLE;
-        end
-        F_ROUND_IDLE: ;
-        default: fill_state_n = F_WRITE;
-      endcase
-
-      for (int i = 0; i < NUM_LANES; i++) begin
-        if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
-          done_count_n[i] = done_count[i] + 1'b1;
-          if ((done_count[i] + 1'b1) == fill_count[i]) lane_collected_n[i] = 1'b1;
-        end
       end
-
-      if (round_done && (fill_state == F_ROUND_IDLE) && !all_collected) begin
-        fill_state_n       = F_WRITE;
-        fill_ptr_n         = '0;
-        fill_round_total_n = '0;
-        round_number_n     = round_number + 1'b1;
-        for (int i = 0; i < NUM_LANES; i++) begin
-          fill_count_n[i]     = '0;
-          done_count_n[i]     = '0;
-          load_finalized_n[i] = 1'b0;
-          gpnae_start_n[i]    = 1'b0;
-          lane_collected_n[i] = 1'b0;
-        end
-      end
-    end else begin
-      for (int i = 0; i < NUM_LANES; i++) gpnae_start_n[i] = 1'b0;
     end
   end
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
-      fill_state       <= F_WRITE;
-      fill_ptr         <= '0;
-      filled_total     <= '0;
-      fill_round_total <= '0;
+      filled_total <= '0;
       for (int i = 0; i < NUM_LANES; i++) begin
         fill_count[i]     <= '0;
         done_count[i]     <= '0;
@@ -677,10 +578,7 @@ module sienna_top #(
         lane_collected[i] <= 1'b0;
       end
     end else begin
-      fill_state       <= fill_state_n;
-      fill_ptr         <= fill_ptr_n;
-      filled_total     <= filled_total_n;
-      fill_round_total <= fill_round_total_n;
+      filled_total <= filled_total_n;
       for (int i = 0; i < NUM_LANES; i++) begin
         fill_count[i]     <= fill_count_n[i];
         done_count[i]     <= done_count_n[i];
@@ -692,9 +590,6 @@ module sienna_top #(
       end
     end
   end
-
-  assign fifo1_rd_ready = (g_state == G_ROUND) && (fill_state == F_WRITE) && fifo1_rd_valid &&
-                          !gpnae_full[fill_ptr] && (filled_total < total_elements) && (fill_round_total < ROUND_CAPACITY[RND_W-1:0]);
 
   // =========================================================================
   // STREAMING MAXPOOL FEEDER (Pre-Packaged Window Receiver)
@@ -833,8 +728,8 @@ module sienna_top #(
 
   assign pipeline_complete_o = pool_done;  // one cycle per set, in issue order
   assign done_set_id_o = p_set_id;
-  assign intermediate_buffer_full_o = (fifo1_count == SRAM_DEPTH[TOT_W-1:0]);
-  assign intermediate_buffer_empty_o = (fifo1_count == 0);
+  assign intermediate_buffer_full_o = 1'b0;  // no buffer between the mesh and the lanes since parallel fill
+  assign intermediate_buffer_empty_o = 1'b1;
 
   assign systolic_busy_o = (mesh_sets != 0);
   assign gpnae_busy_o = (g_state != G_IDLE);

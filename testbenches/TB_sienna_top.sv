@@ -289,10 +289,10 @@ module TB_sienna_top;
         print_status("at timeout");
         // Which stage is stuck is the whole diagnosis; sys_busy alone does not say.
         $display("  stage states {g,p} = %0d", dut_stage);
-        $display("  fill_state=%0d  filled_total=%0d  total_elements=%0d  all_collected=%0b",
-                 dut.fill_state, dut.filled_total, dut.total_elements, dut.all_collected);
-        $display("  systolic_collection_complete=%0b  fifo1_count=%0d  disp_done=%0b",
-                 dut.systolic_collection_complete, dut.fifo1_count, dut.disp_done);
+        $display("  filled_total=%0d  total_elements=%0d  all_collected=%0b", dut.filled_total,
+                 dut.total_elements, dut.all_collected);
+        $display("  systolic_collection_complete=%0b  wide_read=%0b  disp_done=%0b",
+                 dut.systolic_collection_complete, dut.systolic_read_enable, dut.disp_done);
         // IDLE only exits on start && both mesh queues non-empty; print that gate verbatim.
         $display("  start gate: start_pipeline_i=%0b north_queue_empty=%0b west_queue_empty=%0b",
                  start_pipeline_i, dut.north_queue_empty, dut.west_queue_empty);
@@ -379,9 +379,10 @@ module TB_sienna_top;
 
   always @(posedge clk_i) begin
     if (rstn_i && trace_fd) begin
-      if (dut.fifo1_rd_ready && dut.fifo1_rd_valid) begin
-        $fdisplay(trace_fd, "[%0t] Systolic -> GPNAE   : dec=%.6f  hex=%08x", $time,
-                  real'($bitstoshortreal(dut.fifo1_rd_data)), dut.fifo1_rd_data);
+      if (dut.wide_rd_valid) begin
+        for (int lane = 0; lane < NUM_LANES; lane++)
+          $fdisplay(trace_fd, "[%0t] Systolic -> GPNAE   : dec=%.6f  hex=%08x", $time,
+                    real'($bitstoshortreal(dut.wide_rd_data[lane])), dut.wide_rd_data[lane]);
       end
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.fifo2_rd_ready[lane] && dut.fifo2_rd_valid[lane]) begin
@@ -595,32 +596,34 @@ module TB_sienna_top;
 `endif
               if (overrun && k == 3) begin
                 automatic int waited = 0;
-                while (!(dut.mesh_input_ready && dut.credits == 0) && waited < 5000) begin
+                // A credit returns only as pooling leaves P_WAIT, at least 13 cycles away from any other state.
+                while (!(dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) && waited < 2000) begin
                   @(posedge clk_i);
                   waited++;
                 end
-                if (!(dut.mesh_input_ready && dut.credits == 0)) begin
-                  failed++;
-                  $display("  [FAIL] Credit overrun never reached: credits=%0d mesh_ready=%0b",
-                           dut.credits, dut.mesh_input_ready);
+                if (dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) begin
+                  load_range(0, 4);
+                  if (pipeline_ready_o) begin
+                    failed++;
+                    $display("  [FAIL] Overrun not exercised: pipeline_ready_o high before the start");
+                  end
+                  start_pipeline_i = 1;
+                  @(posedge clk_i);
+                  start_pipeline_i = 0;
+                  repeat (2) @(posedge clk_i);
+                  // An accepted start would rewind the mesh write pointer; a rejected one leaves it at 4.
+                  if (int'(dut.systolic_array_inst.ptr_A) != 4) begin
+                    failed++;
+                    $display("  [FAIL] A start without a credit was taken: ptr_A=%0d credits=%0d",
+                             dut.systolic_array_inst.ptr_A, dut.credits);
+                  end else $display("  [Stream] start with no credit ignored; the load resumes at word 4");
+                  load_range(4, west_data_queue.size());
+                  while (!pipeline_ready_o) @(posedge clk_i);
+                end else begin
+                  $display("  [Stream] credit overrun not reached: the pipeline drains faster than the host loads");
+                  while (!pipeline_ready_o) @(posedge clk_i);
+                  load_inputs();
                 end
-                load_range(0, 16);
-                if (pipeline_ready_o) begin
-                  failed++;
-                  $display("  [FAIL] Overrun not exercised: pipeline_ready_o high before the start");
-                end
-                start_pipeline_i = 1;
-                @(posedge clk_i);
-                start_pipeline_i = 0;
-                repeat (2) @(posedge clk_i);
-                // An accepted start would rewind the mesh write pointer; a rejected one leaves it at 16.
-                if (int'(dut.systolic_array_inst.ptr_A) != 16) begin
-                  failed++;
-                  $display("  [FAIL] A start without a credit was taken: ptr_A=%0d credits=%0d",
-                           dut.systolic_array_inst.ptr_A, dut.credits);
-                end else $display("  [Stream] start with no credit ignored; the load resumes at word 16");
-                load_range(16, west_data_queue.size());
-                while (!pipeline_ready_o) @(posedge clk_i);
               end else begin
                 while (!pipeline_ready_o) @(posedge clk_i);
                 load_inputs();

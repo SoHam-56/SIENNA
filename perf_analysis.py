@@ -122,6 +122,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--sets", type=int, default=12)
     ap.add_argument("--configs", nargs="*", default=CONFIGS)
+    ap.add_argument("--clock-mhz", type=float, default=950.0,
+                    help="assumed clock for GFLOPS; no timing run has demonstrated one")
     ap.add_argument("--build-dir", default=os.environ.get("PERF_BUILD_DIR", os.path.join(ROOT, "Verilator_perf")))
     args = ap.parse_args()
     L = ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
@@ -133,7 +135,7 @@ def main() -> None:
         raw = run(name, args.sets, args.build_dir)
         if "RESULT: PASSED" not in raw:
             L += [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""]
-            summary.append([name, "-", "-", "-", "-", "FAIL"])
+            summary.append([name, "-", "-", "-", "-", "-", "-", "FAIL"])
             continue
         a = analyse(events(raw), args.sets)
         s = a["sets"]
@@ -154,16 +156,20 @@ def main() -> None:
               f"single-set latency {s[0]['latency']} cycles",
               f"  Bottleneck   : {bott} ({stage[bott]} cycles per set); stage occupancy over the run: "
               + ", ".join(f"{k} {100*v/a['span']:.0f}%" for k, v in a['busy'].items()),
-              f"  Matmul rate  : 8192 FLOP per set -> {8192/steady:.1f} FLOP/cycle at steady state" if steady else "",
+              f"  Matmul rate  : 8192 FLOP per set -> {8192/steady:.1f} FLOP/cycle at steady state, "
+              f"{8192/steady*args.clock_mhz/1000:.2f} GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz" if steady else "",
               ""]
-        summary.append([name, s[0]["latency"], f"{steady:.0f}", bott, stage[bott], "pass"])
+        summary.append([name, s[0]["latency"], f"{steady:.0f}", f"{8192/steady:.1f}",
+                        f"{8192/steady*args.clock_mhz/1000:.2f}", bott, stage[bott], "pass"])
         # MODEL: lanes fill one word per cycle, so lane 15 starts about 240 cycles after lane 0.
         if bott == "activation" and med("read") >= 240:
             par = med("act") - 240
             est = max(med("load"), med("mesh"), par, med("pool"))
             models.append([name, med("act"), par, f"{steady:.0f}", est, f"{steady / est:.1f}x"])
     L += ["=" * 100, " SUMMARY", "=" * 100]
-    L += fmt_table(summary, ["config", "latency", "cycles/set", "bottleneck", "its cycles", "sim"])
+    L += fmt_table(summary, ["config", "latency", "cycles/set", "FLOP/cyc", f"GFLOPS@{args.clock_mhz:.0f}MHz*",
+                             "bottleneck", "its cycles", "sim"])
+    L += [f" * {args.clock_mhz:.0f} MHz is ASSUMED, not a timing result; GFLOPS count the 8192-FLOP matmul only."]
     mb = mesh_block()
     if mb:
         L += ["", " MESH BLOCK (measured, SystolicMesh regression, mm_random, 5 sets)"]

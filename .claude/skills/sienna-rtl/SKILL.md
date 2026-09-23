@@ -81,7 +81,9 @@ meet them cold:
 
 If the build dies with `No rule to make target '/usr/share/verilator/...'` or
 `undefined reference to main`, the `Verilator/` directory holds stale dependency
-files or a stale archive from a previous toolchain. Remove or move that
+files or a stale archive from a previous toolchain. A stale build directory can also
+build cleanly and then segfault before the testbench prints anything (seen 2026-09-23 on every
+T=16 matmul test); a clean directory passed the same configuration. Remove or move that
 directory and rebuild — **do not** use `make clean` for this, because its
 `rm -f *.log` also deletes `performance_analysis_report.log`, which is untracked.
 

@@ -22,19 +22,24 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 
-Measured at N=16, T=4, with 4 streamed sets per test (farm, 2026-09-22):
+Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-23), after the
+parallel lane fill. GFLOPS count the 8192-FLOP matmul at an **assumed** 950 MHz; no timing run
+exists.
 
-| Test | Single set | 4 sets streamed | Mesh + activation busy | Activation + pooling busy |
+| Config | Single set | Per set, steady | GFLOPS @950 | Bottleneck |
 |---|---|---|---|---|
-| matmul_ident_selu | 750 | 2538 | 605 | 93 |
-| matmul_random_sigm | 718 | 2410 | 604 | 93 |
-| matmul_random_tanh | 776 | 2642 | 606 | 93 |
-| conv_basic_selu | 750 | 2538 | 605 | 93 |
-| conv_basic_tanh | 776 | 2642 | 606 | 93 |
+| matmul_ident_selu / conv_basic_selu | 494 | 336 | 23.2 | host load (257) |
+| matmul_random_tanh | 520 | 459 | 17.0 | activation |
+| matmul_random_sigm | 950 | 472 | 16.5 | activation |
+| matmul_random_tanh_train | 528 | 459 | 17.0 | activation |
+| matmul_large_{selu,sigm,tanh} | 3104-4464 | 2449-3896 | 2.0-3.2 | activation (tails) |
 
-The same 4 tanh sets take 4150 cycles through the serial top. Streamed totals
-include the TB's 256-cycle host load per set; which stage limits steady-state
-throughput has not been measured. Up to 3 sets are in flight.
+Before the parallel fill the same runs gave 751-1003 single-set and 565-645 per set (12.1-13.8
+GFLOPS at the same assumed clock), with lanes 36-48% busy; they are now 93% busy on data inside
+the fitted range. What remains: sets whose elements fall past the fitted polynomials pay ~250
+cycles per such element in `gpnae_tail`, and on well-behaved data the 1-word-per-cycle host load
+is the limit. `python3 perf_analysis.py` regenerates
+`testbenches/results/perf/pipeline_performance_report.log`.
 
 ## Mesh interface after phase 2
 

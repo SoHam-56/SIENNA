@@ -1,5 +1,9 @@
 # SIENNA architecture
 
+> **Stale since 2026-09-22.** This file describes the single outer FSM, 8 lanes and FIFO1. The current
+> design has separate activation and pooling stages, 16 lanes filled in parallel from a wide mesh read,
+> banked buffers and credits; see `SKILL.md` and the `sienna-back-to-back` skill before trusting any FSM detail here.
+
 Module-by-module reference. Line numbers are from the working tree at the time of writing; treat them as pointers, not guarantees.
 
 ## Contents

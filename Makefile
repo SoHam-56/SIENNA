@@ -98,6 +98,13 @@ VCS_DIR       = $(PRJ_DIR)/VCS
 
 TRACE ?= 0
 
+# ccache 3.7 here served corrupted objects that segfaulted at start-up; USE_CCACHE=1 opts back in.
+USE_CCACHE ?= 0
+ifeq ($(USE_CCACHE),0)
+export CCACHE_DISABLE := 1
+endif
+
+
 ifeq ($(filter $(TRACE),0 vcd fst),)
 $(error Invalid TRACE=$(TRACE) — must be one of: 0, vcd, fst)
 endif

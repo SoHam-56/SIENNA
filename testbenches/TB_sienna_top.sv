@@ -24,6 +24,8 @@ module TB_sienna_top;
   // ── DUT I/O ───────────────────────────────────────────────────────────
   logic clk_i, rstn_i;
   logic                     start_pipeline_i;
+  logic                     training_mode_i;
+  logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
 
@@ -81,6 +83,8 @@ module TB_sienna_top;
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
       .start_pipeline_i           (start_pipeline_i),
+      .training_mode_i            (training_mode_i),
+      .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
       .north_write_enable_i       (north_write_enable_i),
@@ -104,8 +108,7 @@ module TB_sienna_top;
 
   wire [3:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
 
-  // Manual binary32 decode. $signed() and $bitstoshortreal both leave the bit pattern as an integer
-  // under Verilator, which turns a 1% bound into roughly a factor of two.
+  // Manual binary32 decode; $bitstoshortreal leaves the bit pattern as an integer under Verilator.
   function automatic real f32(input logic [31:0] b);
     int  e;
     real m, v;
@@ -204,6 +207,8 @@ module TB_sienna_top;
     $display("\n[STAGE] Reset");
     rstn_i = 0;
     start_pipeline_i = 0;
+    training_mode_i = 1'b0;
+    dropout_seed_i = '1;
     north_write_reset_i = 1;
     west_write_reset_i = 1;
     north_write_enable_i = 0;
@@ -455,6 +460,11 @@ module TB_sienna_top;
     end
   end
 
+  // Set k's dropout seed; regression.py's set_dropout_seed() mirrors it.
+  function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
+    return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
+  endfunction
+
   // ── Partial load: words [lo, hi) of both queues ───────────────────────
   task automatic load_range(input int lo, input int hi);
     fork
@@ -480,8 +490,7 @@ module TB_sienna_top;
   endtask
 
   // ── Streaming: K distinct sets through overlapped stages ──────────────
-  // The monitor reads registered state on the falling edge: TB inputs set after a rising
-  // edge are taken at that edge under Verilator, so a combinational view is a cycle late.
+  // The monitor reads registered state on the falling edge, never a combinational view of start.
   bit stream_on = 0;
   int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
   logic [DATA_WIDTH-1:0] stream_results[$];
@@ -576,6 +585,7 @@ module TB_sienna_top;
             for (int k = 0; k < NUM_SETS; k++) begin
               read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
               read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
+              dropout_seed_i = set_seed(k);
               if (overrun && k == 3) begin
                 automatic int waited = 0;
                 while (!(dut.mesh_input_ready && dut.credits == 0) && waited < 5000) begin
@@ -691,6 +701,7 @@ module TB_sienna_top;
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
+    training_mode_i       = TRAINING_MODE[0];
     repeat (2000) begin
       @(posedge clk_i);
       if (pipeline_complete_o || (|result_valid_o)) stray++;
@@ -715,6 +726,7 @@ module TB_sienna_top;
     $display("==============================================");
     $display(" N=%-0d  TILE_SIZE=%-0d  FIFO_DEPTH=%-0d", N, TILE_SIZE, FIFO_DEPTH);
     $display(" Activation code : %0b  Num terms : %0d", ACTIVATION_CODE, NUM_TERMS);
+    $display(" Dropout         : %s  seed 0x%08h", TRAINING_MODE ? "training" : "inference", DROPOUT_SEED);
     $display(" Tolerance       : %s  rel<=%.1f%%  abs<=%.4f", TOLERANCE_MODE, REL_TOL * 100.0,
              ABS_TOL);
     $display(" Timeout         : %0d cycles  Heartbeat: %0d cycles", TIMEOUT_CYCLES,
@@ -740,6 +752,8 @@ module TB_sienna_top;
     $display("\n[STAGE] Starting pipeline");
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
+    training_mode_i       = TRAINING_MODE[0];
+    dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
     start_pipeline_i = 1;
     @(posedge clk_i);
@@ -752,7 +766,7 @@ module TB_sienna_top;
     verify_outputs();
 
 `ifdef BACK_TO_BACK
-    // Run a second, identical matrix WITHOUT asserting reset. Anything that carries state
+    // Run a second, distinct matrix WITHOUT asserting reset. Anything that carries state
     // between matmuls shows up as a different result the second time, and the cycle delta is
     // the real steady-state cost per matrix rather than an estimate.
     begin
@@ -761,6 +775,11 @@ module TB_sienna_top;
       pass1_failed = failed;
 
       $display("\n[STAGE] BACK TO BACK: second matrix, no reset");
+      // A different matrix with its own golden, so a replayed first result cannot pass.
+      read_mem_file("matrix_west_1.mem", west_data_queue);
+      read_mem_file("matrix_north_1.mem", north_data_queue);
+      read_mem_file("expected_output_1.mem", expected_results);
+      dropout_seed_i = set_seed(1);
       trace_states = 1;
       actual_results.delete();
       total_elements = 0;

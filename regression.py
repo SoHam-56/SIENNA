@@ -119,11 +119,67 @@ def apply_maxpool_2d(
     )
 
 
-def apply_dropout(x: np.ndarray, p=0.5, training=False) -> np.ndarray:
-    if training:
-        mask = np.random.binomial(1, 1 - p, size=x.shape)
-        return (x * mask / (1 - p)).astype(np.float32)
-    return x.copy()
+def _lane_seed(seed: int, lane: int) -> int:
+    # Mirrors sienna_top: x = (seed ^ 0x9E3779B9 * (lane + 1)) * 0x85EBCA6B; x ^ (x >> 16), zero -> ones.
+    x = (seed ^ ((0x9E3779B9 * (lane + 1)) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    x = (x * 0x85EBCA6B) & 0xFFFFFFFF
+    x ^= x >> 16
+    return x or 0xFFFFFFFF
+
+
+def set_dropout_seed(base: int, k: int) -> int:
+    # Set k's dropout seed, mirrored by set_seed() in TB_sienna_top.
+    return (base ^ ((0x85EBCA6B * k) & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def _lfsr_next(s: int) -> int:
+    # Mirrors dropout.sv: 32 steps of {s[30:0], s[31] ^ s[21] ^ s[1] ^ s[0]} per beat.
+    for _ in range(32):
+        bit = ((s >> 31) ^ (s >> 21) ^ (s >> 1) ^ s) & 1
+        s = ((s << 1) & 0xFFFFFFFF) | bit
+    return s
+
+
+def _check_dropout_generator() -> None:
+    # The hardware generator must look like independent Bernoulli draws at any drop rate.
+    for p_percent in (25, 50, 75):
+        thr = ((2**32 - 1) * p_percent) // 100
+        s, keeps = 0x2ACE002A, []
+        for _ in range(20000):
+            s = _lfsr_next(s)
+            keeps.append(s >= thr)
+        rate = sum(keeps) / len(keeps)
+        both = sum(a and b for a, b in zip(keeps, keeps[1:])) / (len(keeps) - 1)
+        if abs(rate - (1 - p_percent / 100)) > 0.02 or abs(both - rate * rate) > 0.02:
+            raise RuntimeError(f"dropout generator at p={p_percent}%: keep rate {rate:.3f}, "
+                               f"neighbours both kept {both:.3f}, independent would be {rate*rate:.3f}")
+    # 200 sets must give 200 masks, and two lanes in one beat must look independent.
+    ones = np.ones((9, 9), dtype=np.float32)
+    ms = [tuple((apply_dropout(ones, 0.5, True, set_dropout_seed(0x2ACE002A, k)) != 0).flatten())
+          for k in range(200)]
+    rate = sum(sum(m) for m in ms) / (200 * 81)
+    joint = sum(m[0] and m[1] for m in ms) / 200
+    if len(set(ms)) != 200 or abs(joint - rate * rate) > 0.08:
+        raise RuntimeError(f"dropout masks: {len(set(ms))} distinct of 200, lanes 0 and 1 both kept "
+                           f"{joint:.3f}, independent would be {rate*rate:.3f}")
+
+
+def apply_dropout(x: np.ndarray, p=0.5, training=False, seed=1, num_lanes=16) -> np.ndarray:
+    """Inference copies; training replays dropout.sv's per-lane LFSR, window w on lane w % num_lanes."""
+    if not training:
+        return x.copy()
+    p_percent = int(round(p * 100))
+    thr = ((2**32 - 1) * p_percent) // 100
+    scale = np.float32(100.0 / (100 - p_percent))
+    flat = x.astype(np.float32).flatten()
+    out = np.empty_like(flat)
+    states = [_lane_seed(seed, lane) for lane in range(num_lanes)]
+    for w, v in enumerate(flat):
+        lane = w % num_lanes
+        states[lane] = _lfsr_next(states[lane])
+        keep = states[lane] >= thr  # decided on the word the beat advances to, as dropout.sv does
+        out[w] = v * scale if keep else v * np.float32(0.0)  # a dropped negative stays -0.0
+    return out.reshape(x.shape)
 
 
 def build_conv_matrices(N: int, conv_type: str, seed: int, stride=None) -> tuple:
@@ -181,13 +237,14 @@ def dump_golden_trace(
         write_matrix("Stage 3: Maxpool Output (Input to Dropout)", C_pooled)
 
 
-def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str) -> tuple:
+def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) -> tuple:
     C = _ref_matmul(A, B)
     C_act = apply_activation(C, act_type)
     C_pooled = apply_maxpool_2d(
         C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
     )
-    return C, C_act, C_pooled, apply_dropout(C_pooled, cfg.get("dropout_p", 0.5))
+    C_final = apply_dropout(C_pooled, cfg.get("dropout_p", 0.5), cfg.get("training", False), drop_seed)
+    return C, C_act, C_pooled, C_final
 
 
 def generate_vectors(cfg: dict) -> None:
@@ -197,7 +254,8 @@ def generate_vectors(cfg: dict) -> None:
         cfg.get("tile_size", 4),
         cfg.get("mode", "matmul"),
     )
-    act_type, seed = cfg.get("activation", cfg.get("act", "idle")), cfg.get("seed", 42)
+    act_type = cfg.get("activation", cfg.get("act", "idle"))
+    seed = cfg.get("seed", 42) + int(os.environ.get("SIENNA_SEED", "0"))  # unset keeps the fixed stimulus
     test_name = cfg.get("name", "manual_gen")
 
     if mode == "conv":
@@ -216,29 +274,40 @@ def generate_vectors(cfg: dict) -> None:
         else:
             A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
             B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
+    # "scale" widens the matmul outputs so every activation reaches its tails.
+    scale = np.float32(cfg.get("scale", 1.0))
+    A, B = (A * scale).astype(np.float32), (B * scale).astype(np.float32)
 
-    # Software Golden Model Execution
-    C, C_act, C_pooled, C_final = _golden(A, B, cfg, act_type)
+    # Set k's dropout seed is set_dropout_seed(DROPOUT_SEED, k), as the TB drives it.
+    drop_seed = 0x2ACE0000 + seed
+    C, C_act, C_pooled, C_final = _golden(A, B, cfg, act_type, drop_seed)
 
     # Write files for Verilator testbench
     write_mem(os.path.join(TB_DIR, "matrix_west.mem"), A)
     write_mem(os.path.join(TB_DIR, "matrix_north.mem"), B)
     write_mem(os.path.join(TB_DIR, "expected_output.mem"), C_final)
 
-    # Streamed sets: set 0 is the test's own pattern, the rest random and distinct, so a
-    # stage that replays the previous set cannot pass.
+    # Streamed sets: set 0 is the test's own pattern, the rest random and distinct.
     num_sets = cfg.get("num_sets", 4)
+    masks = []
     for k in range(num_sets):
         if k == 0:
             Ak, Bk, Fk = A, B, C_final
         else:
             rng = np.random.RandomState(seed + 1000 + k)
-            Ak = rng.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
-            Bk = rng.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
-            Fk = _golden(Ak, Bk, cfg, act_type)[3]
+            Ak = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
+            Bk = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
+            Fk = _golden(Ak, Bk, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
         write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
         write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
         write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)
+        if cfg.get("training", False):
+            masks.append(tuple((Fk.flatten() != 0).tolist()))
+    for i in range(len(masks)):
+        for j in range(i + 1, len(masks)):
+            agree = sum(a == b for a, b in zip(masks[i], masks[j])) / len(masks[i])
+            if agree > 0.75:  # independent masks agree about half the time
+                raise RuntimeError(f"{test_name}: sets {i} and {j} dropout masks agree on {agree:.0%}")
 
     # Dump the intermediate Golden Trace for debug comparisons
     dump_golden_trace(test_name, C, C_act, C_pooled)
@@ -264,6 +333,8 @@ def generate_vectors(cfg: dict) -> None:
         ("LFSR_WIDTH", 32, "int"),
         ("CONTROL_WIDTH", 2, "int"),
         ("NUM_SETS", num_sets, "int"),
+        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
+        ("DROPOUT_SEED", drop_seed, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
     ]
     write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"), items)
@@ -424,6 +495,12 @@ PIPELINE_TESTS = [
     },
     {"name": "conv_basic_selu", "mode": "conv", "conv_type": "basic", "act": "selu"},
     {"name": "conv_basic_tanh", "mode": "conv", "conv_type": "basic", "act": "tanh"},
+    {"name": "matmul_random_tanh_train", "mode": "matmul", "matrix_type": "random", "act": "tanh", "training": True},
+    {"name": "matmul_random_sigm_train", "mode": "matmul", "matrix_type": "random", "act": "sigmoid", "training": True},
+    {"name": "conv_basic_selu_train", "mode": "conv", "conv_type": "basic", "act": "selu", "training": True},
+    {"name": "matmul_large_selu", "mode": "matmul", "matrix_type": "random", "act": "selu", "scale": 2.5},
+    {"name": "matmul_large_sigm", "mode": "matmul", "matrix_type": "random", "act": "sigmoid", "scale": 2.5},
+    {"name": "matmul_large_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "scale": 2.5},
 ]
 
 
@@ -477,6 +554,7 @@ def _parse_log(raw: str) -> dict:
 
 
 def run_regression(N: int, T: int, target_test: str = None):
+    _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
 

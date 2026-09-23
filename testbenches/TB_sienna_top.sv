@@ -100,6 +100,8 @@ module TB_sienna_top;
       .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
   );
 
+  wire [3:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
+
   // Manual binary32 decode. $signed() and $bitstoshortreal both leave the bit pattern as an integer
   // under Verilator, which turns a 1% bound into roughly a factor of two.
   function automatic real f32(input logic [31:0] b);
@@ -180,11 +182,11 @@ module TB_sienna_top;
   logic trace_states = 0;
   int   prev_state = -1;
   always @(posedge clk_i) begin
-    if (trace_states && dut.current_state !== prev_state) begin
+    if (trace_states && dut_stage !== prev_state) begin
       $display("  [FSM] @%0t state %0d -> %0d  (coll_complete=%0b mult_complete=%0b)",
-               $time, prev_state, dut.current_state,
+               $time, prev_state, dut_stage,
                dut.systolic_collection_complete, dut.systolic_mult_complete);
-      prev_state = dut.current_state;
+      prev_state = dut_stage;
     end
   end
 
@@ -279,7 +281,7 @@ module TB_sienna_top;
         $display("  Last known state:");
         print_status("at timeout");
         // Which stage is stuck is the whole diagnosis; sys_busy alone does not say.
-        $display("  outer FSM current_state = %0d", dut.current_state);
+        $display("  stage states {g,p} = %0d", dut_stage);
         $display("  fill_state=%0d  filled_total=%0d  total_elements=%0d  all_collected=%0b",
                  dut.fill_state, dut.filled_total, dut.total_elements, dut.all_collected);
         $display("  systolic_collection_complete=%0b  fifo1_count=%0d  disp_done=%0b",
@@ -412,7 +414,7 @@ module TB_sienna_top;
     if (!lane_fd) return;
     $fdisplay(lane_fd,
               "---- %0t  (%s)  current_state=%0d  all_collected=%0b  streaming_complete=%0b ----",
-              $time, reason, dut.current_state, dut.all_collected, dut.streaming_complete);
+              $time, reason, dut_stage, dut.all_collected, dut.streaming_complete);
     // Note: mp_real_consumed explicitly removed to sync with current top-level architecture
     for (int lane = 0; lane < NUM_LANES; lane++) begin
       $fdisplay(
@@ -428,7 +430,7 @@ module TB_sienna_top;
     if (rstn_i && lane_fd) begin
       if (!lane_log_init_done) begin
         for (int lane = 0; lane < NUM_LANES; lane++) prev_mp_state[lane] <= dut.mp_state[lane];
-        prev_current_state <= dut.current_state;
+        prev_current_state <= dut_stage;
         lane_log_init_done <= 1'b1;
       end else begin
         automatic logic any_mp_state_changed = 1'b0;
@@ -437,7 +439,7 @@ module TB_sienna_top;
           prev_mp_state[lane] <= dut.mp_state[lane];
         end
 
-        if (dut.current_state != prev_current_state) begin
+        if (dut_stage != prev_current_state) begin
           print_lane_status("current_state changed");
         end else if (any_mp_state_changed) begin
           print_lane_status("mp_state changed");
@@ -445,7 +447,7 @@ module TB_sienna_top;
           print_lane_status("heartbeat");
         end
 
-        prev_current_state <= dut.current_state;
+        prev_current_state <= dut_stage;
       end
     end
   end
@@ -458,6 +460,7 @@ module TB_sienna_top;
   logic [DATA_WIDTH-1:0] stream_results[$];
   int stream_bounds[$];
   int stream_ids[$];
+  int stream_id_base;  // sets started before the stream, which consumed ids
   wire mesh_computing = (int'(dut.systolic_array_inst.current_state) != 0) &&
                         (int'(dut.systolic_array_inst.current_state) != 7);  // not IDLE, not DONE
 
@@ -488,9 +491,10 @@ module TB_sienna_top;
     automatic int errs = 0;
     logic [DATA_WIDTH-1:0] av;
     string info;
-    if (stream_ids[k] != (k % 4)) begin
+    if (stream_ids[k] != ((stream_id_base + k) % 4)) begin
       failed++;
-      $display("  [FAIL] Stream set %0d completed as set id %0d", k, stream_ids[k]);
+      $display("  [FAIL] Stream set %0d completed as set id %0d, expected %0d", k, stream_ids[k],
+               (stream_id_base + k) % 4);
     end
     if (n_act != exp_q.size()) begin
       failed++;
@@ -523,6 +527,10 @@ module TB_sienna_top;
     stream_bounds.delete();
     stream_ids.delete();
     n_started = 0;
+    stream_id_base = 1;  // the single-set pass
+`ifdef BACK_TO_BACK
+    stream_id_base = 2;  // plus the back-to-back pass
+`endif
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
@@ -652,13 +660,13 @@ module TB_sienna_top;
       @(posedge clk_i);
       start_pipeline_i = 1;
       $display("  [B2B] gate before pulse: state=%0d north_empty=%0b west_empty=%0b",
-               dut.current_state, dut.north_queue_empty, dut.west_queue_empty);
+               dut_stage, dut.north_queue_empty, dut.west_queue_empty);
       @(posedge clk_i);
       $display("  [B2B] gate at pulse   : state=%0d north_empty=%0b west_empty=%0b",
-               dut.current_state, dut.north_queue_empty, dut.west_queue_empty);
+               dut_stage, dut.north_queue_empty, dut.west_queue_empty);
       start_pipeline_i = 0;
       @(posedge clk_i);
-      $display("  [B2B] state after pulse: %0d", dut.current_state);
+      $display("  [B2B] state after pulse: %0d", dut_stage);
 
       collect_outputs();
       verify_outputs();

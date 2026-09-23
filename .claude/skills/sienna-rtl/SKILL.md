@@ -16,14 +16,14 @@ reset, and the obvious test passes anyway because it feeds the same matrix twice
 
 ```
 matrix_west.mem (A) ─┐
-                     ├─> SystolicMesh ──> fwft FIFO1 ──> 8 × GPNAE lanes ──> gpnae_out_mem
+                     ├─> SystolicMesh ══16-wide══> 16 × GPNAE lanes ──> gpnae_out_mem
 matrix_north.mem (B)─┘   (C = A×B)        (256 deep)     (activation)        (N×N buffer)
                                                                                    │
                      final_result_o <── dropout <── Maxpool_2D <── fwft FIFO2 <─ window
                                         (8 lanes)   (8 lanes)      (8 × 16)    dispatcher
 ```
 
-`src/sienna_top.sv` owns this. Since 2026-09-22 there is no single outer FSM: the mesh queues its own sets, an activation stage (`g_state`: G_IDLE → G_FEED → G_LATCH → G_ROUND) turns one mesh result into `gpnae_out_mem`, and a pooling stage (`p_state`: P_IDLE → P_DISPATCH → P_WAIT) drains it through maxpool and dropout. Up to three sets are in flight behind `pipeline_ready_o`; `pipeline_complete_o` is a one-cycle pulse per set. The `sienna-back-to-back` skill has the interface and the measurements. The activation lanes are `gpnae_poly` (fitted polynomials) plus `gpnae_tail` for inputs past the fits, not the published `gpnae`; see known-issues #17. Two inner FSMs matter as much as the outer one: the `fill_state` machine that hands FIFO1 data round-robin to the 8 GPNAE lanes, and the per-lane `mp_state` machine that feeds pre-packaged pooling windows into each Maxpool.
+`src/sienna_top.sv` owns this. Since 2026-09-22 there is no single outer FSM: the mesh queues its own sets, an activation stage (`g_state`: G_IDLE → G_FEED → G_LATCH → G_ROUND) turns one mesh result into `gpnae_out_mem`, and a pooling stage (`p_state`: P_IDLE → P_DISPATCH → P_WAIT) drains it through maxpool and dropout. Up to three sets are in flight behind `pipeline_ready_o`; `pipeline_complete_o` is a one-cycle pulse per set. The `sienna-back-to-back` skill has the interface and the measurements. The activation lanes are `gpnae_poly` (fitted polynomials) plus `gpnae_tail` for inputs past the fits, not the published `gpnae`; see known-issues #17. Since 2026-09-23 the activation stage fills all 16 lanes in parallel: 16 wide reads of the mesh result each give every lane its next element, then every lane starts together; there is no FIFO1 and no lane-by-lane fill FSM. The per-lane `mp_state` machine still feeds pre-packaged pooling windows into each Maxpool.
 
 The key structural idea: the mesh produces results in one flat stream, but activation is the slow part, so the design fans out to 8 parallel GPNAE lanes and reassembles them in `gpnae_out_mem` before pooling. The dispatcher then re-reads that buffer in pooling-window order and scatters windows back across the 8 lanes.
 
@@ -121,7 +121,7 @@ the integration can feel:
   flat two-cycle latency instead of reloading only on a pop.
 - `done_delay` widened 3 -> 4 stages, so each element retires one cycle later.
 
-`sienna_top`'s `fill_state` machine pushes into lanes while they process, which is exactly the
+`sienna_top` used to push into lanes while they processed, which is exactly the
 concurrent push/pop case that the old design got wrong, so this is worth actual measurement
 rather than assumption. Start with `make regression`.
 

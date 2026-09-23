@@ -36,6 +36,8 @@ module sienna_top #(
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
 
     output logic pipeline_complete_o,
+    output logic pipeline_ready_o,  // a credit and a staging bank are free
+    output logic [1:0] done_set_id_o,  // id of the set pipeline_complete_o reports
     output logic systolic_busy_o,
     output logic gpnae_busy_o,
     output logic maxpool_busy_o,
@@ -763,6 +765,8 @@ module sienna_top #(
   end
 
   assign pipeline_complete_o = (current_state == PIPELINE_COMPLETE);
+  assign pipeline_ready_o = (current_state == IDLE);  // stub until the stages overlap
+  assign done_set_id_o = '0;  // stub until the stages overlap
   assign intermediate_buffer_full_o = (fifo1_count == SRAM_DEPTH[TOT_W-1:0]);
   assign intermediate_buffer_empty_o = (fifo1_count == 0);
 

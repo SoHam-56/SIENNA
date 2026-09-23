@@ -24,6 +24,8 @@ module sienna_top #(
     input logic rstn_i,
 
     input logic                     start_pipeline_i,
+    input logic                     training_mode_i,  // dropout mode for the set being started
+    input logic [   LFSR_WIDTH-1:0] dropout_seed_i,   // dropout seed for the set being started
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
     input logic                     north_write_enable_i,
@@ -95,7 +97,10 @@ module sienna_top #(
   int act_wr_base, act_rd_base;
   logic [1:0] credits;  // sets the host may still start
   logic [2:0] mesh_sets;  // accepted sets the activation stage has not taken yet
-  logic [1:0] g_next_id, g_set_id, p_next_id, p_set_id;
+  logic [1:0] g_next_id, g_set_id, p_next_id, p_set_id, host_next_id;
+  // Dropout mode and seed travel with each set, indexed by its id, so sets in flight keep their own.
+  logic                  set_train[4];
+  logic [LFSR_WIDTH-1:0] set_seed [4];
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -304,6 +309,13 @@ module sienna_top #(
           .out_valid(maxpool_out_valid[g])
       );
 
+      // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied.
+      logic [31:0] lane_mul;
+      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
+      assign lane_mul  = (32'(set_seed[p_next_id]) ^ (32'h9E3779B9 * (g + 1))) * 32'h85EBCA6B;
+      assign lane_mix  = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
+      assign lane_seed = (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
+
       dropout #(
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
@@ -312,8 +324,10 @@ module sienna_top #(
           .clk          (clk_i),
           .rst_n        (rstn_i),
           .in_valid     (dropout_in_valid[g]),
-          .training_mode(1'b0),
+          .training_mode(set_train[p_set_id]),
           .data_in      (dropout_data_in[g]),
+          .reseed_i     (p_accept),
+          .seed_i       (lane_seed),
           .data_out     (dropout_data_out[g]),
           .valid_out    (dropout_valid_out[g])
       );
@@ -469,7 +483,17 @@ module sienna_top #(
       g_set_id  <= '0;
       p_next_id <= '0;
       p_set_id  <= '0;
+      host_next_id <= '0;
+      for (int k = 0; k < 4; k++) begin
+        set_train[k] <= 1'b0;
+        set_seed[k]  <= '1;
+      end
     end else begin
+      if (host_accept) begin
+        set_train[host_next_id] <= training_mode_i;
+        set_seed[host_next_id]  <= dropout_seed_i;
+        host_next_id <= host_next_id + 1'b1;
+      end
       case (g_state)
         G_IDLE:  if (g_accept) g_state <= G_FEED;
         G_FEED:  g_state <= G_LATCH;

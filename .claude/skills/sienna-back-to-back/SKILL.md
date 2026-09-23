@@ -224,9 +224,14 @@ test.** Pooling takes far less time than activation and has no output back-press
 that path cannot be reached in this configuration. Its handshake is covered only by the
 `a_act_bank_free` and `a_act_bank_full` assertions.
 
-Still not covered: functional coverage, formal, four-state (VCS) simulation, varied seeds,
-dropout training mode, any N other than 16 at the top level, and synthesis after the
-buffers doubled.
+Since 2026-09-23 also covered: GPNAE's own assertions (fixed, known-issues #16), varied seeds
+(`SIENNA_SEED` shifts every stimulus seed in the mesh and SIENNA generators, `--seed` for GPNAE;
+unset reproduces the fixed stimulus), dropout training mode (`_train` tests, known-issues #18),
+and activation inputs far outside the fitted range (`matmul_large_*`, known-issues #17). The
+back-to-back pass now uses a distinct random second matrix with its own golden.
+
+Still not covered: functional coverage, formal, four-state (VCS) simulation, any N other than
+16 at the top level, and synthesis after the buffers doubled.
 
 ## Traps found in phase 3
 

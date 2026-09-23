@@ -604,7 +604,7 @@ calls `apply_reset()` before every set.
 See the `sienna-back-to-back` skill for the approved pipelining design that
 fixes these.
 
-## 16. GPNAE's `valid_done_signal` assertion cannot hold — OPEN, not changed
+## 16. GPNAE's `valid_done_signal` assertion cannot hold — FIXED (assertion, not RTL)
 
 **Confirmed (reproduced)** 2026-09-23. GPNAE's Makefile never passed `--assert`, so the
 assertions in `GPNAE/testbenches/TB_gpnae.sv` never ran. With `--assert` on, the regression
@@ -618,8 +618,88 @@ The property is `done_o |-> $stable(final_result_o)`, but `gpnae.sv:231-232` reg
 `final_result_o` and `done_o` on the same edge. On the cycle `done_o` rises, the result has
 just changed, so `$stable` is false by construction. The assertion looks wrong rather than
 the RTL; the intended property is probably that the result holds while `done_o` is high.
-GPNAE is published work, so neither the assertion nor the Makefile was changed. The
-SystolicMesh and top-level builds do compile with `--assert`.
+**Fixed 2026-09-23** on Soham's instruction. The property is now
+`!$stable(final_result_o) |-> done_o` (the result changes only on a done cycle), and all three
+TB properties in `TB_gpnae.sv` and `TB_gpnae_poly.sv` carry `disable iff (!rstn_i)`: the TB
+resets before every batch, and reset clears the result without a done pulse. GPNAE's Makefile
+now passes `--assert`; both lanes pass with every assertion live.
+
+## 17. gpnae_poly's fitted polynomials diverge past |x| of about 4 — FIXED
+
+**Confirmed (reproduced)** 2026-09-23 by the seed sweep: `matmul_random_tanh` at
+`SIENNA_SEED=1` returned tanh = 19.32 where the answer was 0.99983. The lane the pipeline uses
+is `gpnae_poly`, not the published `gpnae`. Its coefficient fits hold only near zero, measured
+in fp32 against the exact functions:
+
+| Function | Accurate to | Just past |
+|---|---|---|
+| tanh | \|x\| <= 4 (0.38%) | 422% at 4..4.5 |
+| sigmoid x > 0 | 4.5 (0.15%) | 3.9% at 5..6 |
+| sigmoid x < 0 | -3.5 (0.07%) | 13% at -4..-4.5 |
+| SELU x < 0 | -4.5 (0.07%) | 8% at -5..-6 |
+
+The GPNAE suite never saw it: its stimulus stops at +/-3..4, and the poly lane was not in the
+regression at all. Saturation alone cannot fix sigmoid below -3.5, whose small true value the
+lane's `1 - P` form cancels away. `gpnae_tail.sv` now takes every element past those bounds:
+it halves x to |z| <= 1 (exact), evaluates e^z - 1 by an 11-term Taylor series, and doubles
+back without cancellation (`d <- d(d + 2)` for e^x - 1, `E <- E^2` for e^x). The fitted
+coefficients and the published lane are untouched. `regression.py --lane poly` runs the poly
+lane; it passes at default range, +/-12 and +/-100, worst 0.37%. A tail element costs up to
+~250 cycles against ~20; normal data rarely reaches the tails.
+
+## 18. Dropout training mode could reorder, lose and correlate outputs — FIXED
+
+**Confirmed (inspection, then model)** 2026-09-23. Training mode had never run: `sienna_top`
+tied it to 0. Four defects, each fixed:
+
+- A kept beat went through the 8-cycle multiplier while a dropped beat left combinationally,
+  so beats could leave out of order. Now every beat takes the multiplier, and a 16-deep queue
+  carries each beat's decision to its product.
+- The output mux chose keep or drop from the LFSR's *current* state when the product emerged,
+  after the LFSR had moved on, so a kept result could be discarded and pooling would hang.
+- The LFSR stepped one bit per beat and decisions compared its whole state, so neighbouring
+  decisions shared 31 bits: at p = 25 both-kept ran 0.621 against 0.559 for independent draws.
+  It now advances 32 steps (a full word) per beat, and decides on the new word.
+- Lanes were seeded by XOR with a lane constant, which with a linear LFSR left each beat's 16
+  decisions as one fixed pattern or its complement: 64 distinct masks over 300 sets, and lanes
+  0 and 1 never both kept. Lane seeds now pass through a multiply mix: 300 of 300 distinct,
+  both-kept 0.247 against 0.249.
+
+The mode and a 32-bit seed now enter per set (`training_mode_i`, `dropout_seed_i`), held in a
+4-entry table by set id, and each lane reseeds when pooling takes the set. `regression.py`
+replays the LFSR bit-exactly; `_check_dropout_generator()` refuses to run if the generator's
+statistics degrade. Three `_train` regression tests pass. `CONST_SCALE` is fixed at 2.0, so
+`DROPOUT_P_PERCENT` other than 50 now raises an elaboration error instead of scaling wrongly.
+
+## 19. Mesh simulations crashed at random — FIXED (build cache, not the design)
+
+**Confirmed (reproduced, then eliminated)** 2026-09-23 across more than 30 full mesh regressions.
+Two causes, one after the other.
+
+**A full /proj/work quota.** About 42 GB of farm scratch filled it. Verilator does not check
+its writes, so it left truncated files (a 0-byte `.mk`, a `.cpp` cut at exactly 131072 bytes):
+builds failed with `make: No targets` or produced broken binaries. Keep scratch small; `quota`
+cannot reach its server here, so the first clear sign was a tool printing "Disk quota exceeded".
+
+**Corrupted ccache entries.** With the disk healthy, about 80% of full regressions still had
+one conv group whose binary segfaulted, at time 0 in Verilator's coroutine start-up or early in
+set 0, on every rerun. ccache 3.7.7 in `~/.ccache` stores no checksums (it had logged 15
+"compiler produced empty output" and 937 cleanups against a 5 GB cap), so a bad object or
+precompiled header, most likely written during the quota event or a concurrent cleanup, kept
+being reused. The evidence:
+
+| Build | Full regressions | Crashed |
+|---|---|---|
+| default (cache on) | 14 | 11 |
+| `CCACHE_DISABLE=1` | 4 | 0 |
+| any `-g` or AddressSanitizer flags (new cache keys, so cold) | 6 | 0 |
+
+Also ruled out by measurement: `--assert`, `--threads`, the optimisation level, Verilator
+non-determinism (eight rebuilds gave byte-identical C++), and memory errors in the design or
+TB (AddressSanitizer and valgrind memcheck both clean). All three Makefiles now export
+`CCACHE_DISABLE=1` unless `USE_CCACHE=1`; a full mesh regression takes 16 minutes either way.
+The corrupted cache itself is still in `~/.ccache`; clearing it (`ccache -C`) is the owner's
+call. The mesh sim now runs under `stdbuf -oL`, so a crash log shows how far it got.
 
 ## Cross-reference: which issue explains which failure
 

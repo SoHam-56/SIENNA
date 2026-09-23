@@ -34,6 +34,7 @@ module sienna_top #(
     input logic                     west_write_reset_i,
 
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
+    output logic [NUM_LANES-1:0] result_valid_o,  // lane's final_result_o is new this cycle
 
     output logic pipeline_complete_o,
     output logic pipeline_ready_o,  // a credit and a staging bank are free
@@ -797,9 +798,11 @@ module sienna_top #(
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
       for (int i = 0; i < NUM_LANES; i++) final_result_o[i] <= '0;
+      result_valid_o <= '0;
     end else begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (dropout_valid_out[i]) final_result_o[i] <= dropout_data_out[i];
+        result_valid_o[i] <= dropout_valid_out[i];
       end
     end
   end

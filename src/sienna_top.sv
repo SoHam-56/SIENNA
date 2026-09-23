@@ -830,4 +830,30 @@ module sienna_top #(
   end
   assign dropout_busy_o = any_dropout_active;
 
+`ifndef SYNTHESIS
+  // Stage handshake invariants; live only with --assert.
+  a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) credits <= MAX_SETS_IN_FLIGHT)
+    else $error("sienna_top: more credits than MAX_SETS_IN_FLIGHT");
+  a_credit_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) host_accept |-> credits != 0)
+    else $error("sienna_top: a start was accepted without a credit");
+  a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> credits < MAX_SETS_IN_FLIGHT)
+    else $error("sienna_top: a set finished with every credit already free");
+  a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) systolic_start |-> mesh_input_ready)
+    else $error("sienna_top: a start was forwarded to a mesh with no free staging bank");
+  a_g_from_mesh: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> mesh_sets != 0)
+    else $error("sienna_top: the activation stage took a result the host never started");
+  a_act_bank_free: assert property (@(posedge clk_i) disable iff (!rstn_i) g_done |-> !act_full[act_wr])
+    else $error("sienna_top: activation finished into a full bank");
+  a_act_bank_full: assert property (@(posedge clk_i) disable iff (!rstn_i) p_release |-> act_full[act_rd])
+    else $error("sienna_top: pooling released an empty bank");
+  a_complete_pulse: assert property (@(posedge clk_i) disable iff (!rstn_i) pipeline_complete_o |=> !pipeline_complete_o)
+    else $error("sienna_top: pipeline_complete_o held for more than one cycle");
+  a_complete_dispatched: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> disp_done)
+    else $error("sienna_top: pooling completed a set it never dispatched");
+`ifdef ASSERT_SELFTEST
+  a_selftest: assert property (@(posedge clk_i) disable iff (!rstn_i) 1'b0)
+    else $error("sienna_top: assertion self-test fired, so assertions are live");
+`endif
+`endif
+
 endmodule

@@ -1,5 +1,6 @@
 VIVADO/
 Verilator/
+Verilator_perf/
 testbenches/results/
 testbenches/*.txt
 testbenches*.log

@@ -578,6 +578,9 @@ module TB_sienna_top;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
+`ifdef PERF
+    $display("PERF %0d PASS %0d %0d", int'($time / 10), id_base, overrun);
+`endif
     fork
       begin
         fork
@@ -586,6 +589,10 @@ module TB_sienna_top;
               read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
               read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
               dropout_seed_i = set_seed(k);
+`ifdef PERF
+              while (!pipeline_ready_o && !overrun) @(posedge clk_i);
+              $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
+`endif
               if (overrun && k == 3) begin
                 automatic int waited = 0;
                 while (!(dut.mesh_input_ready && dut.credits == 0) && waited < 5000) begin
@@ -623,6 +630,9 @@ module TB_sienna_top;
                 $display("  [FAIL] Start pulsed while pipeline_ready_o is low");
               end
               start_pipeline_i = 1;
+`ifdef PERF
+              $display("PERF %0d HOST_START %0d", int'($time / 10), k);
+`endif
               @(posedge clk_i);
               start_pipeline_i = 0;
               n_started++;
@@ -717,6 +727,43 @@ module TB_sienna_top;
     end else $display("  [Reset] idle after reset: all credits free, no stray output");
     stream_all_sets(0, 0);
   endtask
+
+  // ── PERF trace: stage transitions per cycle, read by perf_analysis.py ──
+`ifdef PERF
+  int perf_mesh_st = -1, perf_g_st = -1, perf_p_st = -1, perf_cred = -1, perf_mread = 0;
+  int perf_lane_busy = 0, perf_round_cyc = 0;
+  initial forever begin
+    @(negedge clk_i);
+    if (stream_on) begin
+      automatic int c = int'($time / 10);
+      automatic int busy = 0;
+      if (int'(dut.systolic_array_inst.current_state) != perf_mesh_st)
+        $display("PERF %0d MESH %0d", c, dut.systolic_array_inst.current_state);
+      if (int'(dut.g_state) != perf_g_st) begin
+        $display("PERF %0d G %0d", c, dut.g_state);
+        if (perf_g_st == 3) $display("PERF %0d LANES %0d %0d", c, perf_lane_busy, perf_round_cyc);
+        if (int'(dut.g_state) == 1) begin
+          perf_lane_busy = 0;
+          perf_round_cyc = 0;
+        end
+      end
+      if (int'(dut.p_state) != perf_p_st) $display("PERF %0d P %0d", c, dut.p_state);
+      if (int'(dut.credits) != perf_cred) $display("PERF %0d CREDITS %0d", c, dut.credits);
+      if (int'(dut.systolic_read_enable) != perf_mread) $display("PERF %0d MREAD %0d", c, dut.systolic_read_enable);
+      if (pipeline_complete_o) $display("PERF %0d DONE %0d", c, done_set_id_o);
+      if (int'(dut.g_state) == 3) begin
+        for (int i = 0; i < NUM_LANES; i++) if (dut.load_finalized[i] && !dut.lane_collected[i]) busy++;
+        perf_lane_busy += busy;
+        perf_round_cyc++;
+      end
+    end
+    perf_mesh_st = int'(dut.systolic_array_inst.current_state);  // tracked always, printed only in a pass
+    perf_g_st    = int'(dut.g_state);
+    perf_p_st    = int'(dut.p_state);
+    perf_cred    = int'(dut.credits);
+    perf_mread   = int'(dut.systolic_read_enable);
+  end
+`endif
 
   // ── Top-level stimulus ────────────────────────────────────────────────
   initial begin

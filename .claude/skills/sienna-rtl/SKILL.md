@@ -23,7 +23,7 @@ matrix_north.mem (B)─┘   (C = A×B)        (256 deep)     (activation)      
                                         (8 lanes)   (8 lanes)      (8 × 16)    dispatcher
 ```
 
-`src/sienna_top.sv` owns this. Its outer FSM runs IDLE → SYSTOLIC_START_PULSE → SYSTOLIC_PROCESSING → FEED_GPNAE_FIFO → LATCH_GPNAE_COUNT → GPNAE_ROUND → DISPATCH_WINDOWS → WAIT_DOWNSTREAM → PIPELINE_COMPLETE. Two inner FSMs matter as much as the outer one: the `fill_state` machine that hands FIFO1 data round-robin to the 8 GPNAE lanes, and the per-lane `mp_state` machine that feeds pre-packaged pooling windows into each Maxpool.
+`src/sienna_top.sv` owns this. Since 2026-09-22 there is no single outer FSM: the mesh queues its own sets, an activation stage (`g_state`: G_IDLE → G_FEED → G_LATCH → G_ROUND) turns one mesh result into `gpnae_out_mem`, and a pooling stage (`p_state`: P_IDLE → P_DISPATCH → P_WAIT) drains it through maxpool and dropout. Up to three sets are in flight behind `pipeline_ready_o`; `pipeline_complete_o` is a one-cycle pulse per set. The `sienna-back-to-back` skill has the interface and the measurements. Two inner FSMs matter as much as the outer one: the `fill_state` machine that hands FIFO1 data round-robin to the 8 GPNAE lanes, and the per-lane `mp_state` machine that feeds pre-packaged pooling windows into each Maxpool.
 
 The key structural idea: the mesh produces results in one flat stream, but activation is the slow part, so the design fans out to 8 parallel GPNAE lanes and reassembles them in `gpnae_out_mem` before pooling. The dispatcher then re-reads that buffer in pooling-window order and scatters windows back across the 8 lanes.
 

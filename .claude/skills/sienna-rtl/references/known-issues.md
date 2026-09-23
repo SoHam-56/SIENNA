@@ -343,7 +343,23 @@ This may well interact with issue 3.
 
 ---
 
-## 7. Every testbench's tolerance check measures the wrong thing
+## 7. Every testbench's tolerance check measures the wrong thing — FIXED in the mesh and top TBs
+
+**Fixed 2026-09-22.** `TB_SystolicMesh.sv` and `TB_sienna_top.sv` now decode binary32 by hand
+with `f32()`, as `TB_gpnae.sv`'s `fp_to_real()` already did, and run a checker self-test at
+time zero: 1.0 vs 1.0+3 ulp must pass, and 1.0 vs 2.0, 1.0 vs 0.98, 1.0 vs -1.0 and -0.5 vs
+-0.05 must fail, or the run stops with `[FAIL]`. With the old integer decode the self-test
+fails, which is the red check. With the fix, the mesh regression passes 68/68 at T=2/4/8/16
+and SIENNA passes 5/5. Before the fix the old compare passed about 0.43x to 2.5x of the expected
+value. `TB_SystolicArray.sv` still has the old compare.
+
+**Verilator trap:** `2.0 ** (int'(b[30:23]) - 127)` inline in the expression hits
+`Internal Error: V3AstNodeExpr.h:689: Unexpected Call` in 5.035. Cast the exponent into an
+`int` variable first. A function that is never called does not trigger it, so a build that
+compiles is not proof the decoder compiles.
+
+The original analysis follows.
+
 
 **Confirmed (inspection).** `TB_SystolicMesh.sv` and `TB_SystolicArray.sv` both contain:
 
@@ -377,7 +393,7 @@ the reported "Tol%" figures do not mean what they say, and the check will not
 behave sensibly across a sign change or an exponent boundary.
 
 A portable replacement that works under Verilator is a manual decode; see
-`f32()` in `GPNAE/testbenches/TB_gpnae_activations.sv`:
+`fp_to_real()` in `GPNAE/testbenches/TB_gpnae.sv`, or `f32()` in the mesh and top TBs:
 
 ```systemverilog
 function automatic real f32(input logic [31:0] b);

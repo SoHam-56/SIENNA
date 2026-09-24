@@ -29,6 +29,7 @@ module sienna_multi #(
 
     input logic                     start_pipeline_i,
     input logic                     training_mode_i,
+    input logic                     accumulate_i,
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -86,6 +87,7 @@ module sienna_multi #(
         .rstn_i                     (rstn_i),
         .start_pipeline_i           (start_pipeline_i && mine),
         .training_mode_i            (training_mode_i),
+        .accumulate_i               (accumulate_i),
         .dropout_seed_i             (dropout_seed_i),
         .activation_function_i      (activation_function_i),
         .num_terms_i                (num_terms_i),

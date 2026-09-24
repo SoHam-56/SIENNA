@@ -26,7 +26,8 @@ TEST ?=
 ACTIVATION ?= tanh
 
 TOP_FILES = \
-	sienna_top.sv
+	sienna_top.sv \
+	sienna_multi.sv
 
 SM_FILES = \
 	top/SystolicMesh.sv \

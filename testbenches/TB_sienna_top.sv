@@ -10,7 +10,6 @@ module TB_sienna_top;
   localparam string EXPECTED_OUTPUT_FILE = "expected_output.mem";
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
-  localparam int NUM_LANES = 16;
 
   // ── Timeout / heartbeat ───────────────────────────────────────────────
   localparam int TIMEOUT_CYCLES = 200_000;
@@ -66,6 +65,7 @@ module TB_sienna_top;
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
       .N                (N),
+      .TILE_SIZE        (TILE_SIZE),
       .DATA_WIDTH       (DATA_WIDTH),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),

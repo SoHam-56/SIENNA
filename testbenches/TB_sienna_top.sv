@@ -10,6 +10,7 @@ module TB_sienna_top;
   localparam string EXPECTED_OUTPUT_FILE = "expected_output.mem";
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
+  localparam int OVR_WORDS = 4 * HOST_WORDS;  // words loaded before the no-credit start
 
   // ── Timeout / heartbeat ───────────────────────────────────────────────
   localparam int TIMEOUT_CYCLES = 200_000;
@@ -29,9 +30,9 @@ module TB_sienna_top;
   logic [     ADDR_LINES:0] num_terms_i;
 
   logic north_write_enable_i, north_write_reset_i;
-  logic [DATA_WIDTH-1:0] north_write_data_i;
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;
   logic west_write_enable_i, west_write_reset_i;
-  logic [DATA_WIDTH-1:0]                 west_write_data_i;
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i;
 
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
@@ -66,6 +67,7 @@ module TB_sienna_top;
       .NUM_LANES        (NUM_LANES),
       .N                (N),
       .TILE_SIZE        (TILE_SIZE),
+      .HOST_WORDS       (HOST_WORDS),
       .DATA_WIDTH       (DATA_WIDTH),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
@@ -231,26 +233,7 @@ module TB_sienna_top;
     $display("  West  queue : %0d words", west_data_queue.size());
     $display("  North queue : %0d words", north_data_queue.size());
 
-    fork
-      begin
-        foreach (west_data_queue[i]) begin
-          west_write_enable_i = 1;
-          west_write_data_i   = west_data_queue[i];
-          @(posedge clk_i);
-        end
-        west_write_enable_i = 0;
-        @(posedge clk_i);
-      end
-      begin
-        foreach (north_data_queue[i]) begin
-          north_write_enable_i = 1;
-          north_write_data_i   = north_data_queue[i];
-          @(posedge clk_i);
-        end
-        north_write_enable_i = 0;
-        @(posedge clk_i);
-      end
-    join
+    load_range(0, 32'h7FFF_FFFF);
     $display("  Load complete @ %0t  (%0d cycles)", $time, cycle_count);
   endtask
 
@@ -466,22 +449,24 @@ module TB_sienna_top;
     return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
   endfunction
 
-  // ── Partial load: words [lo, hi) of both queues ───────────────────────
+  // ── Partial load: words [lo, hi) of both queues, HOST_WORDS per write ─
   task automatic load_range(input int lo, input int hi);
     fork
       begin
-        for (int i = lo; i < hi && i < west_data_queue.size(); i++) begin
+        for (int i = lo; i < hi && i < west_data_queue.size(); i += HOST_WORDS) begin
           west_write_enable_i = 1;
-          west_write_data_i   = west_data_queue[i];
+          for (int c = 0; c < HOST_WORDS; c++)
+            west_write_data_i[c] = (i + c < hi && i + c < west_data_queue.size()) ? west_data_queue[i+c] : '0;
           @(posedge clk_i);
         end
         west_write_enable_i = 0;
         @(posedge clk_i);
       end
       begin
-        for (int i = lo; i < hi && i < north_data_queue.size(); i++) begin
+        for (int i = lo; i < hi && i < north_data_queue.size(); i += HOST_WORDS) begin
           north_write_enable_i = 1;
-          north_write_data_i   = north_data_queue[i];
+          for (int c = 0; c < HOST_WORDS; c++)
+            north_write_data_i[c] = (i + c < hi && i + c < north_data_queue.size()) ? north_data_queue[i+c] : '0;
           @(posedge clk_i);
         end
         north_write_enable_i = 0;
@@ -602,7 +587,7 @@ module TB_sienna_top;
                   waited++;
                 end
                 if (dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) begin
-                  load_range(0, 4);
+                  load_range(0, OVR_WORDS);
                   if (pipeline_ready_o) begin
                     failed++;
                     $display("  [FAIL] Overrun not exercised: pipeline_ready_o high before the start");
@@ -611,13 +596,13 @@ module TB_sienna_top;
                   @(posedge clk_i);
                   start_pipeline_i = 0;
                   repeat (2) @(posedge clk_i);
-                  // An accepted start would rewind the mesh write pointer; a rejected one leaves it at 4.
-                  if (int'(dut.systolic_array_inst.ptr_A) != 4) begin
+                  // An accepted start would rewind the mesh write pointer; a rejected one leaves it at OVR_WORDS.
+                  if (int'(dut.systolic_array_inst.ptr_A) != OVR_WORDS) begin
                     failed++;
                     $display("  [FAIL] A start without a credit was taken: ptr_A=%0d credits=%0d",
                              dut.systolic_array_inst.ptr_A, dut.credits);
-                  end else $display("  [Stream] start with no credit ignored; the load resumes at word 4");
-                  load_range(4, west_data_queue.size());
+                  end else $display("  [Stream] start with no credit ignored; the load resumes at word %0d", OVR_WORDS);
+                  load_range(OVR_WORDS, west_data_queue.size());
                   while (!pipeline_ready_o) @(posedge clk_i);
                 end else begin
                   $display("  [Stream] credit overrun not reached: the pipeline drains faster than the host loads");

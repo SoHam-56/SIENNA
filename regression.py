@@ -243,7 +243,8 @@ def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str, drop_seed: i
     C_pooled = apply_maxpool_2d(
         C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
     )
-    C_final = apply_dropout(C_pooled, cfg.get("dropout_p", 0.5), cfg.get("training", False), drop_seed)
+    C_final = apply_dropout(C_pooled, cfg.get("dropout_p", 0.5), cfg.get("training", False), drop_seed,
+                            cfg.get("lanes", 16))
     return C, C_act, C_pooled, C_final
 
 
@@ -653,6 +654,8 @@ if __name__ == "__main__":
             {
                 "n": args.matrix_size,
                 "tile_size": args.tile_size,
+                "lanes": args.lanes,
+                "host_words": args.host_words or args.matrix_size,
                 "mode": args.mode,
                 "conv_type": args.conv_type,
                 "activation": args.activation,

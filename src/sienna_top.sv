@@ -5,6 +5,7 @@ module sienna_top #(
     parameter int    N                 = 16,
     parameter int    TILE_SIZE         = 4,
     parameter int    HOST_WORDS        = 1,  // words per host write; must divide N*N
+    parameter int    COLLAPSE_K        = 0,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
@@ -190,7 +191,8 @@ module sienna_top #(
       .TILE_SIZE  (TILE_SIZE),
       .DATA_WIDTH (DATA_WIDTH),
       .WIDE_READ  (NUM_LANES),
-      .HOST_WORDS (HOST_WORDS)
+      .HOST_WORDS (HOST_WORDS),
+      .COLLAPSE_K (COLLAPSE_K)
   ) systolic_array_inst (
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),

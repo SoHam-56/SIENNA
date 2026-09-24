@@ -4,7 +4,8 @@ import test_config_pkg::*;
 
 // Streams NUM_SETS distinct sets through sienna_multi, checks every set against its golden output, and measures throughput.
 module TB_sienna_multi #(
-    parameter int COPIES = 2
+    parameter int COPIES     = 2,
+    parameter int COLLAPSE_K = 1
 );
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int TIMEOUT_CYCLES = 400_000;
@@ -33,6 +34,7 @@ module TB_sienna_multi #(
       .N                (N),
       .TILE_SIZE        (TILE_SIZE),
       .HOST_WORDS       (HOST_WORDS),
+      .COLLAPSE_K       (COLLAPSE_K),
       .DATA_WIDTH       (DATA_WIDTH),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
@@ -189,8 +191,8 @@ module TB_sienna_multi #(
       lo = tl.size() - 1 - ng;
       if (ng > 0 && lo >= 0) gap_sum = real'(tl[tl.size()-1] - tl[lo]);
       if (ng > 0 && lo >= 0)
-        $display("MULTI COPIES=%0d N=%0d lanes=%0d host_words=%0d: steady %.1f cycles per set, %.1f FLOP/cycle",
-                 COPIES, N, NUM_LANES, HOST_WORDS, gap_sum / ng, 2.0 * N * N * N * ng / gap_sum);
+        $display("MULTI COPIES=%0d N=%0d lanes=%0d host_words=%0d collapse_k=%0d: steady %.1f cycles per set, %.1f FLOP/cycle",
+                 COPIES, N, NUM_LANES, HOST_WORDS, COLLAPSE_K, gap_sum / ng, 2.0 * N * N * N * ng / gap_sum);
     end
     $display(failed == 0 ? "RESULT: PASSED" : "RESULT: FAILED");
     $finish;

@@ -21,6 +21,7 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `start_pipeline_i` | pulse after loading; ignored while `pipeline_ready_o` is low |
 | `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
+| `accumulate_i` | sampled with the start: 1 makes the set a partial sum (added into `acc_mem`, no output, still completes in order); the next set with it low is added to the sum and activated |
 
 Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
 defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), SyncArray mesh tiles. GFLOPS count the
@@ -66,6 +67,16 @@ the tail run one element at a time, lanes sat idle while one lane worked through
 set 0 at N=32, T=4: 136 cycles with SystolicArray, 84 with SyncArray (8192 PEs each), 105 with
 collapse-k (1024 PEs). At N=64, T=8 collapse-k takes 197 cycles with 4096 PEs, about 32% PE
 utilisation, against 840 cycles and 32768 PEs for the old serial-reduce mesh.
+
+### Accumulate mode (2026-09-24)
+
+For products deeper than N the host sends the depth in passes: every pass but the last with
+`accumulate_i` high. The activation stage sums partial mesh results in `acc_mem` (NUM_LANES fp32
+adders, the first partial copied exactly) in states G_ACC_RD/G_ACC_WAIT, then fills the lanes from
+the sum (G_AFEED) for the final pass. A partial set takes an activation bank marked null, which
+pooling passes in one cycle, so completions stay in issue order and credits return. A set with no
+pending sum skips all of this, so normal behaviour is unchanged. Tests: `matmul_accum2_tanh`,
+`matmul_accum3_selu`, `matmul_accum2_tanh_train` (ACCUM_PASSES groups the streamed sets).
 
 ### Several pipelines: `sienna_multi`
 

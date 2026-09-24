@@ -32,6 +32,7 @@ TOP_FILES = \
 SM_FILES = \
 	top/SystolicMesh.sv \
 	top/SystolicArray.sv \
+	top/SyncArray.sv \
 	mem/RowInputQueue.sv \
 	mem/ColumnInputQueue.sv \
 	mem/OutputSram.sv \
@@ -39,7 +40,8 @@ SM_FILES = \
 	engine/PEMesh.sv \
 	engine/ProcessingElement.sv \
 	engine/AccumulationUnit.sv \
-	engine/MAC.sv
+	engine/MAC.sv \
+	engine/SyncPE.sv
 
 SM_LIB_FILES = \
 	Multipliers/Radix4Booth/src/R4Booth.sv \
@@ -152,6 +154,9 @@ VERILATOR_FLAGS = \
 	--top-module $(TOP_MODULE) \
 	--threads $(shell nproc) \
 	--build-jobs $(shell nproc) \
+	--output-split 20000 \
+	--output-split-cfuncs 20000 \
+	--output-groups 64 \
 	--sv \
 	-I$(SRC_DIR) \
 	-I$(TB_DIR) \

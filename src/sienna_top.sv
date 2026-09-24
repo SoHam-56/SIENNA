@@ -1,7 +1,7 @@
 `timescale 1ns / 100ps
 
 module sienna_top #(
-    parameter int    NUM_LANES         = 16,
+    parameter int    NUM_LANES         = 32,
     parameter int    N                 = 16,
     parameter int    TILE_SIZE         = 4,
     parameter int    HOST_WORDS        = 1,  // words per host write; must divide N*N

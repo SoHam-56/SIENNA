@@ -4,6 +4,7 @@ package test_config_pkg;
   localparam int N = 16;
   localparam int TILE_SIZE = 4;
   localparam int NUM_LANES = 16;
+  localparam int HOST_WORDS = 16;
   localparam int DATA_WIDTH = 32;
   localparam int SRAM_DEPTH = 256;
   localparam int FIFO_DEPTH = 256;

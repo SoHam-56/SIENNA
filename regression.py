@@ -25,7 +25,7 @@ import numpy as np
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
 
-from conv_tests import _basic_pair, _im2col_patches, _kernel_size
+from conv_tests import _basic_pair, _general_pair, _im2col_patches, _kernel_size
 from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
@@ -183,10 +183,12 @@ def apply_dropout(x: np.ndarray, p=0.5, training=False, seed=1, num_lanes=16) ->
 
 
 def build_conv_matrices(N: int, conv_type: str, seed: int, stride=None) -> tuple:
-    K = _kernel_size(N)
-    if conv_type == "basic":
+    if conv_type != "basic":
+        raise ValueError(f"Unknown conv_type '{conv_type}'")
+    if math.isqrt(N) ** 2 == N:
+        K = _kernel_size(N)
         return _basic_pair(img_size=K * K, K=K, seed=seed)
-    raise ValueError(f"Unknown conv_type '{conv_type}'")
+    return _general_pair(N, seed)[0]  # 3x3 kernel, depth zero-padded to N
 
 
 def write_sv_package(path: str, items: list) -> None:

@@ -14,7 +14,7 @@ module TB_sienna_multi #(
   logic clk_i = 0, rstn_i = 0;
   always #5 clk_i = ~clk_i;
 
-  logic start_pipeline_i = 0, training_mode_i = TRAINING_MODE;
+  logic start_pipeline_i = 0, training_mode_i = TRAINING_MODE, accumulate_i = 0;
   logic [LFSR_WIDTH-1:0] dropout_seed_i = '0;
   logic [CONTROL_WIDTH-1:0] activation_function_i = ACTIVATION_CODE;
   logic [ADDR_LINES:0] num_terms_i = NUM_TERMS;

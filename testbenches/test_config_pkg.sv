@@ -21,6 +21,7 @@ package test_config_pkg;
   localparam int LFSR_WIDTH = 32;
   localparam int CONTROL_WIDTH = 2;
   localparam int NUM_SETS = 4;
+  localparam int ACCUM_PASSES = 1;
   localparam int TRAINING_MODE = 0;
   localparam int DROPOUT_SEED = 718143530;
   localparam int ADDR_LINES = 8;

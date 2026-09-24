@@ -240,7 +240,11 @@ def dump_golden_trace(
 
 
 def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) -> tuple:
-    C = _ref_matmul(A, B)
+    return _golden_from_c(_ref_matmul(A, B), cfg, act_type, drop_seed)
+
+
+def _golden_from_c(C: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) -> tuple:
+    """Activation, pooling and dropout of an already formed product (one matmul or a sum of partials)."""
     C_act = apply_activation(C, act_type)
     C_pooled = apply_maxpool_2d(
         C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
@@ -291,20 +295,30 @@ def generate_vectors(cfg: dict) -> None:
     write_mem(os.path.join(TB_DIR, "expected_output.mem"), C_final)
 
     # Streamed sets: set 0 is the test's own pattern, the rest random and distinct.
-    num_sets = cfg.get("num_sets", 4)
+    # accum_passes P groups the streamed sets P at a time: P-1 partial products, then the set that is activated.
+    passes = cfg.get("accum_passes", 1)
+    num_sets = cfg.get("num_sets", 2 * passes if passes > 1 else 4)
     masks = []
+    run = None
     for k in range(num_sets):
         if k == 0:
-            Ak, Bk, Fk = A, B, C_final
+            Ak, Bk = A, B
         else:
             rng = np.random.RandomState(seed + 1000 + k)
             Ak = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
             Bk = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
-            Fk = _golden(Ak, Bk, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
+        if passes > 1:
+            Ck = _ref_matmul(Ak, Bk)
+            run = Ck if k % passes == 0 else (run + Ck).astype(np.float32)  # summed in pass order, as the hardware does
+            partial = (k % passes) != passes - 1
+            Fk = np.zeros(0, dtype=np.float32) if partial else _golden_from_c(run, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
+        else:
+            partial = False
+            Fk = C_final if k == 0 else _golden(Ak, Bk, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
         write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
         write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
-        write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)
-        if cfg.get("training", False):
+        write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
+        if cfg.get("training", False) and not partial:
             masks.append(tuple((Fk.flatten() != 0).tolist()))
     for i in range(len(masks)):
         for j in range(i + 1, len(masks)):
@@ -338,6 +352,7 @@ def generate_vectors(cfg: dict) -> None:
         ("LFSR_WIDTH", 32, "int"),
         ("CONTROL_WIDTH", 2, "int"),
         ("NUM_SETS", num_sets, "int"),
+        ("ACCUM_PASSES", passes, "int"),
         ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
         ("DROPOUT_SEED", drop_seed, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
@@ -506,6 +521,11 @@ PIPELINE_TESTS = [
     {"name": "matmul_large_selu", "mode": "matmul", "matrix_type": "random", "act": "selu", "scale": 2.5},
     {"name": "matmul_large_sigm", "mode": "matmul", "matrix_type": "random", "act": "sigmoid", "scale": 2.5},
     {"name": "matmul_large_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "scale": 2.5},
+    # Deep products split into passes: partial sums accumulate in the pipeline, only the last pass is activated.
+    {"name": "matmul_accum2_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "accum_passes": 2},
+    {"name": "matmul_accum3_selu", "mode": "matmul", "matrix_type": "random", "act": "selu", "accum_passes": 3},
+    {"name": "matmul_accum2_tanh_train", "mode": "matmul", "matrix_type": "random", "act": "tanh",
+     "accum_passes": 2, "training": True},
 ]
 
 

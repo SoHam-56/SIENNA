@@ -28,6 +28,7 @@ module sienna_top #(
 
     input logic                     start_pipeline_i,
     input logic                     training_mode_i,  // dropout mode for the set being started
+    input logic                     accumulate_i,     // 1: add this set's product to the running sum and output nothing
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,   // dropout seed for the set being started
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -84,7 +85,8 @@ module sienna_top #(
   localparam int MAX_SETS_IN_FLIGHT = 3;
 
   // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
-  typedef enum logic [1:0] {G_IDLE, G_FEED, G_LATCH, G_ROUND} g_state_t;
+  // G_ACC_RD/G_ACC_WAIT add a mesh result into acc_mem; G_AFEED fills the lanes from acc_mem instead of the mesh.
+  typedef enum logic [2:0] {G_IDLE, G_FEED, G_LATCH, G_ROUND, G_ACC_RD, G_ACC_WAIT, G_AFEED} g_state_t;
   // Pooling stage: dispatch windows into FIFO2, then wait for maxpool and dropout to drain.
   typedef enum logic [1:0] {P_IDLE, P_DISPATCH, P_WAIT} p_state_t;
   g_state_t g_state;
@@ -100,6 +102,8 @@ module sienna_top #(
   // Dropout mode and seed travel with each set, indexed by its id, so sets in flight keep their own.
   logic                  set_train[4];
   logic [LFSR_WIDTH-1:0] set_seed [4];
+  logic                  set_accum[4];  // the set is a partial sum: accumulate it, output nothing
+  logic [1:0] act_null;  // per activation bank: holds a partial set, which pooling passes through without output
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -426,6 +430,80 @@ module sienna_top #(
   end
 
   // =========================================================================
+  // ACCUMULATION: partial sets are summed in acc_mem, laid out like the wide read (beat i, word k)
+  // =========================================================================
+  localparam int ACC_LAT = 5;  // fp32Adder: valid_i at t, done_o at t+5
+  localparam int AW = $clog2(PER_LANE + 1);
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] acc_mem[PER_LANE];
+  logic acc_valid;  // acc_mem holds a sum; clear means the next partial is copied, not added
+  logic [AW-1:0] acc_beat;  // wide-read beats taken this accumulation
+  logic [3:0] acc_pend;  // adds issued and not yet written back
+  logic acc_phase, acc_issue;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] acc_sum;
+  logic [NUM_LANES-1:0] acc_sum_v;
+  logic [AW-1:0] acc_tag[ACC_LAT];
+  assign acc_phase = (g_state == G_ACC_RD) || (g_state == G_ACC_WAIT);
+  assign acc_issue = acc_phase && wide_rd_valid && acc_valid;
+  // Every beat taken and every add written back: the sum for this set is final.
+  logic acc_done_w;
+  assign acc_done_w = (acc_beat == AW'(PER_LANE)) && (acc_pend == '0) && !acc_issue && !systolic_read_enable;
+
+  for (genvar k = 0; k < NUM_LANES; k++) begin : ACC_ADD
+    fp32Adder add (
+        .clk_i      (clk_i),
+        .rstn_i     (rstn_i),
+        .valid_i    (acc_issue),
+        .A          (acc_mem[acc_beat][k]),
+        .B          (wide_rd_data[k]),
+        .result_o   (acc_sum[k]),
+        .done_o     (acc_sum_v[k]),
+        .overflow_o (),
+        .underflow_o(),
+        .invalid_o  ()
+    );
+  end
+
+  // Reading acc_mem back into the lanes: one beat per cycle, one cycle of latency like the mesh read.
+  logic acc_rd_en, acc_rd_valid;
+  logic [AW-1:0] acc_rd_addr;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] acc_rd_data;
+
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) begin
+      acc_valid    <= 1'b0;
+      acc_beat     <= '0;
+      acc_pend     <= '0;
+      acc_rd_en    <= 1'b0;
+      acc_rd_addr  <= '0;
+      acc_rd_valid <= 1'b0;
+      acc_rd_data  <= '0;
+      for (int i = 0; i < ACC_LAT; i++) acc_tag[i] <= '0;
+    end else begin
+      acc_tag[0] <= acc_beat;
+      for (int i = 1; i < ACC_LAT; i++) acc_tag[i] <= acc_tag[i-1];
+      acc_pend <= acc_pend + {3'b0, acc_issue} - {3'b0, acc_sum_v[0]};
+      if (acc_sum_v[0]) acc_mem[acc_tag[ACC_LAT-1]] <= acc_sum;
+      if (g_state == G_ACC_RD) acc_beat <= '0;
+      else if (acc_phase && wide_rd_valid) begin
+        if (!acc_valid) acc_mem[acc_beat] <= wide_rd_data;  // the first partial is copied exactly
+        acc_beat <= acc_beat + 1'b1;
+      end
+      // A partial leaves a sum behind; the final set's read of it empties it.
+      if (g_state == G_ACC_WAIT && acc_done_w && set_accum[g_set_id]) acc_valid <= 1'b1;
+      if (g_state == G_AFEED) acc_valid <= 1'b0;
+      acc_rd_valid <= acc_rd_en;
+      if (acc_rd_en) acc_rd_data <= acc_mem[acc_rd_addr];
+      if (g_state == G_AFEED) begin
+        acc_rd_en   <= 1'b1;
+        acc_rd_addr <= '0;
+      end else if (acc_rd_en) begin
+        if (acc_rd_addr == AW'(PER_LANE - 1)) acc_rd_en <= 1'b0;
+        else acc_rd_addr <= acc_rd_addr + 1'b1;
+      end
+    end
+  end
+
+  // =========================================================================
   // STAGE CONTROLLERS: the mesh, activation (G) and pooling (P) each hold one set
   // =========================================================================
   logic streaming_complete;
@@ -436,7 +514,12 @@ module sienna_top #(
   assign g_accept = (g_state == G_IDLE) && systolic_collection_complete && !act_full[act_wr] &&
                     !systolic_read_enable && !systolic_release;
   assign g_done = (g_state == G_ROUND) && all_collected;
-  assign p_accept = (p_state == P_IDLE) && act_full[act_rd];
+  logic g_null_done;  // a partial set has been summed; it takes an activation bank only to keep sets in order
+  assign g_null_done = (g_state == G_ACC_WAIT) && acc_done_w && set_accum[g_set_id];
+  // A partial set passes pooling in one cycle, never right after another completion, so pulses stay one cycle.
+  logic complete_q, p_null;
+  assign p_null = (p_state == P_IDLE) && act_full[act_rd] && act_null[act_rd] && !complete_q;
+  assign p_accept = (p_state == P_IDLE) && act_full[act_rd] && !act_null[act_rd];
   assign p_release = (p_state == P_DISPATCH) && disp_done;  // the bank is copied into FIFO2
   assign pool_done = (p_state == P_WAIT) && streaming_complete;
 
@@ -445,6 +528,8 @@ module sienna_top #(
       g_state   <= G_IDLE;
       p_state   <= P_IDLE;
       act_full  <= '0;
+      act_null  <= '0;
+      complete_q <= 1'b0;
       act_wr    <= 1'b0;
       act_rd    <= 1'b0;
       credits   <= MAX_SETS_IN_FLIGHT[1:0];
@@ -457,19 +542,26 @@ module sienna_top #(
       for (int k = 0; k < 4; k++) begin
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
+        set_accum[k] <= 1'b0;
       end
     end else begin
+      complete_q <= pipeline_complete_o;
       if (host_accept) begin
+        set_accum[host_next_id] <= accumulate_i;
         set_train[host_next_id] <= training_mode_i;
         set_seed[host_next_id]  <= dropout_seed_i;
         host_next_id <= host_next_id + 1'b1;
       end
       case (g_state)
-        G_IDLE:  if (g_accept) g_state <= G_FEED;
-        G_FEED:  g_state <= G_LATCH;
-        G_LATCH: g_state <= G_ROUND;
-        G_ROUND: if (all_collected) g_state <= G_IDLE;
-        default: g_state <= G_IDLE;
+        // A set goes through acc_mem if it is a partial or a sum is pending; otherwise straight to the lanes.
+        G_IDLE:     if (g_accept) g_state <= (set_accum[g_next_id] || acc_valid) ? G_ACC_RD : G_FEED;
+        G_FEED:     g_state <= G_LATCH;
+        G_LATCH:    g_state <= G_ROUND;
+        G_ROUND:    if (all_collected) g_state <= G_IDLE;
+        G_ACC_RD:   g_state <= G_ACC_WAIT;
+        G_ACC_WAIT: if (acc_done_w) g_state <= set_accum[g_set_id] ? G_IDLE : G_AFEED;
+        G_AFEED:    g_state <= G_LATCH;
+        default:    g_state <= G_IDLE;
       endcase
       case (p_state)
         P_IDLE:     if (p_accept) p_state <= P_DISPATCH;
@@ -477,21 +569,22 @@ module sienna_top #(
         P_WAIT:     if (streaming_complete) p_state <= P_IDLE;
         default:    p_state <= P_IDLE;
       endcase
-      if (g_done) begin
+      if (g_done || g_null_done) begin
         act_full[act_wr] <= 1'b1;
+        act_null[act_wr] <= g_null_done;
         act_wr <= ~act_wr;
       end
-      if (p_release) begin
+      if (p_release || p_null) begin
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
-      credits   <= credits - {1'b0, host_accept} + {1'b0, pool_done};
+      credits   <= credits - {1'b0, host_accept} + {1'b0, pipeline_complete_o};
       mesh_sets <= mesh_sets + {2'b0, host_accept} - {2'b0, g_accept};
       if (g_accept) begin
         g_set_id  <= g_next_id;
         g_next_id <= g_next_id + 1'b1;
       end
-      if (p_accept) begin
+      if (p_accept || p_null) begin
         p_set_id  <= p_next_id;
         p_next_id <= p_next_id + 1'b1;
       end
@@ -509,7 +602,7 @@ module sienna_top #(
       systolic_release     <= 1'b0;
     end else begin
       systolic_release <= 1'b0;
-      if (g_state == G_FEED) begin
+      if (g_state == G_FEED || g_state == G_ACC_RD) begin
         systolic_reading     <= 1'b1;
         systolic_read_enable <= 1'b1;
         systolic_read_addr   <= '0;
@@ -522,6 +615,11 @@ module sienna_top #(
       end
     end
   end
+
+  logic fill_v;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
+  assign fill_v = (wide_rd_valid && !acc_phase) || acc_rd_valid;
+  assign fill_d = acc_rd_valid ? acc_rd_data : wide_rd_data;
 
   always_comb begin
     filled_total_n = filled_total;
@@ -544,10 +642,10 @@ module sienna_top #(
         lane_collected_n[i] = 1'b0;
       end
     end else begin
-      if (wide_rd_valid) begin
+      if (fill_v) begin
         filled_total_n = filled_total + NUM_LANES[TOT_W-1:0];
         for (int i = 0; i < NUM_LANES; i++) begin
-          gpnae_signal_n[i] = wide_rd_data[i];
+          gpnae_signal_n[i] = fill_d[i];
           gpnae_wr_en_n[i]  = 1'b1;
           fill_count_n[i]   = fill_count[i] + 1'b1;
         end
@@ -731,8 +829,9 @@ module sienna_top #(
     end
   end
 
-  assign pipeline_complete_o = pool_done;  // one cycle per set, in issue order
-  assign done_set_id_o = p_set_id;
+  // One cycle per set, in issue order; a partial set completes with no outputs as it passes pooling.
+  assign pipeline_complete_o = pool_done || p_null;
+  assign done_set_id_o = p_null ? p_next_id : p_set_id;
   assign intermediate_buffer_full_o = 1'b0;  // no buffer between the mesh and the lanes since parallel fill
   assign intermediate_buffer_empty_o = 1'b1;
 
@@ -770,6 +869,10 @@ module sienna_top #(
     else $error("sienna_top: activation finished into a full bank");
   a_act_bank_full: assert property (@(posedge clk_i) disable iff (!rstn_i) p_release |-> act_full[act_rd])
     else $error("sienna_top: pooling released an empty bank");
+  a_acc_add_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_sum_v[0] |-> (acc_pend != '0))
+    else $error("sienna_top: an accumulation add returned with none outstanding");
+  a_acc_no_lane_fill: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_phase |-> !acc_rd_valid)
+    else $error("sienna_top: the sum was read back while a mesh result was being summed");
   a_complete_pulse: assert property (@(posedge clk_i) disable iff (!rstn_i) pipeline_complete_o |=> !pipeline_complete_o)
     else $error("sienna_top: pipeline_complete_o held for more than one cycle");
   a_complete_dispatched: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> disp_done)

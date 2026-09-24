@@ -25,6 +25,7 @@ module TB_sienna_top;
   logic clk_i, rstn_i;
   logic                     start_pipeline_i;
   logic                     training_mode_i;
+  logic                     accumulate_i;  // this set is a partial sum
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
@@ -86,6 +87,7 @@ module TB_sienna_top;
       .rstn_i                     (rstn_i),
       .start_pipeline_i           (start_pipeline_i),
       .training_mode_i            (training_mode_i),
+      .accumulate_i               (accumulate_i),
       .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
@@ -108,7 +110,7 @@ module TB_sienna_top;
       .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
   );
 
-  wire [3:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
+  wire [4:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
 
   // Manual binary32 decode; $bitstoshortreal leaves the bit pattern as an integer under Verilator.
   function automatic real f32(input logic [31:0] b);
@@ -210,6 +212,7 @@ module TB_sienna_top;
     rstn_i = 0;
     start_pipeline_i = 0;
     training_mode_i = 1'b0;
+    accumulate_i = 1'b0;
     dropout_seed_i = '1;
     north_write_reset_i = 1;
     west_write_reset_i = 1;
@@ -386,7 +389,7 @@ module TB_sienna_top;
 
   integer       lane_fd;
   logic   [1:0] prev_mp_state      [NUM_LANES];
-  logic   [3:0] prev_current_state;
+  logic   [4:0] prev_current_state;
   logic         lane_log_init_done;
 
   initial begin
@@ -443,6 +446,11 @@ module TB_sienna_top;
       end
     end
   end
+
+  // With ACCUM_PASSES = P, sets come in groups of P: the first P-1 are partial sums, the last is activated.
+  function automatic bit is_partial(input int k);
+    return (ACCUM_PASSES > 1) && ((k % ACCUM_PASSES) != ACCUM_PASSES - 1);
+  endfunction
 
   // Set k's dropout seed; regression.py's set_dropout_seed() mirrors it.
   function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
@@ -578,6 +586,7 @@ module TB_sienna_top;
               read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
               read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
               dropout_seed_i = set_seed(k);
+              accumulate_i = is_partial(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
@@ -683,6 +692,7 @@ module TB_sienna_top;
         for (int k = 0; k < NUM_SETS; k++) begin
           read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
           read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
+          accumulate_i = is_partial(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
           start_pipeline_i = 1;

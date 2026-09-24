@@ -97,6 +97,9 @@ TESTBENCH  = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 
 VERILATOR_DIR = $(PRJ_DIR)/Verilator
+
+# Very large meshes put thousands of PEs into a few generated functions that -Os takes hours on; OPT_FAST=-O0 builds in minutes.
+OPT_FAST ?= -Os
 VCS_DIR       = $(PRJ_DIR)/VCS
 
 TRACE ?= 0
@@ -158,6 +161,7 @@ VERILATOR_FLAGS = \
 	--output-split-cfuncs 20000 \
 	--output-groups 64 \
 	-Wno-UNOPTTHREADS \
+	-MAKEFLAGS OPT_FAST=$(OPT_FAST) \
 	--sv \
 	-I$(SRC_DIR) \
 	-I$(TB_DIR) \

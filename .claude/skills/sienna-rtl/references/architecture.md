@@ -86,7 +86,7 @@ SystolicMesh          tile grid, broadcast loader, MeshOutputSram
 
 ### Mesh FSM
 
-`IDLE → RESET_SEQ → BROADCAST → FIRE_PULSE → WAIT_TILES → REDUCE_PULSE → WAIT_REDUCE → DONE`. `BROADCAST` walks `load_idx` over `TILE_ELEMENTS`, computing per-tile addresses into the flat `mem_A`/`mem_B` arrays and writing every tile's input queue in parallel. All tiles then fire simultaneously, so total latency tracks one tile's depth rather than the tile count.
+`IDLE → RESET_SEQ → BROADCAST → FIRE_PULSE → WAIT_TILES → REDUCE_PULSE → WAIT_REDUCE → DONE`. `BROADCAST` walks `load_idx` over the `TILE_SIZE` tile rows, computing per-tile addresses into the flat `mem_A`/`mem_B` arrays and writing one whole tile row into every tile's input queue in parallel (the queues take `WRITE_WORDS = TILE_SIZE` words per write since 2026-09-23), so it costs T cycles, not T². All tiles then fire simultaneously, so total latency tracks one tile's depth rather than the tile count.
 
 ### Row vs Column input queue
 
@@ -111,7 +111,7 @@ Data flows south, weights flow east. `east_o` is muxed: during normal operation 
 
 ### Output path
 
-`OutputSram` (one per tile) collects drained columns right to left, starting at `current_column = N-1`. `AccumulationUnit` then reads each tile's depth slices in turn, chains them through a single `fp32Adder`, and writes the reduced value to the shared `MeshOutputSram` at a globally-offset address computed from `TILE_ROW_OFFSET` / `TILE_COL_OFFSET`. `MeshOutputSram` is multi-write-port (one per tile) and single-read-port.
+`OutputSram` (one per tile) collects drained columns right to left, starting at `current_column = N-1`. `AccumulationUnit` then reads the same pixel from all P depth slices each cycle, sums them in a log2(P) `fp32Adder` tree (since 2026-09-23; it was one serial adder over P·T² adds), and writes one result per cycle the reduced value to the shared `MeshOutputSram` at a globally-offset address computed from `TILE_ROW_OFFSET` / `TILE_COL_OFFSET`. `MeshOutputSram` is multi-write-port (one per tile) and single-read-port.
 
 ---
 

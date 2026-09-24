@@ -23,16 +23,21 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 
 Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-23), after the
-parallel lane fill. GFLOPS count the 8192-FLOP matmul at an **assumed** 950 MHz; no timing run
-exists.
+parallel lane fill, the parallel tree reduce and the row-wide broadcast. GFLOPS count the
+8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
 
 | Config | Single set | Per set, steady | GFLOPS @950 | Bottleneck |
 |---|---|---|---|---|
-| matmul_ident_selu / conv_basic_selu | 494 | 336 | 23.2 | host load (257) |
-| matmul_random_tanh | 520 | 459 | 17.0 | activation |
-| matmul_random_sigm | 950 | 472 | 16.5 | activation |
-| matmul_random_tanh_train | 528 | 459 | 17.0 | activation |
-| matmul_large_{selu,sigm,tanh} | 3104-4464 | 2449-3896 | 2.0-3.2 | activation (tails) |
+| matmul_ident_selu / conv_basic_selu | 421 | 336 | 23.2 | host load (257) |
+| matmul_random_tanh | 447 | 459 | 17.0 | activation (tails) |
+| matmul_random_sigm | 877 | 472 | 16.5 | activation (tails) |
+| matmul_random_tanh_train | 455 | 459 | 17.0 | activation (tails) |
+| matmul_large_{selu,sigm,tanh} | 3031-4391 | 2449-3896 | 2.0-3.2 | activation (tails) |
+
+The mesh stage is 129 cycles per set (broadcast 4, tiles 94, reduce 29); it was 202 (16, 94,
+90) before the tree reduce and the row-wide broadcast. That cut every single-set latency by 73
+cycles and left steady state unchanged, because the mesh was not the slowest stage. The tile
+phase is now most of the mesh: each PE takes about 10 cycles per multiply-accumulate.
 
 Before the parallel fill the same runs gave 751-1003 single-set and 565-645 per set (12.1-13.8
 GFLOPS at the same assumed clock), with lanes 36-48% busy; they are now 93% busy on data inside

@@ -4,7 +4,7 @@
 // Each copy keeps its own output port and set ids, since sienna_top has no output back-pressure to merge them in order.
 module sienna_multi #(
     parameter int COPIES            = 2,
-    parameter int NUM_LANES         = 16,
+    parameter int NUM_LANES         = 32,
     parameter int N                 = 16,
     parameter int TILE_SIZE         = 4,
     parameter int HOST_WORDS        = 1,

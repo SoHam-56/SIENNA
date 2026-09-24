@@ -244,7 +244,7 @@ def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str, drop_seed: i
         C_act, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1)
     )
     C_final = apply_dropout(C_pooled, cfg.get("dropout_p", 0.5), cfg.get("training", False), drop_seed,
-                            cfg.get("lanes", 16))
+                            cfg.get("lanes", 32))
     return C, C_act, C_pooled, C_final
 
 
@@ -318,7 +318,7 @@ def generate_vectors(cfg: dict) -> None:
     items = [
         ("N", N, "int"),
         ("TILE_SIZE", tile_size, "int"),
-        ("NUM_LANES", cfg.get("lanes", 16), "int"),
+        ("NUM_LANES", cfg.get("lanes", 32), "int"),
         ("HOST_WORDS", cfg.get("host_words", N), "int"),
         ("DATA_WIDTH", 32, "int"),
         ("SRAM_DEPTH", sram_depth, "int"),
@@ -556,7 +556,7 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def run_regression(N: int, T: int, target_test: str = None, lanes: int = 16, host_words: int = None):
+def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, host_words: int = None):
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
@@ -637,7 +637,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)
-    p.add_argument("--lanes", type=int, default=16)
+    p.add_argument("--lanes", type=int, default=32)
     p.add_argument("--host-words", type=int, default=None, help="words per host write (default: N, one row)")
     p.add_argument("--mode", default="matmul", choices=["matmul", "conv"])
     p.add_argument("--conv-type", default="basic")

@@ -18,7 +18,7 @@ CONFIGS = ["matmul_random_sigm", "matmul_random_tanh", "matmul_ident_selu", "con
            "matmul_random_tanh_train", "matmul_large_selu", "matmul_large_sigm", "matmul_large_tanh"]
 
 
-GEOM = {"n": 16, "tile_size": 4, "lanes": 16}  # set from the command line in main()
+GEOM = {"n": 16, "tile_size": 4, "lanes": 32}  # set from the command line in main()
 
 
 def run(name: str, num_sets: int, build_dir: str) -> str:
@@ -129,7 +129,7 @@ def main() -> None:
                     help="assumed clock for GFLOPS; no timing run has demonstrated one")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--tile-size", type=int, default=4)
-    ap.add_argument("--lanes", type=int, default=16)
+    ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--build-dir", default=os.environ.get("PERF_BUILD_DIR", os.path.join(ROOT, "Verilator_perf")))
     args = ap.parse_args()
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes)

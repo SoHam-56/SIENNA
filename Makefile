@@ -157,6 +157,7 @@ VERILATOR_FLAGS = \
 	--output-split 20000 \
 	--output-split-cfuncs 20000 \
 	--output-groups 64 \
+	-Wno-UNOPTTHREADS \
 	--sv \
 	-I$(SRC_DIR) \
 	-I$(TB_DIR) \

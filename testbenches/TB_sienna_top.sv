@@ -479,6 +479,7 @@ module TB_sienna_top;
   // The monitor reads registered state on the falling edge, never a combinational view of start.
   bit stream_on = 0;
   int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
+  int pool_with_result = 0;  // pooling busy while a mesh result waited, so activation could have overlapped it
   logic [DATA_WIDTH-1:0] stream_results[$];
   int stream_bounds[$];
   int stream_ids[$];
@@ -502,6 +503,7 @@ module TB_sienna_top;
     if (stream_on) begin
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
+      if (maxpool_busy_tb && dut.systolic_collection_complete) pool_with_result++;
       if (!mesh_computing && dut.systolic_array_inst.in_full[dut.systolic_array_inst.in_rd] &&
           dut.systolic_array_inst.out_full[dut.systolic_array_inst.out_wr])
         bp_mesh++;  // a staged set waits because both mesh result banks are full
@@ -558,6 +560,7 @@ module TB_sienna_top;
     stream_id_base = id_base;
     ov_mesh_g = 0;
     ov_g_p = 0;
+    pool_with_result = 0;
     max_in_flight = 0;
     bp_mesh = 0;
     bp_act = 0;
@@ -657,10 +660,13 @@ module TB_sienna_top;
       failed++;
       $display("  [FAIL] Overlap: the mesh never computed while the activation stage held a set");
     end
-    if (ov_g_p == 0) begin
+    // Only a failure if a mesh result was waiting while pooling ran; with the mesh slowest there is nothing to overlap.
+    if (ov_g_p == 0 && pool_with_result > 0) begin
       failed++;
-      $display("  [FAIL] Overlap: the activation and pooling stages never held sets at once");
-    end
+      $display("  [FAIL] Overlap: a mesh result waited %0d cycles while pooling ran, yet activation never overlapped it",
+               pool_with_result);
+    end else if (ov_g_p == 0)
+      $display("  [Stream] activation/pooling overlap not reachable: no mesh result was ready while pooling ran");
     if (max_in_flight > 3) begin
       failed++;
       $display("  [FAIL] %0d sets in flight, the credit limit is 3", max_in_flight);

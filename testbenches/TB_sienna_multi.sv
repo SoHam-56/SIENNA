@@ -194,7 +194,9 @@ module TB_sienna_multi #(
         $display("MULTI COPIES=%0d N=%0d lanes=%0d host_words=%0d collapse_k=%0d: steady %.1f cycles per set, %.1f FLOP/cycle",
                  COPIES, N, NUM_LANES, HOST_WORDS, COLLAPSE_K, gap_sum / ng, 2.0 * N * N * N * ng / gap_sum);
     end
-    $display(failed == 0 ? "RESULT: PASSED" : "RESULT: FAILED");
+    // A ternary of two strings prints as a number under Verilator, so branch instead.
+    if (failed == 0) $display("RESULT: PASSED");
+    else $display("RESULT: FAILED");
     $finish;
   end
 endmodule

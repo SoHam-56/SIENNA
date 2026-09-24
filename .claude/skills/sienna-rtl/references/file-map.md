@@ -54,7 +54,9 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | File | Lines | What it is |
 |---|---|---|
 | `src/top/SystolicMesh.sv` | 258 | Tile grid, broadcast loader, mesh FSM, `MeshOutputSram` |
-| `src/top/SystolicArray.sv` | 220 | One tile. Also defines the `NorthInputQueue` / `WestInputQueue` wrappers |
+| `src/top/SystolicArray.sv` | 220 | Handshake tile, used when `SYNC_TILES=0`. Also defines the `NorthInputQueue` / `WestInputQueue` wrappers |
+| `src/top/SyncArray.sv` | 170 | Default tile: synchronous N×N output-stationary array for an N×K by K×N product |
+| `src/engine/SyncPE.sv` | 160 | SyncArray PE: one product per cycle into six partial sums, pairwise combine at the end |
 | `src/mem/RowInputQueue.sv` | 141 | Row-major strided input queue |
 | `src/mem/ColumnInputQueue.sv` | 140 | Column-major strided. Identical to the above except the addressing |
 | `src/mem/OutputSram.sv` | 116 | Per-tile column-drain collector |

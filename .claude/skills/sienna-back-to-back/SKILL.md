@@ -22,35 +22,65 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 
-Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-23), after the
-parallel lane fill, the parallel tree reduce, the row-wide broadcast and the tail overlap. GFLOPS
-count the 8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
+Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
+defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), SyncArray mesh tiles. GFLOPS count the
+8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
 
 | Config | Single set | Per set, steady | GFLOPS @950 | Bottleneck |
 |---|---|---|---|---|
-| matmul_ident_selu / conv_basic_selu | 421 | 266 | 29.2 | host load (257) |
-| matmul_random_tanh | 447 | 303 | 25.7 | activation (277) |
-| matmul_random_sigm | 693 | 325 | 24.0 | activation (295) |
-| matmul_random_tanh_train | 455 | 303 | 25.7 | activation (277) |
-| matmul_large_{selu,sigm,tanh} | 2819-4155 | 2235-3659 | 2.1-3.5 | activation (tails) |
+| matmul_ident_selu / conv_basic_selu | 295 | 221 | 35.2 | activation (195) |
+| matmul_random_tanh | 313 | 271 | 28.8 | activation (213, 298 with two tails in a lane) |
+| matmul_random_sigm | 378 | 263 | 29.6 | activation (278) |
+| matmul_random_tanh_train | 321 | 271 | 28.8 | activation (213) |
+| matmul_large_{selu,sigm,tanh} | 1431-2345 | 1510-2078 | 3.7-5.2 | activation (tails) |
 
-Before the tail overlap, steady state was 336 / 459 / 472 / 459 and 2449-3896: a tail element
-started only when its turn came to emit, after the polynomial run, so one such element in any
-lane doubled the round. It now starts as it is captured and runs beside the polynomial; results
-are bit-identical. Lanes with several tail elements still run them one at a time, which is what
-keeps the large-value configs slow.
+What each change bought, all measured the same way:
 
-The mesh stage is 129 cycles per set (broadcast 4, tiles 94, reduce 29); it was 202 (16, 94,
-90) before the tree reduce and the row-wide broadcast. That cut every single-set latency by 73
-cycles and left steady state unchanged, because the mesh was not the slowest stage. The tile
-phase is now most of the mesh: each PE takes about 10 cycles per multiply-accumulate.
+| Change | Stage it moved | Steady state per set (SELU / tanh / sigmoid) |
+|---|---|---|
+| tail overlap (GPNAE `b972abd`) | activation: a lane's first tail element hides under the polynomial | 336 / 459 / 472 -> 266 / 303 / 325 |
+| one-row host writes | host load 257 -> 17 | 266 / 303 / 325 -> 264 / 303 / 325 (activation now the limit) |
+| 32 lanes | activation 251 -> 195 (SELU), 277 -> 213 (tanh) | -> 221 / 271 / 263 |
+| SyncArray tiles | mesh 129 -> 77 (tile phase 94 -> 42) | unchanged; single-set latency -52 |
 
-Before the parallel fill the same runs gave 751-1003 single-set and 565-645 per set (12.1-13.8
-GFLOPS at the same assumed clock), with lanes 36-48% busy; they are now 93% busy on data inside
-the fitted range. What remains: the second and later tail elements in a lane still pay ~270
-cycles each in `gpnae_tail`, and on well-behaved data the 1-word-per-cycle host load is the
-limit. `python3 perf_analysis.py` regenerates
-`testbenches/results/perf/pipeline_performance_report.log`.
+The mesh stage is 77 cycles per set (broadcast 4, tiles 42, reduce 29). It is no longer on the
+critical path; activation is, and within it the tail: a lane with two or more out-of-range
+elements still runs them one at a time, about 270 cycles each. `python3 perf_analysis.py`
+regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes`, `--n` and
+`--tile-size` pick another geometry.
+
+### Larger N (measured 2026-09-24)
+
+Full pipeline at N=32, T=4, one-row host writes, SyncArray tiles: all 8 matmul tests pass (conv needs N to
+be a perfect square in the generator). Mesh stage 82 cycles, host load 33, so activation sets the rate:
+
+| Lanes | SELU steady | tanh steady | GFLOPS @950 (SELU / tanh) | Lanes busy |
+|---|---|---|---|---|
+| 32 | 1036 | 1561 | 60.1 / 39.9 | 51-58% |
+| 64 | 772 | 1122 | 80.7 / 55.5 | 35-41% |
+
+N=32 sums 32 products per output, so far more activation inputs land past the fitted range and the
+serial tail path dominates: lanes sit idle while one lane works through its tail elements. Mesh only,
+set 0 at N=32, T=4: 136 cycles with SystolicArray, 84 with SyncArray (8192 PEs each), 105 with
+collapse-k (1024 PEs). At N=64, T=8 collapse-k takes 197 cycles with 4096 PEs, about 32% PE
+utilisation, against 840 cycles and 32768 PEs for the old serial-reduce mesh.
+
+### Several pipelines: `sienna_multi`
+
+`src/sienna_multi.sv` puts COPIES `sienna_top`s behind one host port; each accepted start goes to
+the next copy in turn and each copy keeps its own output port (no reorder buffer).
+`testbenches/TB_sienna_multi.sv` streams 48 distinct sets and checks every one. Measured with 16
+lanes per copy: tanh 307.5 cycles per set with one copy, 149.0 with two, 73.4 with four; SELU 264.0
+and 66.0. The shared host port costs 17 cycles per set, so it becomes the limit only past about 15
+copies (estimate). Under Verilator a one-element fixed array of queues lost its updates, so the TB
+keys its per-copy queues by int.
+
+### Collapse-k
+
+`COLLAPSE_K=1` in SystolicMesh gives each output tile one SyncArray of depth N, so N^2 PEs instead
+of N^3/T and no reduce. At N=16, T=4: 256 PEs instead of 1024, mesh stage 87 cycles instead of 77,
+same steady state (activation-bound). Mesh 68/68, SIENNA 11/11 and back-to-back 12 clean with it
+selected. It is off by default.
 
 ## Mesh interface after phase 2
 

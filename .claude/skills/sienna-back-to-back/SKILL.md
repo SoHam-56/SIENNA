@@ -32,7 +32,7 @@ defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), SyncArray mesh tiles
 | matmul_random_tanh | 313 | 271 | 28.8 | activation (213, 298 with two tails in a lane) |
 | matmul_random_sigm | 378 | 263 | 29.6 | activation (278) |
 | matmul_random_tanh_train | 321 | 271 | 28.8 | activation (213) |
-| matmul_large_{selu,sigm,tanh} | 1431-2345 | 1510-2078 | 3.7-5.2 | activation (tails) |
+| matmul_large_{selu,sigm,tanh} | 627-691 | 530-591 | 13.2-14.7 | activation (tails) |
 
 What each change bought, all measured the same way:
 
@@ -42,10 +42,11 @@ What each change bought, all measured the same way:
 | one-row host writes | host load 257 -> 17 | 266 / 303 / 325 -> 264 / 303 / 325 (activation now the limit) |
 | 32 lanes | activation 251 -> 195 (SELU), 277 -> 213 (tanh) | -> 221 / 271 / 263 |
 | SyncArray tiles | mesh 129 -> 77 (tile phase 94 -> 42) | unchanged; single-set latency -52 |
+| four tail contexts (GPNAE `e68882c`) | tail elements in a lane run together | normal data unchanged; large-value 1510-2078 -> 530-591 |
 
 The mesh stage is 77 cycles per set (broadcast 4, tiles 42, reduce 29). It is no longer on the
-critical path; activation is, and within it the tail: a lane with two or more out-of-range
-elements still runs them one at a time, about 270 cycles each. `python3 perf_analysis.py`
+critical path; activation is. gpnae_tail now works on four out-of-range elements at once
+(`TAIL_CONTEXTS`), sharing one multiplier and one adder, bit-identical to running them in turn. `python3 perf_analysis.py`
 regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes`, `--n` and
 `--tile-size` pick another geometry.
 
@@ -54,13 +55,14 @@ regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes
 Full pipeline at N=32, T=4, one-row host writes, SyncArray tiles: all 8 matmul tests pass (conv needs N to
 be a perfect square in the generator). Mesh stage 82 cycles, host load 33, so activation sets the rate:
 
-| Lanes | SELU steady | tanh steady | GFLOPS @950 (SELU / tanh) | Lanes busy |
-|---|---|---|---|---|
-| 32 | 1036 | 1561 | 60.1 / 39.9 | 51-58% |
-| 64 | 772 | 1122 | 80.7 / 55.5 | 35-41% |
+| Lanes | Tail | SELU steady | tanh steady | GFLOPS @950 (SELU / tanh) | Lanes busy |
+|---|---|---|---|---|---|
+| 32 | one at a time | 1036 | 1561 | 60.1 / 39.9 | 51-58% |
+| 64 | one at a time | 772 | 1122 | 80.7 / 55.5 | 35-41% |
+| 64 | four contexts | 288 | 380 | 216.6 / 163.8 | 84-87% |
 
-N=32 sums 32 products per output, so far more activation inputs land past the fitted range and the
-serial tail path dominates: lanes sit idle while one lane works through its tail elements. Mesh only,
+N=32 sums 32 products per output, so far more activation inputs land past the fitted range; with
+the tail run one element at a time, lanes sat idle while one lane worked through its tail elements. Mesh only,
 set 0 at N=32, T=4: 136 cycles with SystolicArray, 84 with SyncArray (8192 PEs each), 105 with
 collapse-k (1024 PEs). At N=64, T=8 collapse-k takes 197 cycles with 4096 PEs, about 32% PE
 utilisation, against 840 cycles and 32768 PEs for the old serial-reduce mesh.
@@ -71,7 +73,11 @@ utilisation, against 840 cycles and 32768 PEs for the old serial-reduce mesh.
 the next copy in turn and each copy keeps its own output port (no reorder buffer).
 `testbenches/TB_sienna_multi.sv` streams 48 distinct sets and checks every one. Measured with 16
 lanes per copy: tanh 307.5 cycles per set with one copy, 149.0 with two, 73.4 with four; SELU 264.0
-and 66.0. The shared host port costs 17 cycles per set, so it becomes the limit only past about 15
+and 66.0. Every copy uses the collapse-k mesh (`COLLAPSE_K=1` is sienna_multi's default): at N=16
+with 32 lanes, four copies give 62.6 (tanh) and 55.2 (SELU) cycles per set with or without it, so
+it saves three quarters of the mesh PEs for 11 cycles of latency. At N=32 with 64 lanes and four
+tail contexts, four copies give 79.0 (tanh) and 71.8 (SELU) cycles per set, 829 and 913 FLOP per
+cycle, about 790 and 870 GFLOPS at the assumed 950 MHz; all 48 sets pass. The shared host port costs 17 cycles per set, so it becomes the limit only past about 15
 copies (estimate). Under Verilator a one-element fixed array of queues lost its updates, so the TB
 keys its per-copy queues by int.
 

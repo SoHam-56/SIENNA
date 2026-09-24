@@ -317,6 +317,7 @@ def generate_vectors(cfg: dict) -> None:
     items = [
         ("N", N, "int"),
         ("TILE_SIZE", tile_size, "int"),
+        ("NUM_LANES", cfg.get("lanes", 16), "int"),
         ("DATA_WIDTH", 32, "int"),
         ("SRAM_DEPTH", sram_depth, "int"),
         ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
@@ -553,7 +554,7 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def run_regression(N: int, T: int, target_test: str = None):
+def run_regression(N: int, T: int, target_test: str = None, lanes: int = 16):
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
@@ -578,7 +579,7 @@ def run_regression(N: int, T: int, target_test: str = None):
         )
 
         # 1. Generate Vectors & Dump Expected Traces
-        cfg = {"n": N, "tile_size": T, **t}
+        cfg = {"n": N, "tile_size": T, "lanes": lanes, **t}
         generate_vectors(cfg)
 
         # 2. Run Verilator (Streams live status)
@@ -634,6 +635,7 @@ if __name__ == "__main__":
     )
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)
+    p.add_argument("--lanes", type=int, default=16)
     p.add_argument("--mode", default="matmul", choices=["matmul", "conv"])
     p.add_argument("--conv-type", default="basic")
     p.add_argument("--activation", default="selu")
@@ -643,7 +645,7 @@ if __name__ == "__main__":
     args, unknown = p.parse_known_args()
 
     if args.action == "regression":
-        run_regression(args.matrix_size, args.tile_size, args.test)
+        run_regression(args.matrix_size, args.tile_size, args.test, args.lanes)
     elif args.action == "gen":
         generate_vectors(
             {

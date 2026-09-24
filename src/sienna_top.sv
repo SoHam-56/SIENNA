@@ -3,6 +3,7 @@
 module sienna_top #(
     parameter int    NUM_LANES         = 16,
     parameter int    N                 = 16,
+    parameter int    TILE_SIZE         = 4,
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
@@ -185,7 +186,7 @@ module sienna_top #(
 
   SystolicMesh #(
       .MATRIX_SIZE(N),
-      .TILE_SIZE  (4),
+      .TILE_SIZE  (TILE_SIZE),
       .DATA_WIDTH (DATA_WIDTH),
       .WIDE_READ  (NUM_LANES)
   ) systolic_array_inst (

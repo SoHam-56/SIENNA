@@ -18,9 +18,12 @@ CONFIGS = ["matmul_random_sigm", "matmul_random_tanh", "matmul_ident_selu", "con
            "matmul_random_tanh_train", "matmul_large_selu", "matmul_large_sigm", "matmul_large_tanh"]
 
 
+GEOM = {"n": 16, "tile_size": 4, "lanes": 16}  # set from the command line in main()
+
+
 def run(name: str, num_sets: int, build_dir: str) -> str:
     cfg = next(t for t in reg.PIPELINE_TESTS if t["name"] == name)
-    reg.generate_vectors({"n": 16, "tile_size": 4, **cfg, "num_sets": num_sets})
+    reg.generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
     cmd = ["make", "verilator", "TRACE=0", "EXTRA_FLAGS=-DPERF", f"VERILATOR_DIR={build_dir}"]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     return r.stdout + r.stderr
@@ -82,7 +85,7 @@ def analyse(ev: dict, k_sets: int) -> dict:
             drain=p_done[k] - p_wait[k],
             pool=p_done[k] - p_start[k],
             latency=done[k] - start[k],
-            lane_util=(lanes[k][0] / (16 * lanes[k][1])) if k < len(lanes) and lanes[k][1] else 0.0,
+            lane_util=(lanes[k][0] / (GEOM["lanes"] * lanes[k][1])) if k < len(lanes) and lanes[k][1] else 0.0,
         )
         sets.append(s)
     gaps = [done[k] - done[k - 1] for k in range(1, n)]
@@ -124,10 +127,15 @@ def main() -> None:
     ap.add_argument("--configs", nargs="*", default=CONFIGS)
     ap.add_argument("--clock-mhz", type=float, default=950.0,
                     help="assumed clock for GFLOPS; no timing run has demonstrated one")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=16)
     ap.add_argument("--build-dir", default=os.environ.get("PERF_BUILD_DIR", os.path.join(ROOT, "Verilator_perf")))
     args = ap.parse_args()
+    GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes)
+    flop = 2 * args.n ** 3
     L = ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
-         f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N=16  TILE=4  lanes=16  {args.sets} streamed sets per config",
+         f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  {args.sets} streamed sets per config",
          " Every number below is measured from TB_sienna_top's PERF trace unless marked MODEL.",
          " Stage times are occupancy: from the stage taking a set to releasing it.", ""]
     summary, models = [], []
@@ -156,11 +164,11 @@ def main() -> None:
               f"single-set latency {s[0]['latency']} cycles",
               f"  Bottleneck   : {bott} ({stage[bott]} cycles per set); stage occupancy over the run: "
               + ", ".join(f"{k} {100*v/a['span']:.0f}%" for k, v in a['busy'].items()),
-              f"  Matmul rate  : 8192 FLOP per set -> {8192/steady:.1f} FLOP/cycle at steady state, "
-              f"{8192/steady*args.clock_mhz/1000:.2f} GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz" if steady else "",
+              f"  Matmul rate  : {flop} FLOP per set -> {flop/steady:.1f} FLOP/cycle at steady state, "
+              f"{flop/steady*args.clock_mhz/1000:.2f} GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz" if steady else "",
               ""]
-        summary.append([name, s[0]["latency"], f"{steady:.0f}", f"{8192/steady:.1f}",
-                        f"{8192/steady*args.clock_mhz/1000:.2f}", bott, stage[bott], "pass"])
+        summary.append([name, s[0]["latency"], f"{steady:.0f}", f"{flop/steady:.1f}",
+                        f"{flop/steady*args.clock_mhz/1000:.2f}", bott, stage[bott], "pass"])
         # MODEL: lanes fill one word per cycle, so lane 15 starts about 240 cycles after lane 0.
         if bott == "activation" and med("read") >= 240:
             par = med("act") - 240
@@ -169,7 +177,7 @@ def main() -> None:
     L += ["=" * 100, " SUMMARY", "=" * 100]
     L += fmt_table(summary, ["config", "latency", "cycles/set", "FLOP/cyc", f"GFLOPS@{args.clock_mhz:.0f}MHz*",
                              "bottleneck", "its cycles", "sim"])
-    L += [f" * {args.clock_mhz:.0f} MHz is ASSUMED, not a timing result; GFLOPS count the 8192-FLOP matmul only."]
+    L += [f" * {args.clock_mhz:.0f} MHz is ASSUMED, not a timing result; GFLOPS count the {flop}-FLOP matmul only."]
     mb = mesh_block()
     if mb:
         L += ["", " MESH BLOCK (measured, SystolicMesh regression, mm_random, 5 sets)"]
@@ -180,8 +188,7 @@ def main() -> None:
               " 16-wide mesh result read would remove that, and the next limit is the 257-cycle host load:"]
         L += fmt_table(models, ["config", "activ now", "activ est", "cycles/set now", "cycles/set est", "gain"])
     L += ["", " MODEL (not measured): the host writes A and B one word per cycle each, so a set cannot enter",
-          " faster than 256 cycles plus the start handshake; the activation stage reads the mesh result",
-          " one word per cycle, so it cannot finish a set in fewer than 256 cycles either."]
+          f" faster than {args.n * args.n} cycles plus the start handshake."]
     os.makedirs(os.path.dirname(REPORT), exist_ok=True)
     open(REPORT, "w").write("\n".join(L) + "\n")
     print("\n".join(L))

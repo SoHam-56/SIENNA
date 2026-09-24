@@ -645,7 +645,8 @@ it halves x to |z| <= 1 (exact), evaluates e^z - 1 by an 11-term Taylor series, 
 back without cancellation (`d <- d(d + 2)` for e^x - 1, `E <- E^2` for e^x). The fitted
 coefficients and the published lane are untouched. `regression.py --lane poly` runs the poly
 lane; it passes at default range, +/-12 and +/-100, worst 0.37%. A tail element costs up to
-~250 cycles against ~20; normal data rarely reaches the tails.
+~270 cycles against ~20. Since 2026-09-23 it starts when the element is captured, so the first
+tail element in a lane hides under the polynomial run; later ones in the same lane queue behind it.
 
 ## 18. Dropout training mode could reorder, lose and correlate outputs — FIXED
 

@@ -23,16 +23,22 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 
 Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-23), after the
-parallel lane fill, the parallel tree reduce and the row-wide broadcast. GFLOPS count the
-8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
+parallel lane fill, the parallel tree reduce, the row-wide broadcast and the tail overlap. GFLOPS
+count the 8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
 
 | Config | Single set | Per set, steady | GFLOPS @950 | Bottleneck |
 |---|---|---|---|---|
-| matmul_ident_selu / conv_basic_selu | 421 | 336 | 23.2 | host load (257) |
-| matmul_random_tanh | 447 | 459 | 17.0 | activation (tails) |
-| matmul_random_sigm | 877 | 472 | 16.5 | activation (tails) |
-| matmul_random_tanh_train | 455 | 459 | 17.0 | activation (tails) |
-| matmul_large_{selu,sigm,tanh} | 3031-4391 | 2449-3896 | 2.0-3.2 | activation (tails) |
+| matmul_ident_selu / conv_basic_selu | 421 | 266 | 29.2 | host load (257) |
+| matmul_random_tanh | 447 | 303 | 25.7 | activation (277) |
+| matmul_random_sigm | 693 | 325 | 24.0 | activation (295) |
+| matmul_random_tanh_train | 455 | 303 | 25.7 | activation (277) |
+| matmul_large_{selu,sigm,tanh} | 2819-4155 | 2235-3659 | 2.1-3.5 | activation (tails) |
+
+Before the tail overlap, steady state was 336 / 459 / 472 / 459 and 2449-3896: a tail element
+started only when its turn came to emit, after the polynomial run, so one such element in any
+lane doubled the round. It now starts as it is captured and runs beside the polynomial; results
+are bit-identical. Lanes with several tail elements still run them one at a time, which is what
+keeps the large-value configs slow.
 
 The mesh stage is 129 cycles per set (broadcast 4, tiles 94, reduce 29); it was 202 (16, 94,
 90) before the tree reduce and the row-wide broadcast. That cut every single-set latency by 73
@@ -41,9 +47,9 @@ phase is now most of the mesh: each PE takes about 10 cycles per multiply-accumu
 
 Before the parallel fill the same runs gave 751-1003 single-set and 565-645 per set (12.1-13.8
 GFLOPS at the same assumed clock), with lanes 36-48% busy; they are now 93% busy on data inside
-the fitted range. What remains: sets whose elements fall past the fitted polynomials pay ~250
-cycles per such element in `gpnae_tail`, and on well-behaved data the 1-word-per-cycle host load
-is the limit. `python3 perf_analysis.py` regenerates
+the fitted range. What remains: the second and later tail elements in a lane still pay ~270
+cycles each in `gpnae_tail`, and on well-behaved data the 1-word-per-cycle host load is the
+limit. `python3 perf_analysis.py` regenerates
 `testbenches/results/perf/pipeline_performance_report.log`.
 
 ## Mesh interface after phase 2

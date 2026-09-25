@@ -13,7 +13,7 @@ module sienna_multi #(
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
     parameter int ADDR_LINES        = $clog2(FIFO_DEPTH),
-    parameter int CONTROL_WIDTH     = 2,
+    parameter int CONTROL_WIDTH     = 3,
     parameter int IN_ROWS           = 16,
     parameter int IN_COLS           = 16,
     parameter int POOL_H            = 2,

@@ -10,7 +10,7 @@ module sienna_top #(
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
-    parameter int    CONTROL_WIDTH     = 2,
+    parameter int    CONTROL_WIDTH     = 3,  // activation: 001 SELU, 010 sigmoid, 011 tanh, 100 ReLU, 101 linear
     parameter int    IN_ROWS           = 16,
     parameter int    IN_COLS           = 16,
     parameter int    POOL_H            = 2,
@@ -55,7 +55,7 @@ module sienna_top #(
 
   localparam int GPNAE_DATA_WIDTH = 32;
   localparam int GPNAE_ADDR_LINES = 5;
-  localparam int GPNAE_CTRL_WIDTH = 2;
+  localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
   // Work is split evenly across the lanes rather than filling each to its FIFO depth. With
   // 8 lanes those coincide (256/8 = 32 = GPNAE_FIFO_DEPTH), which is why the old code could use
@@ -103,6 +103,8 @@ module sienna_top #(
   logic                  set_train[4];
   logic [LFSR_WIDTH-1:0] set_seed [4];
   logic                  set_accum[4];  // the set is a partial sum: accumulate it, output nothing
+  logic [CONTROL_WIDTH-1:0] set_act[4];  // activation each set asked for, so layers in flight keep their own
+  logic [   ADDR_LINES:0] set_terms[4];  // polynomial terms that go with set_act
   logic [1:0] act_null;  // per activation bank: holds a partial set, which pooling passes through without output
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
@@ -312,8 +314,8 @@ module sienna_top #(
     for (int i = 0; i < NUM_LANES; i++) begin
       dropout_in_valid[i] = maxpool_out_valid[i];
       dropout_data_in[i] = maxpool_out_data[i];
-      gpnae_terms[i] = num_terms_i[GPNAE_ADDR_LINES-1:0];
-      gpnae_ctrl[i] = activation_function_i;
+      gpnae_terms[i] = set_terms[g_set_id][GPNAE_ADDR_LINES-1:0];
+      gpnae_ctrl[i] = set_act[g_set_id];  // the set the activation stage holds
     end
   end
 
@@ -543,11 +545,15 @@ module sienna_top #(
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
         set_accum[k] <= 1'b0;
+        set_act[k]   <= '0;
+        set_terms[k] <= '0;
       end
     end else begin
       complete_q <= pipeline_complete_o;
       if (host_accept) begin
         set_accum[host_next_id] <= accumulate_i;
+        set_act[host_next_id]   <= activation_function_i;
+        set_terms[host_next_id] <= num_terms_i;
         set_train[host_next_id] <= training_mode_i;
         set_seed[host_next_id]  <= dropout_seed_i;
         host_next_id <= host_next_id + 1'b1;

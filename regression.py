@@ -291,7 +291,11 @@ def generate_vectors(cfg: dict) -> None:
 
     # Set k's dropout seed is set_dropout_seed(DROPOUT_SEED, k), as the TB drives it.
     drop_seed = 0x2ACE0000 + seed
-    C, C_act, C_pooled, C_final = _golden(A, B, cfg, act_type, drop_seed)
+    # "bias" gives the first pass of every group a random bias row, which the mesh adds to each column.
+    use_bias = bool(cfg.get("bias", False))
+    bias_of = lambda k: (np.random.RandomState(seed + 5000 + k).uniform(-1.0, 1.0, N) * scale).astype(np.float32)
+    C0 = _ref_matmul(A, B) + (bias_of(0) if use_bias else np.float32(0.0))
+    C, C_act, C_pooled, C_final = _golden_from_c(C0.astype(np.float32), cfg, act_type, drop_seed)
 
     # Write files for Verilator testbench
     write_mem(os.path.join(TB_DIR, "matrix_west.mem"), A)
@@ -315,14 +319,17 @@ def generate_vectors(cfg: dict) -> None:
             rng = np.random.RandomState(seed + 1000 + k)
             Ak = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
             Bk = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
+        bk = bias_of(k) if use_bias and k % passes == 0 else np.zeros(N, dtype=np.float32)
+        write_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), bk)
         if passes > 1:
-            Ck = _ref_matmul(Ak, Bk)
+            Ck = (_ref_matmul(Ak, Bk) + bk).astype(np.float32)
             run = Ck if k % passes == 0 else (run + Ck).astype(np.float32)  # summed in pass order, as the hardware does
             partial = (k % passes) != passes - 1
             Fk = np.zeros(0, dtype=np.float32) if partial else _golden_from_c(run, cfg, act_k, set_dropout_seed(drop_seed, k))[3]
         else:
             partial = False
-            Fk = C_final if k == 0 else _golden(Ak, Bk, cfg, act_k, set_dropout_seed(drop_seed, k))[3]
+            Fk = C_final if k == 0 else _golden_from_c((_ref_matmul(Ak, Bk) + bk).astype(np.float32), cfg, act_k,
+                                                       set_dropout_seed(drop_seed, k))[3]
         write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
         write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
         write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
@@ -361,6 +368,7 @@ def generate_vectors(cfg: dict) -> None:
         ("CONTROL_WIDTH", 3, "int"),
         ("NUM_SETS", num_sets, "int"),
         ("SETS_IN_FLIGHT", SETS_IN_FLIGHT, "int"),
+        ("HAS_BIAS", int(use_bias), "int"),
         ("ACCUM_PASSES", passes, "int"),
         ("MIXED_LEN", len(mixed), "int"),
         ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
@@ -547,6 +555,12 @@ PIPELINE_TESTS = [
     {"name": "matmul_accum2_mixed_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu",
      "accum_passes": 2, "pool_h": 1, "pool_w": 1, "padding": 0,
      "mixed_acts": ["relu", "relu", "linear", "linear", "tanh", "tanh", "relu", "relu"]},
+    # A bias row added by the mesh: on every set, and on the first pass of each accumulate group.
+    {"name": "matmul_bias_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "bias": True,
+     "pool_h": 1, "pool_w": 1, "padding": 0},
+    {"name": "matmul_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "bias": True},
+    {"name": "matmul_accum3_bias_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
+     "bias": True, "accum_passes": 3, "pool_h": 1, "pool_w": 1, "padding": 0},
 ]
 
 

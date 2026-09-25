@@ -27,6 +27,8 @@ module TB_sienna_top;
   logic                     start_pipeline_i;
   logic                     training_mode_i;
   logic                     accumulate_i;  // this set is a partial sum
+  logic                     bias_valid_i;  // this set carries a bias row
+  logic [N-1:0][DATA_WIDTH-1:0] bias_i;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
@@ -90,6 +92,8 @@ module TB_sienna_top;
       .start_pipeline_i           (start_pipeline_i),
       .training_mode_i            (training_mode_i),
       .accumulate_i               (accumulate_i),
+      .bias_valid_i               (bias_valid_i),
+      .bias_i                     (bias_i),
       .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
@@ -215,6 +219,8 @@ module TB_sienna_top;
     start_pipeline_i = 0;
     training_mode_i = 1'b0;
     accumulate_i = 1'b0;
+    bias_valid_i = 1'b0;
+    bias_i = '0;
     dropout_seed_i = '1;
     north_write_reset_i = 1;
     west_write_reset_i = 1;
@@ -470,6 +476,17 @@ module TB_sienna_top;
     endcase
   endfunction
 
+  // Set k's bias: with HAS_BIAS, the first pass of each group reads bias_<k>.mem.
+  task automatic apply_bias(input int k);
+    logic [DATA_WIDTH-1:0] q[$];
+    bias_valid_i = (HAS_BIAS != 0) && ((k % ACCUM_PASSES) == 0);
+    bias_i = '0;
+    if (bias_valid_i) begin
+      read_mem_file($sformatf("bias_%0d.mem", k), q);
+      for (int c = 0; c < N; c++) bias_i[c] = q[c];
+    end
+  endtask
+
   // Set k's dropout seed; regression.py's set_dropout_seed() mirrors it.
   function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
     return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
@@ -607,6 +624,7 @@ module TB_sienna_top;
               accumulate_i = is_partial(k);
               activation_function_i = act_of(k);
               num_terms_i = terms_of(k);
+              apply_bias(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
@@ -715,6 +733,7 @@ module TB_sienna_top;
           accumulate_i = is_partial(k);
           activation_function_i = act_of(k);
           num_terms_i = terms_of(k);
+          apply_bias(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
           start_pipeline_i = 1;
@@ -831,6 +850,7 @@ module TB_sienna_top;
     $display("\n[STAGE] Starting pipeline");
     activation_function_i = act_of(0);
     num_terms_i           = terms_of(0);
+    apply_bias(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
@@ -861,6 +881,7 @@ module TB_sienna_top;
       dropout_seed_i = set_seed(1);
       activation_function_i = act_of(1);
       num_terms_i = terms_of(1);
+      apply_bias(1);
       trace_states = 1;
       actual_results.delete();
       total_elements = 0;

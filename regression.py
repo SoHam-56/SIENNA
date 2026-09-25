@@ -50,12 +50,12 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 # =============================================================================
 
 
-# GPNAE control words. 01/10/11 are the only modes the hardware decodes; anything else stalls the lane.
+# Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
 # No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
-ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3}
+ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 
 # Polynomial terms per activation, as passed to the TYTAN controller.
-ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30}
+ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
 
 
 def activation_to_code(act: str) -> int:
@@ -88,7 +88,9 @@ def apply_activation(x: np.ndarray, act: str) -> np.ndarray:
         return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
     if act == "tanh":
         return np.tanh(x).astype(np.float32)
-    return x.copy()  # IDLE
+    if act == "relu":
+        return np.where(x > 0, x, np.float32(0.0)).astype(np.float32)
+    return x.copy()  # linear
 
 
 def apply_maxpool_2d(
@@ -297,10 +299,13 @@ def generate_vectors(cfg: dict) -> None:
     # Streamed sets: set 0 is the test's own pattern, the rest random and distinct.
     # accum_passes P groups the streamed sets P at a time: P-1 partial products, then the set that is activated.
     passes = cfg.get("accum_passes", 1)
-    num_sets = cfg.get("num_sets", 2 * passes if passes > 1 else 4)
+    mixed = cfg.get("mixed_acts", [])  # set k uses mixed[k % len], set 0 must match act
+    assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
+    num_sets = cfg.get("num_sets", len(mixed) or (2 * passes if passes > 1 else 4))
     masks = []
     run = None
     for k in range(num_sets):
+        act_k = mixed[k % len(mixed)] if mixed else act_type
         if k == 0:
             Ak, Bk = A, B
         else:
@@ -311,10 +316,10 @@ def generate_vectors(cfg: dict) -> None:
             Ck = _ref_matmul(Ak, Bk)
             run = Ck if k % passes == 0 else (run + Ck).astype(np.float32)  # summed in pass order, as the hardware does
             partial = (k % passes) != passes - 1
-            Fk = np.zeros(0, dtype=np.float32) if partial else _golden_from_c(run, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
+            Fk = np.zeros(0, dtype=np.float32) if partial else _golden_from_c(run, cfg, act_k, set_dropout_seed(drop_seed, k))[3]
         else:
             partial = False
-            Fk = C_final if k == 0 else _golden(Ak, Bk, cfg, act_type, set_dropout_seed(drop_seed, k))[3]
+            Fk = C_final if k == 0 else _golden(Ak, Bk, cfg, act_k, set_dropout_seed(drop_seed, k))[3]
         write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
         write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
         write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
@@ -350,9 +355,11 @@ def generate_vectors(cfg: dict) -> None:
         ("PADDING", cfg.get("padding", 1), "int"),
         ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
         ("LFSR_WIDTH", 32, "int"),
-        ("CONTROL_WIDTH", 2, "int"),
+        ("CONTROL_WIDTH", 3, "int"),
         ("NUM_SETS", num_sets, "int"),
         ("ACCUM_PASSES", passes, "int"),
+        ("MIXED_LEN", len(mixed), "int"),
+        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
         ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
         ("DROPOUT_SEED", drop_seed, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
@@ -526,6 +533,16 @@ PIPELINE_TESTS = [
     {"name": "matmul_accum3_selu", "mode": "matmul", "matrix_type": "random", "act": "selu", "accum_passes": 3},
     {"name": "matmul_accum2_tanh_train", "mode": "matmul", "matrix_type": "random", "act": "tanh",
      "accum_passes": 2, "training": True},
+    # Modes the network layers use: ReLU and linear skip the polynomial, 1x1 pooling with no padding passes values through.
+    {"name": "matmul_random_relu", "mode": "matmul", "matrix_type": "random", "act": "relu"},
+    {"name": "matmul_random_linear", "mode": "matmul", "matrix_type": "random", "act": "linear"},
+    {"name": "matmul_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu",
+     "pool_h": 1, "pool_w": 1, "padding": 0},
+    {"name": "matmul_mixed_act", "mode": "matmul", "matrix_type": "random", "act": "tanh",
+     "mixed_acts": ["tanh", "relu", "selu", "linear", "sigmoid", "relu"]},
+    {"name": "matmul_accum2_mixed_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu",
+     "accum_passes": 2, "pool_h": 1, "pool_w": 1, "padding": 0,
+     "mixed_acts": ["relu", "relu", "linear", "linear", "tanh", "tanh", "relu", "relu"]},
 ]
 
 

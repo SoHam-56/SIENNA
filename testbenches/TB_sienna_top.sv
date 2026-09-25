@@ -452,6 +452,22 @@ module TB_sienna_top;
     return (ACCUM_PASSES > 1) && ((k % ACCUM_PASSES) != ACCUM_PASSES - 1);
   endfunction
 
+  // Set k's activation: with MIXED_LEN > 0 the codes cycle through MIXED_ACTS, 4 bits per set.
+  function automatic logic [CONTROL_WIDTH-1:0] act_of(input int k);
+    return (MIXED_LEN > 0) ? CONTROL_WIDTH'((MIXED_ACTS >> (4 * (k % MIXED_LEN))) & 15) : CONTROL_WIDTH'(ACTIVATION_CODE);
+  endfunction
+
+  // Polynomial terms for set k's code, the same table as regression.py's ACTIVATION_TERMS.
+  function automatic logic [ADDR_LINES:0] terms_of(input int k);
+    if (MIXED_LEN == 0) return NUM_TERMS[ADDR_LINES:0];
+    case (act_of(k))
+      1: return 14;
+      2: return 15;
+      3: return 30;
+      default: return 0;
+    endcase
+  endfunction
+
   // Set k's dropout seed; regression.py's set_dropout_seed() mirrors it.
   function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
     return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
@@ -587,6 +603,8 @@ module TB_sienna_top;
               read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
               dropout_seed_i = set_seed(k);
               accumulate_i = is_partial(k);
+              activation_function_i = act_of(k);
+              num_terms_i = terms_of(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
@@ -693,6 +711,8 @@ module TB_sienna_top;
           read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
           read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
           accumulate_i = is_partial(k);
+          activation_function_i = act_of(k);
+          num_terms_i = terms_of(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
           start_pipeline_i = 1;
@@ -801,8 +821,8 @@ module TB_sienna_top;
     repeat (5) @(posedge clk_i);
 
     $display("\n[STAGE] Starting pipeline");
-    activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
-    num_terms_i           = NUM_TERMS[ADDR_LINES:0];
+    activation_function_i = act_of(0);
+    num_terms_i           = terms_of(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
@@ -831,6 +851,8 @@ module TB_sienna_top;
       read_mem_file("matrix_north_1.mem", north_data_queue);
       read_mem_file("expected_output_1.mem", expected_results);
       dropout_seed_i = set_seed(1);
+      activation_function_i = act_of(1);
+      num_terms_i = terms_of(1);
       trace_states = 1;
       actual_results.delete();
       total_elements = 0;

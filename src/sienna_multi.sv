@@ -9,6 +9,7 @@ module sienna_multi #(
     parameter int TILE_SIZE         = 4,
     parameter int HOST_WORDS        = N,
     parameter int COLLAPSE_K        = 1,  // collapse-k mesh in every copy, as in sienna_top
+    parameter int SETS_IN_FLIGHT    = 7,  // credits per copy
     parameter int DATA_WIDTH        = 32,
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
@@ -45,7 +46,7 @@ module sienna_multi #(
     output logic [COPIES-1:0][NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
     output logic [COPIES-1:0][NUM_LANES-1:0]                 result_valid_o,
     output logic [COPIES-1:0]                                pipeline_complete_o,
-    output logic [COPIES-1:0][1:0]                           done_set_id_o
+    output logic [COPIES-1:0][$clog2(SETS_IN_FLIGHT+1)-1:0]  done_set_id_o
 );
   localparam int SW = $clog2(COPIES + 1);
   logic [SW-1:0] sel;
@@ -68,6 +69,7 @@ module sienna_multi #(
         .TILE_SIZE        (TILE_SIZE),
         .HOST_WORDS       (HOST_WORDS),
         .COLLAPSE_K       (COLLAPSE_K),
+        .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
         .DATA_WIDTH       (DATA_WIDTH),
         .SRAM_DEPTH       (SRAM_DEPTH),
         .FIFO_DEPTH       (FIFO_DEPTH),

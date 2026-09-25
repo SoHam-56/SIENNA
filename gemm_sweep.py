@@ -34,9 +34,10 @@ def main():
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "gemm"))
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL")
     ap.add_argument("--quick", action="store_true", help="a few small shapes only")
+    ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
-    sim = (mr.EmuSim if a.emulate else mr.Sim)(a.n, a.lanes, a.work)
+    sim = (mr.EmuSim if a.emulate else mr.Sim)(a.n, a.lanes, a.work, a.host_gaps)
     sim.build()
     shapes = [(f"grid_{m}x{k}x{n}", m, k, n) for m in GRID_M for k in GRID_K for n in GRID_N] + TRANSFORMER
     if a.quick:

@@ -263,8 +263,9 @@ def read_outputs(path):
 class Sim:
     """The TB_sienna_model binary, built once per configuration and run once per layer."""
 
-    def __init__(self, N, lanes, work):
+    def __init__(self, N, lanes, work, host_gaps=False):
         self.N, self.lanes, self.work = N, lanes, work
+        self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
         self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_model_sim")
         self.cycles = 0
         self.sets = 0
@@ -282,7 +283,8 @@ class Sim:
         sets_f = os.path.join(self.work, f"{tag}.sets")
         out_f = os.path.join(self.work, f"{tag}.out")
         n = write_sets(sets_f, groups, act)
-        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"], cwd=os.path.dirname(self.bin),
+        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
+                           cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
         m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
         if not m or int(m.group(6)) != 0:
@@ -471,6 +473,7 @@ def main():
     ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
     ap.add_argument("--no-sim", action="store_true", help="float reference only")
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL, to check the lowering")
+    ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     report = os.path.join(a.work, f"model_report_N{a.n}.log")
@@ -484,7 +487,7 @@ def main():
 
     sim = None
     if not a.no_sim:
-        sim = (EmuSim if a.emulate else Sim)(a.n, a.lanes, a.work)
+        sim = (EmuSim if a.emulate else Sim)(a.n, a.lanes, a.work, a.host_gaps)
         t0 = time.time()
         sim.build()
         log(f"built TB_sienna_model N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")

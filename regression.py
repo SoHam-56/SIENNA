@@ -52,7 +52,7 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 
 # Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
 # No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
-SETS_IN_FLIGHT = 7  # sienna_top's credits; the testbenches read it from the package
+SETS_IN_FLIGHT = 8  # sienna_top's credits; the testbenches read it from the package
 
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 

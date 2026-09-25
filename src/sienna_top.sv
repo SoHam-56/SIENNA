@@ -6,6 +6,8 @@ module sienna_top #(
     parameter int    TILE_SIZE         = 4,
     parameter int    HOST_WORDS        = N,  // words per host write, one matrix row; must divide N*N
     parameter int    COLLAPSE_K        = 1,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
+    parameter int    SETS_IN_FLIGHT    = 7,  // credits: sets started and not yet complete
+    parameter int    ID_W              = $clog2(SETS_IN_FLIGHT + 1),  // set id width; ids count accepted starts
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
@@ -44,7 +46,7 @@ module sienna_top #(
 
     output logic pipeline_complete_o,
     output logic pipeline_ready_o,  // a credit and a staging bank are free
-    output logic [1:0] done_set_id_o,  // id of the set pipeline_complete_o reports
+    output logic [ID_W-1:0] done_set_id_o,  // id of the set pipeline_complete_o reports
     output logic systolic_busy_o,
     output logic gpnae_busy_o,
     output logic maxpool_busy_o,
@@ -82,7 +84,9 @@ module sienna_top #(
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
   localparam int MAXPOOL_OUT_COUNT = POOL_OUT_ROWS * POOL_OUT_COLS;
 
-  localparam int MAX_SETS_IN_FLIGHT = 3;
+  localparam int NUM_IDS = 1 << ID_W;  // more ids than sets in flight, so ids in flight never repeat
+  localparam int CRW = $clog2(SETS_IN_FLIGHT + 1);
+  initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
 
   // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
   // G_ACC_RD/G_ACC_WAIT add a mesh result into acc_mem; G_AFEED fills the lanes from acc_mem instead of the mesh.
@@ -96,15 +100,15 @@ module sienna_top #(
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
-  logic [1:0] credits;  // sets the host may still start
-  logic [2:0] mesh_sets;  // accepted sets the activation stage has not taken yet
-  logic [1:0] g_next_id, g_set_id, p_next_id, p_set_id, host_next_id;
+  logic [CRW-1:0] credits;  // sets the host may still start
+  logic [CRW-1:0] mesh_sets;  // accepted sets the activation stage has not taken yet
+  logic [ID_W-1:0] g_next_id, g_set_id, p_next_id, p_set_id, host_next_id;
   // Dropout mode and seed travel with each set, indexed by its id, so sets in flight keep their own.
-  logic                  set_train[4];
-  logic [LFSR_WIDTH-1:0] set_seed [4];
-  logic                  set_accum[4];  // the set is a partial sum: accumulate it, output nothing
-  logic [CONTROL_WIDTH-1:0] set_act[4];  // activation each set asked for, so layers in flight keep their own
-  logic [   ADDR_LINES:0] set_terms[4];  // polynomial terms that go with set_act
+  logic                  set_train[NUM_IDS];
+  logic [LFSR_WIDTH-1:0] set_seed [NUM_IDS];
+  logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
+  logic [CONTROL_WIDTH-1:0] set_act[NUM_IDS];  // activation each set asked for, so layers in flight keep their own
+  logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with set_act
   logic [1:0] act_null;  // per activation bank: holds a partial set, which pooling passes through without output
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
@@ -534,14 +538,14 @@ module sienna_top #(
       complete_q <= 1'b0;
       act_wr    <= 1'b0;
       act_rd    <= 1'b0;
-      credits   <= MAX_SETS_IN_FLIGHT[1:0];
+      credits   <= CRW'(SETS_IN_FLIGHT);
       mesh_sets <= '0;
       g_next_id <= '0;
       g_set_id  <= '0;
       p_next_id <= '0;
       p_set_id  <= '0;
       host_next_id <= '0;
-      for (int k = 0; k < 4; k++) begin
+      for (int k = 0; k < NUM_IDS; k++) begin
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
         set_accum[k] <= 1'b0;
@@ -584,8 +588,8 @@ module sienna_top #(
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
-      credits   <= credits - {1'b0, host_accept} + {1'b0, pipeline_complete_o};
-      mesh_sets <= mesh_sets + {2'b0, host_accept} - {2'b0, g_accept};
+      credits   <= credits - CRW'(host_accept) + CRW'(pipeline_complete_o);
+      mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept);
       if (g_accept) begin
         g_set_id  <= g_next_id;
         g_next_id <= g_next_id + 1'b1;
@@ -861,11 +865,11 @@ module sienna_top #(
 
 `ifndef SYNTHESIS
   // Stage handshake invariants; live only with --assert.
-  a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) credits <= MAX_SETS_IN_FLIGHT)
-    else $error("sienna_top: more credits than MAX_SETS_IN_FLIGHT");
+  a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) credits <= SETS_IN_FLIGHT)
+    else $error("sienna_top: more credits than SETS_IN_FLIGHT");
   a_credit_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) host_accept |-> credits != 0)
     else $error("sienna_top: a start was accepted without a credit");
-  a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> credits < MAX_SETS_IN_FLIGHT)
+  a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> credits < SETS_IN_FLIGHT)
     else $error("sienna_top: a set finished with every credit already free");
   a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) systolic_start |-> mesh_input_ready)
     else $error("sienna_top: a start was forwarded to a mesh with no free staging bank");

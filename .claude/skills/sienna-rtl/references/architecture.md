@@ -113,6 +113,16 @@ Output-stationary and fully synchronous. A (T×K) and B (K×T) sit in local regi
 
 These encodings match `activation_to_code()` and `get_polynomial_terms()` in `regression.py`.
 
+The pipeline instantiates `gpnae_poly`, not `gpnae.sv`. Its control word is 3 bits and adds two modes that bypass the polynomial:
+
+| `control_word_i` | Activation | `NUM_TERMS` |
+|---|---|---|
+| `3'b001` / `3'b010` / `3'b011` | SELU / sigmoid / tanh, as above | 14 / 15 / 30 |
+| `3'b100` | ReLU, exact | 0 |
+| `3'b101` | linear, exact | 0 |
+
+`sienna_top` stores the code and the term count per set (`set_act`, `set_terms`), so consecutive sets can use different activations.
+
 ### Structure
 
 `gpnae.sv` holds an `InputFIFO`, a `mac` (the Taylor/Maclaurin evaluator), a `SeLu` block, a `sigtan` block, and `gpnae_control_unit`.

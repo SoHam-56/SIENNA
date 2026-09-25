@@ -323,11 +323,21 @@ module sienna_top #(
     end
   end
 
+  // ReLU and linear need no polynomial: the activation stage writes each beat straight into its bank and the lanes stay idle.
+  logic act_bypass;
+  assign act_bypass = (set_act[g_set_id] == CONTROL_WIDTH'(3'b100)) || (set_act[g_set_id] == CONTROL_WIDTH'(3'b101));
+  logic act_is_relu;
+  assign act_is_relu = (set_act[g_set_id] == CONTROL_WIDTH'(3'b100));
+
   // =========================================================================
   // GPNAE TO CENTRAL BUFFER WRITE LOGIC
   // =========================================================================
   always_ff @(posedge clk_i) begin
-    if (g_state == G_ROUND) begin
+    // Beat b of the wide read holds element k*PER_LANE + b in word k, the element lane k would have taken.
+    if (g_state != G_IDLE && act_bypass && fill_v)
+      for (int k = 0; k < NUM_LANES; k++)
+        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+    if (g_state == G_ROUND && !act_bypass) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           // RESTORED: This is the mathematically perfect chunked indexing!
@@ -519,7 +529,7 @@ module sienna_top #(
   // Not while the previous result's read or release is in flight: its bank flag may still read full.
   assign g_accept = (g_state == G_IDLE) && systolic_collection_complete && !act_full[act_wr] &&
                     !systolic_read_enable && !systolic_release;
-  assign g_done = (g_state == G_ROUND) && all_collected;
+  assign g_done = (g_state == G_ROUND) && (act_bypass ? (fill_count[0] == PER_LANE[FCNT_W-1:0]) : all_collected);
   logic g_null_done;  // a partial set has been summed; it takes an activation bank only to keep sets in order
   assign g_null_done = (g_state == G_ACC_WAIT) && acc_done_w && set_accum[g_set_id];
   // A partial set passes pooling in one cycle, never right after another completion, so pulses stay one cycle.
@@ -567,7 +577,7 @@ module sienna_top #(
         G_IDLE:     if (g_accept) g_state <= (set_accum[g_next_id] || acc_valid) ? G_ACC_RD : G_FEED;
         G_FEED:     g_state <= G_LATCH;
         G_LATCH:    g_state <= G_ROUND;
-        G_ROUND:    if (all_collected) g_state <= G_IDLE;
+        G_ROUND:    if (g_done) g_state <= G_IDLE;
         G_ACC_RD:   g_state <= G_ACC_WAIT;
         G_ACC_WAIT: if (acc_done_w) g_state <= set_accum[g_set_id] ? G_IDLE : G_AFEED;
         G_AFEED:    g_state <= G_LATCH;
@@ -656,13 +666,13 @@ module sienna_top #(
         filled_total_n = filled_total + NUM_LANES[TOT_W-1:0];
         for (int i = 0; i < NUM_LANES; i++) begin
           gpnae_signal_n[i] = fill_d[i];
-          gpnae_wr_en_n[i]  = 1'b1;
+          gpnae_wr_en_n[i]  = !act_bypass;
           fill_count_n[i]   = fill_count[i] + 1'b1;
         end
       end
       // Start every lane together, the cycle after its last element is written.
       for (int i = 0; i < NUM_LANES; i++) begin
-        if ((fill_count[i] == PER_LANE[FCNT_W-1:0]) && !load_finalized[i]) begin
+        if ((fill_count[i] == PER_LANE[FCNT_W-1:0]) && !load_finalized[i] && !act_bypass) begin
           gpnae_start_n[i]    = 1'b1;
           load_finalized_n[i] = 1'b1;
         end

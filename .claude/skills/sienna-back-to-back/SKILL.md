@@ -13,11 +13,14 @@ stage and a pooling stage, banked `gpnae_out_mem`, and put a 3-credit interface 
 front. Phase 4 is the regression: every test streams 4 distinct sets.
 
 **Update 2026-09-25.** The mesh itself is now pipelined (see `sienna-rtl` architecture), the
-credit count is the `SETS_IN_FLIGHT` parameter (default 7, ids `$clog2(SETS_IN_FLIGHT+1)` bits),
+credit count is the `SETS_IN_FLIGHT` parameter (default 8, ids `$clog2(SETS_IN_FLIGHT+1)` bits),
 ReLU and linear sets bypass the lanes, and 1x1 pooling with no padding bypasses FIFO2 and
 Maxpool (`POOL_BYPASS`). Every regression test streams `SETS_IN_FLIGHT + 2` sets. Measured
-steady state for ReLU sets: 19-21 cycles per set at N=16 (was 88) and 35 at N=32 (was 104); both
-are now set by the host load (N+1 cycles per set) plus two testbench handshake cycles. Three
+steady state for ReLU sets through TB_sienna_top: 19-21 cycles per set at N=16 (was 88) and 35 at N=32
+(was 104), set by that testbench's host (N rows plus a start cycle and two handshake cycles). With
+TB_sienna_model's streaming host (start with the last row) a GEMM runs at 17.4 cycles per set at N=16
+and exactly 32.0 at N=32, the mesh's own limit of N cycles per set. `TB_sienna_model +trace` logs every
+stage event and wait, which is how to find the next limit. Three
 credits had capped the rate at latency / 3, about 50 cycles per set, once the stages were fast.
 Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 
@@ -196,7 +199,7 @@ Double-buffering the *input staging* is what makes the credit contract clean.
 Without it, "credits available" would not imply "safe to write `mem_A`" and the
 host would need a second readiness signal on the side.
 
-Interface is credit-based: a counter initialized to `SETS_IN_FLIGHT` (7 since
+Interface is credit-based: a counter initialized to `SETS_IN_FLIGHT` (8 since
 2026-09-25, 3 before), decremented on accept, incremented when a set's last result
 leaves. Each set carries a `set_id` of `$clog2(SETS_IN_FLIGHT+1)` bits held by the
 stage controller processing it, not attached to every data word.

@@ -14,6 +14,8 @@ module TB_sienna_model;
   logic                     start_pipeline_i;
   logic                     training_mode_i;
   logic                     accumulate_i;
+  logic                     bias_valid_i;
+  logic [N-1:0][DATA_WIDTH-1:0] bias_i;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
@@ -61,6 +63,8 @@ module TB_sienna_model;
       .start_pipeline_i           (start_pipeline_i),
       .training_mode_i            (training_mode_i),
       .accumulate_i               (accumulate_i),
+      .bias_valid_i               (bias_valid_i),
+      .bias_i                     (bias_i),
       .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
@@ -135,7 +139,7 @@ module TB_sienna_model;
   initial begin
     string sets_f, out_f;
     integer fin, fout, rc;
-    int n_sets, acc, act, terms, bad_ids;
+    int n_sets, acc, act, terms, has_bias, bad_ids;
     logic [DATA_WIDTH-1:0] w;
     longint t0, waited;
 
@@ -143,6 +147,8 @@ module TB_sienna_model;
     start_pipeline_i = 0;
     training_mode_i = 0;
     accumulate_i = 0;
+    bias_valid_i = 0;
+    bias_i = '0;
     dropout_seed_i = '1;
     activation_function_i = '0;
     num_terms_i = '0;
@@ -172,8 +178,8 @@ module TB_sienna_model;
 
     t0 = cycle;
     for (int k = 0; k < n_sets; k++) begin
-      rc = $fscanf(fin, "%d %d %d", acc, act, terms);
-      if (rc != 3) begin
+      rc = $fscanf(fin, "%d %d %d %d", acc, act, terms, has_bias);
+      if (rc != 4) begin
         $display("[FATAL] set %0d header unreadable in %s", k, sets_f);
         $finish;
       end
@@ -187,6 +193,12 @@ module TB_sienna_model;
         rc = $fscanf(fin, "%h", w);
         north_q.push_back(w);
       end
+      bias_i = '0;
+      if (has_bias != 0)
+        for (int c = 0; c < N; c++) begin
+          rc = $fscanf(fin, "%h", w);
+          bias_i[c] = w;
+        end
       waited = 0;
       while (!pipeline_ready_o) begin
         @(posedge clk_i);
@@ -197,6 +209,7 @@ module TB_sienna_model;
         end
       end
       accumulate_i = acc[0];
+      bias_valid_i = (has_bias != 0);
       activation_function_i = CONTROL_WIDTH'(act);
       num_terms_i = terms[ADDR_LINES:0];
       load_set();

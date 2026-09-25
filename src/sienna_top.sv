@@ -4,8 +4,8 @@ module sienna_top #(
     parameter int    NUM_LANES         = 32,
     parameter int    N                 = 16,
     parameter int    TILE_SIZE         = 4,
-    parameter int    HOST_WORDS        = 1,  // words per host write; must divide N*N
-    parameter int    COLLAPSE_K        = 0,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
+    parameter int    HOST_WORDS        = N,  // words per host write, one matrix row; must divide N*N
+    parameter int    COLLAPSE_K        = 1,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,

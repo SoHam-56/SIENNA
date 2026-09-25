@@ -52,6 +52,8 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 
 # Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
 # No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
+SETS_IN_FLIGHT = 7  # sienna_top's credits; the testbenches read it from the package
+
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 
 # Polynomial terms per activation, as passed to the TYTAN controller.
@@ -301,7 +303,8 @@ def generate_vectors(cfg: dict) -> None:
     passes = cfg.get("accum_passes", 1)
     mixed = cfg.get("mixed_acts", [])  # set k uses mixed[k % len], set 0 must match act
     assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
-    num_sets = cfg.get("num_sets", len(mixed) or (2 * passes if passes > 1 else 4))
+    # Enough sets to use every credit, so the credit-overrun pass is reachable; whole accumulate groups only.
+    num_sets = cfg.get("num_sets", len(mixed) or -(-(SETS_IN_FLIGHT + 2) // passes) * passes)
     masks = []
     run = None
     for k in range(num_sets):
@@ -357,6 +360,7 @@ def generate_vectors(cfg: dict) -> None:
         ("LFSR_WIDTH", 32, "int"),
         ("CONTROL_WIDTH", 3, "int"),
         ("NUM_SETS", num_sets, "int"),
+        ("SETS_IN_FLIGHT", SETS_IN_FLIGHT, "int"),
         ("ACCUM_PASSES", passes, "int"),
         ("MIXED_LEN", len(mixed), "int"),
         ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),

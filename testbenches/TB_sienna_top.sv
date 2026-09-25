@@ -11,6 +11,7 @@ module TB_sienna_top;
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int OVR_WORDS = 4 * HOST_WORDS;  // words loaded before the no-credit start
+  localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);  // set ids count accepted starts modulo 2^ID_W
 
   // ── Timeout / heartbeat ───────────────────────────────────────────────
   localparam int TIMEOUT_CYCLES = 200_000;
@@ -39,7 +40,7 @@ module TB_sienna_top;
   logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
   logic                                  pipeline_ready_o;
-  logic                        [    1:0] done_set_id_o;
+  logic                        [ID_W-1:0] done_set_id_o;
   logic systolic_busy_tb, gpnae_busy_tb;
   logic maxpool_busy_tb, dropout_busy_tb;
   logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
@@ -66,6 +67,7 @@ module TB_sienna_top;
   // ── DUT ───────────────────────────────────────────────────────────────
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
+      .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
       .N                (N),
       .TILE_SIZE        (TILE_SIZE),
       .HOST_WORDS       (HOST_WORDS),
@@ -508,8 +510,10 @@ module TB_sienna_top;
   int stream_bounds[$];
   int stream_ids[$];
   int stream_id_base;  // sets started before the stream, which consumed ids
-  wire mesh_computing = (int'(dut.systolic_array_inst.current_state) != 0) &&
-                        (int'(dut.systolic_array_inst.current_state) != 7);  // not IDLE, not DONE
+  wire mesh_computing = dut.systolic_array_inst.mesh_busy;  // a set between staging and a written result
+  // A finished set waits for a result bank: the mesh is held up by the consumer.
+  wire mesh_blocked = dut.systolic_array_inst.arrays_final && dut.systolic_array_inst.reducers_ready &&
+                      !dut.systolic_array_inst.reduce_start;
 
   always_ff @(posedge clk_i) begin
     if (stream_on) begin
@@ -528,9 +532,7 @@ module TB_sienna_top;
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
       if (maxpool_busy_tb && dut.systolic_collection_complete) pool_with_result++;
-      if (!mesh_computing && dut.systolic_array_inst.in_full[dut.systolic_array_inst.in_rd] &&
-          dut.systolic_array_inst.out_full[dut.systolic_array_inst.out_wr])
-        bp_mesh++;  // a staged set waits because both mesh result banks are full
+      if (mesh_blocked) bp_mesh++;  // a finished set waits because no result bank is free
       if (int'(dut.g_state) == 0 && dut.systolic_collection_complete && dut.act_full[dut.act_wr])
         bp_act++;  // a mesh result waits because both activation banks are full
       if (n_started - stream_bounds.size() > max_in_flight)
@@ -544,10 +546,10 @@ module TB_sienna_top;
     automatic int errs = 0;
     logic [DATA_WIDTH-1:0] av;
     string info;
-    if (stream_ids[k] != ((stream_id_base + k) % 4)) begin
+    if (stream_ids[k] != ((stream_id_base + k) % (1 << ID_W))) begin
       failed++;
       $display("  [FAIL] Stream set %0d completed as set id %0d, expected %0d", k, stream_ids[k],
-               (stream_id_base + k) % 4);
+               (stream_id_base + k) % (1 << ID_W));
     end
     if (n_act != exp_q.size()) begin
       failed++;
@@ -576,7 +578,7 @@ module TB_sienna_top;
   task automatic stream_all_sets(input int id_base, input bit overrun);
     automatic longint t0 = $time;
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s", NUM_SETS,
-             overrun ? ", with a start pulsed on set 3 while no credit is free" : "");
+             overrun ? $sformatf(", with a start pulsed on set %0d while no credit is free", SETS_IN_FLIGHT) : "");
     stream_results.delete();
     stream_bounds.delete();
     stream_ids.delete();
@@ -609,7 +611,7 @@ module TB_sienna_top;
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
 `endif
-              if (overrun && k == 3) begin
+              if (overrun && k == SETS_IN_FLIGHT) begin
                 automatic int waited = 0;
                 // A credit returns only as pooling leaves P_WAIT, at least 13 cycles away from any other state.
                 while (!(dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) && waited < 2000) begin
@@ -694,9 +696,9 @@ module TB_sienna_top;
                pool_with_result);
     end else if (ov_g_p == 0)
       $display("  [Stream] activation/pooling overlap not reachable: no mesh result was ready while pooling ran");
-    if (max_in_flight > 3) begin
+    if (max_in_flight > SETS_IN_FLIGHT) begin
       failed++;
-      $display("  [FAIL] %0d sets in flight, the credit limit is 3", max_in_flight);
+      $display("  [FAIL] %0d sets in flight, the credit limit is %0d", max_in_flight, SETS_IN_FLIGHT);
     end
   endtask
 
@@ -722,16 +724,16 @@ module TB_sienna_top;
         end
       end
     join_none
-    while (!(gpnae_busy_tb && dut.credits <= 1) && waited < TIMEOUT_CYCLES) begin
+    while (!(gpnae_busy_tb && dut.credits <= SETS_IN_FLIGHT - 2) && waited < TIMEOUT_CYCLES) begin
       @(posedge clk_i);
       waited++;
     end
-    if (!(gpnae_busy_tb && dut.credits <= 1)) begin
+    if (!(gpnae_busy_tb && dut.credits <= SETS_IN_FLIGHT - 2)) begin
       failed++;
       $display("  [FAIL] Never reached two sets in flight before the reset");
     end
     disable fork;
-    $display("  [Reset] resetting with %0d sets in flight, stages {g,p}=%0d", 3 - dut.credits, dut_stage);
+    $display("  [Reset] resetting with %0d sets in flight, stages {g,p}=%0d", SETS_IN_FLIGHT - dut.credits, dut_stage);
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
@@ -744,7 +746,7 @@ module TB_sienna_top;
       failed++;
       $display("  [FAIL] %0d cycles of output after reset with nothing started", stray);
     end
-    if (!pipeline_ready_o || dut.credits != 3 || dut_stage != 0) begin
+    if (!pipeline_ready_o || dut.credits != SETS_IN_FLIGHT || dut_stage != 0) begin
       failed++;
       $display("  [FAIL] Not idle after reset: ready=%0b credits=%0d stages=%0d", pipeline_ready_o,
                dut.credits, dut_stage);
@@ -761,8 +763,15 @@ module TB_sienna_top;
     if (stream_on) begin
       automatic int c = int'($time / 10);
       automatic int busy = 0;
-      if (int'(dut.systolic_array_inst.current_state) != perf_mesh_st)
-        $display("PERF %0d MESH %0d", c, dut.systolic_array_inst.current_state);
+      // Mesh events, one of each per set and in set order: 2 broadcast start, 3 broadcast end, 4 feed start, 5 reduce start, 7 written.
+      if (dut.systolic_array_inst.set_launch) begin
+        $display("PERF %0d MESH 1", c);
+        $display("PERF %0d MESH 2", c);
+      end
+      if (dut.systolic_array_inst.bcast_release) $display("PERF %0d MESH 3", c);
+      if (dut.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("PERF %0d MESH 4", c);
+      if (dut.systolic_array_inst.reduce_start) $display("PERF %0d MESH 5", c);
+      if (dut.systolic_array_inst.set_done) $display("PERF %0d MESH 7", c);
       if (int'(dut.g_state) != perf_g_st) begin
         $display("PERF %0d G %0d", c, dut.g_state);
         if (perf_g_st == 3) $display("PERF %0d LANES %0d %0d", c, perf_lane_busy, perf_round_cyc);
@@ -781,7 +790,6 @@ module TB_sienna_top;
         perf_round_cyc++;
       end
     end
-    perf_mesh_st = int'(dut.systolic_array_inst.current_state);  // tracked always, printed only in a pass
     perf_g_st    = int'(dut.g_state);
     perf_p_st    = int'(dut.p_state);
     perf_cred    = int'(dut.credits);

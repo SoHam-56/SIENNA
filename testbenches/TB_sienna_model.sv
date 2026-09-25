@@ -7,6 +7,7 @@ module TB_sienna_model;
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int STALL_CYCLES = 50_000;  // this long with no completion is a hang
+  localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);
 
   // ── DUT I/O ───────────────────────────────────────────────────────────
   logic clk_i, rstn_i;
@@ -26,7 +27,7 @@ module TB_sienna_model;
   logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
   logic                                  pipeline_ready_o;
-  logic                        [    1:0] done_set_id_o;
+  logic                        [ID_W-1:0] done_set_id_o;
   logic systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb;
   logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
 
@@ -37,6 +38,7 @@ module TB_sienna_model;
 
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
+      .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
       .N                (N),
       .TILE_SIZE        (TILE_SIZE),
       .HOST_WORDS       (HOST_WORDS),
@@ -216,9 +218,9 @@ module TB_sienna_model;
     end
     @(posedge clk_i);
 
-    // Sets complete in issue order, so set k's id is k mod 4.
+    // Sets complete in issue order, so set k's id is k mod 2^ID_W.
     bad_ids = 0;
-    for (int k = 0; k < n_sets; k++) if (done_ids[k] != (k % 4)) bad_ids++;
+    for (int k = 0; k < n_sets; k++) if (done_ids[k] != (k % (1 << ID_W))) bad_ids++;
 
     fout = $fopen(out_f, "w");
     for (int k = 0; k < n_sets; k++) begin

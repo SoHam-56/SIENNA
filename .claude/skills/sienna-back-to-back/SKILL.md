@@ -24,7 +24,7 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `accumulate_i` | sampled with the start: 1 makes the set a partial sum (added into `acc_mem`, no output, still completes in order); the next set with it low is added to the sum and activated |
 
 Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
-defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), SyncArray mesh tiles. GFLOPS count the
+defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), synchronous `SystolicArray` mesh tiles. GFLOPS count the
 8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
 
 | Config | Single set | Per set, steady | GFLOPS @950 | Bottleneck |
@@ -42,7 +42,7 @@ What each change bought, all measured the same way:
 | tail overlap (GPNAE `b972abd`) | activation: a lane's first tail element hides under the polynomial | 336 / 459 / 472 -> 266 / 303 / 325 |
 | one-row host writes | host load 257 -> 17 | 266 / 303 / 325 -> 264 / 303 / 325 (activation now the limit) |
 | 32 lanes | activation 251 -> 195 (SELU), 277 -> 213 (tanh) | -> 221 / 271 / 263 |
-| SyncArray tiles | mesh 129 -> 77 (tile phase 94 -> 42) | unchanged; single-set latency -52 |
+| synchronous tiles | mesh 129 -> 77 (tile phase 94 -> 42) | unchanged; single-set latency -52 |
 | four tail contexts (GPNAE `e68882c`) | tail elements in a lane run together | normal data unchanged; large-value 1510-2078 -> 530-591 |
 
 The mesh stage is 77 cycles per set (broadcast 4, tiles 42, reduce 29). It is no longer on the
@@ -53,7 +53,7 @@ regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes
 
 ### Larger N (measured 2026-09-24)
 
-Full pipeline at N=32, T=4, one-row host writes, SyncArray tiles: all 8 matmul tests pass (conv needs N to
+Full pipeline at N=32, T=4, one-row host writes, synchronous tiles: all 8 matmul tests pass (conv needs N to
 be a perfect square in the generator). Mesh stage 82 cycles, host load 33, so activation sets the rate:
 
 | Lanes | Tail | SELU steady | tanh steady | GFLOPS @950 (SELU / tanh) | Lanes busy |
@@ -64,7 +64,7 @@ be a perfect square in the generator). Mesh stage 82 cycles, host load 33, so ac
 
 N=32 sums 32 products per output, so far more activation inputs land past the fitted range; with
 the tail run one element at a time, lanes sat idle while one lane worked through its tail elements. Mesh only,
-set 0 at N=32, T=4: 136 cycles with SystolicArray, 84 with SyncArray (8192 PEs each), 105 with
+set 0 at N=32, T=4: 136 cycles with the old handshake tile, 84 with the synchronous tile (8192 PEs each), 105 with
 collapse-k (1024 PEs). At N=64, T=8 collapse-k takes 197 cycles with 4096 PEs, about 32% PE
 utilisation, against 840 cycles and 32768 PEs for the old serial-reduce mesh.
 
@@ -94,10 +94,10 @@ keys its per-copy queues by int.
 
 ### Collapse-k
 
-`COLLAPSE_K=1` in SystolicMesh gives each output tile one SyncArray of depth N, so N^2 PEs instead
+`COLLAPSE_K=1` in SystolicMesh gives each output tile one SystolicArray of depth N, so N^2 PEs instead
 of N^3/T and no reduce. At N=16, T=4: 256 PEs instead of 1024, mesh stage 87 cycles instead of 77,
 same steady state (activation-bound). Mesh 68/68, SIENNA 11/11 and back-to-back 12 clean with it
-selected. It is off by default.
+selected. It is the default since 2026-09-24 (sienna_top, sienna_multi and the mesh).
 
 ## Mesh interface after phase 2
 
@@ -129,6 +129,8 @@ rule. When a second set misbehaves, look for a flag that is still high from the
 first set before looking anywhere else.
 
 ## Confirmed defects (fixed in phase 1, known-issues #15 has the commits)
+
+The queue, PEMesh and OutputSram rows below refer to the handshake tile removed on 2026-09-24 (git tag `legacy_tile_v1`).
 
 Measured on N=16, TILE=4, tanh, via `make verilator EXTRA_FLAGS=-DBACK_TO_BACK`.
 

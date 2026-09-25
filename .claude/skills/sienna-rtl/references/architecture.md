@@ -3,7 +3,7 @@
 > **Partly stale since 2026-09-22.** The top-level sections describe the single outer FSM, 8 lanes and FIFO1. The current
 > design has separate activation and pooling stages, 32 lanes (default since 2026-09-24) filled in parallel from a wide
 > mesh read, banked buffers and credits; see `SKILL.md` and the `sienna-back-to-back` skill before trusting any FSM
-> detail here. The SystolicMesh section is current as of 2026-09-24.
+> detail here. The SystolicMesh section is current as of 2026-09-24 (after the module renames).
 
 Module-by-module reference. Line numbers are from the working tree at the time of writing; treat them as pointers, not guarantees.
 
@@ -74,53 +74,27 @@ Work is spread round-robin, so `lane_windows_total[i] = MAXPOOL_OUT_COUNT/NUM_LA
 ### Hierarchy
 
 ```
-SystolicMesh          tile grid, broadcast loader, MeshOutputSram
- ├─ AccumulationUnit  one per (i,j) tile position — reduces the depth slices
- ├─ SyncArray         one per (i,j,k) when SYNC_TILES=1 (default) — a TILE_SIZE² synchronous PE array
- │   └─ SyncPE ─ fp32Multiplier, fp32Adder
- └─ SystolicArray     one per (i,j,k) when SYNC_TILES=0 — the older handshake tile
-     ├─ NorthInputQueue ─ ColumnInputQueue   (column-major striding)
-     ├─ WestInputQueue  ─ RowInputQueue      (row-major striding)
-     ├─ PEMesh ─ ProcessingElement ─ MAC ─ fp32Multiplier, fp32Adder
-     └─ OutputSram
+SystolicMesh            tile grid, staging banks, broadcast loader, mesh FSM, MeshOutputSram
+ ├─ AccumulationUnit    one per (i,j) output tile — reduces the depth slices (a copy with collapse-k)
+ └─ SystolicArray       one per (i,j) with collapse-k, one per (i,j,k) without — a TILE_SIZE² synchronous array
+     └─ ProcessingElement ─ fp32Multiplier, fp32Adder
 ```
 
-`TILES_PER_DIM = MATRIX_SIZE / TILE_SIZE`. The problem decomposes into `TILES_PER_DIM³` tiles: `TILES_PER_DIM²` spatial positions each with `TILES_PER_DIM` depth slices. With `COLLAPSE_K=1` there is one tile per position, `SyncArray` with depth `K = MATRIX_SIZE`, so there are `N²` PEs instead of `N³/T` and the `AccumulationUnit` (P=1) only copies the result out.
+`TILES_PER_DIM = MATRIX_SIZE / TILE_SIZE`. With `COLLAPSE_K=1` (default since 2026-09-24) each output tile has one `SystolicArray` of depth `K = MATRIX_SIZE`: N² PEs, and the `AccumulationUnit` (P=1) only copies the result out. With `COLLAPSE_K=0` the problem is `TILES_PER_DIM³` tiles of depth T and the `AccumulationUnit` sums the `TILES_PER_DIM` slices in a log2 adder tree: N³/T PEs.
 
-### SyncArray (default tile since 2026-09-24)
+The handshake tile it replaced (`PEMesh`, the four-state `ProcessingElement` with `MAC`, `RowInputQueue`/`ColumnInputQueue`, per-tile `OutputSram`) was removed on 2026-09-24; it is kept at git tag `legacy_tile_v1` in SystolicMesh and the parent for cross-checks.
 
-Output-stationary and fully synchronous. A (N×K) and B (K×N) sit in local registers, written one row per broadcast cycle. On start, row r of A and column c of B enter r and c cycles late and every operand moves one PE per cycle, so there are no valid joins, no per-PE FSM and no drain wave. Each `SyncPE` takes a product every cycle into one of six partial sums (the adder latency plus one), then adds the partials pairwise with the same adder. Results are read straight from the PE registers through the tile read port. Summation order differs from a serial sum, which the 1% tolerance absorbs. Unit test: `SystolicMesh/testbenches/TB_SyncArray.sv`, parameterized by N and K.
+### SystolicArray
 
-Host writes: `HOST_WORDS` words per write (the regression uses one row, N words). Mesh write pointer steps by `HOST_WORDS`, which must divide N².
+Output-stationary and fully synchronous. A (T×K) and B (K×T) sit in local registers, written one row per broadcast cycle. On start, row r of A and column c of B enter r and c cycles late and every operand moves one PE per cycle, so there are no valid joins, no per-PE state machine and no drain wave. Each `ProcessingElement` takes a product every cycle into one of six partial sums (the adder latency plus one), then adds the partials pairwise with the same adder. Results are read straight from the PE registers through the array read port. Summation order differs from a serial sum, which the 1% tolerance absorbs. Unit test: `SystolicMesh/testbenches/TB_SystolicArray.sv`, parameterized by N and K.
 
 ### Mesh FSM
 
-`IDLE → RESET_SEQ → BROADCAST → FIRE_PULSE → WAIT_TILES → REDUCE_PULSE → WAIT_REDUCE → DONE`. `BROADCAST` walks `load_idx` over the `TILE_SIZE` tile rows, computing per-tile addresses into the flat `mem_A`/`mem_B` arrays and writing one whole tile row into every tile's input queue in parallel (the queues take `WRITE_WORDS = TILE_SIZE` words per write since 2026-09-23), so it costs T cycles, not T². All tiles then fire simultaneously, so total latency tracks one tile's depth rather than the tile count.
-
-### Row vs Column input queue
-
-`RowInputQueue.sv` and `ColumnInputQueue.sv` are otherwise identical files. The entire difference is the addressing:
-
-| | RowInputQueue | ColumnInputQueue |
-|---|---|---|
-| reset address | `read_addr[i] <= i * N` | `read_addr[i] <= i` |
-| advance | `read_addr[i] + 1` | `read_addr[i] + N` |
-
-Row-major walk versus column-major walk over the same `N×N` SRAM. If you fix a bug in one, fix it in the other.
-
-Both delay `passthrough_valid_i` by two cycles (`_d1`, `_d2`) before using it to advance, matching the PE's response latency.
-
-### Processing element
-
-Four-state FSM: `IDLE → LOAD_DATA → MAC_COMPUTE → OUTPUT`, one pass per input element. `MAC.sv` is itself a four-state machine (`IDLE → MULTIPLY → ACCUMULATE → DONE`) wrapping one `fp32Multiplier` and one `fp32Adder`, with single-cycle valid pulses derived from state transitions.
-
-Data flows south, weights flow east. `east_o` is muxed: during normal operation it passes the buffered west input; during the accumulator drain (`select_accumulator_i` while in `IDLE`) it emits the accumulated value instead. `PEMesh` drains column by column using a shift register (`col_shift`) that walks a single `1` from MSB down, triggered one cycle after `done_o` rises.
-
-`inputs_valid` propagates as a wavefront: PE(0,0) takes the external valid, the top row and left column inherit from one neighbor, and interior PEs AND their north and west neighbors' `passthrough_valid_o`.
+`IDLE → RESET_SEQ → BROADCAST → FIRE_PULSE → WAIT_TILES → REDUCE_PULSE → WAIT_REDUCE → DONE`. The host writes `HOST_WORDS` words per cycle (default one matrix row) into two staging banks. `BROADCAST` walks `load_idx` over the `TILE_SIZE` tile rows and writes one row of every array's A and B blocks per cycle, so it costs T cycles. All arrays then fire together, so latency tracks one array's depth rather than the array count. `REDUCE` is the adder tree without collapse-k and a T²-cycle copy with it.
 
 ### Output path
 
-`OutputSram` (one per tile) collects drained columns right to left, starting at `current_column = N-1`. `AccumulationUnit` then reads the same pixel from all P depth slices each cycle, sums them in a log2(P) `fp32Adder` tree (since 2026-09-23; it was one serial adder over P·T² adds), and writes one result per cycle the reduced value to the shared `MeshOutputSram` at a globally-offset address computed from `TILE_ROW_OFFSET` / `TILE_COL_OFFSET`. `MeshOutputSram` is multi-write-port (one per tile) and single-read-port.
+`AccumulationUnit` reads the same pixel from all P partial arrays each cycle, sums them in a log2(P) `fp32Adder` tree, and writes one result per cycle to the shared `MeshOutputSram` at a globally-offset address computed from `TILE_ROW_OFFSET` / `TILE_COL_OFFSET`. `MeshOutputSram` has two banks, one write port per output tile and a wide read port of `WIDE_READ` words for the activation lanes.
 
 ---
 

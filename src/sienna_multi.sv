@@ -9,7 +9,7 @@ module sienna_multi #(
     parameter int TILE_SIZE         = 4,
     parameter int HOST_WORDS        = N,
     parameter int COLLAPSE_K        = 1,  // collapse-k mesh in every copy, as in sienna_top
-    parameter int SETS_IN_FLIGHT    = 7,  // credits per copy
+    parameter int SETS_IN_FLIGHT    = 8,  // credits per copy
     parameter int DATA_WIDTH        = 32,
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,

@@ -32,16 +32,9 @@ TOP_FILES = \
 SM_FILES = \
 	top/SystolicMesh.sv \
 	top/SystolicArray.sv \
-	top/SyncArray.sv \
-	mem/RowInputQueue.sv \
-	mem/ColumnInputQueue.sv \
-	mem/OutputSram.sv \
 	mem/MeshOutputSram.sv \
-	engine/PEMesh.sv \
 	engine/ProcessingElement.sv \
-	engine/AccumulationUnit.sv \
-	engine/MAC.sv \
-	engine/SyncPE.sv
+	engine/AccumulationUnit.sv
 
 SM_LIB_FILES = \
 	Multipliers/Radix4Booth/src/R4Booth.sv \

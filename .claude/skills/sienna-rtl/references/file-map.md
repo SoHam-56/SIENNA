@@ -53,25 +53,20 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 
 | File | Lines | What it is |
 |---|---|---|
-| `src/top/SystolicMesh.sv` | 258 | Tile grid, broadcast loader, mesh FSM, `MeshOutputSram` |
-| `src/top/SystolicArray.sv` | 220 | Handshake tile, used when `SYNC_TILES=0`. Also defines the `NorthInputQueue` / `WestInputQueue` wrappers |
-| `src/top/SyncArray.sv` | 170 | Default tile: synchronous N×N output-stationary array for an N×K by K×N product |
-| `src/engine/SyncPE.sv` | 160 | SyncArray PE: one product per cycle into six partial sums, pairwise combine at the end |
-| `src/mem/RowInputQueue.sv` | 141 | Row-major strided input queue |
-| `src/mem/ColumnInputQueue.sv` | 140 | Column-major strided. Identical to the above except the addressing |
-| `src/mem/OutputSram.sv` | 116 | Per-tile column-drain collector |
-| `src/mem/MeshOutputSram.sv` | 48 | Shared multi-write-port result memory |
-| `src/engine/PEMesh.sv` | 156 | PE array, wavefront valid propagation, drain shift register |
-| `src/engine/ProcessingElement.sv` | 195 | Four-state PE with muxed east output |
-| `src/engine/AccumulationUnit.sv` | 164 | Reduces depth slices, computes global write address |
-| `src/engine/MAC.sv` | 142 | Multiply-accumulate FSM around `fp32Multiplier` + `fp32Adder` |
+| `src/top/SystolicMesh.sv` | 394 | Array grid, staging banks, broadcast loader, mesh FSM, `MeshOutputSram`; `COLLAPSE_K`, `HOST_WORDS`, `WIDE_READ` |
+| `src/top/SystolicArray.sv` | 165 | Synchronous T×T output-stationary array for a T×K by K×T product |
+| `src/engine/ProcessingElement.sv` | 161 | One product per cycle into six partial sums, pairwise combine at the end |
+| `src/engine/AccumulationUnit.sv` | 162 | Adder-tree reduce of the depth slices (a copy with collapse-k), global write address |
+| `src/mem/MeshOutputSram.sv` | 65 | Two-bank result memory, one write port per output tile, wide read port |
+
+The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue`, `OutputSram` and the old `SystolicArray`/`ProcessingElement`) is at git tag `legacy_tile_v1`.
 
 ### Testbenches
 
 | File | Lines | Status | Notes |
 |---|---|---|---|
 | `TB_SystolicMesh.sv` | 421 | live | Main IP testbench. Patched in place by `regression.py`. Tolerance math is wrong — see issue 7 |
-| `TB_SystolicArray.sv` | 504 | live | Single-tile testbench. Same tolerance bug |
+| `TB_SystolicArray.sv` | 146 | live | Unit test of the synchronous array over tile sizes and depths (`-GN=`, `-GK=`), against a real-valued model |
 | `TB_Mesh_2x2.sv` | 382 | **dead** | Targets nonexistent module `Mesh` |
 | `TB_Mesh_3x3.sv` | 391 | **dead** | Same, N=3 |
 | `TB_Mesh_5x5.sv` | 508 | **dead** | Same, N=5 |

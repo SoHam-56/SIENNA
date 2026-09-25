@@ -16,6 +16,7 @@ sys.path.insert(0, ROOT)
 import regression  # noqa: E402
 
 ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
+HW_BIAS = True  # the mesh adds the bias; False lowers it as a ones column and an extra depth row
 
 
 # =============================================================================
@@ -186,9 +187,10 @@ def job_reference(job):
 
 
 def tile_job(job, N):
-    """Accumulate groups, one per N x N output tile, in order; each pass is (A, B) and all-zero weight tiles are skipped."""
+    """Accumulate groups, one per N x N output tile, in order: (tile, passes, bias); all-zero weight tiles are skipped."""
     terms = [(X.astype(np.float32), W.astype(np.float32)) for X, W in job["terms"]]
-    if job["bias"] is not None and np.any(job["bias"]):
+    has_bias = job["bias"] is not None and np.any(job["bias"])
+    if has_bias and not HW_BIAS:
         X0, W0 = terms[0]
         terms[0] = (np.hstack([X0, np.ones((X0.shape[0], 1), np.float32)]), np.vstack([W0, job["bias"][None, :]]))
     P, C = terms[0][0].shape[0], terms[0][1].shape[1]
@@ -214,7 +216,12 @@ def tile_job(job, N):
                     passes.append((Xp[r * N : (r + 1) * N, d * N : (d + 1) * N], B))
             if not passes:
                 passes.append((np.zeros((N, N), np.float32), np.zeros((N, N), np.float32)))
-            groups.append(((r, c), passes))
+            bias = None
+            if has_bias and HW_BIAS:
+                bias = np.zeros(N, np.float32)
+                cols = job["bias"][c * N : (c + 1) * N]
+                bias[: cols.size] = cols
+            groups.append(((r, c), passes, bias))
     return groups, (P, C, rt, ct)
 
 
@@ -222,11 +229,13 @@ def write_sets(path, groups, act):
     code = ACT_CODE[act]
     lines = []
     n = 0
-    for _, passes in groups:
+    for _, passes, bias in groups:
         for k, (A, B) in enumerate(passes):
             partial = int(k < len(passes) - 1)
-            lines.append(f"{partial} {code} 0")
-            words = np.concatenate([A.ravel(), B.ravel()]).astype(np.float32).view(np.uint32)
+            with_bias = int(bias is not None and k == 0)  # the first pass carries the group's bias
+            lines.append(f"{partial} {code} 0 {with_bias}")
+            parts = [A.ravel(), B.ravel()] + ([bias] if with_bias else [])
+            words = np.concatenate(parts).astype(np.float32).view(np.uint32)
             lines.append("\n".join(f"{v:08x}" for v in words.tolist()))
             n += 1
     with open(path, "w") as f:
@@ -296,10 +305,12 @@ class EmuSim(Sim):
 
     def run(self, groups, act, tag):
         outs, n = [], 0
-        for _, passes in groups:
+        for _, passes, bias in groups:
             acc = None
-            for A, B in passes:
+            for k, (A, B) in enumerate(passes):
                 p = A.astype(np.float32) @ B.astype(np.float32)
+                if bias is not None and k == 0:
+                    p = (p + bias[None, :]).astype(np.float32)
                 acc = p if acc is None else (acc + p).astype(np.float32)
                 n += 1
                 outs.append(np.zeros(0, np.float32))
@@ -314,7 +325,7 @@ def run_job_hw(job, sim, tag):
     outs, n, cyc = sim.run(groups, job["act"], tag)
     Y = np.zeros((rt * N, ct * N), np.float32)
     k = 0
-    for (r, c), passes in groups:
+    for (r, c), passes, _ in groups:
         k += len(passes) - 1  # partial sets complete with no output
         o = outs[k]
         k += 1

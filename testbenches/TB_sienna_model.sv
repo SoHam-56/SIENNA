@@ -110,9 +110,50 @@ module TB_sienna_model;
     end
   end
 
+  // +trace: one line per event, read by a script to find the stage that sets the pace.
+  bit trace_on;
+  initial trace_on = $test$plusargs("trace");
+  always_ff @(posedge clk_i) begin
+    if (trace_on && rstn_i) begin
+      if (dut.host_accept) $display("EV %0d host", cycle);
+      if (dut.systolic_array_inst.set_launch) $display("EV %0d bcast", cycle);
+      if (dut.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("EV %0d feed", cycle);
+      if (dut.systolic_array_inst.arrays_final && !$past(dut.systolic_array_inst.arrays_final)) $display("EV %0d final", cycle);
+      if (dut.systolic_array_inst.reduce_start) $display("EV %0d reduce", cycle);
+      if (dut.systolic_array_inst.set_done) $display("EV %0d written", cycle);
+      if (dut.g_accept) $display("EV %0d act", cycle);
+      if (dut.p_accept || dut.p_null) $display("EV %0d pool", cycle);
+      if (pipeline_complete_o) $display("EV %0d done", cycle);
+      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, dut.credits, dut.mesh_input_ready);
+      if (dut.systolic_array_inst.arrays_final && !dut.systolic_array_inst.reduce_start)
+        $display("EV %0d blocked red%0d bank%0d", cycle, dut.systolic_array_inst.reducers_ready,
+                 dut.systolic_array_inst.out_state[dut.systolic_array_inst.out_wr]);
+      if (dut.systolic_array_inst.in_full[dut.systolic_array_inst.in_rd] && !dut.systolic_array_inst.set_launch &&
+          dut.systolic_array_inst.bstate == 0)
+        $display("EV %0d bwait ready%0d", cycle, dut.systolic_array_inst.arrays_load_ready);
+    end
+  end
+
   logic [DATA_WIDTH-1:0] west_q[$], north_q[$];
 
-  // HOST_WORDS words of each operand per cycle, both operands at once.
+  // A streaming host: HOST_WORDS words of each operand per cycle, the start with the last write, the next set right after.
+  task automatic load_and_start();
+    for (int i = 0; i < west_q.size(); i += HOST_WORDS) begin
+      west_write_enable_i  = 1;
+      north_write_enable_i = 1;
+      for (int c = 0; c < HOST_WORDS; c++) begin
+        west_write_data_i[c]  = (i + c < west_q.size()) ? west_q[i+c] : '0;
+        north_write_data_i[c] = (i + c < north_q.size()) ? north_q[i+c] : '0;
+      end
+      start_pipeline_i = (i + HOST_WORDS >= west_q.size());
+      @(posedge clk_i);
+    end
+    west_write_enable_i  = 0;
+    north_write_enable_i = 0;
+    start_pipeline_i     = 0;
+  endtask
+
+  // The host TB_sienna_top models (+host_gaps): an idle cycle after the load, a start cycle, then a cycle for the credit.
   task automatic load_set();
     fork
       begin
@@ -140,6 +181,7 @@ module TB_sienna_model;
     string sets_f, out_f;
     integer fin, fout, rc;
     int n_sets, acc, act, terms, has_bias, bad_ids;
+    bit host_gaps;
     logic [DATA_WIDTH-1:0] w;
     longint t0, waited;
 
@@ -169,6 +211,7 @@ module TB_sienna_model;
       $finish;
     end
     rc = $fscanf(fin, "%d", n_sets);
+    host_gaps = $test$plusargs("host_gaps");
 
     repeat (10) @(posedge clk_i);
     rstn_i = 1;
@@ -212,11 +255,13 @@ module TB_sienna_model;
       bias_valid_i = (has_bias != 0);
       activation_function_i = CONTROL_WIDTH'(act);
       num_terms_i = terms[ADDR_LINES:0];
-      load_set();
-      start_pipeline_i = 1;
-      @(posedge clk_i);
-      start_pipeline_i = 0;
-      @(posedge clk_i);  // let the credit land before sampling ready again
+      if (host_gaps) begin
+        load_set();
+        start_pipeline_i = 1;
+        @(posedge clk_i);
+        start_pipeline_i = 0;
+        @(posedge clk_i);  // let the credit land before sampling ready again
+      end else load_and_start();
     end
     $fclose(fin);
 

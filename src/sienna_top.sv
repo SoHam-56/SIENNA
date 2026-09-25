@@ -316,8 +316,8 @@ module sienna_top #(
 
   always_comb begin
     for (int i = 0; i < NUM_LANES; i++) begin
-      dropout_in_valid[i] = maxpool_out_valid[i];
-      dropout_data_in[i] = maxpool_out_data[i];
+      dropout_in_valid[i] = POOL_BYPASS ? byp_valid[i] : maxpool_out_valid[i];
+      dropout_data_in[i] = POOL_BYPASS ? byp_data[i] : maxpool_out_data[i];
       gpnae_terms[i] = set_terms[g_set_id][GPNAE_ADDR_LINES-1:0];
       gpnae_ctrl[i] = set_act[g_set_id];  // the set the activation stage holds
     end
@@ -356,6 +356,10 @@ module sienna_top #(
   // are free. Row and column are carried per lane rather than divided out of a window index,
   // which would cost NUM_LANES dividers by a non-power-of-two.
   localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;
+  // A 1x1 window with stride 1 and no padding is the identity: windows skip FIFO2 and maxpool and go straight to dropout.
+  localparam bit POOL_BYPASS = (POOL_H == 1) && (POOL_W == 1) && (STRIDE_ROWS == 1) && (STRIDE_COLS == 1) && (PADDING == 0);
+  logic [DATA_WIDTH-1:0] byp_data [NUM_LANES];
+  logic [NUM_LANES-1:0]  byp_valid;
 
   logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
   logic [           $clog2(POOL_H+1)-1:0] disp_pr;
@@ -384,7 +388,7 @@ module sienna_top #(
   always_comb begin
     disp_can_write = 1'b1;
     for (int L = 0; L < NUM_LANES; L++)
-      if (lane_active[L] && (fifo2_count[L] > (FIFO2_DEPTH - 4))) disp_can_write = 1'b0;
+      if (!POOL_BYPASS && lane_active[L] && (fifo2_count[L] > (FIFO2_DEPTH - 4))) disp_can_write = 1'b0;
   end
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
@@ -399,14 +403,21 @@ module sienna_top #(
         lane_c[L]   <= (L % POOL_OUT_COLS);
       end
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
+      byp_valid <= '0;
     end else if (p_state == P_DISPATCH) begin
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
+      byp_valid <= '0;
 
       if (!disp_done && disp_can_write) begin
         for (int L = 0; L < NUM_LANES; L++) begin
           if (lane_active[L]) begin
-            fifo2_wr_data[L]  <= lane_val[L];
-            fifo2_wr_valid[L] <= 1'b1;
+            if (POOL_BYPASS) begin
+              byp_data[L]  <= lane_val[L];
+              byp_valid[L] <= 1'b1;
+            end else begin
+              fifo2_wr_data[L]  <= lane_val[L];
+              fifo2_wr_valid[L] <= 1'b1;
+            end
           end
         end
 
@@ -442,6 +453,7 @@ module sienna_top #(
       end
     end else begin
       for (int i = 0; i < NUM_LANES; i++) fifo2_wr_valid[i] <= 1'b0;
+      byp_valid <= '0;
     end
   end
 
@@ -753,7 +765,7 @@ module sienna_top #(
 
       case (mp_state[i])
         MP_IDLE: begin
-          if (mp_windows_done[i] < lane_windows_total[i]) begin
+          if (!POOL_BYPASS && mp_windows_done[i] < lane_windows_total[i]) begin
             mp_state_n[i] = MP_FEED;
             maxpool_start[i] = 1'b1;
           end else if (p_state == P_WAIT) begin

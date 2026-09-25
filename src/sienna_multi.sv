@@ -7,8 +7,8 @@ module sienna_multi #(
     parameter int NUM_LANES         = 32,
     parameter int N                 = 16,
     parameter int TILE_SIZE         = 4,
-    parameter int HOST_WORDS        = 1,
-    parameter int COLLAPSE_K        = 1,  // every copy uses the collapse-k mesh: a quarter of the PEs at T=4, N=16
+    parameter int HOST_WORDS        = N,
+    parameter int COLLAPSE_K        = 1,  // collapse-k mesh in every copy, as in sienna_top
     parameter int DATA_WIDTH        = 32,
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,

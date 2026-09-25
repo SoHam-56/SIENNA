@@ -31,6 +31,8 @@ module sienna_top #(
     input logic                     start_pipeline_i,
     input logic                     training_mode_i,  // dropout mode for the set being started
     input logic                     accumulate_i,     // 1: add this set's product to the running sum and output nothing
+    input logic                     bias_valid_i,     // with the start: add bias_i[c] to column c of this set's product
+    input logic [N-1:0][DATA_WIDTH-1:0] bias_i,
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,   // dropout seed for the set being started
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -207,6 +209,8 @@ module sienna_top #(
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),
       .start_matrix_mult_i   (systolic_start),
+      .bias_valid_i          (bias_valid_i),
+      .bias_i                (bias_i),
       .north_write_enable_i  (north_write_enable_i),
       .north_write_data_i    (north_write_data_i),
       .north_write_reset_i   (north_write_reset_i),

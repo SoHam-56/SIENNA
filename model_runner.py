@@ -140,7 +140,7 @@ def lower_op(op, t, consts):
         taps = w.reshape(kk, C)
         for c in range(C):
             Wd[c * kk : (c + 1) * kk, c] = taps[:, c]
-        return {"terms": [(X, Wd)], "bias": b, "act": op["act"], "shape": (1, oh, ow, C)}
+        return {"terms": [(X, Wd)], "bias": b, "act": op["act"], "shape": (1, oh, ow, C), "kk": kk}
     if kind == "FULLY_CONNECTED":
         w = consts[op["inputs"][1]]  # Dout x Din
         b = consts[op["inputs"][2]] if len(op["inputs"]) > 2 and op["inputs"][2] >= 0 else np.zeros(w.shape[0], np.float32)
@@ -337,6 +337,105 @@ def run_job_hw(job, sim, tag):
     return Y[:P, :C], n, cyc
 
 
+WC_TILES = 128  # sienna_layer's weight cache; a column block with more than half of it is streamed with its sets
+ACT_CODES = {"linear": 5, "relu": 4, "selu": 1, "sigmoid": 2, "tanh": 3}
+
+
+def format_layer(job, N):
+    """The configuration and the two input streams sienna_layer expects for a job, in its fixed order.
+
+    Terms whose weight is an identity become the residual input; the rest are one product with their depths side by side.
+    A depthwise layer gives each column block only its own channels' depth."""
+    res = [X for X, W in job["terms"] if W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))]
+    dense = [(X, W) for X, W in job["terms"] if not any(X is r for r in res)]
+    if len(res) > 1 or not dense:
+        raise ValueError("a layer takes one product and at most one residual input")
+    X = np.hstack([x for x, _ in dense]).astype(np.float32)
+    W = np.vstack([w for _, w in dense]).astype(np.float32)
+    M, C = X.shape[0], W.shape[1]
+    kk = job.get("kk")
+    kb = kk * min(N, C) if kk else X.shape[1]  # depthwise: the taps of one block's channels, fewer when C < N
+    rt, ct, dt = -(-M // N), -(-C // N), -(-kb // N)
+    bias = job["bias"] if job["bias"] is not None and np.any(job["bias"]) else None
+    cached = rt > 1 and dt <= WC_TILES // 2
+
+    def pad(a, rows, cols):
+        out = np.zeros((rows, cols), np.float32)
+        out[: a.shape[0], : a.shape[1]] = a
+        return out
+
+    Xp = pad(X, rt * N, max(X.shape[1], ct * N * (kk or 0)) if kk else dt * N)
+    Wp = pad(W, max(W.shape[0], ct * N * (kk or 0)) if kk else dt * N, ct * N)
+    Rp = pad(res[0], rt * N, ct * N) if res else None
+    bp = np.zeros(ct * N, np.float32)
+    if bias is not None:
+        bp[: bias.size] = bias
+    a_rows, w_rows = [], []
+    for c in range(ct):
+        k0 = c * N * kk if kk else 0  # depthwise: this block's channels only
+        A_c = pad(Xp[:, k0 : k0 + kb], rt * N, dt * N)
+        W_c = pad(Wp[k0 : k0 + kb, c * N : (c + 1) * N], dt * N, N)
+        if bias is not None:
+            w_rows.append(bp[c * N : (c + 1) * N][None, :])
+        w_rows += [W_c] * (1 if cached else rt)
+        for r in range(rt):
+            for t in range(dt):  # the depth tiles of this row tile, N rows of N words each
+                a_rows.append(A_c[r * N : (r + 1) * N, t * N : (t + 1) * N])
+            if Rp is not None:
+                a_rows.append(Rp[r * N : (r + 1) * N, c * N : (c + 1) * N])
+    cfg = dict(m=M, kb=kb, n=C, residual=int(Rp is not None), bias=int(bias is not None), act=ACT_CODES[job["act"]])
+    return cfg, np.vstack(a_rows), np.vstack(w_rows), (M, C, rt, ct)
+
+
+class LayerSim:
+    """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
+
+    def __init__(self, N, lanes, work):
+        self.N, self.lanes, self.work = N, lanes, work
+        self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_layer_sim")
+        self.cycles = self.sets = self.words = 0
+
+    def build(self):
+        t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
+        regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N, **t})
+        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0"],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(self.bin):
+            sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
+            raise RuntimeError("TB_sienna_layer build failed")
+
+    def run_job(self, job, tag):
+        N = self.N
+        cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
+        lf = os.path.join(self.work, f"{tag}.layer")
+        of = os.path.join(self.work, f"{tag}.out")
+        with open(lf, "w") as f:
+            f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)}\n")
+            f.write("\n".join(f"{v:08x}" for v in np.concatenate([a.ravel(), w.ravel()]).astype(np.float32).view(np.uint32).tolist()))
+            f.write("\n")
+        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
+        m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
+        if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7):
+            sys.stdout.write(r.stdout[-3000:])
+            raise RuntimeError(f"{tag}: layer simulation failed")
+        outs = read_outputs(of)
+        os.remove(lf)
+        os.remove(of)
+        if len(outs) != rt * ct:
+            raise RuntimeError(f"{tag}: {len(outs)} output tiles, expected {rt * ct}")
+        Y = np.zeros((rt * N, ct * N), np.float32)
+        k = 0
+        for c in range(ct):  # the spec's output order: column blocks outer, row tiles inner
+            for r_ in range(rt):
+                Y[r_ * N : (r_ + 1) * N, c * N : (c + 1) * N] = outs[k].reshape(N, N)
+                k += 1
+        n, cyc = int(m.group(1)), int(m.group(3))
+        self.sets += n
+        self.cycles += cyc
+        self.words += (len(a) + len(w)) * N
+        return Y[:M, :C], n, cyc
+
+
 def macs_of(job):
     """Multiply-accumulates the model defines: structural zeros and identity (residual) passes not counted."""
     if job.get("pool"):
@@ -385,6 +484,8 @@ def execute(model, x, sim=None, log=None):
         if sim is None:
             y = ref.astype(np.float32)
             n = cyc = 0
+        elif isinstance(sim, LayerSim):
+            y, n, cyc = sim.run_job(job, f"L{li:02d}")
         else:
             y, n, cyc = run_job_hw(job, sim, f"L{li:02d}")
         scale = float(np.max(np.abs(ref))) or 1.0
@@ -473,6 +574,8 @@ def main():
     ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
     ap.add_argument("--no-sim", action="store_true", help="float reference only")
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL, to check the lowering")
+    ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
+                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
@@ -487,10 +590,15 @@ def main():
 
     sim = None
     if not a.no_sim:
-        sim = (EmuSim if a.emulate else Sim)(a.n, a.lanes, a.work, a.host_gaps)
+        if a.emulate:
+            sim = EmuSim(a.n, a.lanes, a.work, a.host_gaps)
+        elif a.engine == "layer":
+            sim = LayerSim(a.n, a.lanes, a.work)
+        else:
+            sim = Sim(a.n, a.lanes, a.work, a.host_gaps)
         t0 = time.time()
         sim.build()
-        log(f"built TB_sienna_model N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
+        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
     results = {}
     for name in a.models.split(","):
         model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
@@ -507,13 +615,14 @@ def main():
             if sim is None:
                 runs.append({"input": desc, "label": label, "ref_top": int(np.argmax(ref))})
                 continue
-            c0, s0, t0 = sim.cycles, sim.sets, time.time()
+            c0, s0, w0, t0 = sim.cycles, sim.sets, getattr(sim, "words", 0), time.time()
             log(f"  inference on {desc}")
             hw, stats = execute(model, x, sim, log)
-            cyc, sets = sim.cycles - c0, sim.sets - s0
+            cyc, sets, hwords = sim.cycles - c0, sim.sets - s0, getattr(sim, "words", 0) - w0
             macs = sum(s["macs"] for s in stats)
             diff = float(np.max(np.abs(hw.astype(np.float64) - ref)))
             r = {"input": desc, "label": label, "ref_top": int(np.argmax(ref)), "hw_top": int(np.argmax(hw)), "cycles": cyc,
+                 "host_words": hwords,
                  "sets": sets, "macs": macs, "max_abs_out_diff": diff, "wall_s": time.time() - t0, "layers": stats,
                  "ref_out": ref.ravel().tolist()[:16], "hw_out": hw.ravel().tolist()[:16]}
             if name == "ad01":  # the anomaly score is the reconstruction error of each slice
@@ -523,7 +632,7 @@ def main():
             runs.append(r)
             util = macs / (sets * a.n ** 3) if sets else 0
             log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
-                f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
+                f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
         results.setdefault(name, {})["runs"] = runs
         results[name]["source"] = source
         json.dump(results, open(js, "w"), indent=1)

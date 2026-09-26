@@ -34,10 +34,17 @@ def main():
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "gemm"))
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL")
     ap.add_argument("--quick", action="store_true", help="a few small shapes only")
+    ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
+                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
-    sim = (mr.EmuSim if a.emulate else mr.Sim)(a.n, a.lanes, a.work, a.host_gaps)
+    if a.emulate:
+        sim = mr.EmuSim(a.n, a.lanes, a.work)
+    elif a.engine == "layer":
+        sim = mr.LayerSim(a.n, a.lanes, a.work)
+    else:
+        sim = mr.Sim(a.n, a.lanes, a.work, a.host_gaps)
     sim.build()
     shapes = [(f"grid_{m}x{k}x{n}", m, k, n) for m in GRID_M for k in GRID_K for n in GRID_N] + TRANSFORMER
     if a.quick:
@@ -55,7 +62,7 @@ def main():
         B = rng.uniform(-1, 1, (k, n)).astype(np.float32)
         job = {"terms": [(A, B)], "bias": None, "act": "linear", "shape": (m, n)}
         t0 = time.time()
-        y, sets, cyc = mr.run_job_hw(job, sim, name)
+        y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.LayerSim) else mr.run_job_hw(job, sim, name)
         ref = A.astype(np.float64) @ B.astype(np.float64)
         err = float(np.max(np.abs(y - ref)) / (np.max(np.abs(ref)) or 1.0))
         macs = m * k * n
@@ -72,6 +79,23 @@ def main():
         if err > 1e-4:
             print(f"FAIL {name}: error {err:.2e} above 1e-4", flush=True)
             sys.exit(1)
+    if isinstance(sim, mr.LayerSim):
+        # The polynomial activations through the layer engine, with a bias; GPNAE approximates within about 2%.
+        import regression
+        rng = np.random.RandomState(5)
+        A = rng.uniform(-1, 1, (64, 48)).astype(np.float32)
+        B = rng.uniform(-0.3, 0.3, (48, 40)).astype(np.float32)
+        b = rng.uniform(-0.5, 0.5, 40).astype(np.float32)
+        for act in ("tanh", "sigmoid", "selu"):
+            y, sets, cyc = sim.run_job({"terms": [(A, B)], "bias": b, "act": act, "shape": (64, 40)}, f"act_{act}")
+            ref = regression.apply_activation((A.astype(np.float64) @ B + b).astype(np.float32), act)
+            err = float(np.max(np.abs(y - ref)) / np.max(np.abs(ref)))
+            line = f"layer_{act}_bias{'':<9} {64:>5} {48:>5} {40:>5} {sets:>7} {cyc:>10}  max err {err:.1e} of the output range"
+            print(line, flush=True)
+            rep.write(line + "\n")
+            if err > 3e-2:
+                print(f"FAIL layer_{act}: error {err:.2e} above 3e-2", flush=True)
+                sys.exit(1)
 
 
 if __name__ == "__main__":

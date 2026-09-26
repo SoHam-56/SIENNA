@@ -497,6 +497,11 @@ module sienna_top #(
   // Every beat taken and every add written back: the sum for this set is final.
   logic acc_done_w;
   assign acc_done_w = (acc_beat == AW'(PER_LANE)) && (acc_pend == '0) && !acc_issue && !systolic_read_enable;
+  // A partial set leaves once every beat is taken, its adds finishing behind it. The next set's add of beat b issues
+  // PER_LANE + 4 cycles after this one's, whose write-back shows 6 cycles after issue, so PER_LANE >= 3 keeps the order.
+  localparam bit ACC_OVERLAP = (PER_LANE >= 3);
+  logic acc_part_done;
+  assign acc_part_done = ACC_OVERLAP ? ((acc_beat == AW'(PER_LANE)) && !systolic_read_enable) : acc_done_w;
 
   for (genvar k = 0; k < NUM_LANES; k++) begin : ACC_ADD
     fp32Adder add (
@@ -539,7 +544,7 @@ module sienna_top #(
         acc_beat <= acc_beat + 1'b1;
       end
       // A partial leaves a sum behind; the final set's read of it empties it.
-      if (g_state == G_ACC_WAIT && acc_done_w && set_accum[g_set_id]) acc_valid <= 1'b1;
+      if (g_state == G_ACC_WAIT && acc_part_done && set_accum[g_set_id]) acc_valid <= 1'b1;
       if (g_state == G_AFEED) acc_valid <= 1'b0;
       acc_rd_valid <= acc_rd_en;
       if (acc_rd_en) acc_rd_data <= acc_mem[acc_rd_addr];
@@ -565,7 +570,7 @@ module sienna_top #(
                     !systolic_read_enable && !systolic_release;
   assign g_done = (g_state == G_ROUND) && (act_bypass ? (fill_count[0] == PER_LANE[FCNT_W-1:0]) : all_collected);
   logic g_null_done;  // a partial set has been summed; it takes an activation bank only to keep sets in order
-  assign g_null_done = (g_state == G_ACC_WAIT) && acc_done_w && set_accum[g_set_id];
+  assign g_null_done = (g_state == G_ACC_WAIT) && acc_part_done && set_accum[g_set_id];
   // A partial set passes pooling in one cycle, never right after another completion, so pulses stay one cycle.
   logic complete_q, p_null;
   assign p_null = (p_state == P_IDLE) && act_full[act_rd] && act_null[act_rd] && !complete_q;
@@ -613,7 +618,7 @@ module sienna_top #(
         G_LATCH:    g_state <= G_ROUND;
         G_ROUND:    if (g_done) g_state <= G_IDLE;
         G_ACC_RD:   g_state <= G_ACC_WAIT;
-        G_ACC_WAIT: if (acc_done_w) g_state <= set_accum[g_set_id] ? G_IDLE : G_AFEED;
+        G_ACC_WAIT: if (set_accum[g_set_id] ? acc_part_done : acc_done_w) g_state <= set_accum[g_set_id] ? G_IDLE : G_AFEED;
         G_AFEED:    g_state <= G_LATCH;
         default:    g_state <= G_IDLE;
       endcase
@@ -925,6 +930,22 @@ module sienna_top #(
     else $error("sienna_top: pooling released an empty bank");
   a_acc_add_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_sum_v[0] |-> (acc_pend != '0))
     else $error("sienna_top: an accumulation add returned with none outstanding");
+  // Adds in flight, by beat: an add must never read a beat another add has not yet written back.
+  logic acc_tv[ACC_LAT];
+  logic acc_raw;
+  always_ff @(posedge clk_i or negedge rstn_i) begin
+    if (!rstn_i) for (int i = 0; i < ACC_LAT; i++) acc_tv[i] <= 1'b0;
+    else begin
+      acc_tv[0] <= acc_issue;
+      for (int i = 1; i < ACC_LAT; i++) acc_tv[i] <= acc_tv[i-1];
+    end
+  end
+  always_comb begin
+    acc_raw = 1'b0;
+    for (int i = 0; i < ACC_LAT; i++) if (acc_tv[i] && acc_tag[i] == acc_beat) acc_raw = 1'b1;
+  end
+  a_acc_no_raw: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_issue |-> !acc_raw)
+    else $error("sienna_top: an accumulation add read a beat whose previous add had not been written back");
   a_acc_no_lane_fill: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_phase |-> !acc_rd_valid)
     else $error("sienna_top: the sum was read back while a mesh result was being summed");
   a_complete_pulse: assert property (@(posedge clk_i) disable iff (!rstn_i) pipeline_complete_o |=> !pipeline_complete_o)

@@ -195,7 +195,7 @@ def header(args) -> list:
             f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
             " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
             " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
-            " stage occupancy (a partial sum only adds into acc_mem), pool+out = to the set's completion pulse.", ""]
+            " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.", ""]
 
 
 def footer(args, summary: list) -> list:

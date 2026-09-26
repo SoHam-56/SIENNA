@@ -16,6 +16,11 @@ module TB_sienna_model;
   logic                     accumulate_i;
   logic                     bias_valid_i;
   logic [N-1:0][DATA_WIDTH-1:0] bias_i;
+  localparam int WC_TILES = 128;
+  logic weight_cached_i, wc_write_enable_i;
+  logic [$clog2(WC_TILES)-1:0] weight_tile_i;
+  logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
+  logic [1:0] wc_region_busy_o;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
@@ -65,6 +70,11 @@ module TB_sienna_model;
       .accumulate_i               (accumulate_i),
       .bias_valid_i               (bias_valid_i),
       .bias_i                     (bias_i),
+      .weight_cached_i            (weight_cached_i),
+      .weight_tile_i              (weight_tile_i),
+      .wc_write_enable_i          (wc_write_enable_i),
+      .wc_write_addr_i            (wc_write_addr_i),
+      .wc_region_busy_o           (wc_region_busy_o),
       .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
@@ -191,6 +201,10 @@ module TB_sienna_model;
     accumulate_i = 0;
     bias_valid_i = 0;
     bias_i = '0;
+    weight_cached_i = 0;
+    weight_tile_i = '0;
+    wc_write_enable_i = 0;
+    wc_write_addr_i = '0;
     dropout_seed_i = '1;
     activation_function_i = '0;
     num_terms_i = '0;

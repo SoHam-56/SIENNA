@@ -47,6 +47,22 @@ module TB_sienna_layer;
     end
   end
 
+`ifdef PERF
+  // Cycles with work left but no row taken, by cause, printed at the end.
+  int st_credit = 0, st_staging = 0, st_bias = 0, st_tile = 0, st_input = 0, st_rows = 0, st_idle = 0;
+  always_ff @(posedge clk_i) begin
+    if (rstn_i && dut.active && !dut.is_row_ok && dut.is_blk < dut.ct) begin
+      if (dut.is_loading) st_input++;
+      else if (dut.pipe.credits == 0) st_credit++;
+      else if (!dut.pipe.mesh_input_ready) st_staging++;
+      else if (dut.bias_q && !dut.bias_in[dut.is_blk[0]]) st_bias++;
+      else if (dut.is_cached_pass && !(dut.tiles_in[dut.is_blk[0]] > dut.is_p)) st_tile++;
+      else st_idle++;
+    end
+    if (rstn_i && dut.is_row_ok) st_rows++;
+  end
+`endif
+
   logic [DATA_WIDTH-1:0] a_rows[$], w_rows[$];  // N words per row, back to back
 
   initial begin
@@ -138,6 +154,10 @@ module TB_sienna_layer;
     $fclose(fout);
     $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d", bounds.size(), res_q.size(),
              t_done - t0 + 1, ai, na, wi, nw);
+`ifdef PERF
+    $display("[PERF] rows=%0d stalls: mid-set=%0d credits=%0d staging=%0d bias=%0d tile=%0d other=%0d", st_rows, st_input,
+             st_credit, st_staging, st_bias, st_tile, st_idle);
+`endif
     $finish;
   end
 

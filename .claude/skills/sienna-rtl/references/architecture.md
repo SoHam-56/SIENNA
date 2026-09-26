@@ -96,6 +96,16 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 
 `AccumulationUnit` reads one pixel per cycle from its arrays, sums the `RP × U` partials in a log2 `fp32Adder` tree and writes one result per cycle to `MeshOutputSram`; the pixel index and result bank travel beside the data, so a new set can be read while the previous one is still in the tree. `MeshOutputSram` has `RESULT_BANKS` banks, one write port per output tile and a wide read port of `WIDE_READ` words for the activation stage. The reducer reads T² pixels per set, so the mesh needs K ≥ T² to run at K cycles per set (true for T=4 at N ≥ 16).
 
+### sienna_layer: a layer scheduled in hardware
+
+`src/sienna_layer.sv` (2026-09-25) wraps `sienna_top`. Software's only jobs are the configuration, the input streams and the result check: no per-set control crosses the boundary.
+- Configuration (`cfg_load_i` while idle): M, K per column block, output columns, residual, bias, activation, dropout mode and seed.
+- Weight stream, per column block: the bias row, then the block's weight tiles, once if cached (more than one row tile and at most `WC_TILES/2` tiles), else once per row tile.
+- Activation stream, per block, per row tile: the depth tiles of A, then the residual tile.
+- Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
+- The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache and waits for `wc_region_busy_o` before overwriting a half.
+- Testbench `TB_sienna_layer.sv`; `model_runner.py --engine layer` (default) and `gemm_sweep.py` format the streams with `format_layer()`, which only rearranges data.
+
 ---
 
 ## GPNAE — the activation engine

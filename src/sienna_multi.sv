@@ -10,6 +10,7 @@ module sienna_multi #(
     parameter int HOST_WORDS        = N,
     parameter int COLLAPSE_K        = 1,  // collapse-k mesh in every copy, as in sienna_top
     parameter int SETS_IN_FLIGHT    = 8,  // credits per copy
+    parameter int WC_TILES          = 128,  // weight cache tiles per copy; every copy holds the same weights
     parameter int DATA_WIDTH        = 32,
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
@@ -33,6 +34,11 @@ module sienna_multi #(
     input logic                     accumulate_i,
     input logic                     bias_valid_i,
     input logic [N-1:0][DATA_WIDTH-1:0] bias_i,
+    input logic                     weight_cached_i,
+    input logic [$clog2(WC_TILES)-1:0] weight_tile_i,
+    input logic                     wc_write_enable_i,  // written into every copy's cache
+    input logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i,
+    output logic [1:0]              wc_region_busy_o,
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -62,6 +68,12 @@ module sienna_multi #(
     else if (start_pipeline_i && ready[sel]) sel <= (sel == SW'(COPIES - 1)) ? '0 : sel + 1'b1;
   end
 
+  logic [COPIES-1:0][1:0] copy_wc_busy;
+  always_comb begin
+    wc_region_busy_o = '0;
+    for (int c = 0; c < COPIES; c++) wc_region_busy_o |= copy_wc_busy[c];
+  end
+
   for (genvar c = 0; c < COPIES; c++) begin : COPY
     logic mine;
     assign mine = (sel == SW'(c));
@@ -72,6 +84,7 @@ module sienna_multi #(
         .HOST_WORDS       (HOST_WORDS),
         .COLLAPSE_K       (COLLAPSE_K),
         .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
+        .WC_TILES         (WC_TILES),
         .DATA_WIDTH       (DATA_WIDTH),
         .SRAM_DEPTH       (SRAM_DEPTH),
         .FIFO_DEPTH       (FIFO_DEPTH),
@@ -94,6 +107,11 @@ module sienna_multi #(
         .accumulate_i               (accumulate_i),
         .bias_valid_i               (bias_valid_i),
         .bias_i                     (bias_i),
+        .weight_cached_i            (weight_cached_i),
+        .weight_tile_i              (weight_tile_i),
+        .wc_write_enable_i          (wc_write_enable_i),
+        .wc_write_addr_i            (wc_write_addr_i),
+        .wc_region_busy_o           (copy_wc_busy[c]),
         .dropout_seed_i             (dropout_seed_i),
         .activation_function_i      (activation_function_i),
         .num_terms_i                (num_terms_i),

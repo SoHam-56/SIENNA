@@ -61,6 +61,24 @@ module TB_sienna_layer;
     end
     if (rstn_i && dut.is_row_ok) st_rows++;
   end
+  // Downstream: cycles a stage holds a ready set but cannot pass it on, and why.
+  int dn_accbank = 0, dn_resbank = 0, dn_actbusy = 0, dn_actbank = 0, dn_poolbusy = 0, dn_bcast = 0;
+  always_ff @(posedge clk_i) begin
+    if (rstn_i && dut.active) begin
+      if (dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ob_full[dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.fb] &&
+          dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_busy[dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_next])
+        dn_accbank++;
+      if (dut.pipe.systolic_array_inst.in_full[dut.pipe.systolic_array_inst.in_rd] && !dut.pipe.systolic_array_inst.arrays_load_ready &&
+          dut.pipe.systolic_array_inst.bstate == 0)
+        dn_bcast++;
+      if (dut.pipe.systolic_array_inst.arrays_final && !dut.pipe.systolic_array_inst.reduce_start &&
+          dut.pipe.systolic_array_inst.out_state[dut.pipe.systolic_array_inst.out_wr] != 0)
+        dn_resbank++;
+      if (dut.pipe.systolic_collection_complete && dut.pipe.g_state != 0) dn_actbusy++;
+      if (dut.pipe.systolic_collection_complete && dut.pipe.g_state == 0 && dut.pipe.act_full[dut.pipe.act_wr]) dn_actbank++;
+      if (dut.pipe.act_full[dut.pipe.act_rd] && dut.pipe.p_state != 0) dn_poolbusy++;
+    end
+  end
 `endif
 
   logic [DATA_WIDTH-1:0] a_rows[$], w_rows[$];  // N words per row, back to back
@@ -157,6 +175,8 @@ module TB_sienna_layer;
 `ifdef PERF
     $display("[PERF] rows=%0d stalls: mid-set=%0d credits=%0d staging=%0d bias=%0d tile=%0d other=%0d", st_rows, st_input,
              st_credit, st_staging, st_bias, st_tile, st_idle);
+    $display("[PERF] held: operand-bank-full=%0d partial-sum-bank=%0d result-bank=%0d activation-busy=%0d activation-bank=%0d pooling-busy=%0d",
+             dn_bcast, dn_accbank, dn_resbank, dn_actbusy, dn_actbank, dn_poolbusy);
 `endif
     $finish;
   end

@@ -57,6 +57,7 @@ module TB_sienna_top;
   logic [DATA_WIDTH-1:0] north_data_queue[$];
   logic [DATA_WIDTH-1:0] west_data_queue [$];
   logic [DATA_WIDTH-1:0] expected_results[$];
+  logic [DATA_WIDTH-1:0] bound_results[$];  // per-output fp32 error bounds from the golden model
   logic [DATA_WIDTH-1:0] actual_results  [$];
 
   // ── Verification counters ─────────────────────────────────────────────
@@ -142,26 +143,30 @@ module TB_sienna_top;
   endfunction
 
   // ── Tolerance check ───────────────────────────────────────────────────
-  function automatic logic check_tolerance(input [DATA_WIDTH-1:0] expected, actual,
+  // Passes within REL_TOL, or within bound: the golden model's fp32 error bound for this output, for sums that cancel.
+  function automatic logic check_tolerance(input [DATA_WIDTH-1:0] expected, actual, bound,
                                            output string info);
-    real exp_r, act_r, abs_d, rel_d;
+    real exp_r, act_r, abs_d, rel_d, bnd_r;
 
     exp_r = f32(expected[31:0]);
     act_r = f32(actual[31:0]);
+    bnd_r = f32(bound[31:0]);
     abs_d = (exp_r > act_r) ? (exp_r - act_r) : (act_r - exp_r);
 
     if (exp_r != 0.0) rel_d = abs_d / ((exp_r > 0.0) ? exp_r : -exp_r);
     else rel_d = (act_r == 0.0) ? 0.0 : 1.0;
 
     info = $sformatf(
-        "exp=%g act=%g abs=%.3g (lim %.4f) rel=%.4f%% (lim %.1f%%)",
+        "exp=%g act=%g abs=%.3g (lim %.4f, fp32 bound %.3g) rel=%.4f%% (lim %.1f%%)",
         exp_r,
         act_r,
         abs_d,
         ABS_TOL,
+        bnd_r,
         rel_d * 100.0,
         REL_TOL * 100.0
     );
+    if (bnd_r > 0.0 && abs_d <= bnd_r) return 1'b1;
 
     case (TOLERANCE_MODE)
       "ABSOLUTE": return (abs_d <= ABS_TOL);
@@ -174,11 +179,14 @@ module TB_sienna_top;
   // Checker self-test: a loose or broken compare must fail the run before any result is trusted.
   initial begin
     string st_info;
-    if (!check_tolerance(32'h3f800000, 32'h3f800003, st_info) ||   // 1.0 vs 1.0 + 3 ulp: pass
-        check_tolerance(32'h3f800000, 32'h40000000, st_info) ||    // 1.0 vs 2.0: fail
-        check_tolerance(32'h3f800000, 32'h3f7ae148, st_info) ||    // 1.0 vs 0.98: fail
-        check_tolerance(32'h3f800000, 32'hbf800000, st_info) ||    // 1.0 vs -1.0: fail
-        check_tolerance(32'hbf000000, 32'hbd4ccccd, st_info)) begin // -0.5 vs -0.05: fail
+    if (!check_tolerance(32'h3f800000, 32'h3f800003, 0, st_info) ||   // 1.0 vs 1.0 + 3 ulp: pass
+        check_tolerance(32'h3f800000, 32'h40000000, 0, st_info) ||    // 1.0 vs 2.0: fail
+        check_tolerance(32'h3f800000, 32'h3f7ae148, 0, st_info) ||    // 1.0 vs 0.98: fail
+        check_tolerance(32'h3f800000, 32'hbf800000, 0, st_info) ||    // 1.0 vs -1.0: fail
+        check_tolerance(32'hbf000000, 32'hbd4ccccd, 0, st_info) ||    // -0.5 vs -0.05: fail
+        !check_tolerance(32'h370e8795, 32'h37020000, 32'h3727c5ac, st_info) ||  // 8.5e-6 vs 7.7e-6, bound 1e-5: pass
+        check_tolerance(32'h370e8795, 32'h37020000, 32'h350637bd, st_info) ||   // same (off by 7.5e-7), bound 5e-7: fail
+        check_tolerance(32'h3f800000, 32'h40000000, 32'h3a83126f, st_info)) begin // 1.0 vs 2.0, bound 1e-3: fail
       $display("[FAIL] Tolerance checker self-test failed; results cannot be trusted");
       $finish;
     end
@@ -336,7 +344,7 @@ module TB_sienna_top;
       total_elements++;
       if (ev === av) begin
         exact_passed++;
-      end else if (check_tolerance(ev, av, info)) begin
+      end else if (check_tolerance(ev, av, (i < bound_results.size()) ? bound_results[i] : '0, info)) begin
         tol_passed++;
         $display("  [PASS-TOL] [%0d] exp=0x%h act=0x%h | %s", i, ev, av, info);
       end else begin
@@ -597,11 +605,13 @@ module TB_sienna_top;
   end
 
   task automatic verify_slice(input int k, input logic [DATA_WIDTH-1:0] exp_q[$]);
+    automatic logic [DATA_WIDTH-1:0] bnd_q[$];
     automatic int lo = (k == 0) ? 0 : stream_bounds[k-1];
     automatic int n_act = stream_bounds[k] - lo;
     automatic int errs = 0;
     logic [DATA_WIDTH-1:0] av;
     string info;
+    read_mem_file($sformatf("bound_output_%0d.mem", k), bnd_q);
     if (stream_ids[k] != ((stream_id_base + k) % (1 << ID_W))) begin
       failed++;
       $display("  [FAIL] Stream set %0d completed as set id %0d, expected %0d", k, stream_ids[k],
@@ -620,7 +630,7 @@ module TB_sienna_top;
       end else begin
         av = stream_results[lo+i];
         if (av === exp_q[i]) exact_passed++;
-        else if (check_tolerance(exp_q[i], av, info)) tol_passed++;
+        else if (check_tolerance(exp_q[i], av, (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
         else begin
           failed++;
           errs++;
@@ -876,6 +886,7 @@ module TB_sienna_top;
     read_mem_file(WEST_INPUT_FILE, west_data_queue);
     read_mem_file(NORTH_INPUT_FILE, north_data_queue);
     read_mem_file(EXPECTED_OUTPUT_FILE, expected_results);
+    read_mem_file("bound_output.mem", bound_results);
 
     $display("  West=%0d  North=%0d  Expected=%0d words", west_data_queue.size(),
              north_data_queue.size(), expected_results.size());
@@ -921,6 +932,7 @@ module TB_sienna_top;
       read_mem_file("matrix_west_1.mem", west_data_queue);
       read_mem_file("matrix_north_1.mem", north_data_queue);
       read_mem_file("expected_output_1.mem", expected_results);
+      read_mem_file("bound_output_1.mem", bound_results);
       dropout_seed_i = set_seed(1);
       activation_function_i = act_of(1);
       num_terms_i = terms_of(1);

@@ -258,6 +258,24 @@ def _golden_from_c(C: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) 
     return C, C_act, C_pooled, C_final
 
 
+# Largest slope of each activation: an input error of e moves the output by at most slope * e.
+ACTIVATION_SLOPE = {"selu": 1.76, "sigmoid": 0.25, "tanh": 1.0, "relu": 1.0, "linear": 1.0}
+
+
+def fp32_error_bound(S: np.ndarray, products: int, cfg: dict, act_type: str, C: np.ndarray) -> np.ndarray:
+    """Worst-case fp32 error of each output: (products + 8) * 2^-24 * sum|a*b|, carried through activation, pooling, dropout.
+
+    S is the sum of |a_i * b_i| (and |bias|) behind each pre-activation value C. Near-zero outputs of a sum whose terms
+    cancel can miss by this much with correct hardware, which a relative tolerance alone would call a failure."""
+    B = (products + 8) * 2.0**-24 * S.astype(np.float64) * ACTIVATION_SLOPE.get(act_type.lower(), 1.0)
+    if act_type.lower() == "relu":
+        B = np.where(C.astype(np.float64) > -B, B, 0.0)  # clearly negative inputs must come out exactly 0
+    B = apply_maxpool_2d(B, cfg.get("pool_h", 2), cfg.get("pool_w", 2), padding=cfg.get("padding", 1))
+    if cfg.get("training", False):
+        B = B / (1.0 - cfg.get("dropout_p", 0.5))
+    return B.astype(np.float32)
+
+
 def generate_vectors(cfg: dict) -> None:
     os.makedirs(TB_DIR, exist_ok=True)
     N, tile_size, mode = (
@@ -301,6 +319,8 @@ def generate_vectors(cfg: dict) -> None:
     write_mem(os.path.join(TB_DIR, "matrix_west.mem"), A)
     write_mem(os.path.join(TB_DIR, "matrix_north.mem"), B)
     write_mem(os.path.join(TB_DIR, "expected_output.mem"), C_final)
+    S0 = np.abs(A).astype(np.float64) @ np.abs(B).astype(np.float64) + (np.abs(bias_of(0)) if use_bias else 0.0)
+    write_mem(os.path.join(TB_DIR, "bound_output.mem"), fp32_error_bound(S0, N, cfg, act_type, C0))
 
     # Streamed sets: set 0 is the test's own pattern, the rest random and distinct.
     # accum_passes P groups the streamed sets P at a time: P-1 partial products, then the set that is activated.
@@ -312,6 +332,7 @@ def generate_vectors(cfg: dict) -> None:
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
     masks = []
     run = None
+    run_s = None  # sum|a*b| behind the running partial sum
     for k in range(num_sets):
         act_k = mixed[k % len(mixed)] if mixed else act_type
         if k == 0:
@@ -322,9 +343,11 @@ def generate_vectors(cfg: dict) -> None:
             Bk = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
         bk = bias_of(k) if use_bias and k % passes == 0 else np.zeros(N, dtype=np.float32)
         write_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), bk)
+        Sk = np.abs(Ak).astype(np.float64) @ np.abs(Bk).astype(np.float64) + np.abs(bk)
         if passes > 1:
             Ck = (_ref_matmul(Ak, Bk) + bk).astype(np.float32)
             run = Ck if k % passes == 0 else (run + Ck).astype(np.float32)  # summed in pass order, as the hardware does
+            run_s = Sk if k % passes == 0 else run_s + Sk
             partial = (k % passes) != passes - 1
             Fk = np.zeros(0, dtype=np.float32) if partial else _golden_from_c(run, cfg, act_k, set_dropout_seed(drop_seed, k))[3]
         else:
@@ -334,6 +357,10 @@ def generate_vectors(cfg: dict) -> None:
         write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
         write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
         write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
+        Bnd = np.zeros(0, dtype=np.float32) if partial else \
+            fp32_error_bound(run_s if passes > 1 else Sk, N * passes, cfg, act_k,
+                             run if passes > 1 else (_ref_matmul(Ak, Bk) + bk).astype(np.float32))
+        write_mem(os.path.join(TB_DIR, f"bound_output_{k}.mem"), Bnd)
         if cfg.get("training", False) and not partial:
             masks.append(tuple((Fk.flatten() != 0).tolist()))
     for i in range(len(masks)):

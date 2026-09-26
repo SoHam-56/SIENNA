@@ -67,9 +67,11 @@ module TB_sienna_multi #(
     return b[31] ? -v : v;
   endfunction
 
-  function automatic bit close(input logic [31:0] e, input logic [31:0] a);
-    real er = f32(e), ar = f32(a), d;
+  // Within REL_TOL, or within the golden model's fp32 error bound for this output.
+  function automatic bit close(input logic [31:0] e, input logic [31:0] a, input logic [31:0] bnd);
+    real er = f32(e), ar = f32(a), br = f32(bnd), d;
     d = (er > ar) ? er - ar : ar - er;
+    if (br > 0.0 && d <= br) return 1;
     if (er == 0.0) return ar == 0.0;
     return d <= REL_TOL * ((er > 0.0) ? er : -er);
   endfunction
@@ -123,7 +125,7 @@ module TB_sienna_multi #(
     end
   end
 
-  logic [DATA_WIDTH-1:0] wq[$], nq[$], eq[$];
+  logic [DATA_WIDTH-1:0] wq[$], nq[$], eq[$], bq[$];
   int failed = 0;
 
   initial begin
@@ -173,12 +175,13 @@ module TB_sienna_multi #(
     for (int k = 0; k < NUM_SETS; k++) begin
       automatic int errs = 0;
       read_mem_file($sformatf("expected_output_%0d.mem", k), eq);
+      read_mem_file($sformatf("bound_output_%0d.mem", k), bq);
       if (!got.exists(k) || got[k].size() != eq.size()) begin
         failed++;
         $display("  [FAIL] set %0d: %0d outputs, expected %0d", k, got.exists(k) ? got[k].size() : -1, eq.size());
         continue;
       end
-      for (int i = 0; i < eq.size(); i++) if (!close(eq[i], got[k][i])) errs++;
+      for (int i = 0; i < eq.size(); i++) if (!close(eq[i], got[k][i], (i < bq.size()) ? bq[i] : '0)) errs++;
       if (errs) begin
         failed++;
         $display("  [FAIL] set %0d: %0d of %0d outputs out of tolerance", k, errs, eq.size());

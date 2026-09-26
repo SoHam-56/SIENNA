@@ -8,6 +8,9 @@ module sienna_top #(
     parameter int    COLLAPSE_K        = 1,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
     parameter int    SETS_IN_FLIGHT    = 8,  // credits: sets started and not yet complete
     parameter int    ID_W              = $clog2(SETS_IN_FLIGHT + 1),  // set id width; ids count accepted starts
+    parameter int    WC_TILES          = 128,  // weight cache tiles in the mesh
+    parameter int    WCTW              = $clog2(WC_TILES),
+    parameter int    WCAW              = $clog2(WC_TILES * N * N),
     parameter int    DATA_WIDTH        = 32,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
@@ -33,6 +36,11 @@ module sienna_top #(
     input logic                     accumulate_i,     // 1: add this set's product to the running sum and output nothing
     input logic                     bias_valid_i,     // with the start: add bias_i[c] to column c of this set's product
     input logic [N-1:0][DATA_WIDTH-1:0] bias_i,
+    input logic                     weight_cached_i,  // with the start: B is cache tile weight_tile_i, only A is written
+    input logic [WCTW-1:0]          weight_tile_i,
+    input logic                     wc_write_enable_i,  // weight cache write of north_write_data_i at word wc_write_addr_i
+    input logic [WCAW-1:0]          wc_write_addr_i,
+    output logic [1:0]              wc_region_busy_o,   // a started set not yet broadcast reads this cache region
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,   // dropout seed for the set being started
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -204,13 +212,19 @@ module sienna_top #(
       .DATA_WIDTH (DATA_WIDTH),
       .WIDE_READ  (NUM_LANES),
       .HOST_WORDS (HOST_WORDS),
-      .COLLAPSE_K (COLLAPSE_K)
+      .COLLAPSE_K (COLLAPSE_K),
+      .WC_TILES   (WC_TILES)
   ) systolic_array_inst (
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),
       .start_matrix_mult_i   (systolic_start),
       .bias_valid_i          (bias_valid_i),
       .bias_i                (bias_i),
+      .weight_cached_i       (weight_cached_i),
+      .weight_tile_i         (weight_tile_i),
+      .wc_write_enable_i     (wc_write_enable_i),
+      .wc_write_addr_i       (wc_write_addr_i),
+      .wc_region_busy_o      (wc_region_busy_o),
       .north_write_enable_i  (north_write_enable_i),
       .north_write_data_i    (north_write_data_i),
       .north_write_reset_i   (north_write_reset_i),
@@ -541,7 +555,7 @@ module sienna_top #(
   logic streaming_complete;
 
   assign pipeline_ready_o = (credits != 0) && mesh_input_ready;
-  assign host_accept = start_pipeline_i && pipeline_ready_o && !north_queue_empty && !west_queue_empty;
+  assign host_accept = start_pipeline_i && pipeline_ready_o && (weight_cached_i || !north_queue_empty) && !west_queue_empty;
   // Not while the previous result's read or release is in flight: its bank flag may still read full.
   assign g_accept = (g_state == G_IDLE) && systolic_collection_complete && !act_full[act_wr] &&
                     !systolic_read_enable && !systolic_release;

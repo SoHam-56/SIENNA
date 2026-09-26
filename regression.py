@@ -52,7 +52,7 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 
 # Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
 # No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
-SETS_IN_FLIGHT = 8  # sienna_top's credits; the testbenches read it from the package
+SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its banks, ACC_BANKS=RESULT_BANKS=4); the testbenches read it from the package
 
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 
@@ -308,7 +308,8 @@ def generate_vectors(cfg: dict) -> None:
     mixed = cfg.get("mixed_acts", [])  # set k uses mixed[k % len], set 0 must match act
     assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
     # Enough sets to use every credit, so the credit-overrun pass is reachable; whole accumulate groups only.
-    num_sets = cfg.get("num_sets", len(mixed) or -(-(SETS_IN_FLIGHT + 2) // passes) * passes)
+    credits = cfg.get("credits", SETS_IN_FLIGHT)  # a test may build the pipeline with fewer credits than the default
+    num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
     masks = []
     run = None
     for k in range(num_sets):
@@ -367,7 +368,7 @@ def generate_vectors(cfg: dict) -> None:
         ("LFSR_WIDTH", 32, "int"),
         ("CONTROL_WIDTH", 3, "int"),
         ("NUM_SETS", num_sets, "int"),
-        ("SETS_IN_FLIGHT", SETS_IN_FLIGHT, "int"),
+        ("SETS_IN_FLIGHT", credits, "int"),
         ("HAS_BIAS", int(use_bias), "int"),
         ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
         ("ACCUM_PASSES", passes, "int"),
@@ -533,6 +534,11 @@ PIPELINE_TESTS = [
         "matrix_type": "random",
         "act": "tanh",
     },
+    {"name": "matmul_random_selu", "mode": "matmul", "matrix_type": "random", "act": "selu"},  # ident_selu alone masks faults
+    # The default credits cover every bank, so the host rarely runs out; three credits make it, for the no-credit start check.
+    {"name": "matmul_relu_nopool_credits3", "mode": "matmul", "matrix_type": "random", "act": "relu", "credits": 3,
+     "pool_h": 1, "pool_w": 1, "padding": 0},
+    {"name": "matmul_tanh_credits3", "mode": "matmul", "matrix_type": "random", "act": "tanh", "credits": 3},
     {"name": "conv_basic_selu", "mode": "conv", "conv_type": "basic", "act": "selu"},
     {"name": "conv_basic_tanh", "mode": "conv", "conv_type": "basic", "act": "tanh"},
     {"name": "matmul_random_tanh_train", "mode": "matmul", "matrix_type": "random", "act": "tanh", "training": True},

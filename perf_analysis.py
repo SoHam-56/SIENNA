@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Cycle, latency and throughput analysis of the streamed SIENNA pipeline from TB_sienna_top's PERF trace."""
 import argparse
+import json
 import os
 import re
 import statistics
@@ -13,9 +14,7 @@ sys.path.insert(0, ROOT)
 import regression as reg  # noqa: E402
 
 REPORT = os.path.join(ROOT, "testbenches", "results", "perf", "pipeline_performance_report.log")
-MESH = {1: "RESET_SEQ", 2: "BROADCAST", 3: "FIRE", 4: "WAIT_TILES", 5: "REDUCE", 6: "WAIT_REDUCE", 7: "DONE"}
-CONFIGS = ["matmul_random_sigm", "matmul_random_tanh", "matmul_ident_selu", "conv_basic_selu",
-           "matmul_random_tanh_train", "matmul_large_selu", "matmul_large_sigm", "matmul_large_tanh"]
+CONFIGS = [t["name"] for t in reg.PIPELINE_TESTS]
 
 
 GEOM = {"n": 16, "tile_size": 4, "lanes": 32}  # set from the command line in main()
@@ -26,11 +25,14 @@ def run(name: str, num_sets: int, build_dir: str) -> str:
     reg.generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
     cmd = ["make", "verilator", "TRACE=0", "EXTRA_FLAGS=-DPERF", f"VERILATOR_DIR={build_dir}"]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    raw_dir = os.path.join(os.path.dirname(REPORT), "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    open(os.path.join(raw_dir, f"{name}_N{GEOM['n']}.log"), "w").write(r.stdout + r.stderr)  # to re-parse without a rerun
     return r.stdout + r.stderr
 
 
 def events(raw: str) -> dict:
-    """PERF lines of the first plain stream pass, as {kind: [(cycle, value), ...]}."""
+    """PERF lines of the first plain stream pass, as {kind: [(cycle, value, value2), ...]}."""
     ev, on = {}, False
     for m in re.finditer(r"^PERF (\d+) (\w+)(?: (-?\d+))?(?: (-?\d+))?", raw, re.M):
         c, kind = int(m.group(1)), m.group(2)
@@ -46,71 +48,82 @@ def events(raw: str) -> dict:
     return ev
 
 
-def entries(ev: dict, kind: str, value: int) -> list:
-    return [c for c, a, _ in ev.get(kind, []) if a == value]
-
-
-def exits(ev: dict, kind: str, value: int) -> list:
-    out, prev = [], None
+def leaves(ev: dict, kind: str, idle: int) -> tuple:
+    """Cycles a state machine leaves and re-enters its idle state: one pair per set it takes."""
+    up, down, prev = [], [], idle
     for c, a, _ in ev.get(kind, []):
-        if prev == value and a != value:
-            out.append(c)
+        if prev == idle and a != idle:
+            up.append(c)
+        if prev != idle and a == idle:
+            down.append(c)
         prev = a
-    return out
+    return up, down
 
 
 def analyse(ev: dict, k_sets: int) -> dict:
     load, start = [c for c, _, _ in ev["HOST_LOAD"]], [c for c, _, _ in ev["HOST_START"]]
-    mesh = {v: entries(ev, "MESH", v) for v in MESH}
-    rd_up, rd_dn = entries(ev, "MREAD", 1), entries(ev, "MREAD", 0)
-    g_feed, g_round, g_done = entries(ev, "G", 1), entries(ev, "G", 3), exits(ev, "G", 3)
-    p_start, p_wait, p_done = entries(ev, "P", 1), entries(ev, "P", 2), exits(ev, "P", 2)
+    launch = [c for c, a, _ in ev.get("MESH", []) if a == 1]
+    written = [c for c, a, _ in ev.get("MESH", []) if a == 7]
+    reduce = [c for c, a, _ in ev.get("MESH", []) if a == 5]
+    g_up, g_dn = leaves(ev, "G", 0)
+    p_up, p_dn = leaves(ev, "P", 0)
     done = [c for c, _, _ in ev["DONE"]]
-    lanes = [(a, b) for _, a, b in ev.get("LANES", [])]
-    n = min(k_sets, len(done), len(mesh[7]), len(g_done), len(p_done), len(start))
-    sets = []
-    for k in range(n):
-        s = dict(
-            load=start[k] - load[k],
-            wait_mesh=mesh[1][k] - start[k],
-            broadcast=mesh[3][k] - mesh[2][k],
-            tiles=mesh[5][k] - mesh[4][k],
-            reduce=mesh[7][k] - mesh[5][k],
-            mesh=mesh[7][k] - mesh[1][k],
-            wait_act=g_feed[k] - mesh[7][k],
-            read=rd_dn[k] - rd_up[k] if k < min(len(rd_up), len(rd_dn)) else 0,
-            act=g_done[k] - g_feed[k],
-            wait_pool=p_start[k] - g_done[k],
-            dispatch=p_wait[k] - p_start[k],
-            drain=p_done[k] - p_wait[k],
-            pool=p_done[k] - p_start[k],
-            latency=done[k] - start[k],
-            lane_util=(lanes[k][0] / (GEOM["lanes"] * lanes[k][1])) if k < len(lanes) and lanes[k][1] else 0.0,
-        )
-        sets.append(s)
-    gaps = [done[k] - done[k - 1] for k in range(1, n)]
+    n = min(k_sets, len(done), len(written), len(g_dn), len(start))
+    sets = [dict(load=start[k] - load[k], wait_mesh=launch[k] - start[k], mesh=written[k] - launch[k],
+                 wait_act=g_up[k] - written[k], act=g_dn[k] - g_up[k], out=done[k] - g_dn[k],
+                 latency=done[k] - start[k]) for k in range(n)]
+    gap = lambda xs: [xs[k] - xs[k - 1] for k in range(1, min(n, len(xs)))]
+    gaps = gap(done)
     steady = gaps[len(gaps) // 2:] if gaps else []
-    span = done[n - 1] - start[0] if n else 0
-    busy = {name: sum(s[name] for s in sets) for name in ("load", "mesh", "act", "pool")}
-    return dict(sets=sets, gaps=gaps, steady=steady, span=span, busy=busy, n=n)
+    lanes = [a / (GEOM["lanes"] * b) for _, a, b in ev.get("LANES", []) if b]
+    pool = [d - u for u, d in zip(p_up, p_dn)]  # sets that output; partial sums skip pooling
+    return dict(sets=sets, gaps=gaps, steady=steady, n=n, launch_gaps=gap(launch), host_gaps=gap(start),
+                act_gaps=gap(g_up), pool=pool, lanes=lanes, reduce_to_written=[w - r for r, w in zip(reduce, written)])
 
 
-def mesh_block() -> list:
-    """Per-matmul mesh cycles by tile size, from the mesh regression's own logs if present."""
-    d = os.path.join(ROOT, "SystolicMesh", "testbenches", "results", "readiness")
-    rows = []
-    for t in (2, 4, 8, 16):
-        f = os.path.join(d, f"mm_random_N16_T{t}.log")
-        if not os.path.exists(f):
-            continue
-        raw = open(f, errors="ignore").read()
-        one = re.search(r"Set 0 : (\d+) cycles", raw)
-        ser = re.search(r"\[Serial\] (\d+) sets in (\d+) cycles", raw)
-        stm = re.search(r"\[Stream\] (\d+) sets in (\d+) cycles", raw)
-        if one and ser and stm:
-            rows.append([t, (16 // t) ** 3, one.group(1), f"{int(ser.group(2)) / int(ser.group(1)):.0f}",
-                         f"{int(stm.group(2)) / int(stm.group(1)):.0f}"])
-    return rows
+DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table
+MUL_LAT, ADD_LAT = 8, 5  # fp32Multiplier and fp32Adder, valid in to done out
+
+
+def pkg() -> dict:
+    """The generated test_config_pkg's integer parameters: the geometry this run was built with."""
+    raw = open(os.path.join(ROOT, "testbenches", "test_config_pkg.sv")).read()
+    return {k: int(v) for k, v in re.findall(r"localparam int (\w+) = (-?\d+);", raw)}
+
+
+def clog2(x: int) -> int:
+    return max(0, (x - 1).bit_length())
+
+
+def model(cfg: dict, collapse: bool = True) -> dict:
+    """Cycles each stage should take per set, from the RTL's structure."""
+    P = pkg()
+    N, T, lanes = P["N"], P["TILE_SIZE"], P["NUM_LANES"]
+    per_lane = P["SRAM_DEPTH"] // lanes
+    K = N if collapse else T  # depth each array multiplies
+    U = min(K, 6)  # partial sums per PE pixel
+    RP = 1 if collapse else N // T  # depth slices summed per output tile
+    LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
+    words = len(open(os.path.join(reg.TB_DIR, "matrix_west_0.mem")).read().split())
+    rows = -(-words // P["HOST_WORDS"])
+    m = dict(
+        # TB_sienna_top: one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
+        host=rows + 3,
+        # Broadcast T rows plus commit, the array feed of K products, the reducer's T^2 reads: whichever is longest.
+        mesh=max(T + 2, K, T * T),
+        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 2,
+        # then T^2 reads and the tree.
+        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 2 + T * T + LAT,
+        per_lane=per_lane, LAT=LAT)
+    act = cfg.get("act")
+    windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
+              ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
+    m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
+    if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+        m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done
+    elif act in DEGREE:
+        m["act_rounds"] = (DEGREE[act] + 1) * max(per_lane, MUL_LAT + ADD_LAT + 1)  # barrel MAC round: max(n, 14)
+    return m
 
 
 def fmt_table(rows: list, cols: list) -> list:
@@ -121,9 +134,85 @@ def fmt_table(rows: list, cols: list) -> list:
     return out
 
 
+def med(xs: list) -> int:
+    return int(statistics.median(xs)) if xs else 0
+
+
+SUMMARY_COLS = ["config", "latency", "cycles/set", "FLOP/cyc", "GFLOPS*", "PE use", "limit", "its cycles",
+                "host model", "mesh model", "mesh lat model", "mesh lat", "sim"]
+
+
+def one_config(name: str, args) -> tuple:
+    """(detail lines, summary row) for one regression config."""
+    flop = 2 * args.n ** 3
+    cfg = next(t for t in reg.PIPELINE_TESTS if t["name"] == name)
+    if args.reparse:  # the saved trace; only the stimulus is regenerated, for the model's geometry
+        reg.generate_vectors({**GEOM, **cfg, "num_sets": args.sets})
+        raw = open(os.path.join(args.reparse, f"{name}_N{args.n}.log"), errors="ignore").read()
+    else:
+        raw = run(name, args.sets, args.build_dir)
+    mdl = model(cfg, not args.slices)
+    if "RESULT: PASSED" not in raw or "Assertion failed" in raw:
+        return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
+    a = analyse(events(raw), args.sets)
+    s = a["sets"]
+    steady = statistics.mean(a["steady"]) if a["steady"] else 0
+    # Each stage's own cost per set: the host's start interval; activation runs one set at a time; the mesh is
+    # pipelined, so its cost is its tightest launch interval, not the time a set spends inside it.
+    stage = {"host": min(a["host_gaps"] or [0]), "mesh": min(a["launch_gaps"] or [0]),
+             "activation": med([x["act"] for x in s]), "pooling": med(a["pool"])}
+    lim = max(stage, key=stage.get)
+    L = [f"--- {name}", ""]
+    L += fmt_table([[k, x["load"], x["wait_mesh"], x["mesh"], x["wait_act"], x["act"], x["out"], x["latency"]]
+                    for k, x in enumerate(s)],
+                   ["set", "load", "wait", "mesh", "wait", "activ", "pool+out", "latency"])
+    L += ["",
+          f"  Stage cost per set: host load {stage['host']}, mesh launch interval min {stage['mesh']} median "
+          f"{med(a['launch_gaps'])}, activation {stage['activation']}, pooling {stage['pooling']} (cycles)",
+          f"  Mesh inside  : reduce start to result written {med(a['reduce_to_written'])} cycles (median)"
+          + (f"; GPNAE lanes busy {100 * statistics.median(a['lanes']):.0f}% of a round" if a["lanes"] else ""),
+          f"  Completion gaps: {a['gaps']}",
+          f"  Steady state : {steady:.1f} cycles per set (mean of the last {len(a['steady'])} gaps); "
+          f"single-set latency {s[0]['latency']} cycles",
+          f"  Limit        : {lim} ({stage[lim]} cycles per set)",
+          f"  Design model : host {mdl['host']} (measured {stage['host']}), mesh interval {mdl['mesh']} (measured min "
+          f"{stage['mesh']}, host-bound), mesh latency {mdl['mesh_lat']} (measured {s[0]['mesh']} on the first set), "
+          + (f"activation {mdl['act']} (measured {stage['activation']})" if "act" in mdl else
+             f"activation: {mdl.get('act_rounds', '-')} cycles of polynomial rounds in the measured {stage['activation']}")
+          + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}",
+          f"  Matmul rate  : {flop} FLOP per set -> {flop / steady:.1f} FLOP/cycle, {flop / steady * args.clock_mhz / 1000:.1f}"
+          f" GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
+          f" {args.n ** 2} MAC/cycle" if steady else "", ""]
+    row = [name, s[0]["latency"], f"{steady:.1f}", f"{flop / steady:.1f}", f"{flop / steady * args.clock_mhz / 1000:.1f}",
+           f"{100 * flop / 2 / steady / args.n ** 2:.0f}%", lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"],
+           s[0]["mesh"], "pass"]
+    return L, row
+
+
+def header(args) -> list:
+    return ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
+            f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  "
+            f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
+            " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
+            " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
+            " stage occupancy (a partial sum only adds into acc_mem), pool+out = to the set's completion pulse.", ""]
+
+
+def footer(args, summary: list) -> list:
+    L = ["=" * 100, " SUMMARY", "=" * 100]
+    L += fmt_table(summary, SUMMARY_COLS)
+    L += [" latency = host start to completion pulse of set 0 on an idle pipeline. host/mesh model: cycles per set the",
+          " design needs (host N+3 is TB_sienna_top's handshake; the mesh alone needs max(T+2, K, T^2)).",
+          " mesh lat model: launch to result written, 3T+K+T^2+LAT+16; mesh lat: the same, measured on set 0."]
+    L += [f" * GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz clock, not a timing result; they count the set's"
+          f" {2 * args.n ** 3}-FLOP matmul only.",
+          " PE use = multiply-accumulates per cycle over the mesh's N^2. limit = the stage with the largest cost per set."]
+    return L
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--sets", type=int, default=12)
+    ap.add_argument("--sets", type=int, default=24, help="streamed sets; 24 fits every accumulate and mixed pattern")
     ap.add_argument("--configs", nargs="*", default=CONFIGS)
     ap.add_argument("--clock-mhz", type=float, default=950.0,
                     help="assumed clock for GFLOPS; no timing run has demonstrated one")
@@ -131,68 +220,28 @@ def main() -> None:
     ap.add_argument("--tile-size", type=int, default=4)
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--build-dir", default=os.environ.get("PERF_BUILD_DIR", os.path.join(ROOT, "Verilator_perf")))
+    ap.add_argument("--report", default=REPORT)
+    ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
+    ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
+    ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
     args = ap.parse_args()
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes)
-    flop = 2 * args.n ** 3
-    L = ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
-         f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  {args.sets} streamed sets per config",
-         " Every number below is measured from TB_sienna_top's PERF trace unless marked MODEL.",
-         " Stage times are occupancy: from the stage taking a set to releasing it.", ""]
-    summary, models = [], []
-    for name in args.configs:
-        raw = run(name, args.sets, args.build_dir)
-        if "RESULT: PASSED" not in raw:
-            L += [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""]
-            summary.append([name, "-", "-", "-", "-", "-", "-", "FAIL"])
-            continue
-        a = analyse(events(raw), args.sets)
-        s = a["sets"]
-        med = lambda key: int(statistics.median(x[key] for x in s))
-        steady = statistics.mean(a["steady"]) if a["steady"] else 0
-        stage = {"host load": med("load"), "mesh": med("mesh"), "activation": med("act"), "pooling": med("pool")}
-        bott = max(stage, key=stage.get)
-        L += [f"--- {name}", ""]
-        L += fmt_table([[k, x["load"], x["wait_mesh"], x["mesh"], x["wait_act"], x["act"], x["wait_pool"],
-                         x["pool"], x["latency"], f"{100*x['lane_util']:.0f}%"] for k, x in enumerate(s)],
-                       ["set", "load", "wait", "mesh", "wait", "activ", "wait", "pool", "latency", "lanes"])
-        L += ["",
-              f"  Mesh inside  : broadcast {med('broadcast')}, tiles {med('tiles')}, reduce {med('reduce')} (median cycles)",
-              f"  Activation   : mesh read {med('read')} of {med('act')} cycles; lanes busy {100*statistics.median(x['lane_util'] for x in s):.0f}% of the round",
-              f"  Pooling      : dispatch {med('dispatch')}, drain {med('drain')} cycles",
-              f"  Completion gaps: {a['gaps']}",
-              f"  Steady state : {steady:.0f} cycles per set (mean of the last {len(a['steady'])} gaps); "
-              f"single-set latency {s[0]['latency']} cycles",
-              f"  Bottleneck   : {bott} ({stage[bott]} cycles per set); stage occupancy over the run: "
-              + ", ".join(f"{k} {100*v/a['span']:.0f}%" for k, v in a['busy'].items()),
-              f"  Matmul rate  : {flop} FLOP per set -> {flop/steady:.1f} FLOP/cycle at steady state, "
-              f"{flop/steady*args.clock_mhz/1000:.2f} GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz" if steady else "",
-              ""]
-        summary.append([name, s[0]["latency"], f"{steady:.0f}", f"{flop/steady:.1f}",
-                        f"{flop/steady*args.clock_mhz/1000:.2f}", bott, stage[bott], "pass"])
-        # MODEL: lanes fill one word per cycle, so lane 15 starts about 240 cycles after lane 0.
-        if bott == "activation" and med("read") >= 240:
-            par = med("act") - 240
-            est = max(med("load"), med("mesh"), par, med("pool"))
-            models.append([name, med("act"), par, f"{steady:.0f}", est, f"{steady / est:.1f}x"])
-    L += ["=" * 100, " SUMMARY", "=" * 100]
-    L += fmt_table(summary, ["config", "latency", "cycles/set", "FLOP/cyc", f"GFLOPS@{args.clock_mhz:.0f}MHz*",
-                             "bottleneck", "its cycles", "sim"])
-    L += [f" * {args.clock_mhz:.0f} MHz is ASSUMED, not a timing result; GFLOPS count the {flop}-FLOP matmul only."]
-    mb = mesh_block()
-    if mb:
-        L += ["", " MESH BLOCK (measured, SystolicMesh regression, mm_random, 5 sets)"]
-        L += fmt_table(mb, ["tile", "tile-matmuls", "one set", "serial per set", "streamed per set"])
-    if models:
-        L += ["", " MODEL (estimate, not measured): the activation stage fills its 16 lanes one word per cycle,",
-              " so lane 15 cannot start until about 240 cycles after lane 0. Filling every lane at once from a",
-              " 16-wide mesh result read would remove that, and the next limit is the 257-cycle host load:"]
-        L += fmt_table(models, ["config", "activ now", "activ est", "cycles/set now", "cycles/set est", "gain"])
-    L += ["", " MODEL (not measured): the host writes A and B one word per cycle each, so a set cannot enter",
-          f" faster than {args.n * args.n} cycles plus the start handshake."]
-    os.makedirs(os.path.dirname(REPORT), exist_ok=True)
-    open(REPORT, "w").write("\n".join(L) + "\n")
-    print("\n".join(L))
-    print(f"\nReport: {REPORT}")
+    if args.merge:
+        parts = [json.load(open(f)) for f in args.merge]
+        L = header(args) + [x for p in parts for x in p["lines"]] + footer(args, [r for p in parts for r in p["rows"]])
+    else:
+        lines, rows = [], []
+        for name in args.configs:
+            d, r = one_config(name, args)
+            lines += d
+            rows.append(r)
+            print("\n".join(d), flush=True)
+        json.dump({"lines": lines, "rows": rows}, open(os.path.splitext(args.report)[0] + ".json", "w"))
+        L = header(args) + lines + footer(args, rows)
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
+    open(args.report, "w").write("\n".join(L) + "\n")
+    print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
+    print(f"\nReport: {args.report}")
 
 
 if __name__ == "__main__":

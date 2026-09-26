@@ -9,7 +9,9 @@ module sienna_multi #(
     parameter int TILE_SIZE         = 4,
     parameter int HOST_WORDS        = N,
     parameter int COLLAPSE_K        = 1,  // collapse-k mesh in every copy, as in sienna_top
-    parameter int SETS_IN_FLIGHT    = 8,  // credits per copy
+    parameter int ACC_BANKS         = 4,
+    parameter int RESULT_BANKS      = 4,
+    parameter int SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // credits per copy, as sienna_top
     parameter int WC_TILES          = 128,  // weight cache tiles per copy; every copy holds the same weights
     parameter int DATA_WIDTH        = 32,
     parameter int SRAM_DEPTH        = N * N,
@@ -84,6 +86,8 @@ module sienna_multi #(
         .HOST_WORDS       (HOST_WORDS),
         .COLLAPSE_K       (COLLAPSE_K),
         .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
+        .ACC_BANKS        (ACC_BANKS),
+        .RESULT_BANKS     (RESULT_BANKS),
         .WC_TILES         (WC_TILES),
         .DATA_WIDTH       (DATA_WIDTH),
         .SRAM_DEPTH       (SRAM_DEPTH),

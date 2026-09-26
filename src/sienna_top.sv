@@ -6,7 +6,9 @@ module sienna_top #(
     parameter int    TILE_SIZE         = 4,
     parameter int    HOST_WORDS        = N,  // words per host write, one matrix row; must divide N*N
     parameter int    COLLAPSE_K        = 1,  // 1: one full-depth mesh tile per output tile, N^2 PEs and no reduce
-    parameter int    SETS_IN_FLIGHT    = 8,  // credits: sets started and not yet complete
+    parameter int    ACC_BANKS         = 4,  // mesh partial-sum banks per PE
+    parameter int    RESULT_BANKS      = 4,  // mesh result banks
+    parameter int    SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // credits: every set the banks can hold (staging, operand, partial-sum, result, activation, pooling)
     parameter int    ID_W              = $clog2(SETS_IN_FLIGHT + 1),  // set id width; ids count accepted starts
     parameter int    WC_TILES          = 128,  // weight cache tiles in the mesh
     parameter int    WCTW              = $clog2(WC_TILES),
@@ -213,7 +215,9 @@ module sienna_top #(
       .WIDE_READ  (NUM_LANES),
       .HOST_WORDS (HOST_WORDS),
       .COLLAPSE_K (COLLAPSE_K),
-      .WC_TILES   (WC_TILES)
+      .WC_TILES   (WC_TILES),
+      .ACC_BANKS  (ACC_BANKS),
+      .RESULT_BANKS(RESULT_BANKS)
   ) systolic_array_inst (
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),

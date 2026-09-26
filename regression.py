@@ -369,6 +369,7 @@ def generate_vectors(cfg: dict) -> None:
         ("NUM_SETS", num_sets, "int"),
         ("SETS_IN_FLIGHT", SETS_IN_FLIGHT, "int"),
         ("HAS_BIAS", int(use_bias), "int"),
+        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
         ("ACCUM_PASSES", passes, "int"),
         ("MIXED_LEN", len(mixed), "int"),
         ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
@@ -561,6 +562,11 @@ PIPELINE_TESTS = [
     {"name": "matmul_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "bias": True},
     {"name": "matmul_accum3_bias_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
      "bias": True, "accum_passes": 3, "pool_h": 1, "pool_w": 1, "padding": 0},
+    # B from the mesh's weight cache: every set's B is written to its own tile once, then only A is sent.
+    {"name": "matmul_cached_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "cached": True,
+     "pool_h": 1, "pool_w": 1, "padding": 0},
+    {"name": "matmul_accum2_cached_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "cached": True,
+     "bias": True, "accum_passes": 2},
 ]
 
 

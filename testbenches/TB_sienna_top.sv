@@ -29,6 +29,12 @@ module TB_sienna_top;
   logic                     accumulate_i;  // this set is a partial sum
   logic                     bias_valid_i;  // this set carries a bias row
   logic [N-1:0][DATA_WIDTH-1:0] bias_i;
+  localparam int WC_TILES = 128;
+  logic                     weight_cached_i;  // this set takes B from cache tile weight_tile_i
+  logic [$clog2(WC_TILES)-1:0] weight_tile_i;
+  logic                     wc_write_enable_i;
+  logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
+  logic [1:0]               wc_region_busy_o;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
@@ -94,6 +100,11 @@ module TB_sienna_top;
       .accumulate_i               (accumulate_i),
       .bias_valid_i               (bias_valid_i),
       .bias_i                     (bias_i),
+      .weight_cached_i            (weight_cached_i),
+      .weight_tile_i              (weight_tile_i),
+      .wc_write_enable_i          (wc_write_enable_i),
+      .wc_write_addr_i            (wc_write_addr_i),
+      .wc_region_busy_o           (wc_region_busy_o),
       .dropout_seed_i             (dropout_seed_i),
       .activation_function_i      (activation_function_i),
       .num_terms_i                (num_terms_i),
@@ -221,6 +232,10 @@ module TB_sienna_top;
     accumulate_i = 1'b0;
     bias_valid_i = 1'b0;
     bias_i = '0;
+    weight_cached_i = 1'b0;
+    weight_tile_i = '0;
+    wc_write_enable_i = 1'b0;
+    wc_write_addr_i = '0;
     dropout_seed_i = '1;
     north_write_reset_i = 1;
     west_write_reset_i = 1;
@@ -487,6 +502,30 @@ module TB_sienna_top;
     end
   endtask
 
+  // With WEIGHT_CACHE, set k's B is written once into cache tile k and the set sends only A.
+  task automatic write_cache();
+    logic [DATA_WIDTH-1:0] q[$];
+    if (WEIGHT_CACHE == 0) return;
+    for (int k = 0; k < NUM_SETS; k++) begin
+      read_mem_file($sformatf("matrix_north_%0d.mem", k), q);
+      for (int i = 0; i < N * N; i += HOST_WORDS) begin
+        wc_write_enable_i = 1'b1;
+        wc_write_addr_i = ($clog2(WC_TILES*N*N))'(k * N * N + i);
+        for (int c = 0; c < HOST_WORDS; c++) north_write_data_i[c] = q[i+c];
+        @(posedge clk_i);
+      end
+    end
+    wc_write_enable_i = 1'b0;
+    north_write_data_i = '0;
+    $display("  [Cache] %0d weight tiles written", NUM_SETS);
+  endtask
+
+  task automatic apply_weight(input int k);
+    weight_cached_i = (WEIGHT_CACHE != 0);
+    weight_tile_i = ($clog2(WC_TILES))'(k);
+    if (weight_cached_i) north_data_queue.delete();
+  endtask
+
   // Set k's dropout seed; regression.py's set_dropout_seed() mirrors it.
   function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
     return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
@@ -625,6 +664,7 @@ module TB_sienna_top;
               activation_function_i = act_of(k);
               num_terms_i = terms_of(k);
               apply_bias(k);
+              apply_weight(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
@@ -734,6 +774,7 @@ module TB_sienna_top;
           activation_function_i = act_of(k);
           num_terms_i = terms_of(k);
           apply_bias(k);
+          apply_weight(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
           start_pipeline_i = 1;
@@ -840,6 +881,8 @@ module TB_sienna_top;
              north_data_queue.size(), expected_results.size());
 
     reset();
+    write_cache();
+    apply_weight(0);
 
     // Clear array right before run so streaming block cleanly builds it
     // actual_results.delete();
@@ -882,6 +925,7 @@ module TB_sienna_top;
       activation_function_i = act_of(1);
       num_terms_i = terms_of(1);
       apply_bias(1);
+      apply_weight(1);
       trace_states = 1;
       actual_results.delete();
       total_elements = 0;

@@ -16,6 +16,10 @@ module TB_sienna_multi #(
 
   logic start_pipeline_i = 0, training_mode_i = TRAINING_MODE, accumulate_i = 0, bias_valid_i = 0;
   logic [N-1:0][DATA_WIDTH-1:0] bias_i = '0;
+  logic weight_cached_i = 0, wc_write_enable_i = 0;
+  logic [$clog2(128)-1:0] weight_tile_i = '0;
+  logic [$clog2(128*N*N)-1:0] wc_write_addr_i = '0;
+  logic [1:0] wc_region_busy_o;
   logic [LFSR_WIDTH-1:0] dropout_seed_i = '0;
   logic [CONTROL_WIDTH-1:0] activation_function_i = ACTIVATION_CODE;
   logic [ADDR_LINES:0] num_terms_i = NUM_TERMS;

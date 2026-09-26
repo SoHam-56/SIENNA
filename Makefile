@@ -27,7 +27,8 @@ ACTIVATION ?= tanh
 
 TOP_FILES = \
 	sienna_top.sv \
-	sienna_multi.sv
+	sienna_multi.sv \
+	sienna_layer.sv
 
 SM_FILES = \
 	top/SystolicMesh.sv \

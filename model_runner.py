@@ -390,14 +390,15 @@ def format_layer(job, N):
 class LayerSim:
     """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
 
-    def __init__(self, N, lanes, work):
-        self.N, self.lanes, self.work = N, lanes, work
+    def __init__(self, N, lanes, work, op_format="fp32"):
+        self.N, self.lanes, self.work, self.op_format = N, lanes, work, op_format
         self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_layer_sim")
         self.cycles = self.sets = self.words = 0
 
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
-        regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N, **t})
+        regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N,
+                                     "op_format": self.op_format, **t})
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0"],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
@@ -411,7 +412,7 @@ class LayerSim:
         of = os.path.join(self.work, f"{tag}.out")
         with open(lf, "w") as f:
             f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)}\n")
-            f.write("\n".join(f"{v:08x}" for v in np.concatenate([a.ravel(), w.ravel()]).astype(np.float32).view(np.uint32).tolist()))
+            f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.op_format)))
             f.write("\n")
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
@@ -480,6 +481,11 @@ def execute(model, x, sim=None, log=None):
             t[out] = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)  # host
             continue
         job = fuse_add(op, producers, t, consts, consumers) if kind == "ADD" else lower_op(op, t, consts)
+        _, ref_float = job_reference(job)
+        fmt = getattr(sim, "op_format", "fp32")
+        if fmt != "fp32":  # the hardware takes rounded operands; judge it on those, and report the format's own cost apart
+            job = dict(job, terms=[(regression.op_round(X, fmt), regression.op_round(W, fmt)) for X, W in job["terms"]],
+                       bias=None if job["bias"] is None else regression.op_round(job["bias"], fmt))
         _, ref = job_reference(job)
         if sim is None:
             y = ref.astype(np.float32)
@@ -490,8 +496,9 @@ def execute(model, x, sim=None, log=None):
             y, n, cyc = run_job_hw(job, sim, f"L{li:02d}")
         scale = float(np.max(np.abs(ref))) or 1.0
         err = float(np.max(np.abs(y.astype(np.float64) - ref))) / scale
+        err_fmt = float(np.max(np.abs(y.astype(np.float64) - ref_float))) / (float(np.max(np.abs(ref_float))) or 1.0)
         stats.append({"layer": li, "kind": kind, "sets": n, "cycles": cyc, "macs": macs_of(job),
-                      "passes": len(job["terms"]), "shape": list(job["shape"]), "err": err})
+                      "passes": len(job["terms"]), "shape": list(job["shape"]), "err": err, "err_vs_float": err_fmt})
         if log:
             log(f"    L{li:02d} {kind:<18} {str(job['shape']):<18} sets {n:6d}  cycles {cyc:8d}  MACs {stats[-1]['macs']:9d}  max err/max|ref| {err:.2e}")
         t[out] = y.reshape(job["shape"]).astype(np.float32)
@@ -569,6 +576,8 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
     ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--op-format", default="fp32", choices=sorted(regression.OP_FORMATS),
+                    help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
     ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
@@ -593,7 +602,7 @@ def main():
         if a.emulate:
             sim = EmuSim(a.n, a.lanes, a.work, a.host_gaps)
         elif a.engine == "layer":
-            sim = LayerSim(a.n, a.lanes, a.work)
+            sim = LayerSim(a.n, a.lanes, a.work, a.op_format)
         else:
             sim = Sim(a.n, a.lanes, a.work, a.host_gaps)
         t0 = time.time()

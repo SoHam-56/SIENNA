@@ -36,13 +36,15 @@ def main():
     ap.add_argument("--quick", action="store_true", help="a few small shapes only")
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
                     help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
+    ap.add_argument("--op-format", default="fp32", choices=sorted(mr.regression.OP_FORMATS),
+                    help="format of A and B on the layer engine; sums stay fp32, and the error is judged on the rounded inputs")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     if a.emulate:
         sim = mr.EmuSim(a.n, a.lanes, a.work)
     elif a.engine == "layer":
-        sim = mr.LayerSim(a.n, a.lanes, a.work)
+        sim = mr.LayerSim(a.n, a.lanes, a.work, a.op_format)
     else:
         sim = mr.Sim(a.n, a.lanes, a.work, a.host_gaps)
     sim.build()
@@ -52,14 +54,15 @@ def main():
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, fp32; peak {peak} MAC/cycle", head):
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.op_format} operands, fp32 sums; "
+                 f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
     rows = []
     for name, m, k, n in shapes:
         rng = np.random.RandomState(m * 7 + k * 13 + n)
-        A = rng.uniform(-1, 1, (m, k)).astype(np.float32)
-        B = rng.uniform(-1, 1, (k, n)).astype(np.float32)
+        A = mr.regression.op_round(rng.uniform(-1, 1, (m, k)), a.op_format)
+        B = mr.regression.op_round(rng.uniform(-1, 1, (k, n)), a.op_format)
         job = {"terms": [(A, B)], "bias": None, "act": "linear", "shape": (m, n)}
         t0 = time.time()
         y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.LayerSim) else mr.run_job_hw(job, sim, name)

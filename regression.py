@@ -56,6 +56,42 @@ SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its bank
 
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 
+# Operand formats of A and B as (exponent bits, mantissa bits); products, sums and results stay fp32.
+OP_FORMATS = {"fp32": (8, 23), "bf16": (8, 7), "fp16": (5, 10)}
+
+
+def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
+    """x rounded to the operand format (nearest, ties to even), as float32; subnormals flush to zero as the RTL reads them."""
+    x = np.asarray(x, dtype=np.float32)
+    if fmt == "fp32":
+        return x
+    if fmt == "bf16":
+        u = x.view(np.uint32).astype(np.uint64)
+        u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+        y = u.astype(np.uint32).view(np.float32)
+        return np.where((u.astype(np.uint32) & 0x7F800000) == 0, np.copysign(np.float32(0), y), y).astype(np.float32)
+    h = x.astype(np.float16)
+    h = np.where((h.view(np.uint16) & 0x7C00) == 0, np.copysign(np.float16(0), h), h)
+    return h.astype(np.float32)
+
+
+def op_hex(data, fmt: str) -> list:
+    """Values as hex words of the operand format, after rounding: 8 digits for fp32, 4 for bf16 and fp16."""
+    v = op_round(np.asarray(data, dtype=np.float32).flatten(), fmt)
+    if fmt == "fp32":
+        return [f"{int(b):08x}" for b in v.view(np.uint32)]
+    bits = (v.view(np.uint32) >> 16) if fmt == "bf16" else v.astype(np.float16).view(np.uint16)
+    return [f"{int(b):04x}" for b in bits]
+
+
+def write_op_mem(path: str, data, fmt: str) -> None:
+    """Operands as hex words of the format's width; fp32 keeps the 8-digit words of write_mem."""
+    if fmt == "fp32":
+        write_mem(path, data)
+        return
+    with open(path, "w") as fh:
+        fh.write("".join(w + "\n" for w in op_hex(data, fmt)))
+
 # Polynomial terms per activation, as passed to the TYTAN controller.
 ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
 
@@ -305,7 +341,8 @@ def generate_vectors(cfg: dict) -> None:
             B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
     # "scale" widens the matmul outputs so every activation reaches its tails.
     scale = np.float32(cfg.get("scale", 1.0))
-    A, B = (A * scale).astype(np.float32), (B * scale).astype(np.float32)
+    fmt = cfg.get("op_format", "fp32")
+    A, B = op_round(A * scale, fmt), op_round(B * scale, fmt)
 
     # Set k's dropout seed is set_dropout_seed(DROPOUT_SEED, k), as the TB drives it.
     drop_seed = 0x2ACE0000 + seed
@@ -316,8 +353,8 @@ def generate_vectors(cfg: dict) -> None:
     C, C_act, C_pooled, C_final = _golden_from_c(C0.astype(np.float32), cfg, act_type, drop_seed)
 
     # Write files for Verilator testbench
-    write_mem(os.path.join(TB_DIR, "matrix_west.mem"), A)
-    write_mem(os.path.join(TB_DIR, "matrix_north.mem"), B)
+    write_op_mem(os.path.join(TB_DIR, "matrix_west.mem"), A, fmt)
+    write_op_mem(os.path.join(TB_DIR, "matrix_north.mem"), B, fmt)
     write_mem(os.path.join(TB_DIR, "expected_output.mem"), C_final)
     S0 = np.abs(A).astype(np.float64) @ np.abs(B).astype(np.float64) + (np.abs(bias_of(0)) if use_bias else 0.0)
     write_mem(os.path.join(TB_DIR, "bound_output.mem"), fp32_error_bound(S0, N, cfg, act_type, C0))
@@ -339,8 +376,8 @@ def generate_vectors(cfg: dict) -> None:
             Ak, Bk = A, B
         else:
             rng = np.random.RandomState(seed + 1000 + k)
-            Ak = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
-            Bk = (rng.uniform(-1.0, 1.0, (N, N)) * scale).astype(np.float32)
+            Ak = op_round(rng.uniform(-1.0, 1.0, (N, N)) * scale, fmt)
+            Bk = op_round(rng.uniform(-1.0, 1.0, (N, N)) * scale, fmt)
         bk = bias_of(k) if use_bias and k % passes == 0 else np.zeros(N, dtype=np.float32)
         write_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), bk)
         Sk = np.abs(Ak).astype(np.float64) @ np.abs(Bk).astype(np.float64) + np.abs(bk)
@@ -354,8 +391,8 @@ def generate_vectors(cfg: dict) -> None:
             partial = False
             Fk = C_final if k == 0 else _golden_from_c((_ref_matmul(Ak, Bk) + bk).astype(np.float32), cfg, act_k,
                                                        set_dropout_seed(drop_seed, k))[3]
-        write_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak)
-        write_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk)
+        write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), Ak, fmt)
+        write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), Bk, fmt)
         write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
         Bnd = np.zeros(0, dtype=np.float32) if partial else \
             fp32_error_bound(run_s if passes > 1 else Sk, N * passes, cfg, act_k,
@@ -380,6 +417,9 @@ def generate_vectors(cfg: dict) -> None:
         ("NUM_LANES", cfg.get("lanes", 32), "int"),
         ("HOST_WORDS", cfg.get("host_words", N), "int"),
         ("DATA_WIDTH", 32, "int"),
+        ("OP_EXP_W", OP_FORMATS[fmt][0], "int"),
+        ("OP_MAN_W", OP_FORMATS[fmt][1], "int"),
+        ("OP_W", 1 + sum(OP_FORMATS[fmt]), "int"),
         ("SRAM_DEPTH", sram_depth, "int"),
         ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
         ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
@@ -652,7 +692,8 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, host_words: int = None):
+def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, host_words: int = None,
+                   op_format: str = "fp32"):
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = PIPELINE_TESTS
@@ -664,7 +705,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             return
 
     print(
-        f"  Matrix size : {N}×{N}\n  Tile size   : {T}×{T}\n  Total tests : {len(tests_to_run)}\n"
+        f"  Matrix size : {N}×{N}\n  Tile size   : {T}×{T}\n  Operands    : {op_format}\n  Total tests : {len(tests_to_run)}\n"
         + hdr(f"{'═'*70}")
     )
 
@@ -677,7 +718,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         )
 
         # 1. Generate Vectors & Dump Expected Traces
-        cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, **t}
+        cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, "op_format": op_format, **t}
         generate_vectors(cfg)
 
         # 2. Run Verilator (Streams live status)
@@ -734,6 +775,7 @@ if __name__ == "__main__":
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)
     p.add_argument("--lanes", type=int, default=32)
+    p.add_argument("--op-format", default="fp32", choices=sorted(OP_FORMATS), help="format of A and B; sums stay fp32")
     p.add_argument("--host-words", type=int, default=None, help="words per host write (default: N, one row)")
     p.add_argument("--mode", default="matmul", choices=["matmul", "conv"])
     p.add_argument("--conv-type", default="basic")
@@ -744,7 +786,7 @@ if __name__ == "__main__":
     args, unknown = p.parse_known_args()
 
     if args.action == "regression":
-        run_regression(args.matrix_size, args.tile_size, args.test, args.lanes, args.host_words)
+        run_regression(args.matrix_size, args.tile_size, args.test, args.lanes, args.host_words, args.op_format)
     elif args.action == "gen":
         generate_vectors(
             {

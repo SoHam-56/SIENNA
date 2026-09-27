@@ -13,7 +13,10 @@ module sienna_top #(
     parameter int    WC_TILES          = 128,  // weight cache tiles in the mesh
     parameter int    WCTW              = $clog2(WC_TILES),
     parameter int    WCAW              = $clog2(WC_TILES * N * N),
-    parameter int    DATA_WIDTH        = 32,
+    parameter int    DATA_WIDTH        = 32,  // products, sums, activations and results: fp32
+    parameter int    OP_EXP_W          = 8,   // operand format of A and B: fp32 by default; bf16 is 8 and 7
+    parameter int    OP_MAN_W          = 23,
+    parameter int    OP_W              = 1 + OP_EXP_W + OP_MAN_W,
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -47,10 +50,10 @@ module sienna_top #(
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
     input logic                     north_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i,
+    input logic [HOST_WORDS-1:0][OP_W-1:0]       north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i,
+    input logic [HOST_WORDS-1:0][OP_W-1:0]       west_write_data_i,
     input logic                     west_write_reset_i,
 
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
@@ -212,6 +215,8 @@ module sienna_top #(
       .MATRIX_SIZE(N),
       .TILE_SIZE  (TILE_SIZE),
       .DATA_WIDTH (DATA_WIDTH),
+      .OP_EXP_W   (OP_EXP_W),
+      .OP_MAN_W   (OP_MAN_W),
       .WIDE_READ  (NUM_LANES),
       .HOST_WORDS (HOST_WORDS),
       .COLLAPSE_K (COLLAPSE_K),

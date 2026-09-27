@@ -14,6 +14,9 @@ module sienna_multi #(
     parameter int SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // credits per copy, as sienna_top
     parameter int WC_TILES          = 128,  // weight cache tiles per copy; every copy holds the same weights
     parameter int DATA_WIDTH        = 32,
+    parameter int OP_EXP_W          = 8,   // operand format, as sienna_top
+    parameter int OP_MAN_W          = 23,
+    parameter int OP_W              = 1 + OP_EXP_W + OP_MAN_W,
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
     parameter int ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -45,10 +48,10 @@ module sienna_multi #(
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
     input logic                     north_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i,
+    input logic [HOST_WORDS-1:0][OP_W-1:0] north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i,
+    input logic [HOST_WORDS-1:0][OP_W-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
 
     output logic                                 pipeline_ready_o,  // the copy whose turn it is can take a set
@@ -90,6 +93,8 @@ module sienna_multi #(
         .RESULT_BANKS     (RESULT_BANKS),
         .WC_TILES         (WC_TILES),
         .DATA_WIDTH       (DATA_WIDTH),
+        .OP_EXP_W         (OP_EXP_W),
+        .OP_MAN_W         (OP_MAN_W),
         .SRAM_DEPTH       (SRAM_DEPTH),
         .FIFO_DEPTH       (FIFO_DEPTH),
         .ADDR_LINES       (ADDR_LINES),

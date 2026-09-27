@@ -41,6 +41,7 @@ SM_LIB_FILES = \
 	Multipliers/Radix4Booth/src/R4Booth.sv \
 	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
 	Multipliers/FP32/src/fp32Multiplier.sv \
+	Multipliers/FPWiden/src/fpMulWiden.sv \
 	Adders/FP32/src/LZC.sv \
 	Adders/FP32/src/fp32Adder.sv
 

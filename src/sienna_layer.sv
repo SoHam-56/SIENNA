@@ -17,7 +17,10 @@ module sienna_layer #(
     parameter int RESULT_BANKS      = 4,
     parameter int SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // as sienna_top: every set the banks can hold
     parameter int WC_TILES          = 128,
-    parameter int DATA_WIDTH        = 32,
+    parameter int DATA_WIDTH        = 32,  // results and bias inside the pipeline: fp32
+    parameter int OP_EXP_W          = 8,   // format of both input streams: fp32 by default; bf16 is 8 and 7
+    parameter int OP_MAN_W          = 23,
+    parameter int OP_W              = 1 + OP_EXP_W + OP_MAN_W,
     parameter int CONTROL_WIDTH     = 3,
     parameter int LFSR_WIDTH        = 32,
     parameter int POOL_H            = 1,
@@ -45,10 +48,10 @@ module sienna_layer #(
     output logic                    done_o,  // one cycle: the layer's last result has left
 
     input  logic                              a_valid_i,
-    input  logic [N-1:0][DATA_WIDTH-1:0]      a_data_i,
+    input  logic [N-1:0][OP_W-1:0]            a_data_i,
     output logic                              a_ready_o,
     input  logic                              w_valid_i,
-    input  logic [N-1:0][DATA_WIDTH-1:0]      w_data_i,
+    input  logic [N-1:0][OP_W-1:0]            w_data_i,
     output logic                              w_ready_o,
 
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
@@ -61,7 +64,18 @@ module sienna_layer #(
   localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);
   localparam int ADDR_LINES = $clog2(N * N);
   localparam int RW = (N > 1) ? $clog2(N) : 1;  // row within a tile
-  localparam logic [DATA_WIDTH-1:0] ONE = 32'h3f800000;
+  localparam int OP_BIAS = (1 << (OP_EXP_W - 1)) - 1;
+  localparam logic [OP_W-1:0] ONE = {1'b0, OP_EXP_W'(OP_BIAS), OP_MAN_W'(0)};  // 1.0 in the operand format
+
+  // An operand-format value widened to fp32, exactly: subnormals read as zero, as the multiplier treats them.
+  function automatic logic [31:0] op_to_fp32(input logic [OP_W-1:0] x);
+    automatic logic [OP_EXP_W-1:0] e = x[OP_W-2:OP_MAN_W];
+    automatic logic [22:0] m = 23'(x[OP_MAN_W-1:0]) << (23 - OP_MAN_W);
+    if (OP_EXP_W == 8 && OP_MAN_W == 23) return 32'(x);
+    if (e == '0) return {x[OP_W-1], 31'd0};
+    if (e == '1) return {x[OP_W-1], 8'hFF, m};
+    return {x[OP_W-1], 8'(int'(e) - OP_BIAS + 127), m};
+  endfunction
 
   // ── Configuration and what follows from it ────────────────────────────
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
@@ -87,7 +101,8 @@ module sienna_layer #(
 
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_ready, p_complete, p_wc_we;
-  logic [N-1:0][DATA_WIDTH-1:0]  p_bias, p_west, p_north;
+  logic [N-1:0][DATA_WIDTH-1:0]  p_bias;
+  logic [N-1:0][OP_W-1:0]        p_west, p_north;
   logic [WCTW-1:0]               p_tile;
   logic [WCAW-1:0]               p_wc_addr;
   logic [1:0]                    p_region_busy;
@@ -106,6 +121,8 @@ module sienna_layer #(
       .RESULT_BANKS     (RESULT_BANKS),
       .WC_TILES         (WC_TILES),
       .DATA_WIDTH       (DATA_WIDTH),
+      .OP_EXP_W         (OP_EXP_W),
+      .OP_MAN_W         (OP_MAN_W),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (N),
       .IN_COLS          (N),
@@ -277,7 +294,7 @@ module sienna_layer #(
           automatic logic last_row = wl_take_tile && (wl_row == RW'(N - 1));
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
-            bias_buf[wl_blk[0]] <= w_data_i;
+            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= op_to_fp32(w_data_i[c]);
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;

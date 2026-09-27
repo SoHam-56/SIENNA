@@ -178,7 +178,7 @@ VERILATOR_FLAGS = \
 	--Wno-TIMESCALEMOD \
 	--Wno-UNSIGNED
 
-# Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK
+# Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK; SIM_ARGS go to the simulator (e.g. +verilator+rand+reset+2)
 VERILATOR_FLAGS += $(EXTRA_FLAGS)
 
 ifeq ($(TRACE),fst)
@@ -292,7 +292,7 @@ verilator:
 	$(MAKE) -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
 	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running simulation"
-	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim
+	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
 	@echo "-- Done"
 ifneq ($(TRACE),0)
 	@echo "-- Trace ($(TRACE)) : $(VERILATOR_DIR)/$(TRACE_FILE)"

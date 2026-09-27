@@ -82,12 +82,14 @@ module sienna_top #(
 
   // Lanes take contiguous blocks of PER_LANE elements, so the division has to be exact: a
   // remainder would be dropped silently, and PER_LANE must fit a lane's input FIFO.
+`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial begin
     if ((SRAM_DEPTH % NUM_LANES) != 0)
       $error("sienna_top: NUM_LANES (%0d) must divide SRAM_DEPTH (%0d)", NUM_LANES, SRAM_DEPTH);
     if (PER_LANE > GPNAE_FIFO_DEPTH)
       $error("sienna_top: PER_LANE (%0d) exceeds GPNAE_FIFO_DEPTH (%0d)", PER_LANE, GPNAE_FIFO_DEPTH);
   end
+`endif
 
   localparam int FCNT_W = $clog2(PER_LANE + 1);  // what fill_count/done_count actually range over
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
@@ -101,7 +103,9 @@ module sienna_top #(
 
   localparam int NUM_IDS = 1 << ID_W;  // more ids than sets in flight, so ids in flight never repeat
   localparam int CRW = $clog2(SETS_IN_FLIGHT + 1);
+`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
+`endif
 
   // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
   // A partial set is summed in the mesh's PEs and leaves no result; it passes this stage in G_IDLE as a null.
@@ -384,6 +388,8 @@ module sienna_top #(
   // are free. Row and column are carried per lane rather than divided out of a window index,
   // which would cost NUM_LANES dividers by a non-power-of-two.
   localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;
+  localparam int ADV_R = NUM_LANES / POOL_OUT_COLS;  // rows and columns a lane moves by per group of windows
+  localparam int ADV_C = NUM_LANES % POOL_OUT_COLS;
   // A 1x1 window with stride 1 and no padding is the identity: windows skip FIFO2 and maxpool and go straight to dropout.
   localparam bit POOL_BYPASS = (POOL_H == 1) && (POOL_W == 1) && (STRIDE_ROWS == 1) && (STRIDE_COLS == 1) && (PADDING == 0);
   logic [DATA_WIDTH-1:0] byp_data [NUM_LANES];
@@ -459,16 +465,12 @@ module sienna_top #(
             disp_pr <= '0;
             if (disp_g < NUM_GROUPS - 1) begin
               disp_g <= disp_g + 1;
-              // Advance every lane by NUM_LANES windows, carrying into the row.
+              // Advance every lane by NUM_LANES windows: whole rows plus a column step, wrapping at most once
+              // since a lane's column is below POOL_OUT_COLS; one add and compare, not a loop of subtractions.
               for (int L = 0; L < NUM_LANES; L++) begin
-                automatic int c_tmp = lane_c[L] + NUM_LANES;
-                automatic int r_tmp = lane_r[L];
-                for (int k = 0; k < NUM_LANES; k++) begin
-                  if (c_tmp >= POOL_OUT_COLS) begin
-                    c_tmp = c_tmp - POOL_OUT_COLS;
-                    r_tmp = r_tmp + 1;
-                  end
-                end
+                automatic int c_tmp = lane_c[L] + ADV_C;
+                automatic int r_tmp = lane_r[L] + ADV_R + ((c_tmp >= POOL_OUT_COLS) ? 1 : 0);
+                if (c_tmp >= POOL_OUT_COLS) c_tmp = c_tmp - POOL_OUT_COLS;
                 lane_c[L]   <= c_tmp[$clog2(POOL_OUT_COLS+1)-1:0];
                 lane_r[L]   <= r_tmp[$clog2(POOL_OUT_ROWS+1)-1:0];
                 lane_win[L] <= lane_win[L] + NUM_LANES;

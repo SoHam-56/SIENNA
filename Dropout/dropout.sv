@@ -44,10 +44,12 @@ module dropout #(
   end
 
   // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
+`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial begin
     if (DROPOUT_P_PERCENT != 50 && CONST_SCALE == 32'h40000000)
       $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
   end
+`endif
 
   // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
   localparam int KQ_DEPTH = 16;

@@ -24,7 +24,7 @@ module TB_sienna_multi #(
   logic [CONTROL_WIDTH-1:0] activation_function_i = ACTIVATION_CODE;
   logic [ADDR_LINES:0] num_terms_i = NUM_TERMS;
   logic north_write_enable_i = 0, west_write_enable_i = 0, north_write_reset_i = 0, west_write_reset_i = 0;
-  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i = '0, west_write_data_i = '0;
+  logic [HOST_WORDS-1:0][OP_W-1:0] north_write_data_i = '0, west_write_data_i = '0;  // operands in the package's format
 
   logic pipeline_ready_o;
   logic [$clog2(COPIES+1)-1:0] copy_sel_o;
@@ -42,6 +42,8 @@ module TB_sienna_multi #(
       .COLLAPSE_K       (COLLAPSE_K),
       .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
       .DATA_WIDTH       (DATA_WIDTH),
+      .OP_EXP_W         (OP_EXP_W),
+      .OP_MAN_W         (OP_MAN_W),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (IN_ROWS),

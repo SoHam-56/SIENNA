@@ -18,7 +18,7 @@ module TB_sienna_layer;
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
   logic a_valid_i = 0, w_valid_i = 0, a_ready_o, w_ready_o;
-  logic [N-1:0][DATA_WIDTH-1:0] a_data_i = '0, w_data_i = '0;
+  logic [N-1:0][OP_W-1:0] a_data_i = '0, w_data_i = '0;  // both streams in the package's operand format
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [NUM_LANES-1:0] result_valid_o;
 
@@ -28,6 +28,8 @@ module TB_sienna_layer;
       .TILE_SIZE     (TILE_SIZE),
       .SETS_IN_FLIGHT(SETS_IN_FLIGHT),
       .DATA_WIDTH    (DATA_WIDTH),
+      .OP_EXP_W      (OP_EXP_W),
+      .OP_MAN_W      (OP_MAN_W),
       .CONTROL_WIDTH (CONTROL_WIDTH),
       .LFSR_WIDTH    (LFSR_WIDTH)
   ) dut (.*);

@@ -26,9 +26,9 @@ module TB_sienna_model;
   logic [     ADDR_LINES:0] num_terms_i;
 
   logic north_write_enable_i, north_write_reset_i;
-  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;
+  logic [HOST_WORDS-1:0][OP_W-1:0] north_write_data_i;  // operands in the package's format
   logic west_write_enable_i, west_write_reset_i;
-  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i;
+  logic [HOST_WORDS-1:0][OP_W-1:0] west_write_data_i;
 
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
@@ -50,6 +50,8 @@ module TB_sienna_model;
       .TILE_SIZE        (TILE_SIZE),
       .HOST_WORDS       (HOST_WORDS),
       .DATA_WIDTH       (DATA_WIDTH),
+      .OP_EXP_W         (OP_EXP_W),
+      .OP_MAN_W         (OP_MAN_W),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (IN_ROWS),

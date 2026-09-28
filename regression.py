@@ -438,7 +438,7 @@ def generate_vectors(cfg: dict) -> None:
             A = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
             B = np.random.uniform(-1.0, 1.0, (N, N)).astype(np.float32)
     # "scale" widens the matmul outputs so every activation reaches its tails.
-    if cfg.get("zero_rows"):  # rows of +0 and -0: zero sums start from +0 in the PE, where a float golden gives -0
+    if cfg.get("zero_rows"):  # rows of +0 and -0: every product a signed zero, and the PE's first add is +0 + p
         A[0::4, :] = np.float32(-0.0)
         A[1::4, :] = np.float32(0.0)
     scale = np.float32(cfg.get("scale", 1.0))
@@ -749,6 +749,8 @@ PIPELINE_TESTS = [
     # Modes the network layers use: ReLU and linear skip the polynomial, 1x1 pooling with no padding passes values through.
     {"name": "matmul_random_relu", "mode": "matmul", "matrix_type": "random", "act": "relu"},
     {"name": "matmul_zero_rows_relu", "mode": "matmul", "matrix_type": "random", "act": "relu", "zero_rows": True},
+    # Linear keeps -0: integer sums cancel exactly (x + -x gives -0 when A is negative) and meet +0 in the pooling windows.
+    {"name": "matmul_signed_zero_linear", "mode": "matmul", "matrix_type": "small_exact", "act": "linear", "zero_rows": True},
     {"name": "matmul_random_linear", "mode": "matmul", "matrix_type": "random", "act": "linear"},
     {"name": "matmul_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu",
      "pool_h": 1, "pool_w": 1, "padding": 0},

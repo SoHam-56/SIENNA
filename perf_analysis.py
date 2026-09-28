@@ -82,7 +82,8 @@ def analyse(ev: dict, k_sets: int) -> dict:
 
 
 DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table
-MUL_LAT, ADD_LAT = 8, 5  # fp32Multiplier and fp32Adder, valid in to done out
+MUL_LAT, ADD_LAT = 8, 5  # valid in to done out: fp32Multiplier and fp32Adder; main() sets the build's format's values
+UNIT_LAT = {"fp32": (8, 5), "bf16": (3, 5)}  # sienna_fmt_pkg::mul_lat, add_lat
 
 
 def pkg() -> dict:
@@ -224,8 +225,11 @@ def main() -> None:
     ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
     ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
     ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(UNIT_LAT), help="number format of the build")
     args = ap.parse_args()
-    GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes)
+    global MUL_LAT, ADD_LAT
+    MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
+    GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
     if args.merge:
         parts = [json.load(open(f)) for f in args.merge]
         L = header(args) + [x for p in parts for x in p["lines"]] + footer(args, [r for p in parts for r in p["rows"]])

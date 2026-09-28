@@ -41,9 +41,10 @@ SM_LIB_FILES = \
 	Multipliers/Radix4Booth/src/R4Booth.sv \
 	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
 	Multipliers/FP32/src/fp32Multiplier.sv \
-	Multipliers/FPWiden/src/fpMulWiden.sv \
+	Multipliers/FP/src/fpMultiplier.sv \
 	Adders/FP32/src/LZC.sv \
-	Adders/FP32/src/fp32Adder.sv
+	Adders/FP32/src/fp32Adder.sv \
+	Adders/FP/src/fpAdder.sv
 
 GPNAE_FILES = \
 	TYTAN/Memory/CoeffROM.v \
@@ -77,6 +78,7 @@ DROPOUT_FILES = \
 	dropout.sv
 
 DESIGN_FILES = \
+	$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
 	$(addprefix $(SM_DIR)/,$(SM_FILES)) \
 	$(addprefix $(SM_LIB_DIR)/,$(SM_LIB_FILES)) \

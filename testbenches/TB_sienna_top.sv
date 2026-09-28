@@ -40,9 +40,9 @@ module TB_sienna_top;
   logic [     ADDR_LINES:0] num_terms_i;
 
   logic north_write_enable_i, north_write_reset_i;
-  logic [HOST_WORDS-1:0][OP_W-1:0] north_write_data_i;  // operands in the package's format
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;  // operands in the package's format
   logic west_write_enable_i, west_write_reset_i;
-  logic [HOST_WORDS-1:0][OP_W-1:0] west_write_data_i;
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i;
 
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
@@ -81,8 +81,8 @@ module TB_sienna_top;
       .TILE_SIZE        (TILE_SIZE),
       .HOST_WORDS       (HOST_WORDS),
       .DATA_WIDTH       (DATA_WIDTH),
-      .OP_EXP_W         (OP_EXP_W),
-      .OP_MAN_W         (OP_MAN_W),
+      .EXP_W         (EXP_W),
+      .MAN_W         (MAN_W),
       .SRAM_DEPTH       (SRAM_DEPTH),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (IN_ROWS),
@@ -150,9 +150,13 @@ module TB_sienna_top;
                                            output string info);
     real exp_r, act_r, abs_d, rel_d, bnd_r;
 
-    exp_r = f32(expected[31:0]);
-    act_r = f32(actual[31:0]);
-    bnd_r = f32(bound[31:0]);
+    if (EXACT_GOLDEN) begin  // narrow formats: the golden is bit-exact, so only identical bits pass
+      info = $sformatf("exp=%h act=%h", expected, actual);
+      return expected === actual;
+    end
+    exp_r = f32(32'(expected));
+    act_r = f32(32'(actual));
+    bnd_r = f32(32'(bound));
     abs_d = (exp_r > act_r) ? (exp_r - act_r) : (act_r - exp_r);
 
     if (exp_r != 0.0) rel_d = abs_d / ((exp_r > 0.0) ? exp_r : -exp_r);
@@ -181,14 +185,19 @@ module TB_sienna_top;
   // Checker self-test: a loose or broken compare must fail the run before any result is trusted.
   initial begin
     string st_info;
-    if (!check_tolerance(32'h3f800000, 32'h3f800003, 0, st_info) ||   // 1.0 vs 1.0 + 3 ulp: pass
+    if (EXACT_GOLDEN && (!check_tolerance(DATA_WIDTH'(16'h3F80), DATA_WIDTH'(16'h3F80), '0, st_info) ||
+                         check_tolerance(DATA_WIDTH'(16'h3F80), DATA_WIDTH'(16'h3F81), '0, st_info))) begin
+      $display("[FAIL] Exact checker self-test failed; results cannot be trusted");
+      $finish;
+    end
+    if (!EXACT_GOLDEN && (!check_tolerance(32'h3f800000, 32'h3f800003, 0, st_info) ||   // 1.0 vs 1.0 + 3 ulp: pass
         check_tolerance(32'h3f800000, 32'h40000000, 0, st_info) ||    // 1.0 vs 2.0: fail
         check_tolerance(32'h3f800000, 32'h3f7ae148, 0, st_info) ||    // 1.0 vs 0.98: fail
         check_tolerance(32'h3f800000, 32'hbf800000, 0, st_info) ||    // 1.0 vs -1.0: fail
         check_tolerance(32'hbf000000, 32'hbd4ccccd, 0, st_info) ||    // -0.5 vs -0.05: fail
         !check_tolerance(32'h370e8795, 32'h37020000, 32'h3727c5ac, st_info) ||  // 8.5e-6 vs 7.7e-6, bound 1e-5: pass
         check_tolerance(32'h370e8795, 32'h37020000, 32'h350637bd, st_info) ||   // same (off by 7.5e-7), bound 5e-7: fail
-        check_tolerance(32'h3f800000, 32'h40000000, 32'h3a83126f, st_info)) begin // 1.0 vs 2.0, bound 1e-3: fail
+        check_tolerance(32'h3f800000, 32'h40000000, 32'h3a83126f, st_info))) begin // 1.0 vs 2.0, bound 1e-3: fail
       $display("[FAIL] Tolerance checker self-test failed; results cannot be trusted");
       $finish;
     end

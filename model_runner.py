@@ -265,8 +265,8 @@ def read_outputs(path, fmt="fp32"):
 class Sim:
     """The TB_sienna_model binary, built once per configuration and run once per layer."""
 
-    def __init__(self, N, lanes, work, host_gaps=False):
-        self.N, self.lanes, self.work = N, lanes, work
+    def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
+        self.N, self.lanes, self.work, self.T = N, lanes, work, tile_size
         self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
         self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_model_sim")
         self.cycles = 0
@@ -274,7 +274,7 @@ class Sim:
 
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
-        regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N, **t})
+        regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N, **t})
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0"],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
@@ -392,14 +392,14 @@ def format_layer(job, N):
 class LayerSim:
     """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
 
-    def __init__(self, N, lanes, work, fmt_name="fp32"):
-        self.N, self.lanes, self.work, self.fmt_name = N, lanes, work, fmt_name
+    def __init__(self, N, lanes, work, fmt_name="fp32", tile_size=4):
+        self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
         self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_layer_sim")
         self.cycles = self.sets = self.words = 0
 
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
-        regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N,
+        regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N,
                                      "fmt_name": self.fmt_name, **t})
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0"],
                            cwd=ROOT, capture_output=True, text=True)
@@ -581,6 +581,7 @@ def main():
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(regression.FORMATS),
                     help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
     ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
     ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
     ap.add_argument("--no-sim", action="store_true", help="float reference only")
@@ -604,9 +605,9 @@ def main():
         if a.emulate:
             sim = EmuSim(a.n, a.lanes, a.work, a.host_gaps)
         elif a.engine == "layer":
-            sim = LayerSim(a.n, a.lanes, a.work, a.fmt_name)
+            sim = LayerSim(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
         else:
-            sim = Sim(a.n, a.lanes, a.work, a.host_gaps)
+            sim = Sim(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
         t0 = time.time()
         sim.build()
         log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")

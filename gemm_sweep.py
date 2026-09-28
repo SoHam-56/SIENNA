@@ -85,7 +85,7 @@ def main():
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands, fp32 sums; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and sums; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")

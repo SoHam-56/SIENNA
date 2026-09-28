@@ -13,10 +13,9 @@ module sienna_top #(
     parameter int    WC_TILES          = 128,  // weight cache tiles in the mesh
     parameter int    WCTW              = $clog2(WC_TILES),
     parameter int    WCAW              = $clog2(WC_TILES * N * N),
-    parameter int    DATA_WIDTH        = 32,  // products, sums, activations and results: fp32
-    parameter int    OP_EXP_W          = 8,   // operand format of A and B: fp32 by default; bf16 is 8 and 7
-    parameter int    OP_MAN_W          = 23,
-    parameter int    OP_W              = 1 + OP_EXP_W + OP_MAN_W,
+    parameter int    EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
+    parameter int    MAN_W             = 23,
+    parameter int    DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, results, activations
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -50,10 +49,10 @@ module sienna_top #(
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
     input logic                     north_write_enable_i,
-    input logic [HOST_WORDS-1:0][OP_W-1:0]       north_write_data_i,
+    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0]       north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
-    input logic [HOST_WORDS-1:0][OP_W-1:0]       west_write_data_i,
+    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0]       west_write_data_i,
     input logic                     west_write_reset_i,
 
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
@@ -70,7 +69,8 @@ module sienna_top #(
     output logic intermediate_buffer_empty_o
 );
 
-  localparam int GPNAE_DATA_WIDTH = 32;
+  localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
+  localparam logic [DATA_WIDTH-1:0] NEG_INF = {1'b1, {EXP_W{1'b1}}, {MAN_W{1'b0}}};  // pooling pad: -infinity in the format
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
@@ -218,9 +218,9 @@ module sienna_top #(
   SystolicMesh #(
       .MATRIX_SIZE(N),
       .TILE_SIZE  (TILE_SIZE),
+      .EXP_W      (EXP_W),
+      .MAN_W      (MAN_W),
       .DATA_WIDTH (DATA_WIDTH),
-      .OP_EXP_W   (OP_EXP_W),
-      .OP_MAN_W   (OP_MAN_W),
       .WIDE_READ  (NUM_LANES),
       .HOST_WORDS (HOST_WORDS),
       .COLLAPSE_K (COLLAPSE_K),
@@ -267,6 +267,8 @@ module sienna_top #(
     for (g = 0; g < NUM_LANES; g++) begin : backend_lanes
 
       gpnae_poly #(
+          .EXP_W        (EXP_W),
+          .MAN_W        (MAN_W),
           .DATA_WIDTH   (GPNAE_DATA_WIDTH),
           .ADDR_LINES   (GPNAE_ADDR_LINES),
           .CONTROL_WIDTH(GPNAE_CTRL_WIDTH)
@@ -309,7 +311,9 @@ module sienna_top #(
           .STRIDE_ROWS(POOL_H),
           .STRIDE_COLS(POOL_W),
           .PADDING    (0),
-          .IS_FP32    (1)
+          .IS_FP32    (1),
+          .EXP_W      (EXP_W),
+          .MAN_W      (MAN_W)
       ) maxpool_inst (
           .clk      (clk_i),
           .rst_n    (rstn_i),
@@ -329,6 +333,8 @@ module sienna_top #(
       assign lane_seed = (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
 
       dropout #(
+          .EXP_W            (EXP_W),
+          .MAN_W            (MAN_W),
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
           .LFSR_WIDTH       (LFSR_WIDTH)
@@ -414,7 +420,7 @@ module sienna_top #(
       automatic logic signed [31:0] ic = signed'(lane_c[L] * STRIDE_COLS + disp_pc) - signed'(PADDING);
       lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
       lane_val[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS))
-                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : 32'hFF800000;
+                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : NEG_INF;
     end
   end
 

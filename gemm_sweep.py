@@ -27,6 +27,37 @@ TRANSFORMER = [
 ]
 
 
+def exact_layer(A, B, bias, act, N, fmt):
+    """Bit-exact output of sienna_layer for one product in a narrow format: per output tile, the depth blocks as passes in
+    order (format_layer's order), the bias with the first, then the lane; returns the output's bit patterns."""
+    import regression as reg
+    from mesh_model import fpu
+    import mesh_model
+    import gpnae_model
+    f = fpu.FORMATS[fmt]
+    M, K = A.shape
+    C = B.shape[1]
+    rt, ct, dt = -(-M // N), -(-C // N), -(-K // N)
+    Ap = np.zeros((rt * N, dt * N), np.float32)
+    Ap[:M, :K] = A
+    Bp = np.zeros((dt * N, ct * N), np.float32)
+    Bp[:K, :C] = B
+    bp = np.zeros(ct * N, np.float32)
+    if bias is not None:
+        bp[: bias.size] = bias
+    rom = gpnae_model.read_rom(os.path.join(reg.ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
+    lane = gpnae_model.Lane(f, rom)
+    Y = np.zeros((rt * N, ct * N), np.int64)
+    for c in range(ct):
+        for r in range(rt):
+            passes = [(reg.fmt_bits(Ap[r * N:(r + 1) * N, t * N:(t + 1) * N], fmt), reg.fmt_bits(Bp[t * N:(t + 1) * N, c * N:(c + 1) * N], fmt))
+                      for t in range(dt)]
+            b = reg.fmt_bits(bp[c * N:(c + 1) * N], fmt) if bias is not None else None
+            Ct = mesh_model.matmul(f, passes, N, 4, 1, b)
+            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = lane.run(Ct, reg.activation_to_code(act))
+    return Y[:M, :C]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n", type=int, default=16)
@@ -68,6 +99,9 @@ def main():
         y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.LayerSim) else mr.run_job_hw(job, sim, name)
         ref = A.astype(np.float64) @ B.astype(np.float64)
         err = float(np.max(np.abs(y - ref)) / (np.max(np.abs(ref)) or 1.0))
+        mism = 0
+        if a.fmt_name != "fp32" and isinstance(sim, mr.LayerSim):  # narrow formats: every output bit-exact
+            mism = int(np.sum(mr.regression.fmt_bits(y, a.fmt_name) != exact_layer(A, B, None, "linear", a.n, a.fmt_name)))
         macs = m * k * n
         r = {"shape": name, "M": m, "K": k, "N": n, "sets": sets, "cycles": cyc, "macs": macs,
              "mac_per_cycle": macs / cyc if cyc else 0, "pe_use": macs / (cyc * peak) if cyc else 0,
@@ -79,16 +113,19 @@ def main():
         rep.write(line + "\n")
         rep.flush()
         json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
-        if err > 1e-4:
+        if a.fmt_name == "fp32" and err > 1e-4:
             print(f"FAIL {name}: error {err:.2e} above 1e-4", flush=True)
+            sys.exit(1)
+        if a.fmt_name != "fp32" and mism:
+            print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
             sys.exit(1)
     if isinstance(sim, mr.LayerSim):
         # The polynomial activations through the layer engine, with a bias; GPNAE approximates within about 2%.
         import regression
         rng = np.random.RandomState(5)
-        A = rng.uniform(-1, 1, (64, 48)).astype(np.float32)
-        B = rng.uniform(-0.3, 0.3, (48, 40)).astype(np.float32)
-        b = rng.uniform(-0.5, 0.5, 40).astype(np.float32)
+        A = regression.op_round(rng.uniform(-1, 1, (64, 48)), a.fmt_name)
+        B = regression.op_round(rng.uniform(-0.3, 0.3, (48, 40)), a.fmt_name)
+        b = regression.op_round(rng.uniform(-0.5, 0.5, 40), a.fmt_name)
         for act in ("tanh", "sigmoid", "selu"):
             y, sets, cyc = sim.run_job({"terms": [(A, B)], "bias": b, "act": act, "shape": (64, 40)}, f"act_{act}")
             ref = regression.apply_activation((A.astype(np.float64) @ B + b).astype(np.float32), act)
@@ -96,9 +133,15 @@ def main():
             line = f"layer_{act}_bias{'':<9} {64:>5} {48:>5} {40:>5} {sets:>7} {cyc:>10}  max err {err:.1e} of the output range"
             print(line, flush=True)
             rep.write(line + "\n")
-            if err > 3e-2:
+            if a.fmt_name == "fp32" and err > 3e-2:
                 print(f"FAIL layer_{act}: error {err:.2e} above 3e-2", flush=True)
                 sys.exit(1)
+            if a.fmt_name != "fp32":  # narrow formats: bit-exact against the model; the error above is reported, not gated
+                mism = int(np.sum(regression.fmt_bits(y, a.fmt_name) != exact_layer(A, B, b, act, a.n, a.fmt_name)))
+                print(f"  layer_{act}: {mism} outputs differ from the bit-exact model", flush=True)
+                rep.write(f"  layer_{act}: {mism} outputs differ from the bit-exact model\n")
+                if mism:
+                    sys.exit(1)
 
 
 if __name__ == "__main__":

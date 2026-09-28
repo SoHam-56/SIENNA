@@ -249,6 +249,7 @@ def main() -> None:
     global MUL_LAT, ADD_LAT
     MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
     if args.merge:
         parts = [json.load(open(f)) for f in args.merge]
         L = header(args) + [x for p in parts for x in p["lines"]] + footer(args, [r for p in parts for r in p["rows"]])
@@ -261,7 +262,6 @@ def main() -> None:
             print("\n".join(d), flush=True)
         json.dump({"lines": lines, "rows": rows}, open(os.path.splitext(args.report)[0] + ".json", "w"))
         L = header(args) + lines + footer(args, rows)
-    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
     open(args.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
     print(f"\nReport: {args.report}")

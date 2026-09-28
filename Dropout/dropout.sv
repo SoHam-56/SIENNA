@@ -1,12 +1,14 @@
 `timescale 1ns / 1ps
 
 module dropout #(
-    parameter int                    DATA_WIDTH        = 32,
+    parameter int                    EXP_W             = 8,   // the build's format: fp32 8/23, bf16 8/7
+    parameter int                    MAN_W             = 23,
+    parameter int                    DATA_WIDTH        = 1 + EXP_W + MAN_W,
     parameter int                    DROPOUT_P_PERCENT = 50,
     parameter int                    LFSR_WIDTH        = 32,
     parameter logic [DATA_WIDTH-1:0] CONST_ZERO        = '0,
-    parameter logic [DATA_WIDTH-1:0] CONST_ONE         = 32'h3F800000,
-    parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = 32'h40000000
+    parameter logic [DATA_WIDTH-1:0] CONST_ONE         = DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h3F800000, MAN_W)),
+    parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W))
 ) (
     input wire clk,
     input wire rst_n,
@@ -46,7 +48,7 @@ module dropout #(
   // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
 `ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial begin
-    if (DROPOUT_P_PERCENT != 50 && CONST_SCALE == 32'h40000000)
+    if (DROPOUT_P_PERCENT != 50 && CONST_SCALE == DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W)))
       $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
   end
 `endif
@@ -93,17 +95,14 @@ module dropout #(
     end
   end
 
-  fp32Multiplier MUL (
-      .clk_i      (clk),
-      .rstn_i     (rst_n),
-      .valid_i    (mult_valid_in),
-      .A          (data_in),
-      .B          (CONST_SCALE),
-      .result_o   (mult_out),
-      .done_o     (mult_done),
-      .overflow_o (),
-      .underflow_o(),
-      .invalid_o  ()
-  );
+  if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
+    $fatal(1, "dropout: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
+  end else if (sienna_fmt_pkg::is_fp32(EXP_W, MAN_W)) begin : G_FP32
+    fp32Multiplier MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .A(data_in), .B(CONST_SCALE),
+                        .result_o(mult_out), .done_o(mult_done), .overflow_o(), .underflow_o(), .invalid_o());
+  end else begin : G_FP
+    fpMultiplier #(.EXP_W(EXP_W), .MAN_W(MAN_W)) MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .A(data_in),
+        .B(CONST_SCALE), .result_o(mult_out), .done_o(mult_done), .overflow_o(), .underflow_o(), .invalid_o());
+  end
 
 endmodule

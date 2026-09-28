@@ -9,7 +9,9 @@ module Maxpool_2D #(
     parameter     STRIDE_ROWS = 2,
     parameter     STRIDE_COLS = 2,
     parameter     PADDING     = 1,
-    parameter bit IS_FP32     = 1    // Added flag for FP32 sign-magnitude compare
+    parameter bit IS_FP32     = 1,   // float sign-magnitude compare, any width given EXP_W and MAN_W (the name predates bf16)
+    parameter int EXP_W       = 8,
+    parameter int MAN_W       = 23
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -40,6 +42,10 @@ module Maxpool_2D #(
 
   state_t state, next_state;
 
+  localparam bit FLOAT = IS_FP32 && (DATA_WIDTH == 1 + EXP_W + MAN_W);
+  localparam logic [DATA_WIDTH-1:0] FLOOR = FLOAT ? {1'b1, {EXP_W{1'b1}}, {MAN_W{1'b0}}}  // -infinity in the format
+                                                  : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};  // most negative integer
+
   logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
   logic [$clog2(IN_SIZE+1)-1:0] input_count;
   logic input_collection_done;
@@ -52,17 +58,15 @@ module Maxpool_2D #(
   logic [$clog2(OUT_COLS+1)-1:0] out_c;
 
   // ---------------------------------------------------------
-  // Safe FP32 / Signed Int Comparator
+  // Float (sign-magnitude) or signed-integer compare
   // ---------------------------------------------------------
   function automatic logic is_greater(input logic [DATA_WIDTH-1:0] a,
                                       input logic [DATA_WIDTH-1:0] b);
-    if (IS_FP32 && DATA_WIDTH == 32) begin
-      logic a_sign = a[31];
-      logic b_sign = b[31];
-      if ((a[30:0] == 0) && (b[30:0] == 0)) return 1'b0;
-      if (a_sign != b_sign) return !a_sign;
-      if (!a_sign) return a[30:0] > b[30:0];
-      return a[30:0] < b[30:0];
+    if (FLOAT) begin
+      if ((a[DATA_WIDTH-2:0] == 0) && (b[DATA_WIDTH-2:0] == 0)) return 1'b0;
+      if (a[DATA_WIDTH-1] != b[DATA_WIDTH-1]) return !a[DATA_WIDTH-1];
+      if (!a[DATA_WIDTH-1]) return a[DATA_WIDTH-2:0] > b[DATA_WIDTH-2:0];
+      return a[DATA_WIDTH-2:0] < b[DATA_WIDTH-2:0];
     end else begin
       return $signed(a) > $signed(b);
     end
@@ -76,9 +80,7 @@ module Maxpool_2D #(
 
   generate
     if (SINGLE_SEG) begin : gen_stream
-      localparam logic [DATA_WIDTH-1:0] NEG_FLOOR = (IS_FP32 && DATA_WIDTH == 32)
-                                                    ? 32'hFF800000
-                                                    : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};
+      localparam logic [DATA_WIDTH-1:0] NEG_FLOOR = FLOOR;
 
       logic [DATA_WIDTH-1:0]        run_max;
       logic [$clog2(IN_SIZE+1)-1:0] in_cnt;
@@ -188,8 +190,7 @@ module Maxpool_2D #(
           logic [DATA_WIDTH-1:0] current_val;
 
           // Initialize with correct minimum floor
-          if (IS_FP32 && DATA_WIDTH == 32) max_val = 32'hFF800000;  // -Infinity
-          else max_val = {1'b1, {(DATA_WIDTH - 1) {1'b0}}};  // Max Neg 2's Complement
+          max_val = FLOOR;  // -infinity for floats, the most negative integer otherwise
 
           for (int sr = 0; sr < SEG_ROWS; sr++) begin
             for (int sc = 0; sc < SEG_COLS; sc++) begin

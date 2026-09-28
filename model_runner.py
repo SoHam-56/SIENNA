@@ -243,7 +243,9 @@ def write_sets(path, groups, act):
     return n
 
 
-def read_outputs(path):
+def read_outputs(path, fmt="fp32"):
+    """Output sets as float32; words are in the build's format, a narrow one widened exactly."""
+    sh = 23 - regression.FORMATS[fmt][1]
     sets = []
     cur = None
     for line in open(path):
@@ -251,7 +253,7 @@ def read_outputs(path):
             cur = []
             sets.append(cur)
         else:
-            cur.append(int(line, 16))
+            cur.append(int(line, 16) << sh)
     return [np.array(s, dtype=np.uint32).view(np.float32) for s in sets]
 
 
@@ -419,7 +421,7 @@ class LayerSim:
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7):
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: layer simulation failed")
-        outs = read_outputs(of)
+        outs = read_outputs(of, self.fmt_name)
         os.remove(lf)
         os.remove(of)
         if len(outs) != rt * ct:

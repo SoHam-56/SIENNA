@@ -390,15 +390,15 @@ def format_layer(job, N):
 class LayerSim:
     """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
 
-    def __init__(self, N, lanes, work, op_format="fp32"):
-        self.N, self.lanes, self.work, self.op_format = N, lanes, work, op_format
+    def __init__(self, N, lanes, work, fmt_name="fp32"):
+        self.N, self.lanes, self.work, self.fmt_name = N, lanes, work, fmt_name
         self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_layer_sim")
         self.cycles = self.sets = self.words = 0
 
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
         regression.generate_vectors({"n": self.N, "tile_size": 4, "lanes": self.lanes, "host_words": self.N,
-                                     "op_format": self.op_format, **t})
+                                     "fmt_name": self.fmt_name, **t})
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0"],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
@@ -412,7 +412,7 @@ class LayerSim:
         of = os.path.join(self.work, f"{tag}.out")
         with open(lf, "w") as f:
             f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)}\n")
-            f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.op_format)))
+            f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
             f.write("\n")
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
@@ -482,7 +482,7 @@ def execute(model, x, sim=None, log=None):
             continue
         job = fuse_add(op, producers, t, consts, consumers) if kind == "ADD" else lower_op(op, t, consts)
         _, ref_float = job_reference(job)
-        fmt = getattr(sim, "op_format", "fp32")
+        fmt = getattr(sim, "fmt_name", "fp32")
         if fmt != "fp32":  # the hardware takes rounded operands; judge it on those, and report the format's own cost apart
             job = dict(job, terms=[(regression.op_round(X, fmt), regression.op_round(W, fmt)) for X, W in job["terms"]],
                        bias=None if job["bias"] is None else regression.op_round(job["bias"], fmt))
@@ -576,7 +576,7 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
     ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--op-format", default="fp32", choices=sorted(regression.OP_FORMATS),
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(regression.FORMATS),
                     help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
@@ -602,7 +602,7 @@ def main():
         if a.emulate:
             sim = EmuSim(a.n, a.lanes, a.work, a.host_gaps)
         elif a.engine == "layer":
-            sim = LayerSim(a.n, a.lanes, a.work, a.op_format)
+            sim = LayerSim(a.n, a.lanes, a.work, a.fmt_name)
         else:
             sim = Sim(a.n, a.lanes, a.work, a.host_gaps)
         t0 = time.time()

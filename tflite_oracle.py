@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against tflite_ref in both roundings; pins the rounding."""
 import argparse
+import itertools
 import os
 import sys
 
@@ -25,6 +26,7 @@ REF = tf.lite.experimental.OpResolverType.BUILTIN_REF
 MIN_DISCRIMINATING = 100  # outputs where the two roundings differ: the pick must rest on evidence
 MIN_UNCLAMPED = 0.25  # per model: the comparison must not be dominated by saturated outputs
 N_SAVED = 64  # test inputs and interpreter outputs kept per npz for G4
+MIN_SAVED_DISC = {"fc": 1, "conv": 50}  # discriminating outputs each saved npz must hold, so G4 sees a wrong rounding
 
 
 def build_model(layer, act, seed):
@@ -123,6 +125,14 @@ def test_inputs(p, lo, hi, n, rng):
     return xq
 
 
+def pick_saved(disc_in, k, n):
+    """Indices of the saved inputs: the most discriminating first (up to n), then alternately calibration and uniform ones."""
+    top = [int(i) for i in np.argsort(-disc_in, kind="stable") if disc_in[i] > 0][:n]
+    rest = [i for i in range(disc_in.size) if i not in set(top)]
+    fill = [i for pair in itertools.zip_longest([i for i in rest if i >= k], [i for i in rest if i < k]) for i in pair if i is not None]
+    return np.array(sorted(top + fill[:n - len(top)]))
+
+
 def save(out, name, model, p, xs, ys, rounding):
     with open(os.path.join(out, name + ".tflite"), "wb") as f:
         f.write(model)
@@ -158,7 +168,8 @@ def main() -> None:
             want = {r: reference(p, xs, r) for r in ROUNDINGS}
             mism = {r: int(np.sum(ys != want[r])) for r in ROUNDINGS}
             dflt = {r: int(np.sum(ys_default != want[r])) for r in ROUNDINGS}
-            disc = int(np.sum(want["DOUBLE"] != want["SINGLE"]))
+            disc_in = (want["DOUBLE"] != want["SINGLE"]).reshape(len(xs), -1).sum(axis=1)
+            disc = int(disc_in.sum())
             fold = sum(int(np.sum(reference(p, xs, r, folded=True) != want[r])) for r in ROUNDINGS)
             unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
             _, shifts = ref.layer_multipliers(layer, p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], "DOUBLE")
@@ -184,7 +195,14 @@ def main() -> None:
             for r in ROUNDINGS:
                 tot[r] += mism[r]
             if seed == 0:
-                keep[name] = (model, p, xs[:N_SAVED], ys[:N_SAVED])
+                idx = pick_saved(disc_in, a.inputs // 10, N_SAVED)
+                sd, need = int(disc_in[idx].sum()), MIN_SAVED_DISC[layer]
+                lines.append(f"  saved {name}: {idx.size} inputs ({int(np.sum(idx < a.inputs // 10))} uniform int8, "
+                             f"{int(np.sum(idx >= a.inputs // 10))} calibration), discriminating outputs {sd} (need {need}, "
+                             f"the {a.inputs} test inputs hold {disc})")
+                if sd < need:
+                    problems.append(f"saved {name}: {sd} discriminating outputs, need {need} (at most {disc} available)")
+                keep[name] = (model, p, xs[idx], ys[idx])
     lines.append(f"totals: outputs {tot['outputs']}, mismatches DOUBLE {tot['DOUBLE']} SINGLE {tot['SINGLE']}, "
                  f"discriminating {tot['disc']}, folded {tot['folded']}")
     winners = [r for r in ROUNDINGS if tot[r] == 0]

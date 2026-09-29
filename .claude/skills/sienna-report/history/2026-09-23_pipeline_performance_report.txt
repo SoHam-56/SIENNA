@@ -1,0 +1,225 @@
+====================================================================================================
+ SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)
+====================================================================================================
+ Generated 2026-09-23 22:57  N=16  TILE=4  lanes=16  12 streamed sets per config
+ Every number below is measured from TB_sienna_top's PERF trace unless marked MODEL.
+ Stage times are occupancy: from the stage taking a set to releasing it.
+
+--- matmul_random_sigm
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1    523     1    38      693    44%
+    1   257     2   129   266    294     1    38      729    71%
+    2   257     2   129   302    287     1    38      758    71%
+    3   257     2   129   157    294     1    38      620    70%
+    4   257     2   129   157    304     1    38      630    68%
+    5   257     2   129   174    219     1    38      562    92%
+    6   257     2   129    99    287     1    38      555    74%
+    7   257     2   129    82    297     1    38      548    69%
+    8   257     2   129   121    304     1    38      594    72%
+    9   257     2   129   167    531     1    38      867    44%
+   10   257     2   129   411    219     1    38      799    92%
+   11   257     2   129   326    304     1    38      799    69%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 295 cycles; lanes busy 70% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [295, 288, 295, 305, 220, 288, 298, 305, 532, 220, 305]
+  Steady state : 325 cycles per set (mean of the last 6 gaps); single-set latency 693 cycles
+  Bottleneck   : activation (295 cycles per set); stage occupancy over the run: load 76%, mesh 38%, act 96%, pool 11%
+  Matmul rate  : 8192 FLOP per set -> 25.2 FLOP/cycle at steady state, 23.97 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_random_tanh
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1    277     1    38      447    93%
+    1   257     2   129    20    277     1    38      466    93%
+    2   257     2   129    39    277     1    38      485    93%
+    3   257     2   129    58    277     1    38      504    93%
+    4   257     2   129    77    314     1    38      560    83%
+    5   257     2   129   133    277     1    38      579    93%
+    6   257     2   129   152    277     1    38      598    93%
+    7   257     2   129   130    314     1    38      613    83%
+    8   257     2   129   167    314     1    38      650    83%
+    9   257     2   129   204    314     1    38      687    83%
+   10   257     2   129   204    277     1    38      650    93%
+   11   257     2   129   167    314     1    38      650    84%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 277 cycles; lanes busy 93% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [278, 278, 278, 315, 278, 278, 315, 315, 315, 278, 315]
+  Steady state : 303 cycles per set (mean of the last 6 gaps); single-set latency 447 cycles
+  Bottleneck   : activation (277 cycles per set); stage occupancy over the run: load 84%, mesh 42%, act 95%, pool 12%
+  Matmul rate  : 8192 FLOP per set -> 27.1 FLOP/cycle at steady state, 25.71 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_ident_selu
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1    251     1    38      421    93%
+    1   257     2   129     1    251     1    38      421    93%
+    2   257     2   129     1    251     1    38      421    93%
+    3   257     2   129     1    251     1    38      421    93%
+    4   257     2   129     1    251     1    38      421    93%
+    5   257     2   129     1    251     1    38      421    93%
+    6   257     2   129     1    251     1    38      421    93%
+    7   257     2   129     1    287     1    38      457    82%
+    8   257     2   129    30    251     1    38      450    93%
+    9   257     2   129    23    287     1    38      479    82%
+   10   257     2   129    52    251     1    38      472    93%
+   11   257     2   129    45    251     1    38      465    93%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 251 cycles; lanes busy 93% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [259, 259, 259, 259, 259, 259, 295, 252, 288, 252, 252]
+  Steady state : 266 cycles per set (mean of the last 6 gaps); single-set latency 421 cycles
+  Bottleneck   : host load (257 cycles per set); stage occupancy over the run: load 93%, mesh 47%, act 93%, pool 14%
+  Matmul rate  : 8192 FLOP per set -> 30.8 FLOP/cycle at steady state, 29.22 GFLOPS at an ASSUMED 950 MHz
+
+--- conv_basic_selu
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1    251     1    38      421    93%
+    1   257     2   129     1    251     1    38      421    93%
+    2   257     2   129     1    251     1    38      421    93%
+    3   257     2   129     1    251     1    38      421    93%
+    4   257     2   129     1    251     1    38      421    93%
+    5   257     2   129     1    251     1    38      421    93%
+    6   257     2   129     1    251     1    38      421    93%
+    7   257     2   129     1    287     1    38      457    82%
+    8   257     2   129    30    251     1    38      450    93%
+    9   257     2   129    23    287     1    38      479    82%
+   10   257     2   129    52    251     1    38      472    93%
+   11   257     2   129    45    251     1    38      465    93%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 251 cycles; lanes busy 93% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [259, 259, 259, 259, 259, 259, 295, 252, 288, 252, 252]
+  Steady state : 266 cycles per set (mean of the last 6 gaps); single-set latency 421 cycles
+  Bottleneck   : host load (257 cycles per set); stage occupancy over the run: load 93%, mesh 47%, act 93%, pool 14%
+  Matmul rate  : 8192 FLOP per set -> 30.8 FLOP/cycle at steady state, 29.22 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_random_tanh_train
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1    277     1    46      455    93%
+    1   257     2   129    20    277     1    46      474    93%
+    2   257     2   129    39    277     1    46      493    93%
+    3   257     2   129    58    277     1    46      512    93%
+    4   257     2   129    77    314     1    46      568    83%
+    5   257     2   129   133    277     1    46      587    93%
+    6   257     2   129   152    277     1    46      606    93%
+    7   257     2   129   122    314     1    46      613    83%
+    8   257     2   129   159    314     1    46      650    83%
+    9   257     2   129   196    314     1    46      687    83%
+   10   257     2   129   196    277     1    46      650    93%
+   11   257     2   129   159    314     1    46      650    84%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 277 cycles; lanes busy 93% of the round
+  Pooling      : dispatch 25, drain 21 cycles
+  Completion gaps: [278, 278, 278, 315, 278, 278, 315, 315, 315, 278, 315]
+  Steady state : 303 cycles per set (mean of the last 6 gaps); single-set latency 455 cycles
+  Bottleneck   : activation (277 cycles per set); stage occupancy over the run: load 83%, mesh 42%, act 95%, pool 15%
+  Matmul rate  : 8192 FLOP per set -> 27.1 FLOP/cycle at steady state, 25.71 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_large_selu
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1   2649     1    38     2819    61%
+    1   257     2   129  2392   2057     1    38     4618    64%
+    2   257     2   129  4191   1793     1    38     6153    68%
+    3   257     2   129  3426   1863     1    38     5458    67%
+    4   257     2   129  3232   2358     1    38     5759    62%
+    5   257     2   129  3797   1585     1    38     5551    79%
+    6   257     2   129  3519   2302     1    38     5990    67%
+    7   257     2   129  3463   2511     1    38     6143    50%
+    8   257     2   129  4389   2370     1    38     6928    66%
+    9   257     2   129  4457   2072     1    38     6698    61%
+   10   257     2   129  4018   1849     1    38     6036    60%
+   11   257     2   129  3497   2301     1    38     5967    54%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 2186 cycles; lanes busy 63% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [2058, 1794, 1864, 2359, 1586, 2303, 2512, 2371, 2073, 1850, 2302]
+  Steady state : 2235 cycles per set (mean of the last 6 gaps); single-set latency 2819 cycles
+  Bottleneck   : activation (2186 cycles per set); stage occupancy over the run: load 12%, mesh 6%, act 99%, pool 2%
+  Matmul rate  : 8192 FLOP per set -> 3.7 FLOP/cycle at steady state, 3.48 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_large_sigm
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1   3789     1    38     3959    82%
+    1   257     2   129  3532   3162     1    38     6863    82%
+    2   257     2   129  6436   3394     1    38     9999    77%
+    3   257     2   129  6132   3516     1    38     9817    79%
+    4   257     2   129  6486   3723     1    38    10378    80%
+    5   257     2   129  6815   3747     1    38    10731    73%
+    6   257     2   129  7046   3482     1    38    10697    83%
+    7   257     2   129  6805   3710     1    38    10684    75%
+    8   257     2   129  6768   3974     1    38    10911    81%
+    9   257     2   129  7260   3716     1    38    11145    73%
+   10   257     2   129  7266   3233     1    38    10668    81%
+   11   257     2   129  6525   3505     1    38    10199    84%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 3613 cycles; lanes busy 80% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [3163, 3395, 3517, 3724, 3748, 3483, 3711, 3975, 3717, 3234, 3506]
+  Steady state : 3604 cycles per set (mean of the last 6 gaps); single-set latency 3959 cycles
+  Bottleneck   : activation (3613 cycles per set); stage occupancy over the run: load 7%, mesh 4%, act 100%, pool 1%
+  Matmul rate  : 8192 FLOP per set -> 2.3 FLOP/cycle at steady state, 2.16 GFLOPS at an ASSUMED 950 MHz
+
+--- matmul_large_tanh
+
+  set  load  wait  mesh  wait  activ  wait  pool  latency  lanes
+  ---  ----  ----  ----  ----  -----  ----  ----  -------  -----
+    0   257     2   129     1   3985     1    38     4155    81%
+    1   257     2   129  3728   3082     1    38     6979    83%
+    2   257     2   129  6552   3362     1    38    10083    78%
+    3   257     2   129  6020   3674     1    38     9863    75%
+    4   257     2   129  6612   3664     1    38    10445    79%
+    5   257     2   129  6914   3674     1    38    10757    73%
+    6   257     2   129  6914   3654     1    38    10737    79%
+    7   257     2   129  6904   3885     1    38    10958    73%
+    8   257     2   129  7115   3975     1    38    11259    77%
+    9   257     2   129  7436   3381     1    38    10986    76%
+   10   257     2   129  6932   3392     1    38    10493    75%
+   11   257     2   129  6349   3663     1    38    10181    78%
+
+  Mesh inside  : broadcast 4, tiles 94, reduce 29 (median cycles)
+  Activation   : mesh read 16 of 3663 cycles; lanes busy 78% of the round
+  Pooling      : dispatch 25, drain 13 cycles
+  Completion gaps: [3083, 3363, 3675, 3665, 3675, 3655, 3886, 3976, 3382, 3393, 3664]
+  Steady state : 3659 cycles per set (mean of the last 6 gaps); single-set latency 4155 cycles
+  Bottleneck   : activation (3663 cycles per set); stage occupancy over the run: load 7%, mesh 4%, act 100%, pool 1%
+  Matmul rate  : 8192 FLOP per set -> 2.2 FLOP/cycle at steady state, 2.13 GFLOPS at an ASSUMED 950 MHz
+
+====================================================================================================
+ SUMMARY
+====================================================================================================
+                    config  latency  cycles/set  FLOP/cyc  GFLOPS@950MHz*  bottleneck  its cycles   sim
+  ------------------------  -------  ----------  --------  --------------  ----------  ----------  ----
+        matmul_random_sigm      693         325      25.2           23.97  activation         295  pass
+        matmul_random_tanh      447         303      27.1           25.71  activation         277  pass
+         matmul_ident_selu      421         266      30.8           29.22   host load         257  pass
+           conv_basic_selu      421         266      30.8           29.22   host load         257  pass
+  matmul_random_tanh_train      455         303      27.1           25.71  activation         277  pass
+         matmul_large_selu     2819        2235       3.7            3.48  activation        2186  pass
+         matmul_large_sigm     3959        3604       2.3            2.16  activation        3613  pass
+         matmul_large_tanh     4155        3659       2.2            2.13  activation        3663  pass
+ * 950 MHz is ASSUMED, not a timing result; GFLOPS count the 8192-FLOP matmul only.
+
+ MODEL (not measured): the host writes A and B one word per cycle each, so a set cannot enter
+ faster than 256 cycles plus the start handshake; the activation stage reads the mesh result
+ one word per cycle, so it cannot finish a set in fewer than 256 cycles either.

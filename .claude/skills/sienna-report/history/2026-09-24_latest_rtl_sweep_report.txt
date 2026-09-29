@@ -1,0 +1,63 @@
+====================================================================================================
+ SIENNA LATEST-RTL SWEEP (Verilator simulation, cycles)
+====================================================================================================
+ GFLOPS assume a 950 MHz clock (no synthesis). PASS means every set matched the golden model within 1%,
+ no [FAIL] line and no assertion failure. sync = SyncArray tiles with the tree reduce; collapse = collapse-k.
+
+ 1. MESH ONLY (TB_SystolicMesh, random matmul, 15 sets; set 0 from start to result; FLOP 2N^3)
+   N   T      mesh    PEs  set0 cyc  FLOP/cyc  PE util  GFLOPS     verdict
+  --  --  --------  -----  --------  --------  -------  ------  ----------
+  16   2      sync   2048        56       146     3.6%     139  PASS 15/15
+  16   4      sync   1024        79       104     5.1%      99  PASS 15/15
+  16   8      sync    512       146        56     5.5%      53  PASS 15/15
+  16  16      sync    256       365        22     4.4%      21  PASS 15/15
+  16   2  collapse    256        71       115    22.5%     110  PASS 15/15
+  16   4  collapse    256        89        92    18.0%      87  PASS 15/15
+  16   8  collapse    256       149        55    10.7%      52  PASS 15/15
+  16  16  collapse    256       365        22     4.4%      21  PASS 15/15
+  32   2      sync  16384        61      1074     3.3%    1021  PASS 15/15
+  32   2  collapse   1024        87       753    36.8%     716  PASS 15/15
+  32   4      sync   8192        84       780     4.8%     741  PASS 15/15
+  32   4  collapse   1024       105       624    30.5%     593  PASS 15/15
+  32   8      sync   4096       151       434     5.3%     412  PASS 15/15
+  32   8  collapse   1024       165       397    19.4%     377  PASS 15/15
+  32  16      sync   2048       370       177     4.3%     168  PASS 15/15
+  32  16  collapse   1024       381       172     8.4%     163  PASS 15/15
+  32  32      sync   1024      1197        55     2.7%      52  PASS 15/15
+  32  32  collapse   1024      1197        55     2.7%      52  PASS 15/15
+  64   4      sync  65536        89      5891     4.5%    5596  PASS 15/15
+  64   4  collapse   4096       137      3827    46.7%    3636  PASS 15/15
+  64   8      sync  32768       156      3361     5.1%    3193  PASS 15/15
+  64   8  collapse   4096       197      2661    32.5%    2528  PASS 15/15
+  64  16      sync  16384       375      1398     4.3%    1328  PASS 15/15
+  64  16  collapse   4096       413      1269    15.5%    1206  PASS 15/15
+  64  32      sync   8192      1202       436     2.7%     414  PASS 15/15
+  64  32  collapse   4096      1229       427     5.2%     405  PASS 15/15
+  64  64      sync   4096      4397       119     1.5%     113  PASS 15/15
+  64  64  collapse   4096      4397       119     1.5%     113  PASS 15/15
+
+ 2. FULL PIPELINE (regression verdict; perf_analysis steady state and single-set latency, one pipeline)
+   N   T      mesh  lanes  mesh PEs                regression  tanh cyc/set  tanh lat  tanh GFLOPS  SELU cyc/set  SELU lat  SELU GFLOPS
+  --  --  --------  -----  --------  ------------------------  ------------  --------  -----------  ------------  --------  -----------
+  16   2      sync     32      2048                PASS 11/11           270       290         28.8           221       272         35.2
+  16   4      sync     32      1024  PASS 11/11, b2b 12 clean           270       313         28.8           221       295         35.2
+  16   8      sync     32       512                PASS 11/11           270       380         28.8           221       362         35.2
+  16  16      sync     32       256                PASS 11/11           378       599         20.6           364       581         21.4
+  16   4  collapse     32       256  PASS 11/11, b2b 12 clean           270       323         28.8           221       305         35.2
+  32   4      sync     64      8192                PASS 10/10           380       431        163.8           288       368        216.2
+  32   4  collapse     64      1024                PASS 11/11           380       452        163.8           288       389        216.2
+  32   8      sync     64      4096                  PASS 8/8           380       498        163.8           288       435        216.2
+  32  16      sync     64      2048                  PASS 8/8           421       717        147.9           369       654        168.7
+  64   8  collapse    128      4096                  PASS 4/4           973      1147        511.9           728       751        684.2
+
+ 3. MESH CONV SUITE AT N=32 (9 conv tests per tile size, general 3x3 layout since N is not a perfect square)
+  collapse  T= 2  PASS 9/9 tests, set 0 87 cycles
+  collapse  T= 4  PASS 9/9 tests, set 0 105 cycles
+  collapse  T= 8  PASS 9/9 tests, set 0 165 cycles
+  collapse  T=16  PASS 9/9 tests, set 0 381 cycles
+  collapse  T=32  PASS 9/9 tests, set 0 1197 cycles
+  sync      T= 2  PASS 9/9 tests, set 0 61 cycles
+  sync      T= 4  PASS 9/9 tests, set 0 84 cycles
+  sync      T= 8  PASS 9/9 tests, set 0 151 cycles
+  sync      T=16  PASS 9/9 tests, set 0 370 cycles
+  sync      T=32  PASS 9/9 tests, set 0 1197 cycles

@@ -1,0 +1,147 @@
+====================================================================================================
+ SIENNA THROUGHPUT ANALYSIS  (measured)
+ Date      : 2026-09-21 (refreshed after all six optimisations)
+ Simulator : Verilator 5.035, cycle accurate, gcc-toolset-13 + -fcoroutines
+ Question  : what is the achievable throughput, and what limits it
+ Units     : the datapath is FP32, so achieved figures are GFLOPS/TFLOPS. GOPS and TOPS appear
+             only where an integer format is being discussed, and are not interchangeable.
+ Note      : refreshed after the nine optimisations of 2026-09-20/21. See latency_analysis.log
+             for the per-stage breakdown and what remains.
+====================================================================================================
+
+1. ANSWER IN ONE LINE
+----------------------------------------------------------------------------------------------------
+   Achieved throughput is ~10 GFLOPS FP32 at 1 GHz, not TFLOPS. Today's work was 3.32x end to end
+   and 4.2x on the mesh, and the conclusion is unchanged: the limit is dataflow, not arithmetic.
+   The array is provisioned for the whole problem at once and then used once. Utilisation is
+   2.0 percent at the mesh and 0.50 percent end to end.
+
+2. GEOMETRY  (verified empirically, not read off the source)
+----------------------------------------------------------------------------------------------------
+   SystolicMesh generates TILES_PER_DIM^3 SystolicArray instances, each TILE_SIZE^2 PEs, so the
+   i, j AND k dimensions are all spatially unrolled:
+
+     PEs = (N/TILE)^3 * TILE^2 = N^3 / TILE
+
+   Confirmed by counting scopes in the generated Verilator model at N=16, TILE=4:
+     64 distinct ROW/COL/DEPTH tile scopes, 16 gen_row/gen_col PE scopes per tile = 1024 PEs.
+
+   Consequence: area grows as N^3. N=32 at TILE=4 would be 8192 PEs, N=64 would be 65536.
+   This design cannot be scaled up in N.
+
+3. MEASURED THROUGHPUT  (N=16, TILE=4)
+----------------------------------------------------------------------------------------------------
+   Useful work in one 16x16 matmul = 2 * 16^3 = 8192 ops.
+   Peak = 1024 PEs * 2 ops = 2048 ops/cycle (assumes 1 MAC/cycle/PE, which the PE does NOT
+   currently achieve; see 6b, so the real peak today is lower).
+
+     phase                    cycles  FLOP/cycle   % of peak GFLOPS @1GHz
+     mesh only                   203       40.35      1.970%          40.35
+     full pipeline, sigmoid      718       11.41      0.557%          11.41
+     full pipeline, SELU         750       10.92      0.533%          10.92
+     full pipeline, tanh         776       10.56      0.516%          10.56
+
+   Was, before today: mesh 849, tanh 2578 at 3.18 ops/cycle and 0.155% of peak. 3.32x end to
+   end, 4.2x on the mesh.
+
+   WHAT THE DENOMINATOR MEANS. Peak = 1024 PEs x 2 ops = 2048 ops/cycle assumes each PE
+   sustains one MAC per cycle. It does not: it was about 20 cycles this morning and is about 10
+   now. So "% of peak" is the distance from a perfect array of this size, not from what this
+   silicon can do. Against what these PEs can currently issue, 1024 x 2 / 10 = 204.8 ops/cycle,
+   today's 10.18 is 5.0%. The 1024 is measured from the elaborated netlist; the 1 MAC/cycle and
+   the 1 GHz are assumptions, and the 2-ops-per-MAC convention halves if a MAC is counted as one.
+
+4. THE CLOSED FORM STILL HOLDS
+----------------------------------------------------------------------------------------------------
+   utilisation = (2N^3 / cycles) / (2 * N^3/TILE) = TILE / cycles
+
+   The N^3 cancels, so matrix size does not appear. This is algebraic and unaffected by the
+   optimisations; only the cycle counts moved. N=16 mesh sweep, before and after the C-slow
+   reduction fix:
+
+     TILE   cycles          utilisation        overhead (cycles/TILE)
+      2      399 ->  117    0.501% -> 1.709%    200x ->  58x
+      4      849 ->  203    0.471% -> 1.970%    212x ->  51x
+      8     1797 ->  455    0.445% -> 1.758%    225x ->  57x
+     16     3885 -> 1151    0.412% -> 1.390%    243x ->  72x
+
+   A perfectly used systolic array of side TILE does its work in about TILE cycles of fill, so
+   cycles/TILE is the overhead factor. Three mesh fixes took it from around 200x to around 55x.
+
+   Caveat: "ideal = TILE cycles" counts systolic fill only. A real optimal schedule for this
+   decomposition also needs cycles for the k-dimension reduction, so the true ceiling is below
+   these figures and the overhead factors are the optimistic reading.
+
+   The N=8 (561 cycles at TILE=4) and N=32 (2949 at TILE=8) points in the previous revision
+   were measured BEFORE the reduction fix and have not been re-run. The closed form and the
+   conclusion in 5b do not depend on them, but do not quote those two numbers as current.
+
+5. WHAT THIS RULES OUT
+----------------------------------------------------------------------------------------------------
+   a) More PEs will not help. Utilisation stayed flat across an 8x range of PE count both
+      before and after the fix. Tiling is a pure area-time trade.
+
+   b) Bigger matrices make it worse. N cancels out of the closed form, and the pre-fix
+      measurements showed the trend running the wrong way: at fixed TILE=8, doubling N from 16
+      to 32 raised cycles 1.64x and divided utilisation by the same 1.64x.
+
+   c) No single block is. GPNAE was 94% of runtime before this work and is 60% now; the mesh
+      went from 33% to 25% despite being sped up 4.2x. Everything left is worth a few hundred
+      cycles, not a factor.
+
+6. WHAT WAS FIXED, AND WHAT IS LEFT
+----------------------------------------------------------------------------------------------------
+   Fixed (all measured, all regressions passing):
+     AccumulationUnit C-slow reduction    504 cycles   k-reduction was 70% of the mesh
+     fp32_down pipelining bug               -          latent, corrupted back-to-back operands
+     gpnae_poly streamed squaring/post    490 cycles   544 cycles of latency waiting became 54
+     parallel window dispatch             210 cycles   dispatch was width-limited, not stalled
+
+   Left, in value order (projections, see latency_analysis.log section 6):
+     a) NUM_LANES 8 -> 16                ~330 cycles   doubles Maxpool and dropout area
+     b) Stream the GPNAE input FIFO      ~138 cycles   no area cost, needs exact pop accounting
+     c) Mesh WAIT_TILES, 236 cycles, 68.6% of the mesh, needs the PE forwarding decoupled from
+        arithmetic AND the drain wave redesigned with it. Attempted and reverted.
+     d) Widen FIFO1's read port. Only after (a): the GPNAE fill is 256 serial cycles bounded by
+        a single read port, and that becomes the floor.
+
+7. THE LIMIT NONE OF THIS BREAKS
+----------------------------------------------------------------------------------------------------
+   1 TFLOPS at 1 GHz needs 1000 FLOP/cycle. tanh now reaches 10.56, so it is 95x short; this
+   morning it was 314x. Note the target is TFLOPS, not TOPS: this datapath is FP32, and the
+   TOPS figures quoted for inference parts are almost always INT8, which is not the same work.
+   Doubling the throughput did not change the order of magnitude, and nothing in section 6 will.
+
+   A second structural fact, measured: at N=16 each output element takes 16 matmul MACs and 8
+   activation MACs, so activation is 50% of the arithmetic in the system. That share is 8/N, so
+   it falls to 12.5% at N=64 and 3% at N=256. N=16 is a pathological size for this pipeline and
+   is why GPNAE dominates the profile.
+
+   The reason is structural. The design spatially unrolls i, j AND k, giving 1024 PEs for a
+   16x16 matmul in which each PE performs just 4 MACs. Even at a perfect II=1 the entire PE
+   workload is about 4 cycles. The array is provisioned for the whole problem at once and then
+   used once, so almost everything measured is fill, reduce and write-back around a compute
+   phase that barely exists.
+
+   The same 1024 PEs arranged as a single 32x32 array, kept fed by a streaming dataflow, would
+   sustain roughly 1024 MACs/cycle = 2048 FLOP/cycle = 2.05 TFLOPS at 1 GHz. That is the same
+   silicon delivering about 350x more, purely from dataflow. The lever for throughput is to stop
+   unrolling k spatially and time-multiplex a smaller array over a stream of work.
+
+8. CLOCK AND AREA FIGURES ARE STILL NOT TRUSTWORTHY
+----------------------------------------------------------------------------------------------------
+   Any TFLOPS number of the form "1024 PEs x 950 MHz" is unfounded twice over:
+
+   a) The 950 MHz FP32 clock has never been closed in a timing run. It is a back-calculation in
+      the old performance_analysis_report.log. The GFLOPS columns above assume it because it was
+      asked for as a working assumption; the ops/cycle columns are what is measured.
+
+   b) VIVADO/SIENNA.runs/synth_1/sienna_top_utilization_synth.rpt (Vivado 2025.2, 2026-07-27,
+      xc7a200tfbg484-3) reports 132262 LUTs at 98.26%, 48598 FFs, 4 BRAM tiles, 0 DSPs. Spread
+      over 1024 FP32 PEs that is ~129 LUTs per multiply-accumulate. An FP32 multiplier built
+      from Booth/Karatsuba in fabric is nearer 1000 LUTs on its own, so the synthesised netlist
+      cannot contain the array being simulated. Vivado very likely trimmed most tiles. The
+      hierarchical utilisation report is not in that file, so which tiles survived is unknown.
+      Resolve this before quoting any area or throughput figure externally. Note also that the report
+      predates all of today's RTL changes.
+====================================================================================================

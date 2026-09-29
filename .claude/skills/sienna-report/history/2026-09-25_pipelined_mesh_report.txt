@@ -1,0 +1,62 @@
+SIENNA raw-performance pass: pipelined mesh (2026-09-25)
+========================================================
+All numbers are Verilator RTL simulation on the farm. Latency in time assumes a 950 MHz clock (no synthesis yet).
+Commits: SystolicMesh c85b431 e7cb172 60b0c66 e8119be fa61ddc f3952ca e1ad49d 5a3d143; SIENNA 2f57700 c53234e 96a1a0f
+8ac0f0e 46e07de c63ccac 708abc1 5a46444 382dcad 501ea33 (+ skill commits aee63e7 06167d2, gemm_sweep bb998cb).
+The one-set-at-a-time design is at tag serial_mesh_v1 in both repos.
+
+What changed
+------------
+1. Mesh pipelined: sets flow through the arrays back to back. Two operand banks per array, a gap-free skewed feed, PEs keep
+   ACC_BANKS=4 banks of 6 partial sums, the reducers combine them in their adder tree, pipelined across sets and restarted
+   with no gap (next_final look-ahead). RESULT_BANKS=4. The last host row may come with the start.
+2. Credits: SETS_IN_FLIGHT parameter, default 8 (was 3), ids $clog2(SETS_IN_FLIGHT+1) bits.
+3. ReLU and linear sets bypass the GPNAE lanes (exact); 1x1 pooling with no padding bypasses FIFO2 and Maxpool.
+4. Per-set bias added by the mesh as one more reducer-tree input (no latency); the compiler attaches it to the first pass.
+5. TB_sienna_model: streaming host by default (+host_gaps for the old handshake), +trace stage-event log.
+
+Per-set cost, ReLU sets, cycles
+-------------------------------
+                         N=16 before   N=16 now          N=32 before   N=32 now
+TB_sienna_top host       88            19 (host-bound)   104           35 (host-bound)
+Streaming host (GEMM)    -             17.4              -             32.0 (= N, every PE busy every cycle)
+
+GEMM sweep (67 shapes, all within 4.6e-6 of float64)
+----------------------------------------------------
+                         N=16 before -> now            N=32 before -> now
+peak MAC/cycle           46.5 -> 254.4 of 256          315 -> 1023.5 of 1024
+BERT qkv 128 tokens      18.2% -> 93.4% PE use         30.7% -> 99.8%
+MLP up 128 tokens        18.2% -> 93.4%                30.8% -> 99.9%
+attention scores         18.1% -> 84.6%                29.3% -> 86.8%
+decode, 1 token          1.1% -> 5.8%                  1.0% -> 3.1%   (each weight used once: bandwidth-bound)
+
+MLPerf Tiny models end to end (hardware top-1 equal to the float reference on every run; worst layer error 1.2e-5)
+---------------------------------------------------------------------------------------------------------------
+cycles per inference     N=16 first run -> now         N=32 first run -> now
+ResNet-8                 298,383 -> 56,382 (5.3x)      67,103 -> 21,284 (3.2x)     59 us / 22 us at 950 MHz
+KWS DS-CNN               181,709 -> 33,478 (5.4x)      47,909 -> 13,812 (3.5x)
+VWW MobileNet            586,075 -> 109,044 (5.4x)     191,635 -> 55,740 (3.4x)
+ad01 (one slice)         100,990 -> 19,326 (5.2x)      34,198 -> 9,984 (3.4x)
+Published, measured int8 silicon: Syntiant Core 2 (98.7 MHz) IC 5.1 ms, KWS 1.5 ms, VWW 4.1 ms;
+Qualcomm Snapdragon 8 Elite Gen 5 sensing hub < 0.30 ms. Not like for like: fp32 RTL, assumed clock, host im2col not counted.
+
+Verification on the final design
+--------------------------------
+TB_SystolicArray 14/14 (sizes, depths, reader gaps); mesh regression 68/68 collapse-k and 68/68 depth slices;
+mesh at N=32 and N=64, collapse-k, every tile size: 21/21 sets; depth slices N=32 T=4/8/16 21/21;
+full regression 22/22 collapse-k and depth slices; N=32 conv 3/3; back-to-back 27 clean sets; four copies 48/48.
+N=32 matmul + bias 19/19; depth slices N=32 T=2 (16k PEs, 60 cycles) and N=64 T=16 (363) 21/21 on 128 GB nodes.
+No assertion fired anywhere. Still building: depth slices N=64 T=4 (65k PEs) and T=8 (32k), which need more than 64 GB.
+
+Costs to weigh at synthesis
+---------------------------
+Per PE: 4 banks x 6 partial sums = 24 registers (was 6), plus two operand banks per array (was one). Result memory 4 N^2
+words (was 2). One extra adder per output tile for the bias. The per-PE final flags are ANDed across the array each cycle.
+
+Where the remaining time goes
+-----------------------------
+N=32: none at the mesh; it is at its arithmetic limit (N cycles per set). N=16: about 8% in the activation stage's per-set
+overhead and result-bank turnaround. Beyond that the host feed (N words per operand per cycle) and the mesh need the same N
+cycles per set, so the next step up needs operands kept on chip (weight cache), and only then does partitioning a large
+mesh into smaller ones pay off. Model efficiency is also bounded by the lowering: depthwise layers (KWS, VWW) use ~31-36%
+of each set's MAC slots, and batch-1 fully connected layers ~6%.

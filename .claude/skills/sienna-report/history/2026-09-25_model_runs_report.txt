@@ -1,0 +1,27 @@
+MLPerf Tiny float models end to end on the SIENNA RTL (2026-09-25)
+RTL: GPNAE f1482f4, SIENNA 98454b8. Verilator 5.035 on the farm. Collapse-k mesh, T=4, HOST_WORDS=N, 32 lanes at N=16, 64 at N=32.
+Latency = cycles from the first host write of a layer to its last output, summed over layers, at an ASSUMED 950 MHz clock (no synthesis).
+The host does im2col, reshapes and softmax; that data movement is not counted. Arithmetic is fp32, models are the float tflite files.
+Runs: /proj/work/spramanik/sienna_jobs/runs/mdl_rn_n16, mdl_rn_n32 (resnet8, ad01), mdl3_n16, mdl3_n32 (kws, vww).
+
+| Model | N | Mode | Inferences | HW top-1 = float top-1 | HW top-1 = label | Worst layer err (max err / max ref) | Cycles / inference | Latency ms @950 MHz (assumed) | Sets | MACs | MAC-slot use | Effective GMAC/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| resnet8 | 16 | batch 1 | 200 | 200/200 | 174/200 | 1.5e-06 | 298,383 | 0.314 | 3,381 | 12.51 M | 90.3% | 39.8 |
+| ad01 | 16 | batch 1 | 40 | 40/40 | - | 1.4e-05 | 100,990 | 0.106 | 1,137 | 0.26 M | 5.7% | 2.5 |
+| ad01 | 16 | batched | 1 | 1/1 | - | 7.6e-06 | 301,102 | 0.317 | 3,411 | 10.57 M | 75.6% | 33.3 |
+| resnet8 | 32 | batch 1 | 50 | 50/50 | 45/50 | 8.9e-07 | 67,103 | 0.071 | 631 | 12.51 M | 60.5% | 177.0 |
+| ad01 | 32 | batch 1 | 40 | 40/40 | - | 9.0e-06 | 34,198 | 0.036 | 313 | 0.26 M | 2.6% | 7.3 |
+| ad01 | 32 | batched | 1 | 1/1 | - | 4.0e-06 | 66,750 | 0.070 | 626 | 10.57 M | 51.5% | 150.4 |
+| kws | 16 | batch 1 | 5 | 5/5 | 1/1 | 4.1e-07 | 181,709 | 0.191 | 2,053 | 2.63 M | 31.3% | 13.8 |
+| vww | 16 | batch 1 | 5 | 5/5 | - | 6.5e-07 | 586,075 | 0.617 | 6,629 | 7.49 M | 27.6% | 12.1 |
+| kws | 32 | batch 1 | 5 | 5/5 | 1/1 | 4.6e-07 | 47,909 | 0.050 | 443 | 2.63 M | 18.1% | 52.2 |
+| vww | 32 | batch 1 | 5 | 5/5 | - | 5.7e-07 | 191,635 | 0.202 | 1,797 | 7.49 M | 12.7% | 37.1 |
+
+resnet8 float reference top-1 on 10000 CIFAR-10 test images: 87.2%
+
+Inputs: resnet8 = the 200 MLPerf Tiny perf-sample CIFAR-10 test images (50 at N=32); ad01 = the 40 ToyCar slices shipped with MLPerf Tiny, each alone and all 40 as one batch;
+kws = one real clip ('marvin', label Unknown) with numpy MFCCs plus 4 synthetic; vww = 5 synthetic images (no COCO set here).
+ad01 top-1 is meaningless for an autoencoder: its anomaly score (reconstruction MSE) agrees within 2.7e-4 relative on all 80 slice results.
+resnet8 accuracy vs labels: hardware 174/200 = 87.0%, identical to the float reference on the same images; float reference 87.2% on all 10,000 test images.
+Published MLPerf Tiny latencies (int8 silicon, measured): Syntiant Core 2 v1.2 at 98.7 MHz IC 5.1 ms, KWS 1.5 ms, VWW 4.1 ms;
+Qualcomm Snapdragon 8 Elite Gen 5 sensing hub v1.4 below 0.30 ms for KWS, VWW and IC.

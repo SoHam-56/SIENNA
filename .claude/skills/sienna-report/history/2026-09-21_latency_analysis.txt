@@ -1,0 +1,222 @@
+====================================================================================================
+ SIENNA LATENCY ANALYSIS  (measured)
+ Date      : 2026-09-21
+ Config    : N=16, TILE=4, 16 GPNAE lanes, gpnae_poly activation lane, FP32
+ Simulator : Verilator 5.035, cycle accurate, gcc-toolset-13 + -fcoroutines
+ Provenance: every cycle count is measured. Projections are labelled.
+====================================================================================================
+
+1. WHERE THE DESIGN IS NOW
+----------------------------------------------------------------------------------------------------
+   Full regression 5/5 PASS. Mesh regression 32/32 PASS.
+
+     test                  before today    now   speedup
+     matmul_ident_selu             2290    750     3.05x
+     matmul_random_sigm            2084    718     2.90x
+     matmul_random_tanh            2578    776     3.32x
+     conv_basic_selu               2290    750     3.05x
+     conv_basic_tanh               2578    776     3.32x
+
+   Eleven changes landed, all verified and pushed:
+     AccumulationUnit C-slow reduction              504 cycles
+     fp32_down pipelining bug (latent, see 5a)        -
+     gpnae_poly streamed squaring and post stage    490 cycles on tanh
+     parallel window dispatch                       210 cycles
+     PE forwarding decoupled from the MAC           107 cycles
+     PE multiply overlapped with its accumulate      35 cycles
+     InputFIFO occupancy exposed                      -
+     poly lane streams its FIFO reads               124 cycles
+     work split evenly across lanes, 8 -> 16        303 cycles
+     lane-count constraints checked at elaboration    -
+     Maxpool streams when the input is one segment   29 cycles
+
+2. OUTER PIPELINE STAGES  (conv_basic_tanh, 776 cycles)
+----------------------------------------------------------------------------------------------------
+     stage                    cycles    share
+     GPNAE_ROUND                ~486    60.4%   derived by subtraction
+     SYSTOLIC_PROCESSING         203    25.2%
+     DISPATCH_WINDOWS             84    10.4%
+     WAIT_DOWNSTREAM              32     4.0%
+
+   The mesh was 33% of runtime this morning and is 25% now, having been sped up 4.2x while the
+   rest of the pipeline was sped up faster still.
+
+   At 1 GHz: 10.56 FLOP/cycle, 10.56 GFLOPS (FP32, so floating point: GOPS/TOPS are the
+   INT8 units and do not apply here), 0.497% of the 2048 ops/cycle a fully pipelined
+   1024-PE array would give. See throughput_analysis.log for what that denominator does and
+   does not mean.
+
+3. THE MESH, N=16, ACROSS THE DAY
+----------------------------------------------------------------------------------------------------
+     TILE   morning   reduction   forwarding   MAC overlap   speedup
+      2       399        167          132          117         3.4x
+      4       849        345          238          203         4.2x
+      8      1797        781          530          455         3.9x
+     16      3885       1845         1306         1151         3.4x
+
+   Mesh phase breakdown at TILE=4, measured after the reduction fix:
+     WAIT_TILES    236 -> about 95 now   systolic arrays computing
+     WAIT_REDUCE    89                   k-reduction and SRAM write
+     BROADCAST      16                   input queue fill
+
+4. INSIDE ONE GPNAE LANE
+----------------------------------------------------------------------------------------------------
+   Measured at 8 lanes, so 32 elements per lane and two barrel-MAC groups. The lane now takes
+   16 elements and one group, so halve the per-element terms; the shape is what matters.
+
+     state      before   now   what it costs
+     G_RUN         324   324   barrel MAC running, waiting on first result
+     G_WAIT        128   128   DEAD: FIFO read-pointer latency, 4 cycles per element
+     G_CAP          34    34   pop FIFO, capture element
+     G_SQ           32    32   issue x*x
+     G_POST         32    32   issue post op
+     G_POSTW       288    32   was DEAD: waiting on the post multiply
+     G_RECV         30    30   collect MAC results
+     G_SQW         256    22   was DEAD: waiting on the squaring multiply
+     G_NEXT          2     2   group turnaround
+     ------------------------------------------------------------------------------
+     busy         1126   636
+
+   G_WAIT has since gone: the lane reads its whole group from the FIFO back to back, using the
+   FIFO's occupancy to know how many words to pop. There is no dead time left in the lane.
+
+   GPNAE_ROUND is now about 256 cycles of fill plus roughly 230 of lane work. The fill FSM
+   writes one element per cycle into one lane at a time and fifo1_rd_data is a single read port,
+   so the fill is now more than half of GPNAE_ROUND and is the next thing to attack.
+
+   The MAC is the bulk of the lane work and is real work at one result per cycle: 16 elements x
+   9 coefficient rounds plus drain. It shortens only with a lower degree, since more lanes now
+   hit barrel_mac's period floor.
+
+5. THREE LATENT BUGS FOUND, ALL THE SAME SHAPE
+----------------------------------------------------------------------------------------------------
+   Each was an assumption that held under the old timing and silently stopped holding under the
+   new, with nothing in the code marking it as an assumption.
+
+   a) fp32_down exposes valid_stage1..6 so it looks pipelined. Stage 2 writes check, sign,
+      BigExp, BigMan and SmallMan; stages 4, 5 and 6 read them up to four cycles later from
+      single copies. A second operand issued behind the first overwrites them in flight. SeLu.sv
+      is the only other user and issues one at a time, so nothing had exposed it. It surfaced
+      when the poly lane streamed the sigmoid negative branch: act_negative failed 218 of 240
+      elements with errors to 537%. Fixed by carrying the values per stage.
+
+   b) PER_LANE. The fill FSM used GPNAE_FIFO_DEPTH as the per-lane fill target, which is not
+      the per-lane share of the work. It only looked correct because 256 elements over 8 lanes
+      is 32 each and the FIFO depth is also 32. At 16 lanes the first 8 would have taken
+      everything and gpnae_out_mem would have been indexed to 511 against a 256 deep buffer.
+
+   c) idle_o was (current_state == IDLE), which meant "finished" only while the PE stayed in
+      MAC_COMPUTE until mac_done. Once it left on ready_o it went idle with its final accumulate
+      still in the adder, so the drain wave read stale accumulators. It showed as 9 to 17 wrong
+      elements per test, with mm_ones and mm_zero_b passing because neither can see a stale
+      accumulator. MAC now reports busy_o and idle_o accounts for it.
+
+6. REMAINING OPTIONS, MEASURED BASIS
+----------------------------------------------------------------------------------------------------
+   a) Widen FIFO1's read port          ~270 cycles   ATTEMPTED AND REVERTED, see 8. The fill is
+                                                      256 serial cycles bounded by a single read
+                                                      port and is about half of GPNAE_ROUND.
+   b) Overlap the pipeline phases      ATTEMPTED AND REVERTED, see 8b. The outer FSM waits on
+                                       whole-phase completion (all_collected, disp_done), so the
+                                       stage occupancies sum exactly to the wall clock: nothing
+                                       overlaps between stages. Worth about 110 cycles within a
+                                       matrix and 1.6x across a stream of them.
+   c) Collapse k in the mesh           NOT YET, see 7
+   d) More lanes than 16               NOT worth it: barrel_mac's period is max(n, 14), so below
+                                       14 elements per group it stops shrinking. 32 lanes costs
+                                       twice the Maxpool and dropout area for about 10%.
+
+   Done since the last revision: NUM_LANES 8 -> 16 (303 cycles), FIFO streaming (124), Maxpool
+   streaming (29), and the PE accumulator clear (correctness, see 8c).
+
+   Not worth pursuing: the barrel MAC and the reduction are both at one operation per cycle.
+
+7. WHY k IS STILL UNROLLED
+----------------------------------------------------------------------------------------------------
+   Splitting the 16-deep contraction into 4 chunks lets four arrays compute partial products at
+   once, but something must then add them back: that is the whole WAIT_REDUCE phase, 89 cycles
+   and 16 AccumulationUnits that exist only to undo the split.
+
+     k parallel: compute 4*T, then a flat 89 cycles of reduction
+     k serial  : compute 16*T, no reduction
+
+   Parallelism saves 12*T cycles and costs a flat 89, so it pays while T > 7.4 cycles. The PE
+   MAC was about 20 cycles this morning and is about 10 now. Still above the crossover, so
+   parallel k is currently the right choice and collapsing it today would make things worse.
+
+   Collapsing k becomes correct once the PE reaches roughly one cycle per MAC, which needs
+   several output contexts per PE, i.e. a dataflow change. It then pays twice: PEs drop from
+   N^3/TILE to N^2, and the reduction phase stops existing rather than getting faster.
+
+8. THE WIDE FILL ATTEMPT, AND WHAT IS KNOWN ABOUT IT
+----------------------------------------------------------------------------------------------------
+   Reverted after three attempts. Recorded because it is fast and the remaining bug is narrow.
+
+   The idea: deal NUM_LANES elements per cycle from a wide FIFO1 read instead of one element per
+   cycle to one lane, which makes the fill PER_LANE cycles rather than SRAM_DEPTH. It needs the
+   lane assignment interleaved, lane i taking elements i, i+NUM_LANES, ..., so that one wide read
+   feeds every lane; the output index then becomes done_count[i]*NUM_LANES + i.
+
+   It works mechanically: 805 -> 308 cycles, a 2.6x saving. But Stage 2 comes out entirely zero,
+   so the lanes receive nothing, while Stage 1 confirms FIFO1 is given the right data. The loss
+   is inside rd_wide_o. Requiring whole batches and rewriting the width handling both changed the
+   cycle count and not the failure, so the fault is upstream of both.
+
+   Note the failure pattern is misleading and cost two attempts: with an identity matrix 240 of
+   256 elements are legitimately zero, so an all-zero fill presents as exactly 9 failures on the
+   output diagonal. Read the stage dumps, not the failure count.
+
+8b. THE PHASE-OVERLAP ATTEMPT
+----------------------------------------------------------------------------------------------------
+   Convolution, activation, pooling and dropout are strictly ordered per element, but not per
+   stage: only maxpool has a spatial dependency and it is two rows deep, so the stages can run
+   concurrently on different elements. They do not. The outer FSM advances on whole-phase
+   completion, and the measurement agrees: 486 + 203 + 84 + 32 = 805 exactly, so the mesh sits
+   idle for 573 of those cycles and the pooling hardware for 692.
+
+   Two pieces were already in place: the maxpool feeder is not gated on current_state, so a
+   window written to FIFO2 early is pooled at once, and lane_collected[i] already gives per-lane
+   completion. The attempt let the dispatcher run during GPNAE_ROUND, gated on whether the input
+   rows a batch needs had been activated (row_ready, derived from lane_collected).
+
+   It hangs at reset, before any input is loaded, which points at the added combinational blocks
+   not settling rather than at the pipeline logic. Reverted. Worth retrying with the readiness
+   check registered rather than combinational.
+
+8c. THE DESIGN CANNOT YET RUN BACK TO BACK
+----------------------------------------------------------------------------------------------------
+   Two separate blockers, one fixed and one not.
+
+   Datapath, FIXED: MAC zeroed its accumulator only on rst_n, never per pass, so a second matmul
+   would have added onto the first one's partial sums. Invisible until now because the testbench
+   resets before every matrix. The PE now clears it from the drain pulse, which is after the last
+   add and after buffered_accumulator has taken the value the drain reads.
+
+   Control, OPEN: with that fixed, a second matrix still never starts. Everything reads idle,
+   pipeline_complete_o never asserts and it times out after 200000 cycles, so the pipeline is not
+   producing wrong results, it is not starting at all. Something latches per reset rather than per
+   matrix. PEMesh's last_element_seen is the likeliest, set once and cleared only by rst_n. Also
+   check the fill FSM's lane_collected and load_finalized, the maxpool feeder's mp_windows_done,
+   and the dispatcher's disp_done.
+
+   Reproduce with:  make verilator EXTRA_FLAGS=-DBACK_TO_BACK
+   The second pass is ifdef guarded and off by default. Note EXTRA_FLAGS has to sit outside the
+   TRACE conditional in the Makefile or it only applies when tracing is on.
+
+   This matters because the 1.6x from streaming in 6b is unreachable until a second matrix can
+   run at all, so this is the real first step of that work, not the phase overlap.
+
+9. METHOD NOTE
+----------------------------------------------------------------------------------------------------
+   `make verilator` from the repo root fails with "fatal error: coroutine: No such file or
+   directory" unless the shell exports VERILATOR_ROOT and puts a g++ wrapper adding -fcoroutines
+   ahead of gcc-toolset-13 on PATH, as GPNAE/run_regression.sh does. Verilator then exits
+   non-zero and the regression silently runs whatever TB_sienna_top_sim is already in
+   Verilator/, reporting results from stale RTL. Always confirm the build exit status before
+   trusting a cycle count.
+
+   Failure signatures are diagnostic. A hang means a handshake never completes. A handful of
+   wrong elements means the handshakes are fine and a value raced. Which patterns pass narrows
+   it further: mm_ones and mm_zero_b cannot see a stale accumulator, so their passing while
+   mm_identity failed pointed straight at 5b.
+====================================================================================================

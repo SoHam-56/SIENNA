@@ -1,0 +1,180 @@
+SIENNA performance analysis: sienna_layer engine (2026-09-25)
+RTL: SystolicMesh a601a95, SIENNA 74ff3a7. Farm Verilator runs; time at an ASSUMED 950 MHz clock, no synthesis.
+Software writes each layer's configuration, streams its data in the fixed order and checks the output. All scheduling is in hardware.
+One layer per simulation run; each layer starts from an empty pipeline (fill and drain counted).
+
+1. End to end, per inference
+model     N   cycles  time us   sets  MACs M  PE use  host words words/cyc  vs float ref
+resnet8  16    56902     59.9   3156   12.51   85.9%      890112      15.6  3/3 top-1
+kws      16    33831     35.6   1796    2.63   30.4%      525904      15.5  3/3 top-1
+vww      16   109988    115.8   5918    7.49   26.6%     1901520      17.3  3/3 top-1
+ad01     16    19363     20.4   1040    0.26    5.3%      534160      27.6  3/3 top-1
+resnet8  32    21764     22.9    622   12.51   56.1%      727360      33.4  3/3 top-1
+kws      32    14292     15.0    378    2.63   18.0%      492128      34.4  3/3 top-1
+vww      32    57026     60.0   1605    7.49   12.8%     2219808      38.9  3/3 top-1
+ad01     32    10057     10.6    264    0.26    2.6%      542368      53.9  3/3 top-1
+
+2. Where the cycles go (share of each model's total)
+   useful = MACs at 100% PE use; padding = MAC slots of sets the layer shape leaves empty;
+   per-set = cycles a set takes beyond N; per-layer = fill and drain of each layer's pipeline.
+model     N  useful  padding  per-set per-layer
+resnet8  16     86%       3%       9%        2%   (9 layers, ~121 cycles fill+drain each)
+kws      16     30%      55%      11%        4%   (11 layers, ~121 cycles fill+drain each)
+vww      16     27%      59%      11%        3%   (29 layers, ~102 cycles fill+drain each)
+ad01     16      5%      81%       8%        6%   (10 layers, ~110 cycles fill+drain each)
+resnet8  32     56%      35%       2%        7%   (9 layers, ~158 cycles fill+drain each)
+kws      32     18%      67%       3%       12%   (11 layers, ~158 cycles fill+drain each)
+vww      32     13%      77%       3%        7%   (29 layers, ~134 cycles fill+drain each)
+ad01     32      3%      81%       2%       14%   (10 layers, ~138 cycles fill+drain each)
+
+3. Per layer (N=16, first input)
+  resnet8
+   layer kind                sets  cycles cyc/set slot use  PE use
+   L00  CONV_2D              128    2687    21.0      84%     64%
+   L01  CONV_2D              576   10336    17.9     100%     89%
+   L03  ADD                  640   11424    17.9      90%     81%
+   L04  CONV_2D              288    5248    18.2     100%     88%
+   L07  ADD                  608   10728    17.6     100%     91%
+   L08  CONV_2D              288    5184    18.0     100%     89%
+   L11  ADD                  608   10704    17.6     100%     91%
+   L12  AVERAGE_POOL_2D       16     406    25.4       6%      4%
+   L14  FULLY_CONNECTED        4     185    46.2       4%      1%
+  kws
+   layer kind                sets  cycles cyc/set slot use  PE use
+   L00  CONV_2D               96    1960    20.4      79%     62%
+   L01  DEPTHWISE_CONV_2D    288    5248    18.2       6%      5%
+   L02  CONV_2D              128    2504    19.6      96%     79%
+   L03  DEPTHWISE_CONV_2D    288    5248    18.2       6%      5%
+   L04  CONV_2D              128    2504    19.6      96%     79%
+   L05  DEPTHWISE_CONV_2D    288    5248    18.2       6%      5%
+   L06  CONV_2D              128    2504    19.6      96%     79%
+   L07  DEPTHWISE_CONV_2D    288    5248    18.2       6%      5%
+   L08  CONV_2D              128    2504    19.6      96%     79%
+   L09  AVERAGE_POOL_2D       32     678    21.2       6%      5%
+   L11  FULLY_CONNECTED        4     185    46.2       5%      2%
+  vww
+   layer kind                sets  cycles cyc/set slot use  PE use
+   L00  CONV_2D              288    5887    20.4      42%     33%
+   L01  DEPTHWISE_CONV_2D    720   13248    18.4       6%      5%
+   L02  CONV_2D              144    2423    16.8      50%     48%
+   L03  DEPTHWISE_CONV_2D    324    5884    18.2       6%      6%
+   L04  CONV_2D               72    1271    17.7     100%     91%
+   L05  DEPTHWISE_CONV_2D    648   11608    17.9       6%      6%
+   L06  CONV_2D              144    3007    20.9     100%     77%
+   L07  DEPTHWISE_CONV_2D    162    3022    18.7       6%      5%
+   L08  CONV_2D               72    1567    21.8     100%     74%
+   L09  DEPTHWISE_CONV_2D    324    5884    18.2       6%      6%
+   L10  CONV_2D              144    2800    19.4     100%     82%
+   L11  DEPTHWISE_CONV_2D    108    2068    19.1       5%      4%
+   L12  CONV_2D               96    1912    19.9      75%     60%
+   L13  DEPTHWISE_CONV_2D    216    3976    18.4       5%      4%
+   L14  CONV_2D              192    3560    18.5      75%     65%
+   L15  DEPTHWISE_CONV_2D    216    3976    18.4       5%      4%
+   L16  CONV_2D              192    3560    18.5      75%     65%
+   L17  DEPTHWISE_CONV_2D    216    3976    18.4       5%      4%
+   L18  CONV_2D              192    3560    18.5      75%     65%
+   L19  DEPTHWISE_CONV_2D    216    3976    18.4       5%      4%
+   L20  CONV_2D              192    3560    18.5      75%     65%
+   L21  DEPTHWISE_CONV_2D    216    3976    18.4       5%      4%
+   L22  CONV_2D              192    3560    18.5      75%     65%
+   L23  DEPTHWISE_CONV_2D     72    1383    19.2       4%      3%
+   L24  CONV_2D              128    2383    18.6      56%     48%
+   L25  DEPTHWISE_CONV_2D    144    2655    18.4       4%      3%
+   L26  CONV_2D              256    4559    17.8      56%     51%
+   L27  AVERAGE_POOL_2D       16     358    22.4       4%      3%
+   L29  FULLY_CONNECTED       16     389    24.3       1%      1%
+  ad01
+   layer kind                sets  cycles cyc/set slot use  PE use
+   L00  FULLY_CONNECTED      320    5599    17.5       6%      6%
+   L01  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L02  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L03  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L04  FULLY_CONNECTED        8     253    31.6       3%      2%
+   L05  FULLY_CONNECTED        8     238    29.8       3%      2%
+   L06  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L07  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L08  FULLY_CONNECTED       64    1247    19.5       6%      5%
+   L09  FULLY_CONNECTED      320    5791    18.1       6%      6%
+
+4. GEMM sweep through sienna_layer (67 shapes each, all within 4.6e-6 of float64)
+  N=16 grid_16x16x16             118 cycles     34.7 MAC/cycle   13.6% of peak
+  N=16 grid_256x256x256        71351 cycles    235.1 MAC/cycle   91.9% of peak
+  N=16 grid_1024x1024x256    1120631 cycles    239.5 MAC/cycle   93.6% of peak
+  N=16 qkv_proj_128tok        315959 cycles    238.9 MAC/cycle   93.3% of peak
+  N=16 mlp_up_128tok         1262903 cycles    239.1 MAC/cycle   93.4% of peak
+  N=16 attn_scores              4871 cycles    215.3 MAC/cycle   84.1% of peak
+  N=16 decode_proj_1tok        39566 cycles     14.9 MAC/cycle    5.8% of peak
+  N=32 grid_16x16x16             166 cycles     24.7 MAC/cycle    2.4% of peak
+  N=32 grid_256x256x256        16604 cycles   1010.4 MAC/cycle   98.7% of peak
+  N=32 grid_1024x1024x256     262484 cycles   1022.7 MAC/cycle   99.9% of peak
+  N=32 qkv_proj_128tok         74028 cycles   1019.9 MAC/cycle   99.6% of peak
+  N=32 mlp_up_128tok          295212 cycles   1023.0 MAC/cycle   99.9% of peak
+  N=32 attn_scores              1214 cycles    863.7 MAC/cycle   84.3% of peak
+  N=32 decode_proj_1tok        18590 cycles     31.7 MAC/cycle    3.1% of peak
+
+5. Stage-level steady state (TB_sienna_top, its handshake host)
+  N=16 matmul_random_relu    21 cycles per set (mean of the last 8 gaps); single-set latency 110 cycles
+  N=16 matmul_relu_nopool    19 cycles per set (mean of the last 8 gaps); single-set latency 100 cycles
+  N=16 matmul_random_tanh    266 cycles per set (mean of the last 8 gaps); single-set latency 312 cycles
+  N=16 matmul_random_sigm    268 cycles per set (mean of the last 8 gaps); single-set latency 376 cycles
+  N=16 matmul_ident_selu     205 cycles per set (mean of the last 8 gaps); single-set latency 294 cycles
+  N=32 matmul_random_relu    35 cycles per set (mean of the last 8 gaps); single-set latency 146 cycles
+  N=32 matmul_relu_nopool    35 cycles per set (mean of the last 8 gaps); single-set latency 132 cycles
+  N=32 matmul_random_tanh    347 cycles per set (mean of the last 8 gaps); single-set latency 441 cycles
+
+6. Reading it
+- Dense layers run close to the mesh's limit: ResNet-8 at N=16 uses 86% of all MAC slots end to end; large GEMMs reach
+  93% (N=16) and 99.9% (N=32).
+- The biggest loss is padding, a property of how layers map onto N x N sets, not of the pipeline:
+  depthwise layers fill 2-6% of a set (one weight per column per tap), batch-1 fully connected layers 1/N of the rows,
+  and layers with fewer channels than N (ResNet-8's first stage at N=32) half the columns. That is why N=32 is only
+  2.6x faster than N=16 on ResNet-8 despite 4x the PEs, and why KWS, VWW and ad01 sit at 3-30%.
+- Per-set overhead is 9-11% at N=16 and 2-3% at N=32. Measured on 2026-09-26 with TB_sienna_layer's stall counter:
+  at N=16 it is all credits (934 of 10336 cycles on a ResNet-8-like layer), because SETS_IN_FLIGHT=8 sets of 16
+  cycles do not cover a set's start-to-completion time under load; at N=32 there are no credit stalls.
+- Per-layer fill and drain is 100-160 cycles, 2-14% of a model; it grows with layer count and matters most for small
+  layers (FC, pooling). Running consecutive layers back to back would hide it.
+- Host traffic is 15-17 words per cycle at N=16 and 33-54 at N=32 per bus pair, with the weight cache cutting it by
+  32-45% on convolutional models.
+- What would move the numbers next, largest first: a depthwise mode that packs channels (KWS/VWW 3-10x on those layers),
+  partitioning N=32 into smaller meshes for narrow layers, overlapping consecutive layers, and batching fully connected
+  layers.
+
+7. FLOPs (2 per multiply-accumulate of the workload itself; bias adds and ReLU not counted; ASSUMED 950 MHz clock)
+   peak: N=16 256 MAC/cycle = 486.4 GFLOPS; N=32 1024 MAC/cycle = 1945.6 GFLOPS
+
+  a) Models end to end, per inference (sienna_layer)
+  model                MFLOP  N=16 cycles   GFLOPS  of peak  N=32 cycles   GFLOPS  of peak
+  ResNet-8             25.01        56902    417.6    85.9%        21764   1091.8    56.1%
+  KWS DS-CNN            5.26        33831    147.7    30.4%        14292    349.7    18.0%
+  VWW MobileNet        14.98       109988    129.4    26.6%        57026    249.6    12.8%
+  ad01, 1 slice         0.53        19363     25.9     5.3%        10057     49.9     2.6%
+  ad01, 40 batched     21.14        56377    356.1    73.2%        18952   1059.4    54.5%
+
+  b) GEMM shapes through sienna_layer (from section 4)
+  shape                  N=16 GFLOPS  of peak  N=32 GFLOPS  of peak
+  grid_16x16x16                 65.9    13.6%         46.9     2.4%
+  grid_256x256x256             446.7    91.8%       1919.8    98.7%
+  grid_1024x1024x256           455.1    93.6%       1943.1    99.9%
+  qkv_proj_128tok              453.9    93.3%       1937.8    99.6%
+  mlp_up_128tok                454.3    93.4%       1943.7    99.9%
+  attn_scores                  409.1    84.1%       1641.0    84.3%
+  decode_proj_1tok              28.3     5.8%         60.2     3.1%
+  The older host-driven path (the host issues each set) reached 254.4 MAC/cycle = 483 GFLOPS at N=16 on the same
+  large shapes; sienna_layer is 6% lower there until the credit limit above is raised. N=32 is the same on both.
+
+  c) One matmul set plus its activation, streamed (TB_sienna_top; pipeline_performance_N16/N32.log)
+  test                           N=16 cyc/set   GFLOPS  N=32 cyc/set   GFLOPS   limit
+  matmul_relu_nopool                     19.0    409.6          35.0   1778.8   host / host
+  matmul_random_relu                     21.0    370.6          35.0   1778.8   pooling / host
+  matmul_bias_relu_nopool                19.0    409.6          35.0   1778.8   host / host
+  matmul_cached_relu_nopool              19.0    409.6          35.0   1778.8   host / host
+  matmul_accum3_bias_linear_nopool         19.0    409.6          35.0   1778.8   host / host
+  matmul_ident_selu                     214.8     36.2         287.1    216.9   activation / activation
+  matmul_random_tanh                    263.0     29.6         315.3    197.4   activation / activation
+  matmul_random_sigm                    273.3     28.5         361.4    172.3   activation / activation
+  matmul_bias_tanh                      298.0     26.1         315.5    197.3   activation / activation
+  matmul_large_tanh                     594.4     13.1        1168.4     53.3   activation / activation
+  ReLU and linear sets are held to N+3 cycles by this testbench's host handshake; the hardware alone takes N.
+  Polynomial activations are limited by the GPNAE lanes, not the mesh.
+

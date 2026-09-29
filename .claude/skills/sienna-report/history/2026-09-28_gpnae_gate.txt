@@ -1,0 +1,57 @@
+GATE G2: GPNAE poly lane (gpnae_poly, barrel_mac, gpnae_tail) in the build's format
+=====================================================================================
+GPNAE bf16 41cad2d (pushed), ArithmeticLibrary d97e270. Gate run: sienna_jobs/runs/g2, plus the random power-up
+reruns g2_ri_fp32a/b, g2_ri_bf16a/b and the fp32 identity rerun g2_poly32x after the testbench reset fix.
+
+VERDICT: PASS for correctness: fp32 unchanged, bf16 bit-exact everywhere. The bf16 ACCURACY of the activations does
+not meet the 6.25% regression tolerance for sigmoid and tanh (table below). That is a property of the lane design at
+8 bits of precision, not a hardware fault, and it needs a decision from Soham (see OPEN ITEM).
+
+1. fp32 UNCHANGED (published behaviour kept)
+   Poly lane, 9 patterns, default range and range 8 (tails): RESULT and ERRSTAT lines identical to the baselines
+   (u0_gpnae32, g10_base_r8); cycle counts identical before the TB reset change, +48 per activation after it
+   (6 extra reset cycles x 8 batches, the TB's own time). Taylor lane (gpnae.sv): identical.
+
+2. bf16 BIT-EXACT (TB exact mode against gpnae_model.py)
+   10 patterns (the 9 standard plus act_threshold: +/-3.5, +/-4 and their neighbours) x 3 activations:
+   default range 30/30, range 8 30/30 (every tail path), seeds 101/202/303 30/30 each,
+   random power-up 30/30 in three separate runs. Coefficient ROM check: the lane loads poly_coeffs_bf16.mem.
+
+3. MODEL VALIDATION ON THE fp32 RTL (before any bf16 run)
+   SELU and tanh exact on every element incl. tails; sigmoid exact except negative inputs within 3.5 (923 elements),
+   all on the fp32_down path (finding F-GP1 below).
+
+4. UNSUPPORTED FORMAT (EXP_W=5, MAN_W=10)
+   barrel_mac, gpnae_tail, gpnae_poly: elaboration fails with "<block>: unsupported format" ($fatal).
+
+5. ACCURACY AGAINST THE EXACT FUNCTIONS (worst relative error over all patterns; mean of per-pattern means)
+                        fp32 worst   fp32 mean    bf16 worst   bf16 mean    cycles/input fp32 -> bf16
+   SELU                 0.0056%      0.0001%      2.82%        0.74%        18 -> 18
+   sigmoid              0.0613%      0.0148%      7.22%        0.53%        16 -> 16
+   sigmoid, range 8     0.0731%      0.0134%     12.68%        0.74%        20 -> 16
+   tanh                 0.3878%      0.1422%      8.59%        3.96%        20 -> 19
+   bf16 regression tolerance (suggested_rel_tol) is 6.25%: SELU within it; sigmoid and tanh not.
+
+6. LINT (-Wall, SYNTHESIS, gpnae_poly on top): no LATCH, MULTIDRIVEN, UNOPTFLAT or errors in either format.
+   Warnings are pin/width/unused/filename classes, one SYNCASYNCNET (RAM.v, known item 3e), BLKSEQ (R4Booth, 3f).
+
+OPEN ITEM FOR SOHAM: bf16 activation accuracy (testbenches/results/uniform/poly_coeffs_fit.log has the full table)
+   - The fp32 degrees (8/6/8) gave bf16 worst errors of 5.3% / 21.7% / 331%: power-basis Horner at 8 bits.
+     The table now uses degree 3 (SELU), 5 (sigmoid) and 4 (tanh), stored with zero leading coefficients, which the
+     MAC evaluates bit-identically to the lower degree; ROM layout and rounds unchanged.
+   - sigmoid: the polynomial itself is within 0.77%; the error comes from computing 1 - P for x near -3.5,
+     where one bf16 step of P is about 13% of the answer. Better coefficients cannot fix it.
+   - tanh: x * P(x^2) over u = x^2 in [0, 16] cancels badly at 8 bits; best worst case 8.4%, mean 4-6%.
+   - Options, all design changes: lower the bf16 tail thresholds (the tail computes sigmoid and tanh from e^-|x|
+     without the cancellation, one element per context), a range split for tanh, or accept this accuracy.
+
+FINDINGS IN PUBLISHED CODE (reported, not changed)
+   F-GP1  fp32_down (published) differs from fp32Adder(P, -1) by 2-32 ulp on negative sigmoid inputs.
+   D-7    (from G1) fp32Adder's unreset valid stages: with a 2-cycle reset, fp32 random power-up hung one SELU tail
+          batch (spurious done in gpnae_tail). TB now holds reset 8 cycles; bf16 uses fpAdder and is unaffected.
+
+TEST-SIDE RULINGS (ledgered): TB reset held from power-up and for 8 cycles; the coefficient table is chosen by a
+literal in an if-generate (a string parameter passed down to the ROM's $readmemb was not found); $fatal for
+unsupported formats (Verilator demotes an elaboration $error to a warning).
+
+NOT RUN: the published Taylor lane (gpnae.sv) in bf16 (out of scope).

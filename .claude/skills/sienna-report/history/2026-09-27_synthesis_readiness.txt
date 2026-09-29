@@ -1,0 +1,85 @@
+SIENNA SYNTHESIS READINESS: fixes on main (SIENNA 66ed4e5, SystolicMesh 8b2dd12) and on bf16 (SIENNA 6d72531, SystolicMesh 934d99b, ArithmeticLibrary 7ad20b7)
+==============================================================================================================
+main is fp32 only; bf16 adds bf16 operands as a parameter, and its fp32 default behaves exactly as main. Both verified as below.
+
+1. VERIFIED ON THIS STATE
+   - Regression 27/27, fp32 N=16 (cycle counts identical to pre_synthesis_v1) and bf16 N=16.
+   - Regression 27/27 with every unreset register and memory powering up random (Verilator --x-initial unique,
+     -DNO_ZERO_INIT, +verilator+rand+reset+2): fp32 N=16, bf16 N=16, fp32 N=32. Nothing depends on power-up zeros.
+   - Mesh regression 68/68, TB_SystolicArray 14/14, fpMulWiden against fp32Multiplier: 0 mismatches.
+   - Lint (Verilator -Wall, SYNTHESIS defined, sienna_layer on top, fp32 and bf16): elaborates from one file list;
+     no latches, no multiple drivers, no combinational loops. 156 warnings left: widths, unused/empty pins, file
+     names, plus the two items in 3e and 3f.
+
+2. FIXED IN THIS PASS (behaviour unchanged, checks above)
+   - Pooling dispatcher: a lane's window advance was a loop of up to NUM_LANES compare-and-subtract steps, a
+     32-deep chain in one cycle; now one add and one compare (elaboration constants ADV_R, ADV_C).
+   - MeshOutputSram: writes no longer gated by rstn_i (a reset net used as data).
+   - SystolicMesh broadcast: module-level integer temporaries made block-local (no inferred registers).
+   - Parameter checks in initial blocks, and the result memory's zero fill, under ifndef SYNTHESIS.
+   - synth/sienna_rtl.f: the RTL once, with SystolicMesh's ArithmeticLibrary. Reading both copies defines
+     fp32Adder, fp32Multiplier, LZC, R4Booth and karatsubaUnsigned twice; the copies differ only in port style.
+
+3. NEEDS A DECISION BEFORE OR DURING SYNTHESIS (structural; not changed)
+   a. Weight cache (128 KiB fp32 / 64 KiB bf16 at N=16; 4x at N=32): must be SRAM. The broadcast reads N/T full
+      rows (N words each) per cycle, so bank it by row: N/T banks, one N-word row per bank per cycle. The RTL assumes
+      a one-cycle read; at 950 MHz a macro this size may need two, which costs one broadcast cycle per set (not
+      throughput, since broadcast takes T+2 of the N cycles a set has).
+   b. Result SRAM (MeshOutputSram): one array with one write port per reducer ((N/T)^2 = 16) and a NUM_LANES-word
+      wide read. As written that is per-word write decoding across 16 ports plus 32 read muxes. Each reducer writes
+      only its own tile, so a bank per tile removes the write-port logic; the wide read then needs a small crossbar.
+   c. Activation buffer (gpnae_out_mem, 2 KiB at N=16): the pooling dispatcher reads NUM_LANES words per cycle at
+      computed addresses, i.e. 32 read ports of 512:1 on 32-bit words. Fine for timing, heavy for area; a
+      per-lane layout matching the dispatch order would cut it.
+   d. Array operand banks: every array keeps its own copy of the A rows it shares with its tile row (and B with its
+      column): 16 KiB at N=16 but 128 KiB at N=32, fp32. Sharing one copy per tile row/column saves about 3/4 of
+      it at T=4.
+   e. GPNAE (published TYTAN code, reported rather than changed): RAM.v resets its output register synchronously to
+      X while the same reset is asynchronous elsewhere (lint SYNCASYNCNET); ROM.v loads each lane's 32-entry
+      coefficient ROM with $readmemb, which ASIC flows do not turn into a ROM (use a constant table or ROM macro);
+      the 32 lanes hold identical ROMs that could be one.
+   f. ArithmeticLibrary R4Booth: blocking assignments inside always_ff (style; synthesizes correctly).
+
+4. LIKELY CRITICAL PATHS (by inspection; to confirm with the first timing report)
+   - Arithmetic units: the same fp32 multiplier/adder library met 950 MHz in FreePDK45 in the published TYTAN work;
+     fpMulWiden does an 8x8 (bf16) or 11x11 (fp16) product in one stage.
+   - Array 'set final' AND: every PE's per-bank final flag ANDed across the mesh, feeding reduce_start in the same
+     cycle: 256 inputs at N=16, 1024 at N=32. Register it if timing needs (one cycle of latency).
+   - Weight-cache read (3a) and the result SRAM ports (3b): memory access, not logic, sets the limit.
+   - Dispatcher address and read (3c): about 9 mux levels after a small add; expected to fit.
+
+5. STORAGE AND ARITHMETIC (estimate from the RTL's own sizing; real area comes from synthesis)
+   N=16 T=4, 32 lanes, 256 PEs: storage fp32 207 KiB, bf16 133 KiB (-36%)
+     weight cache (wcache)                                      128.0    64.0 KiB   SRAM, banked by row (N/T banks, N words wide)
+     staging banks (mem_A, mem_B)                                 4.0     2.0 KiB   flops at N=16; SRAM banked by row beyond
+     array operand banks (a_mem, b_mem)                          16.0     8.0 KiB   flops (one word per row per cycle)
+     PE partial-sum banks (acc)                                  24.0    24.0 KiB   flops, in the PE
+     reducer pipelines (adder tree + tags)                        1.2     1.2 KiB   flops
+     bias queue                                                   1.0     1.0 KiB   flops
+     result SRAM (MeshOutputSram)                                 4.0     4.0 KiB   flops at N=16; SRAM banked per tile beyond
+     activation buffer (gpnae_out_mem)                            2.0     2.0 KiB   flops (32 arbitrary reads per cycle)
+     GPNAE per-lane state (FIFO, ROM, MAC slots, buffers, tail)    25.0    25.0 KiB   flops; the 32-entry ROM per lane could be shared
+     pooling FIFOs (FIFO2)                                        2.0     2.0 KiB   flops
+     units fp32: fp32 multipliers 416, fp32 adders 416, fp32_down units 32
+     units bf16: fp32 multipliers 160, narrow multipliers (fpMulWiden) 256, fp32 adders 416, fp32_down units 32
+   N=32 T=4, 64 lanes, 1024 PEs: storage fp32 837 KiB, bf16 509 KiB (-39%)
+     weight cache (wcache)                                      512.0   256.0 KiB   SRAM, banked by row (N/T banks, N words wide)
+     staging banks (mem_A, mem_B)                                16.0     8.0 KiB   flops at N=16; SRAM banked by row beyond
+     array operand banks (a_mem, b_mem)                         128.0    64.0 KiB   flops (one word per row per cycle)
+     PE partial-sum banks (acc)                                  96.0    96.0 KiB   flops, in the PE
+     reducer pipelines (adder tree + tags)                        5.0     5.0 KiB   flops
+     bias queue                                                   2.0     2.0 KiB   flops
+     result SRAM (MeshOutputSram)                                16.0    16.0 KiB   flops at N=16; SRAM banked per tile beyond
+     activation buffer (gpnae_out_mem)                            8.0     8.0 KiB   flops (64 arbitrary reads per cycle)
+     GPNAE per-lane state (FIFO, ROM, MAC slots, buffers, tail)    50.0    50.0 KiB   flops; the 32-entry ROM per lane could be shared
+     pooling FIFOs (FIFO2)                                        4.0     4.0 KiB   flops
+     units fp32: fp32 multipliers 1344, fp32 adders 1536, fp32_down units 64
+     units bf16: fp32 multipliers 320, narrow multipliers (fpMulWiden) 1024, fp32 adders 1536, fp32_down units 64
+   bf16 halves the weight cache, staging and operand banks and replaces the mesh's 24-bit-mantissa multipliers with
+   8-bit ones; partial sums, results, GPNAE and pooling stay fp32. GPNAE and dropout hold 38% of the fp32 multipliers at N=16.
+
+6. FOR THE SYNTHESIS RUN
+   - Files: synth/sienna_rtl.f. Top: sienna_layer (whole layer engine) or sienna_top. Define SYNTHESIS.
+   - First configuration: N=16, TILE_SIZE=4, COLLAPSE_K=1, NUM_LANES=32; once with fp32 operands (defaults) and
+     once with OP_EXP_W=8, OP_MAN_W=7 (bf16).
+   - Map to SRAM: weight cache (3a). Everything else can start as flops at N=16 and be revisited with 3b-3d.

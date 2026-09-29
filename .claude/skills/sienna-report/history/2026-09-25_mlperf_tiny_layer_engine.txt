@@ -1,0 +1,44 @@
+MLPerf Tiny float models end to end on the SIENNA RTL, sienna_layer engine (2026-09-25)
+Hardware schedules every layer; software writes each layer's configuration, streams its data in the fixed order
+(im2col in software, as agreed) and checks the result. Verilator on the farm; time at an ASSUMED 950 MHz clock.
+FLOPs count 2 per multiply-accumulate of the model's own layers (bias adds and ReLU not counted).
+hw=float: hardware top-1 equals the float reference's. For ad01, an autoencoder, it is the worst relative
+difference in anomaly score (mean squared reconstruction error) instead. hw=label: hardware top-1 equals the label.
+worst err: largest per-layer max|hw-ref|/max|ref|. Cycles are identical for every input of a model: the schedule
+does not depend on the data (ReLU and linear layers bypass the polynomial lanes, so no tail elements arise).
+
+== N=16: 256 multiply-accumulate units, peak 486 GFLOPS
+model              runs  hw=float  hw=label   cycles   latency   MFLOP  GFLOPS of peak  host words worst err
+ResNet-8            200   200/200   174/200    56902    59.9us   25.01   417.6   85.9%      890112   1.5e-06
+KWS DS-CNN            5       5/5       1/1    33831    35.6us    5.26   147.7   30.4%      525904   3.7e-07
+VWW MobileNet         5       5/5         -   109988   115.8us   14.98   129.4   26.6%     1901520   5.5e-07
+ad01 (1 slice)       40     3e-04         -    19363    20.4us    0.53    25.9    5.3%      534160   1.4e-05
+ad01 (40 batched)     1         -         -    56377    59.3us   21.14   356.1   73.2%     1066640
+ResNet-8 float reference on all 10000 CIFAR-10 test images: 87.2% top-1
+
+== N=32: 1024 multiply-accumulate units, peak 1946 GFLOPS
+model              runs  hw=float  hw=label   cycles   latency   MFLOP  GFLOPS of peak  host words worst err
+ResNet-8            200   200/200   174/200    21764    22.9us   25.01  1091.8   56.1%      727360   8.9e-07
+KWS DS-CNN            5       5/5       1/1    14292    15.0us    5.26   349.7   18.0%      492128   3.7e-07
+VWW MobileNet         5       5/5         -    57026    60.0us   14.98   249.6   12.8%     2219808   4.7e-07
+ad01 (1 slice)       40     1e-04         -    10057    10.6us    0.53    49.9    2.6%      542368   8.9e-06
+ad01 (40 batched)     1         -         -    18952    19.9us   21.14  1059.4   54.5%      812704
+
+== Against this morning's first run (host-driven, one set at a time through the mesh, 3 credits)
+model       N  first cycles      now  speedup
+resnet8    16        298383    56902     5.2x
+kws        16        181709    33831     5.4x
+vww        16        586075   109988     5.3x
+ad01       16        100990    19363     5.2x
+resnet8    32         67103    21764     3.1x
+kws        32         47909    14292     3.4x
+vww        32        191635    57026     3.4x
+ad01       32         34198    10057     3.4x
+
+== Against published MLPerf Tiny results (measured int8 silicon; ours is fp32 RTL at an assumed clock)
+model      Syntiant Core 2 ms  its cycles  SIENNA N=16 cycles  N=32 cycles  N=16 ms  N=32 ms
+resnet8                   5.1      503370               56902        21764    0.060    0.023
+kws                       1.5      148050               33831        14292    0.036    0.015
+vww                       4.1      404670              109988        57026    0.116    0.060
+Qualcomm Snapdragon 8 Elite Gen 5 sensing hub (v1.4): below 0.30 ms for KWS, VWW and image classification.
+Not like for like: fp32 against int8, no power or area yet, host im2col not counted.

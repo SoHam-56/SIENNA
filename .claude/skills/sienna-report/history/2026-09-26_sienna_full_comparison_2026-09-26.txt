@@ -1,0 +1,160 @@
+SIENNA: EVERY CONFIGURATION MEASURED, AGAINST REFERENCE EDGE DEVICES (2026-09-26)
+======================================================================================================================
+All SIENNA numbers are Verilator RTL simulation on the farm, fp32. Time assumes a 950 MHz clock: NO timing run exists.
+GFLOPS count 2 per multiply-accumulate of the workload. TOPS = GFLOPS / 1000. Latency = one set (or one inference) through
+an empty pipeline. Throughput = steady state with sets streamed back to back. No power or area figures exist yet.
+
+1. REFERENCE DEVICES (approximate public peak figures, the same ones used in the earlier comparisons; not re-verified)
+  device                                                    peak     precision          power
+  NVIDIA Jetson Nano                      ~472 GFLOPS (~236 fp32)          fp16         5-10 W
+  Google Coral Edge TPU                                  ~4 TOPS          int8           ~2 W
+  NVIDIA Jetson Orin Nano                            ~20-40 TOPS  int8, sparse         7-15 W
+  TYTAN (VDAT 2025, FreePDK45, synthesized)     activation engine          fp32   19.9-24.4 mW
+  Syntiant Core 2 (MLPerf Tiny v1.2)      IC 5.1 / KWS 1.5 / VWW 4.1 ms          int8              -
+  Qualcomm 8 Elite Gen 5 sensing hub (v1.4)   < 0.30 ms per model          int8              -
+
+2. MESH ALONE, ONE SET, start to result written (SystolicMesh README; measured = 3T+K+T^2+LAT+17 at every point)
+    N   T  PEs collapse  cycles      ns  PEs slices  cycles      ns  peak GFLOPS  peak TOPS
+   16   2           256      59      62       2 048      55      58          486       0.49
+   16   4           256      77      81       1 024      75      79          486       0.49
+   16   8           256     137     144         512     134     141          486       0.49
+   16  16           256     353     372         256     353     372          486       0.49
+   32   2         1 024      75      79      16 384      60      63         1946       1.95
+   32   4         1 024      93      98       8 192      80      84         1946       1.95
+   32   8         1 024     153     161       4 096     139     146         1946       1.95
+   32  16         1 024     369     388       2 048     358     377         1946       1.95
+   32  32         1 024    1185    1247       1 024    1185    1247         1946       1.95
+   64   4         4 096     125     132      65 536      85      89         7782       7.78
+   64   8         4 096     185     195      32 768     144     152         7782       7.78
+   64  16         4 096     401     422      16 384     363     382         7782       7.78
+   64  32         4 096    1217    1281       8 192    1190    1253         7782       7.78
+   64  64         4 096    4385    4616       4 096    4385    4616         7782       7.78
+
+3. FULL PIPELINE, EVERY N AND TILE SIZE (TB_sienna_top, 24 streamed sets, lanes = 2N, collapse-k; before the partial-sum
+   overlap). Each cell: cycles per set / GFLOPS / single-set latency in ns. ReLU is held to N+3 cycles per set by this
+   testbench's host handshake; the hardware alone takes max(N, T^2).  * = one near-zero output failed the old
+   relative-only tolerance; the same outputs pass the fp32-bound tolerance of 747d03b.
+    N   T   peak                      ReLU               ReLU cached               accum3+bias                      tanh
+    8   2    122                  11/88/69                  11/88/69                  14/71/63                 194/5/274
+    8   4    122                  16/61/88                  16/61/88                  16/61/82                 194/5/293
+    8   8    122                 64/15/152                 64/15/152                 64/15/145                 194/5/356
+   16   2    486                 19/410/86                 19/410/86                 19/410/76                263/30/309
+   16   4    486                19/410/105                19/410/105                 19/410/95                263/30/328
+   16   8    486                64/122/168                64/122/168                64/122/158                263/30/392
+   16  16    486                256/30/396                256/30/396                256/30/385                263/30/619
+   32   2   1946               35/1779/120               35/1779/120               35/1779/101               315/197/445
+   32   4   1946               35/1779/139               35/1779/139               35/1779/120               315/197/464
+   32   8   1946                64/973/202                64/973/202                64/973/183               315/197/527
+   32  16   1946               256/243/429               256/243/429               256/243/411               315/197/755
+   32  32   1946              1024/61/1288              1024/61/1288              1024/61/1269              1024/61/1614
+   64   2   7782              67/7434/187*              67/7434/187*              67/7434/152*             1059/470/1114
+   64   4   7782              67/7434/206*              67/7434/206*              67/7434/171*             1059/470/1133
+   64   8   7782              67/7434/269*              67/7434/269*              67/7434/234*             1059/470/1196
+   64  16   7782             256/1946/497*             256/1946/497*             256/1946/461*             1059/470/1423
+   64  32   7782            1024/486/1356*            1024/486/1356*            1024/486/1320*             1063/468/2282
+   64  64   7782            4096/122/4691*            4096/122/4691*            4096/122/4655*             4095/122/5617
+
+    N   T   peak                      SELU                tanh large                SELU large
+    8   2    122                 180/5/259                 302/3/396                 281/3/364
+    8   4    122                 180/5/278                 302/3/415                 281/3/383
+    8   8    122                 180/5/341                 302/3/478                 281/3/446
+   16   2    486                215/36/291                594/13/707                493/16/640
+   16   4    486                215/36/309                594/13/726                493/16/659
+   16   8    486                215/36/373                594/13/789                493/16/722
+   16  16    486                256/30/600               594/13/1017                493/16/949
+   32   2   1946               287/217/416              1168/53/1345                821/76/983
+   32   4   1946               287/217/435              1168/53/1364               821/76/1002
+   32   8   1946               287/217/498              1168/53/1427               821/76/1065
+   32  16   1946               287/217/725              1168/53/1655               821/76/1293
+   32  32   1946              1024/61/1584              1168/53/2514              1021/61/2152
+   64   2   7782              669/745/1014             2365/211/2663             1648/302/1822
+   64   4   7782              669/745/1033             2365/211/2682             1648/302/1841
+   64   8   7782              669/745/1096             2365/211/2745             1648/302/1904
+   64  16   7782              669/745/1323             2365/211/2973             1648/302/2132
+   64  32   7782             1009/494/2182             2365/211/3832             1648/302/2991
+   64  64   7782             4081/122/5517             4098/122/7166             4077/122/6325
+
+4. EVERY REGRESSION TEST, N=16 and N=32, T=4 (perf_analysis; lanes 32 / 64; before the partial-sum overlap)
+  test                               N=16 cyc/set  GFLOPS  lat ns  N=32 cyc/set  GFLOPS  lat ns   limit
+  matmul_ident_selu                         214.8    36.2     309         287.1   216.9     398   activation / activation
+  matmul_random_sigm                        273.3    28.5     396         361.4   172.3     454   activation / activation
+  matmul_random_tanh                        263.0    29.6     328         315.3   197.5     464   activation / activation
+  conv_basic_selu                           214.8    36.2     309         287.1   216.9     398   activation / activation
+  conv_basic_tanh                           263.0    29.6     328         315.3   197.5     425   activation / activation
+  matmul_random_tanh_train                  263.0    29.6     337         315.3   197.5     473   activation / activation
+  matmul_random_sigm_train                  273.3    28.5     404         361.4   172.3     462   activation / activation
+  conv_basic_selu_train                     214.8    36.2     318         287.1   216.9     406   activation / activation
+  matmul_large_selu                         493.3    15.8     659         820.8    75.9    1002   activation / activation
+  matmul_large_sigm                         571.3    13.6     700        1118.8    55.6    1306   activation / activation
+  matmul_large_tanh                         594.4    13.1     726        1168.4    53.3    1364   activation / activation
+  matmul_accum2_tanh                        164.0    47.5      95         310.1   200.8     120   activation / activation
+  matmul_accum3_selu                        106.0    73.4      95         198.4   313.8     120   pooling / host
+  matmul_accum2_tanh_train                  164.0    47.5      95         310.1   200.8     120   activation / activation
+  matmul_random_relu                         21.0   370.6     116          35.0  1778.8     154   pooling / host
+  matmul_random_linear                       21.0   370.6     116          35.0  1778.8     154   pooling / host
+  matmul_relu_nopool                         19.0   409.6     105          35.0  1778.8     139   host / host
+  matmul_mixed_act                          129.5    60.1     328         181.9   342.3     464   activation / activation
+  matmul_accum2_mixed_nopool                 67.7   115.0      95         124.1   501.7     120   host / host
+  matmul_bias_relu_nopool                    19.0   409.6     105          35.0  1778.8     139   host / host
+  matmul_bias_tanh                          298.0    26.1     417         315.5   197.3     464   activation / activation
+  matmul_accum3_bias_linear_nopool           19.0   409.6      95          35.0  1778.8     120   host / host
+  matmul_cached_relu_nopool                  19.0   409.6     105          35.0  1778.8     139   host / host
+  matmul_accum2_cached_bias_tanh            164.0    47.5      95         311.5   199.9     120   activation / activation
+
+5. GEMM SHAPES THROUGH sienna_layer (67-shape sweep; before = before the partial-sum work, now = sums kept in the PEs)
+  shape                  N=16 before     now  of peak  time us  N=32 before     now  of peak  time us
+  grid_16x16x16                 65.9    66.0    13.6%     0.12         46.9    46.9     2.4%     0.17
+  grid_256x256x256             446.7   485.0    99.7%    69.18       1919.8  1922.6    98.8%    17.45
+  grid_1024x1024x256           455.0   486.2   100.0%  1104.21       1943.1  1943.3    99.9%   276.27
+  qkv_proj_128tok              453.9   485.8    99.9%   310.80       1937.8  1938.3    99.6%    77.90
+  mlp_up_128tok                454.3   486.3   100.0%  1242.10       1943.7  1943.8    99.9%   310.72
+  attn_scores                  409.1   471.7    97.0%     4.45       1641.0  1674.2    86.1%     1.25
+  decode_proj_1tok              28.3    30.3     6.2%    38.91         60.2    60.4     3.1%    19.54
+
+6. MLPerf TINY MODELS END TO END (sienna_layer; hardware top-1 equals the float reference on every run)
+  model               N                   cycles latency us  GFLOPS  of peak  Syntiant ms vs Syntiant
+  ResNet-8           16  before overlap    56902       59.9   417.6    85.9%          5.1         85x
+  KWS DS-CNN         16  before overlap    33831       35.6   147.7    30.4%          1.5         42x
+  VWW MobileNet      16  before overlap   109988      115.8   129.4    26.6%          4.1         35x
+  ad01, 1 slice      16  before overlap    19363       20.4    25.9     5.3%            -           -
+  ad01, 40 batched   16  before overlap    56377       59.3   356.1    73.2%            -           -
+  ResNet-8           32  before overlap    21764       22.9  1091.8    56.1%          5.1        223x
+  KWS DS-CNN         32  before overlap    14292       15.0   349.7    18.0%          1.5        100x
+  VWW MobileNet      32  before overlap    57026       60.0   249.6    12.8%          4.1         68x
+  ad01, 1 slice      32  before overlap    10057       10.6    49.9     2.6%            -           -
+  ad01, 40 batched   32  before overlap    18952       19.9  1059.4    54.5%            -           -
+  ResNet-8           16   after overlap    52652       55.4   451.3    92.8%          5.1         92x
+  KWS DS-CNN         16   after overlap    30522       32.1   163.7    33.7%          1.5         47x
+  VWW MobileNet      16   after overlap   101092      106.4   140.8    28.9%          4.1         39x
+  ad01, 1 slice      16   after overlap    17909       18.9    28.0     5.8%            -           -
+  ad01, 40 batched   16   after overlap    51684       54.4   388.5    79.9%            -           -
+  ResNet-8           32   after overlap    21764       22.9  1091.8    56.1%          5.1        223x
+  KWS DS-CNN         32   after overlap    14292       15.0   349.7    18.0%          1.5        100x
+  VWW MobileNet      32   after overlap    57026       60.0   249.6    12.8%          4.1         68x
+  ad01, 1 slice      32   after overlap    10057       10.6    49.9     2.6%            -           -
+  ad01, 40 batched   32   after overlap    18952       19.9  1059.4    54.5%            -           -
+  ResNet-8           16     sums in PEs    52004       54.7   456.9    93.9%          5.1         93x
+  KWS DS-CNN         16     sums in PEs    30222       31.8   165.4    34.0%          1.5         47x
+  VWW MobileNet      16     sums in PEs    98684      103.9   144.2    29.7%          4.1         39x
+  ad01, 1 slice      16     sums in PEs    17765       18.7    28.3     5.8%            -           -
+  ad01, 40 batched   16     sums in PEs    51540       54.3   389.6    80.1%            -           -
+  ResNet-8           32     sums in PEs    21572       22.7  1101.5    56.6%          5.1        225x
+  KWS DS-CNN         32     sums in PEs    14028       14.8   356.2    18.3%          1.5        102x
+  VWW MobileNet      32     sums in PEs    56474       59.4   252.1    13.0%          4.1         69x
+  ad01, 1 slice      32     sums in PEs     9841       10.4    51.0     2.6%            -           -
+  ad01, 40 batched   32     sums in PEs    18736       19.7  1071.7    55.1%            -           -
+  vs Syntiant = Syntiant Core 2 latency / SIENNA latency at the assumed clock. Qualcomm: < 0.30 ms per model.
+
+7. AGAINST THE REFERENCE DEVICES (SIENNA fp32 at an assumed 950 MHz)
+  SIENNA figure                                    GFLOPS   TOPS  vs Nano fp32 236  vs Edge TPU 4 TOPS
+  peak, N=16 (256 MACs)                               486   0.49             2.06x              0.122x
+  peak, N=32 (1024 MACs)                             1946   1.95             8.24x              0.486x
+  peak, N=64 (4096 MACs)                             7782   7.78            32.98x              1.946x
+  best GEMM achieved, N=16                            486   0.49             2.06x              0.122x
+  best GEMM achieved, N=32                           1944   1.94             8.24x              0.486x
+  ReLU set streamed, N=64 T=4                        7434   7.43            31.50x              1.858x
+  tanh set streamed, N=64 T=4                         470   0.47             1.99x              0.118x
+  ResNet-8 end to end, N=32                          1101   1.10             4.67x              0.275x
+  ResNet-8 end to end, N=16                           457   0.46             1.94x              0.114x
+  Not like for like: their figures are marketing peaks at fp16/int8; ours are fp32, simulated, at an assumed clock,
+  with no power. At equal precision an int8 datapath would be far smaller and faster per MAC than fp32.

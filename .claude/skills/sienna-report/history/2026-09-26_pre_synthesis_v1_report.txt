@@ -1,0 +1,83 @@
+SIENNA PRE-SYNTHESIS REVIEW (pre_synthesis_v1, 2026-09-26)
+====================================================================================================
+Verilator RTL, fp32; time at an ASSUMED 950 MHz; no power or area yet.
+
+MODELS (time us / GFLOPS / useful-padding-overhead), N=16 then N=32
+  ResNet-8 (image classification) | 54,741.1 | 457 | 94% / 3% / 3% | 22,707.4 | 1,101 | 57% / 36% / 8% | 20/20 · 10/10
+  DS-CNN (keyword spotting) | 31,812.6 | 165 | 34% / 61% / 5% | 14,766.3 | 356 | 18% / 68% / 14% | 3/3 · 3/3
+  MobileNet (visual wake words) | 103,877.9 | 144 | 30% / 66% / 4% | 59,446.3 | 252 | 13% / 78% / 9% | 3/3 · 3/3
+  ad01 autoencoder, 1 slice | 18,700.0 | 28 | 6% / 88% / 6% | 10,358.9 | 51 | 3% / 83% / 14% | 20/20 · 10/10
+  ad01, 40 slices batched | 54,252.6 | 390 | 80% / 17% / 3% | 19,722.1 | 1,072 | 55% / 35% / 10% | 1/1 · 1/1
+
+VS PUBLISHED (Syntiant Core 2 time and energy; Qualcomm; SIENNA N=16; N=32; faster)
+  Image classification (ResNet-8) | 5,100 µs · 139.4 µJ | < 300 µs | 54,741.1 µs | 22,707.4 µs | 0× / 0×
+  Keyword spotting (DS-CNN) | 1,500 µs · 43.8 µJ | < 300 µs | 31,812.6 µs | 14,766.3 µs | 0× / 0×
+  Visual wake words (MobileNet) | 4,100 µs · 97.2 µJ | < 300 µs | 103,877.9 µs | 59,446.3 µs | 0× / 0×
+
+GEMM (GFLOPS, of peak, time us), N=16 then N=32
+  Dense 1024×1024×256 | 486 | 100.0% | 1,104.21 | 1,943 | 99.9% | 276.27
+  BERT QKV projection, 128 tokens | 486 | 99.9% | 310.80 | 1,938 | 99.6% | 77.90
+  Transformer MLP up, 128 tokens | 486 | 100.0% | 1,242.10 | 1,944 | 99.9% | 310.72
+  Attention scores | 472 | 97.0% | 4.45 | 1,674 | 86.1% | 1.25
+  Dense 256×256×256 | 485 | 99.7% | 69.18 | 1,923 | 98.8% | 17.45
+  Decode projection, 1 token | 30 | 6.2% | 38.91 | 60 | 3.1% | 19.54
+  Tiny 16×16×16 | 66 | 13.6% | 0.12 | 47 | 2.4% | 0.17
+
+FULL PIPELINE SWEEP (126/126 pass): N T peak | ReLU | accum3+bias | SELU | tanh | tanh large
+  8 | 2 | 122 | 88 (11 cyc · 69 ns) | 73 (13 cyc · 93 ns) | 5 (180 cyc · 259 ns) | 5 (194 cyc · 274 ns) | 3 (302 cyc · 396 ns)
+  8 | 4 | 122 | 61 (16 cyc · 88 ns) | 69 (14 cyc · 112 ns) | 5 (180 cyc · 278 ns) | 5 (194 cyc · 293 ns) | 3 (302 cyc · 415 ns)
+  8 | 8 | 122 | 15 (64 cyc · 152 ns) | 38 (26 cyc · 179 ns) | 5 (180 cyc · 341 ns) | 5 (194 cyc · 356 ns) | 3 (302 cyc · 478 ns)
+  16 | 2 | 486 | 410 (19 cyc · 86 ns) | 360 (22 cyc · 126 ns) | 36 (215 cyc · 291 ns) | 30 (263 cyc · 309 ns) | 13 (594 cyc · 707 ns)
+  16 | 4 | 486 | 410 (19 cyc · 105 ns) | 348 (22 cyc · 145 ns) | 36 (215 cyc · 309 ns) | 30 (263 cyc · 328 ns) | 13 (594 cyc · 726 ns)
+  16 | 8 | 486 | 122 (64 cyc · 168 ns) | 289 (27 cyc · 208 ns) | 36 (215 cyc · 373 ns) | 30 (263 cyc · 392 ns) | 13 (594 cyc · 789 ns)
+  16 | 16 | 486 | 30 (256 cyc · 396 ns) | 84 (92 cyc · 448 ns) | 30 (256 cyc · 600 ns) | 30 (263 cyc · 619 ns) | 13 (594 cyc · 1,017 ns)
+  32 | 2 | 1,946 | 1,779 (35 cyc · 120 ns) | 1,626 (38 cyc · 194 ns) | 217 (287 cyc · 416 ns) | 197 (315 cyc · 445 ns) | 53 (1,168 cyc · 1,345 ns)
+  32 | 4 | 1,946 | 1,779 (35 cyc · 139 ns) | 1,595 (39 cyc · 213 ns) | 217 (287 cyc · 435 ns) | 197 (315 cyc · 464 ns) | 53 (1,168 cyc · 1,364 ns)
+  32 | 8 | 1,946 | 973 (64 cyc · 202 ns) | 1,499 (42 cyc · 276 ns) | 217 (287 cyc · 498 ns) | 197 (315 cyc · 527 ns) | 53 (1,168 cyc · 1,427 ns)
+  32 | 16 | 1,946 | 243 (256 cyc · 429 ns) | 658 (95 cyc · 503 ns) | 217 (287 cyc · 725 ns) | 197 (315 cyc · 755 ns) | 53 (1,168 cyc · 1,655 ns)
+  32 | 32 | 1,946 | 61 (1,024 cyc · 1,288 ns) | 176 (354 cyc · 1,392 ns) | 61 (1,024 cyc · 1,584 ns) | 61 (1,024 cyc · 1,614 ns) | 53 (1,168 cyc · 2,514 ns)
+  64 | 2 | 7,782 | 7,434 (67 cyc · 187 ns) | 6,954 (72 cyc · 328 ns) | 745 (669 cyc · 1,014 ns) | 470 (1,059 cyc · 1,114 ns) | 211 (2,365 cyc · 2,663 ns)
+  64 | 4 | 7,782 | 7,434 (67 cyc · 206 ns) | 6,882 (72 cyc · 347 ns) | 745 (669 cyc · 1,033 ns) | 470 (1,059 cyc · 1,133 ns) | 211 (2,365 cyc · 2,682 ns)
+  64 | 8 | 7,782 | 7,434 (67 cyc · 269 ns) | 6,652 (75 cyc · 411 ns) | 745 (669 cyc · 1,096 ns) | 470 (1,059 cyc · 1,196 ns) | 211 (2,365 cyc · 2,745 ns)
+  64 | 16 | 7,782 | 1,946 (256 cyc · 497 ns) | 4,985 (100 cyc · 638 ns) | 745 (669 cyc · 1,323 ns) | 470 (1,059 cyc · 1,423 ns) | 211 (2,365 cyc · 2,973 ns)
+  64 | 32 | 7,782 | 486 (1,024 cyc · 1,356 ns) | 1,392 (358 cyc · 1,497 ns) | 494 (1,009 cyc · 2,182 ns) | 468 (1,063 cyc · 2,282 ns) | 211 (2,365 cyc · 3,832 ns)
+  64 | 64 | 7,782 | 122 (4,096 cyc · 4,691 ns) | 359 (1,388 cyc · 4,895 ns) | 122 (4,081 cyc · 5,517 ns) | 122 (4,095 cyc · 5,617 ns) | 122 (4,098 cyc · 7,166 ns)
+
+REGRESSION TESTS (54/54 pass): test | N=16 cyc/set GFLOPS lat_ns limit | N=32 ...
+  conv_basic_selu | 214.8 | 36.2 | 309 | activation | 287.1 | 216.9 | 398 | activation
+  conv_basic_selu_train | 214.8 | 36.2 | 318 | activation | 287.1 | 216.9 | 406 | activation
+  conv_basic_tanh | 263.0 | 29.6 | 328 | activation | 315.3 | 197.4 | 425 | activation
+  matmul_accum2_cached_bias_tanh | 154.3 | 50.4 | 437 | run average | 296.0 | 210.3 | 779 | run average
+  matmul_accum2_mixed_nopool | 48.8 | 159.6 | 125 | run average | 89.8 | 693.1 | 176 | run average
+  matmul_accum2_tanh | 154.3 | 50.4 | 437 | run average | 294.7 | 211.3 | 778 | run average
+  matmul_accum2_tanh_train | 154.7 | 50.3 | 445 | run average | 295.0 | 211.0 | 786 | run average
+  matmul_accum3_bias_linear_nopool | 22.4 | 347.8 | 145 | run average | 39.0 | 1,594.7 | 213 | run average
+  matmul_accum3_selu | 97.3 | 80.0 | 428 | run average | 164.8 | 377.7 | 527 | run average
+  matmul_bias_relu_nopool | 19.0 | 409.6 | 105 | host | 35.0 | 1,778.8 | 139 | host
+  matmul_bias_tanh | 298.0 | 26.1 | 417 | activation | 315.5 | 197.3 | 464 | activation
+  matmul_cached_relu_nopool | 19.0 | 409.6 | 105 | host | 35.0 | 1,778.8 | 139 | host
+  matmul_ident_selu | 214.8 | 36.2 | 309 | activation | 287.1 | 216.9 | 398 | activation
+  matmul_large_selu | 493.3 | 15.8 | 659 | activation | 820.8 | 75.9 | 1,002 | activation
+  matmul_large_sigm | 571.3 | 13.6 | 700 | activation | 1,118.8 | 55.7 | 1,306 | activation
+  matmul_large_tanh | 594.4 | 13.1 | 726 | activation | 1,168.4 | 53.3 | 1,364 | activation
+  matmul_mixed_act | 129.5 | 60.1 | 328 | activation | 181.9 | 342.2 | 464 | activation
+  matmul_random_linear | 21.0 | 370.6 | 116 | pooling | 35.0 | 1,778.8 | 154 | host
+  matmul_random_relu | 21.0 | 370.6 | 116 | pooling | 35.0 | 1,778.8 | 154 | host
+  matmul_random_selu | 214.8 | 36.2 | 309 | activation | 287.1 | 216.9 | 435 | activation
+  matmul_random_sigm | 273.3 | 28.5 | 396 | activation | 361.4 | 172.3 | 454 | activation
+  matmul_random_sigm_train | 273.3 | 28.5 | 404 | activation | 361.4 | 172.3 | 462 | activation
+  matmul_random_tanh | 263.0 | 29.6 | 328 | activation | 315.3 | 197.4 | 464 | activation
+  matmul_random_tanh_train | 263.0 | 29.6 | 337 | activation | 315.3 | 197.4 | 473 | activation
+  matmul_relu_nopool | 19.0 | 409.6 | 105 | host | 35.0 | 1,778.8 | 139 | host
+  matmul_relu_nopool_credits3 | 39.3 | 197.9 | 105 | host | 55.3 | 1,125.2 | 139 | host
+  matmul_tanh_credits3 | 263.0 | 29.6 | 328 | activation | 315.3 | 197.4 | 464 | activation
+
+NUMBER FORMAT PORTABILITY
+  Arithmetic units: fp32Multiplier, fp32Adder (PE, reducer tree, dropout); GPNAE also fp32Divider, fp32_up_down, fp32_down -> Swap for the target format with the same ports (valid in, done out, result) [Same as published]
+  Word width: DATA_WIDTH on every module, memory and bus -> Change one top-level parameter [Same as published]
+  Unit latencies: MUL_LAT = 8, ADD_LAT = 5 as local constants in the PE, reducer and barrel MAC; U = min(K, 6) in the mesh -> Edit to the new units' latencies (one line each); promoting them to parameters is a small cleanup [New since publication]
+  Constants in the format: Residual identity 1.0 (sienna_layer), pooling pad −∞ (sienna_top), λ and λα (GPNAE), dropout 1.0 and scale -> Re-encode about six constants; dropout already takes them as parameters [Published lane had λ, λα too]
+  Pooling compare: Maxpool_2D: sign-magnitude compare when IS_FP32 and width 32, else integer compare -> Widen the float branch to any width (a few lines) [Unchanged]
+  Activation coefficients: poly_coeffs.mem and taylor_coeffs.mem hold fp32 values -> Regenerate for the format (and refit for fewer mantissa bits) [Published lane: regenerate, as in the paper]
+  Slow path for large inputs: gpnae_tail works on fp32 exponent and mantissa fields directly; range thresholds are fp32 bit patterns -> Rewrite with EXP_BITS / MAN_BITS parameters, or restrict inputs [New since publication, poly lane only]
+  Golden model and testbenches: SIENNA side: numpy float32, fp32 hex files, fp32 decoders, error bound 2^-24 -> Reuse GPNAE's format-generic FloatFormat (fp16, bf16, tf32 ready) [GPNAE side already generic]

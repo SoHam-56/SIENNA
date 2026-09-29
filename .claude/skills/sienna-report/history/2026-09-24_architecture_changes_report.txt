@@ -1,0 +1,55 @@
+====================================================================================================
+ SIENNA ARCHITECTURE CHANGES, 2026-09-24  (measured in Verilator simulation, cycles)
+====================================================================================================
+ GFLOPS assume a 950 MHz clock; no synthesis or timing run backs it. FLOP counts the matmul only
+ (2 N^3 per set). Steady state = mean completion gap late in a streamed run. Every row below passed
+ its functional checks (1% relative tolerance against the numpy golden model).
+
+1. SINGLE PIPELINE, N=16, T=4 (perf_analysis.py, 12 sets)
+----------------------------------------------------------------------------------------------------
+   step                               SELU steady  tanh steady  sigm steady  SELU latency
+   start of 2026-09-23 (after fill)        336          459          472          494
+   + tree reduce, row broadcast            336          459          472          421
+   + tail overlap (GPNAE b972abd)          266          303          325          421
+   + one-row host writes                   264          303          325          421
+   + 32 lanes                              221          271          263          347
+   + SyncArray mesh tiles                  221          271          263          295
+   GFLOPS @950 now                        35.2         28.8         29.6
+
+   Stage times now (SELU): host load 17, mesh 77 (broadcast 4, tiles 42, reduce 29), activation 195,
+   pooling 20. Activation is the limit; within it, lanes that get two or more out-of-range inputs.
+
+2. SEVERAL PIPELINES, N=16 (sienna_multi, TB_sienna_multi, 48 sets)
+----------------------------------------------------------------------------------------------------
+   copies  lanes   tanh cyc/set   SELU cyc/set   GFLOPS @950 (tanh / SELU)
+     1      16        307.5          264.0          25.3 / 29.5
+     2      16        149.0            -            52.2 /  -
+     4      16         73.4           66.0         106.0 / 117.9
+     4      32         62.7           55.3         124.1 / 140.6
+   Host port: 17 cycles per set, so about 15 copies before it limits (estimate).
+
+3. FULL PIPELINE AT N=32, T=4, SyncArray tiles, one-row host writes
+----------------------------------------------------------------------------------------------------
+   lanes   SELU cyc/set   tanh cyc/set   GFLOPS @950 (SELU / tanh)   lanes busy
+     32        1036           1561             60.1 / 39.9            51-58%
+     64         772           1122             80.7 / 55.5            35-41%
+   Mesh 82 cycles, host load 33. All 8 matmul regression tests pass at 32 lanes; tanh and tanh_train
+   pass at 64 lanes. Conv tests are not generated at N=32 (generator needs N = K^2).
+
+4. MESH ONLY, set 0 cycles (TB_SystolicMesh, random matmul, 15 sets each, all pass)
+----------------------------------------------------------------------------------------------------
+   N   T   SystolicArray          SyncArray              collapse-k
+   16  2    76 (2048 PEs)          56 (2048 PEs)          71 (256 PEs)
+   16  4   131 (1024 PEs)          79 (1024 PEs)          89 (256 PEs)
+   16  8   270  (512 PEs)         146  (512 PEs)         149 (256 PEs)
+   16 16   649  (256 PEs)         365  (256 PEs)         365 (256 PEs)
+   32  4   136 (8192 PEs)          84 (8192 PEs)         105 (1024 PEs)
+   64  8   840 (32768 PEs, old serial reduce)   pending          197 (4096 PEs), ~32% PE utilisation
+
+5. WHAT LIMITS IT NOW
+----------------------------------------------------------------------------------------------------
+   Activation, and in it the serial tail path (~270 cycles per out-of-range input, one at a time
+   per lane). It matters more as N grows, because each output sums more products. Next fix:
+   interleave several tail elements through gpnae_tail's units, as barrel_mac does for the
+   polynomial. Also missing for real layers deeper than N: an accumulate-without-activation pass.
+====================================================================================================

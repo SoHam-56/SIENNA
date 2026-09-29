@@ -1,0 +1,51 @@
+GATE G1: ArithmeticLibrary (AriL), uniform bf16 units
+=====================================================
+AriL bf16 d97e270 (pushed). Gate run: sienna_jobs/runs/g1b (one snapshot, every check below). Farm, Verilator 5.035.
+
+VERDICT: PASS. Every check passed; nothing was skipped.
+
+1. FORMAT PACKAGE (sienna_fmt_pkg)
+   TB_sienna_fmt_pkg: 0 errors (supported formats, mul_lat 8/3, add_lat 5, constants narrowed nearest-even incl. ties).
+
+2. PYTHON BIT-EXACT MODEL (Common/models/fpu.py) AGAINST THE PUBLISHED fp32 UNITS
+   fp32Multiplier: 205,776 results, 0 mismatches.   fp32Adder: 205,776 results, 0 mismatches.
+   Stimulus covers the multiplier overflow/underflow edges (26,877 / 26,437 flagged results) and 118 D-1 cases.
+
+3. fpMultiplier (Multipliers/FP)
+   At (8, 23) against fp32Multiplier: 205,776 products, 0 mismatches (result, flags, done cycle).
+   bf16 against SoftFloat (2 ulp, fp32 TB rules): 205,392 products, 0 errors, latency 3 = sienna_fmt_pkg::mul_lat.
+   bf16 against fpu.py: 205,392 results, 0 mismatches.
+   bf16 Vivado testbench, vectors_bf16.mem: 10,000 checked, 0 errors.
+   Exhaustive, every bf16 pair: 4,294,967,296 products in 16 slices, 0 errors (runs/u4_exh_*, about 2 min each).
+   Random power-up (--x-initial unique, +verilator+rand+reset+2): equivalence and SoftFloat runs pass.
+
+4. fpAdder (Adders/FP)
+   At (8, 23) against fp32Adder: 205,776 sums, 0 mismatches; 118 vectors where only fp32Adder raises overflow (D-1).
+   bf16 against SoftFloat (3 ulp): 205,392 sums, 0 errors, latency 5 = sienna_fmt_pkg::add_lat.
+   bf16 against fpu.py: 205,392 results, 0 mismatches (zero signs included).
+   bf16 Vivado testbench: 10,000 checked, 0 errors.
+   Exhaustive, every bf16 pair: 4,294,967,296 sums in 16 slices, 0 errors (runs/u6x_exh_*).
+   Random power-up: equivalence (130 D-1 flags with that run's seed) and SoftFloat runs pass.
+
+5. UNCHANGED UNITS
+   fp32Multiplier TB 2003/2003, fp32Adder TB 2007/2007, fpMulWiden bf16 and fp16 0 mismatches.
+
+6. LINT (-Wall, SYNTHESIS, bf16 and fp32 widths)
+   No LATCH, MULTIDRIVEN, UNOPTFLAT or errors. Warnings: fpAdder 10 UNUSEDSIGNAL (low significand bits, package
+   arguments); fpMultiplier 7 UNUSEDSIGNAL, 2 BLKSEQ and 4 WIDTHEXPAND, the latter two from the existing R4Booth/Karatsuba.
+
+FINDINGS IN THE PUBLISHED fp32 UNITS (reported, not changed)
+   D-1  fp32Adder raises overflow_o together with underflow_o when a cancellation's exponent goes negative
+        (01000001 + 81000000: Ov=1 Un=1; IEEE Ov=0 Un=1). Result bits are correct. fpAdder raises overflow correctly.
+   D-6  fp32Adder returns -0 for an exact cancellation when A is the negative operand (IEEE nearest gives +0).
+        fpAdder keeps the same rule (same algorithm); the model reproduces it.
+   D-7  fp32Adder's stage 2-4 valid bits have no reset: reset must be held 4+ cycles or a spurious done_o can appear.
+        fpAdder resets its valid bits.
+
+TEST-SIDE RULINGS MADE ON THE WAY (ledgered)
+   - Reference flags follow the units' rounding direction (toward zero): products just under 2^128 give max finite,
+     no overflow. The result is still compared with nearest-even within the ulp rule.
+   - Ulp distance measured on the ordered line (-0 and +0 are one point); zero signs are checked bit-exact by the model.
+   - Verilator mis-evaluates pop_front() inside $fwrite argument lists and concatenations: popped into locals.
+
+NOT RUN AT THIS LEVEL: VCS, Vivado itself (the Vivado testbenches ran in Verilator), synthesis of the new units.

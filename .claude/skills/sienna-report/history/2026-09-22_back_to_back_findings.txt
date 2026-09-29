@@ -1,0 +1,62 @@
+SIENNA back-to-back matmul: root-cause analysis
+Date: 2026-09-22   Config: N=16, TILE=4, tanh (ACTIVATION_CODE=3, NUM_TERMS=30)
+Build: make verilator EXTRA_FLAGS=-DBACK_TO_BACK TRACE=0
+
+SYMPTOM
+  Matrix 1 passes. Matrix 2 (no intervening reset) never completes; TB times out
+  with pipeline_complete_o low.
+
+BUG 1 - CONFIRMED, FIXED. False "queue empty" blocks the second start.
+  SystolicMesh.sv:40   ptr_A/ptr_B are [$clog2(GLOBAL_ELEMENTS):0].
+                       N=16 -> GLOBAL_ELEMENTS=256 -> 9 bits, range 0..511.
+  SystolicMesh.sv:59   west_queue_empty_o  = (ptr_A == 0)
+  SystolicMesh.sv:60   north_queue_empty_o = (ptr_B == 0)
+  ptr is cleared only by rstn_i or write_reset_i. sienna_top never pulses
+  write_reset_i, and the TB pulsed it only during initial reset. A second load of
+  256 words takes ptr 256 -> 512, which wraps to 0, so "empty" reads 1.
+  sienna_top.sv:445 gates IDLE exit on !north_queue_empty && !west_queue_empty,
+  so the one-cycle start pulse is rejected. IDLE has no start latch, so it is lost.
+  Measured: "gate at pulse: state=0 north_empty=1 west_empty=1".
+  Fix applied (TB): pulse north/west_write_reset_i at the top of load_inputs().
+  After fix: state 0 -> 1 -> 2, pipeline runs, 81/81 elements pass.
+
+BUG 2 - CONFIRMED, NOT FIXED. The mesh completion chain never re-arms.
+  With bug 1 fixed the run reports PASSED, but that pass is hollow. Feeding a
+  deliberately different second matrix (all 1.0) produced byte-identical results
+  and an identical cycle count, proving the second matmul's output is not used.
+  mem_A was verified to hold the new data (ptr_A=256, mem_A[0..255]=3f800000),
+  so the load is correct; the completion flags are the problem.
+
+  Three set-and-hold flags, none cleared on a new matmul:
+   a) OutputSram.sv:90  COMPLETE is a terminal state - no exit transition exists.
+      collection_complete_o stays 1 until rstn_i. This feeds tile_col_done, so
+      SystolicMesh's all_tiles_collected is stuck high and WAIT_TILES falls through.
+   b) AccumulationUnit.sv:107  done_o = (r_curr == RDONE); parks in RDONE until
+      its next start_i, so reducer_done / all_reducers_done are stuck high and
+      WAIT_REDUCE falls through.
+   c) SystolicMesh.sv:189  collection_complete_o = all_reducers_done, ungated, so
+      sienna_top's SYSTOLIC_PROCESSING saw "complete" before the mesh had run.
+  Net effect: the second matmul traverses the mesh FSM in ~23 cycles without
+  computing, and sienna_top reads the previous matmul's MeshOutputSram contents.
+
+  Partial fix applied to (c) only, in SystolicMesh.sv:189 -
+    collection_complete_o = all_reducers_done && (current_state == DONE)
+                            && !start_matrix_mult_i;
+  This makes SYSTOLIC_PROCESSING wait properly (1 cycle -> 23 cycles) but cannot
+  help while (a) and (b) remain stale. Keep or revert with the real fix.
+
+PROPOSED FIX for (a) and (b)
+  ctrl_reset_all (asserted in RESET_SEQ) already means "re-arm for a new matmul"
+  and is already wired to the input queues' write_reset_i (SystolicMesh.sv:239,242).
+  It is not plumbed to the output side. Route it down to OutputSram and the
+  AccumulationUnit so their completion state clears when a matmul starts.
+  This adds a clear/re-arm port to OutputSram and SystolicArray - an interface
+  change to the SystolicMesh IP, so it needs sign-off before it lands.
+
+TEST GAP
+  The BACK_TO_BACK test feeds the same matrix twice, so it cannot distinguish a
+  correct second matmul from a reused first one. It must use a different second
+  matrix with its own expected output before it can certify this fix.
+
+NOT VERIFIED
+  Full `make regression` has not been re-run with the SystolicMesh.sv:189 change.

@@ -1,0 +1,226 @@
+SIENNA / GPNAE REVIEW NOTES, 2026-09-25 to 2026-09-26
+======================================================
+Everything below is Verilator RTL simulation unless marked otherwise. Times assume a 950 MHz clock; no synthesis
+or timing run exists yet. Full reports: SIENNA/testbenches/results/perf/ (mlperf_tiny_layer_engine.log,
+layer_engine_performance.log, pipeline_performance_N16.log, pipeline_performance_N32.log).
+
+
+1. TERMS
+--------
+Set: one tile of work, not an image. An N x N block of inputs times an N x N block of weights (16x16 at N=16),
+     then the activation on the N^2 results.
+     Example, ResNet-8 layer L01 (32x32 map, 16 channels in, 3x3 conv, 16 out): im2col (software) turns it into a
+     1024 x 144 input matrix (one row per output pixel, 3x3x16 values per row) times a 144 x 16 weight matrix.
+     At N=16: 64 row blocks x 9 depth blocks x 1 column block = 576 sets (measured 576).
+     One ResNet-8 image = 3,156 sets at N=16, 622 at N=32.
+Single-set latency: time for one set through an empty pipeline (ReLU, N=16: 100 cycles).
+Cycles per set: how often a set completes when sets stream back to back; this is what sets time per image.
+Software/hardware boundary (agreed): software writes each layer's configuration (sizes, residual, bias,
+     activation), streams the data in a fixed order (im2col and data movement stay in software for now) and
+     checks the results. All scheduling, caching and control are inside the hardware (sienna_layer).
+
+
+2. STANDARD MODELS ON sienna_layer (MLPerf Tiny, fp32 float models)
+-------------------------------------------------------------------
+model              N=16 cycles  latency  GFLOPS  PE use   N=32 cycles  latency  GFLOPS  PE use
+ResNet-8              56,902    60 us     418     86%        21,764    23 us    1092     56%
+KWS DS-CNN            33,831    36 us     148     30%        14,292    15 us     350     18%
+VWW MobileNet        109,988   116 us     129     27%        57,026    60 us     250     13%
+ad01, one slice       19,363    20 us      26      5%        10,057    11 us      50      3%
+ad01, 40 batched      56,377    59 us     356     73%        18,952    20 us    1059     54%
+- Hardware top-1 equals the float reference on every run: 200/200 ResNet-8 images at N=16 and N=32, 5/5 KWS, 5/5 VWW.
+  ad01 anomaly score within 3e-4 relative. Worst per-layer error 1.5e-5.
+- ResNet-8 accuracy 174/200 = 87% (float model: 87.2% on all 10,000 CIFAR-10 test images).
+- Cycle counts are identical for every input: the schedule does not depend on the data.
+- Published, measured int8 silicon: Syntiant Core 2 (98.7 MHz) IC 5.1 ms (~503k cycles), KWS 1.5 ms (~148k),
+  VWW 4.1 ms (~405k). Qualcomm Snapdragon 8 Elite Gen 5 sensing hub below 0.30 ms. NOT like for like: we are fp32
+  RTL at an assumed clock with no power or area, host im2col not counted.
+
+
+3. FLOPS (2 per multiply-accumulate; peak N=16 486 GFLOPS, N=32 1946 GFLOPS)
+----------------------------------------------------------------------------
+GEMM through sienna_layer           N=16 GFLOPS  of peak   N=32 GFLOPS  of peak
+1024x1024x256                            455.1    93.6%        1943.1    99.9%
+BERT qkv projection, 128 tokens          453.9    93.3%        1937.8    99.6%
+MLP up, 128 tokens                       454.3    93.4%        1943.7    99.9%
+attention scores                         409.1    84.1%        1641.0    84.3%
+decode, 1 token                           28.3     5.8%          60.2     3.1%   (each weight used once)
+The older host-driven path reached 483 GFLOPS at N=16 on large shapes; sienna_layer is 6% lower there because of
+the credit limit in section 6. N=32 is the same on both paths.
+
+One matmul set plus activation, streamed (TB_sienna_top)
+test                         N=16 cyc/set  GFLOPS   N=32 cyc/set  GFLOPS   limit
+ReLU or linear, no pooling          19.0    409.6           35.0  1778.8   testbench host (N+3)
+ReLU, 2x2 pooling                   21.0    370.6           35.0  1778.8   pooling (N=16) / host
+SELU                               214.8     36.2          287.1   216.9   polynomial activation
+tanh                               263.0     29.6          315.3   197.4   polynomial activation
+sigmoid                            273.3     28.5          361.4   172.3   polynomial activation
+tanh, inputs far out of range      594.4     13.1         1168.4    53.3   activation slow path (gpnae_tail)
+All 24 regression tests pass at N=16 and N=32; 7 tile-size / depth-slice geometries pass.
+
+
+4. WHAT THE RTL SAYS THE CYCLES SHOULD BE (and the measurements agree)
+----------------------------------------------------------------------
+Mesh latency, start to result written:  3T + K + T^2 + LAT + 17
+   T tile size; K depth each array multiplies (N with collapse-k, T with depth slices); U = min(K, 6) partial sums
+   per PE; RP depth slices (1 with collapse-k, N/T otherwise); LAT = 1 + 5 * ceil(log2(RP*U + 1)) reducer tree.
+   Terms: 1 to launch, T+2 broadcast and commit, 2 feed registers, 2(T-1) skew, K-1 products, 8 multiply,
+   5 add, 2 to flag the set final, then T^2 reducer reads and LAT.
+   Matches every measured entry: 77 (N=16 T=4), 93 (N=32 T=4), 4385 (N=64 T=64), 85 / 144 / 1190 (N=64 depth
+   slices T=4/8/32), and in the full pipeline 76 at N=16 and 92 at N=32 on all 24 tests.
+Mesh throughput: one set every max(T+2, K, T^2) cycles; N at T=4.
+Host (TB_sienna_top): N rows + 3 (enable drop, start, credit settle) = 19 at N=16, 35 at N=32; measured exactly.
+Activation, ReLU/linear: bypass GPNAE, N^2/lanes + 4 cycles (12 at N=16, 20 at N=32).
+Activation, polynomial: (degree + 1) x max(N^2/lanes, 14) cycles of multiply-add rounds (126 at N=16), plus fixed
+   overhead; measured 195-280 per set in total.
+The bias became one more reducer-tree input. Where RP*U is a power of two that adds a tree level (5 cycles): the
+   README's 16x16 T=2/T=4 and 32x32 T=4 depth-slice entries rose from 50/70/75 to 55/75/80. Adding the bias into the
+   PE's first partial sum instead would remove it (not done; needs your OK).
+
+
+5. IMPROVEMENT SINCE DAY ONE (2026-09-19; day-one numbers from session notes, not a checked-in report)
+------------------------------------------------------------------------------------------------------
+workload                                   day one                 now                    gain
+16x16 matmul + sigmoid, per set            12,685 (one at a time)  273 streamed           ~46x
+mesh alone N=16 T=4, latency               849                     77                     11x
+mesh alone N=16, cycles per set            849 (no overlap)        16                     53x
+ReLU / linear set                          not supported           16-19                  new
+best GEMM N=16                             ~0.6 GFLOPS             455 (layer engine)     ~750x
+ResNet-8, N=16 (first model run 09-25)     298,383                 56,902                 5.2x
+ResNet-8, N=32                             67,103                  21,764                 3.1x
+Accuracy kept throughout: every model output still matches the float reference.
+
+
+6. FINDINGS FROM THE LATEST RUNS
+--------------------------------
+- N=16 per-set overhead in sienna_layer is all credit stalls: 934 of 10,336 cycles (9%) on a ResNet-8-like layer,
+  2,622 of 39,816 on a deep K=576 layer. SETS_IN_FLIGHT=8 x 16 cycles = 128 does not cover a set's
+  start-to-completion time under load. N=32: zero credit stalls. (Superseded: see section 12, credits were a symptom.)
+- Weight-tile waits: 56 cycles per ResNet-8-like layer (cache fill at block start), small.
+- Unexplained: cached-weight test at T=8 and T=16, set 0 spends 375 cycles in the mesh against 135 predicted. T=4
+  (the default) matches.
+
+
+7. ACTION ITEMS LEFT
+--------------------
+ 1. Raise SETS_IN_FLIGHT at N=16: done, no gain; the real fix was the partial-sum overlap (section 12).
+ 2. Explain the cached-test mesh time at T=8/16. Debug.
+ 3. Depthwise channel packing and batch-1 fully connected: KWS/VWW use 13-30% of the PEs; biggest model-level gain.
+ 4. Partition a large mesh into smaller ones for narrow layers (task #15).
+ 5. Overlap consecutive layers: 2-14% lost to per-layer fill and drain.
+ 6. Bias into the PE's first partial sum: 5 cycles latency in some depth-slice configs. Needs your OK.
+ 7. More activation throughput, and SiLU/GELU (need your review).
+ 8. Housekeeping: done 2026-09-26 (README, perf_analysis.py, stall counter committed and pushed).
+ 9. Synthesis: timing, area, power.
+
+
+8. IS IT WORTH PUBLISHING (my judgment)
+---------------------------------------
+Yes, if post-synthesis power and area are reasonable: a fit for venues like VDAT, VLSI Design, ISCAS or an IEEE
+brief. A top-tier venue (ISSCC, ISCA, MICRO) would need silicon or a clearly new architectural idea.
+Strong: general fp32 engine with hardware layer scheduling and an internal weight cache, clean software/hardware
+   boundary, programmable activation engine from published work, GEMM at 93-99.9% of peak, deterministic latency,
+   exact float match on four standard models, a day-by-day ablation history.
+Reviewers will push on:
+   - fp32 only: the field compares int8/bf16 on energy per inference and TOPS/W; add a mode or a projection.
+   - memory and area: weight cache is 128 KB at N=16, 512 KB at N=32; report an area breakdown.
+   - fair comparisons: MLPerf Tiny results are whole systems; count im2col and memory or say so; the best
+     like-for-like baseline is an open-source accelerator (e.g. Gemmini) synthesized in the same node.
+   - novelty: output-stationary systolic arrays are well known; the contribution is the combination (hardware layer
+     scheduling, cache, activation engine) backed by measured PPA.
+Needed: post-synthesis PPA in a named node, power from real switching activity from these simulations, energy per
+inference for the four models. 950 MHz is plausible given the 8-cycle multiply and 5-cycle add, but unproven.
+
+
+9. GPNAE: WHAT CHANGED FROM THE VDAT 2025 DESIGN (SohamPramanik_130_3c.pdf)
+----------------------------------------------------------------------------
+Published design: TYTAN (Horner-form Taylor series of e^x from a coefficient buffer) plus helper modules per
+activation: divider and +/-1 for sigmoid/tanh, x2 for tanh, lambda / lambda*alpha and a mux for SELU.
+
+There are now two lanes.
+
+a) gpnae: the published design, structurally unchanged.
+   - Bug fixes (2026-09-19, reported at the time): SELU operand race in the TYTAN MAC; FIFO pop lost when it
+     coincided with a push; lambda*alpha constant about 4.8% off; exact cancellation gave -0 instead of +0;
+     tri-state numerator mux in sigtan.
+   - TYTAN's inside: mac.sv, controller.sv, datapath.v replaced by barrel_mac. Same Horner arithmetic in the same
+     order, bit-identical results; up to 16 elements share one multiplier and adder. ~4.6x faster.
+   - The term-count control still works here, as published. Still in the GPNAE regression (default lane).
+
+b) gpnae_poly: the lane SIENNA uses.
+   - Same core: TYTAN (barrel_mac), coefficient ROM, Horner evaluation.
+   - Different method: a polynomial fitted directly to each activation (SELU x*P(x) for x<0; sigmoid P(|x|) with a
+     sign flip for x<0; tanh x*P(x^2)), not e^x reshaped. Divider and +/-1 adders gone.
+   - Remaining helpers are shared units selected by the activation code, but each function still routes differently:
+     tanh squares x first and multiplies by x after; SELU multiplies by x (x<0) or lambda (x>=0); sigmoid does
+     1 - P for x<0.
+   - Fixed degrees 8 (tanh), 6 (sigmoid), 8 (SELU) from a table. The term-count input is IGNORED in this lane, so
+     the per-layer term selection (7-25 terms, iterative search) is not in effect in SIENNA today; the 30 terms
+     sienna_top passes for tanh has no effect.
+   - Added gpnae_tail for inputs past the fitted range (4 elements at once, started as soon as an element arrives)
+     and ReLU/linear modes.
+   - Own coefficient file poly_coeffs.mem; the published e^x coefficients are untouched.
+   - Swish, GELU, Softplus from the talk are not implemented in either lane.
+
+Other GPNAE changes: InputFIFO occupancy output and streamed reads; fp32_down fix for a value that went stale when
+pipelined; fp32_up_down +0 on cancellation; protocol assertions; rewritten testbench, golden model, regression with
+--lane poly.
+Around GPNAE in SIENNA: 32 lanes per pipeline (64 at N=32) instead of 16; all lanes filled at once from one wide
+read; ReLU/linear sets skip GPNAE entirely; per-set activation codes so different layers can be in flight;
+partial sums of deep layers are added up before the activation stage.
+Not changed: fp32, the TYTAN nested-multiply datapath, the published lane's coefficients and term control.
+
+Is it drastic? For the published lane, no. For the poly lane, the method is a real departure (fitted polynomials,
+fixed degree, a second datapath for large inputs), though TYTAN stays at the center and modularity holds more
+strongly (a new activation is a new coefficient set). Present SIENNA's lane as a follow-on to TYTAN, and decide
+whether to bring back the dynamic term count.
+
+
+10. WHY "OUT OF RANGE" EXISTS (the original design is affected too, past the plotted +/-5)
+-----------------------------------------------------------------------------------------
+Original method emulated in numpy with every operation rounded to fp32 (not an RTL run), SIENNA's term counts:
+   x     tanh, 30 terms  true       sigmoid, 15 terms  true      SELU x<0, 14 terms  true
+  -4       -0.99934     -0.99933       0.0186          0.0180        -1.730        -1.726
+  -5       -1.0056      -0.99991       0.0239          0.0067        -1.838        -1.746
+  -6       -4.63        -1.0000        0.208           0.0025        -2.88         -1.754
+  -8       +1.0006      -1             0.947           0.0003        -59.1         -1.758
+  -10      +1           -1             0.998           0.00005       -1199         -1.758
+  +5..+40  correct                     correct
+Cause: for large negative x the Taylor series of e^x alternates in sign with terms x^n/n! in the thousands before
+they shrink; the true e^x is tiny, so fp32 rounding on the large terms swamps it, and stopping at 30 terms leaves a
+remainder larger than the answer. The positive side is fine because sigmoid and tanh are ratios that saturate.
+The poly lane fails sooner (|x| ~ 4): a polynomial fitted to a saturating function diverges outside its fit range.
+A random regression seed caught tanh = 19.32 instead of 0.99983 (known-issues #17).
+gpnae_tail fixes it without cancellation: halve x until |z| <= 1, short Taylor series of e^z - 1, square back up.
+Worst error 0.37% out to +/-100. A slow-path element costs up to ~270 cycles against ~20.
+The same fix could repair the published lane's negative side; not changed, since it is published work.
+
+
+11. POLYNOMIAL PATH vs SLOW PATH
+--------------------------------
+Polynomial path (normal): inside the fitted range, one polynomial of degree 6-8 per function, evaluated by the barrel
+   MAC with many elements in lockstep; a batch costs about (degree + 1) x 14 cycles regardless of the values.
+Slow path (gpnae_tail): elements past the range (tanh |x| > 4, sigmoid |x| > 3.5, SELU x < -4) get the exact formula
+   built on e^x, a few hundred cycles each, 4 at a time on one shared multiplier and adder.
+ReLU and linear use neither.
+
+
+12. UPDATE, LATER ON 2026-09-26
+-------------------------------
+- Credits: SETS_IN_FLIGHT now defaults to every set the banks can hold, 2+2+ACC_BANKS+RESULT_BANKS+2+1 = 15
+  (78014e4). It gave NO speedup: the waits moved to the staging banks. Kept because it costs nothing. Two 3-credit
+  tests keep the no-credit start covered; a random-matrix SELU test was added (275d7d8).
+- Real N=16 limit found with the downstream stall probe (9877256): partial sums of deep layers were added into
+  acc_mem at N^2/lanes + 9 cycles per partial set (17 at N=16), above the 16-cycle set.
+- Fix, option (a) (e8d0da6): a partial set leaves the activation stage once its reads are done; the final set still
+  waits for every add. Enabled when N^2/lanes >= 3; a_acc_no_raw assertion guards the acc_mem ordering.
+  N=16 models: ResNet-8 56,902 -> 52,652 cycles (55.4 us, 451 GFLOPS, 93% of peak), KWS 33,831 -> 30,522,
+  VWW 109,988 -> 101,092, ad01 19,363 -> 17,909. N=32 unchanged. Regression 27/27 at N=16 and N=32.
+- Tolerance (747d03b): outputs pass within 1% relative OR within a per-output fp32 error bound from the golden model,
+  (products + 8) * 2^-24 * sum|a*b|. Fixed false failures at N=64 from near-zero cancelling sums.
+- Sweep N=8..64, every tile size 2..N, collapse-k: mesh latency matches 3T+K+T^2+LAT+17 at every point; tanh and
+  SELU pass everywhere. ReLU reaches 84% / 91% / 96% of peak at N=16 / 32 / 64 (T=2-4).
+- Full comparison table (every configuration, GFLOPS, latency, vs Jetson Nano / Edge TPU / Orin Nano / Syntiant):
+  SIENNA/testbenches/results/perf/sienna_full_comparison_2026-09-26.log
+- Still open: option (b), keep partial sums inside the PEs across depth passes; depthwise channel packing; mesh
+  partitioning; layer overlap; bias in the PE's first partial sum (needs your OK); synthesis.

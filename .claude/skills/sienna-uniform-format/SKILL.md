@@ -98,7 +98,8 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   and a signed-zero test that keeps -0), the four models in bf16 with accuracy against float, the
   GEMM sweep (bf16 checked bit-exact against the mesh model; error against float64 is reported,
   not gated, and grows with K: 6% at 256, 23% at 1024, 50% at 3072), the random power-up regression
-  and the lint. fp32: every existing check unchanged, identical cycle counts.
+  and the lint. fp32: identical cycle counts; SIENNA-level checks unchanged (tolerance with the fp32 error bound).
+  The mesh checks fp32 bit-exact too (Soham, 2026-09-28): a 1% relative limit failed correct N=64 cancellations.
 
 ## Open decisions (Soham)
 

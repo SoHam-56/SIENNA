@@ -38,7 +38,7 @@ int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 m
 | Activation engine | GPNAE, fixed point (Soham's choice over a 256-entry LUT): the same Horner polynomial and barrel_mac / gpnae_poly structure, with 16-bit integer multiply and add units | one activation engine for every format |
 | GPNAE number format | input int8 q -> `x = round(((q - z_in) * M_x) >> sh_x)`, int16 Q4.11 (range +/-16, saturating); 16 x 16 -> 32-bit products shifted back to Q4.11; 32-bit add | 8-bit intermediates cannot hold a polynomial's terms; 16 bits is 8x finer than any int8 output |
 | GPNAE coefficients | re-encoded to 16-bit fixed point by `fit_poly_coeffs.py` into a new `poly_coeffs_int8.mem` (degree as the fit needs, as bf16 needed); fp32 / bf16 tables never change | published work; same kind of change as bf16's refit |
-| Beyond the fitted range | the lane outputs the saturated int8 value (tanh +/-127/128 past abs(x) ~2.8, sigmoid 0 / 255/256 past ~6.2, SELU -lambda*alpha); `gpnae_tail` not instantiated in int8 builds | Soham 2026-09-29: an exact computation rounds to the same values; the tail's squaring step would need wider than 16 bits |
+| Beyond the fitted range | the float lane's own ranges (tanh abs(x) <= 4, sigmoid abs(x) <= 3.5, SELU x >= -4); beyond them the lane outputs the saturated int8 value (tanh +/-127/128, sigmoid 0 / 255/256, SELU -lambda*alpha); `gpnae_tail` not instantiated in int8 builds | Soham 2026-09-29: same design as the other formats; the saturation error is judged by the tolerance (sigmoid ~2.8%, SELU ~1.9% at the thresholds, estimates) |
 | GPNAE output | tanh: y * 128, zero point 0; sigmoid: y * 256, zero point -128 (TFLite's fixed output quantization); SELU: negative branch from the polynomial, positive branch lambda * x exact, per-layer `(M_out, sh_out, z_out)`; ReLU and linear pass through (already clamped) | TFLite's conventions where it has the op; SELU is not a TFLite op |
 | GPNAE per-layer parameters | `M_x, sh_x` (input rescale) and SELU's `M_out, sh_out, z_out`, carried with the set's configuration | fixed per layer |
 | Max pooling | Maxpool_2D's existing integer compare, pad -128 | exact: max commutes with monotonic requantize and activation |
@@ -55,7 +55,9 @@ int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 m
   multiply / add exhaustive where feasible; requantize unit corners (INT_MIN, largest multiplier, every shift) plus
   10^6 random against the G0 reference. fp32 / bf16 units unchanged.
 - **G2, GPNAE:** the fixed-point lane bit-exact against `gpnae_model.py`'s int8 extension; every int8 input (256)
-  for tanh, sigmoid, SELU at several input scales; accuracy target at most 1 int8 LSB against the exact functions;
+  for tanh, sigmoid, SELU at several input scales; accuracy judged by GPNAE's tolerance, as for fp32 and bf16 (Soham
+  2026-09-29): relative error <= max(1%, 8 * eps) = 6.25% (eps = 2^-7) or absolute error <= 1 output LSB, reported,
+  never a stop (a miss is an open accuracy item, as bf16's was);
   agreement with TFLite's int8 tanh / logistic reported, not gated. fp32 / bf16 lanes unchanged.
 - **G3, mesh:** int8 bit-exact against an integer mesh model (numpy int64 matmul, int32 wrap; integer addition is
   associative, so order does not matter) at N = 8..64, every tile size, both collapse modes, random power-up.
@@ -85,8 +87,8 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
    `BUILTIN_REF`.
 2. The per-lane 32 x 32 requantize multiplier is the largest new unit (128 at N = 64); G4 reports its area estimate
    next to fp32 / bf16. Fallback if too large: time-share it across lanes, at a known throughput cost.
-3. The 1-LSB GPNAE target may need a higher polynomial degree (longer rounds); if 16 bits cannot reach it for an
-   activation, G2 reports the best achieved error and Soham decides.
+3. An activation may miss the tolerance at every degree 16 bits allow (tanh most likely: its polynomial runs on
+   u in [0, 16]); G2 then reports it as an open accuracy item for Soham, as bf16's accuracy was, and work continues.
 4. SELU has no TFLite op: its output scale in the regression tests is calibrated from each test's data range, as
    TFLite post-training quantization would.
 5. fp32 and bf16 must not move: every int8 path is under generate blocks, every gate reruns both suites.

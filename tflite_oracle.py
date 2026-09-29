@@ -253,5 +253,31 @@ def main() -> None:
     sys.exit(1 if problems else 0)
 
 
+def activation_int8(op, in_scale, in_zp):
+    """TFLite's int8 TANH or LOGISTIC (reference kernels) on every int8 input; returns (outputs, input scale, input zero point)."""
+    lo, hi = in_scale * (-128 - in_zp), in_scale * (127 - in_zp)
+    grid = np.linspace(lo, hi, 256, dtype=np.float32).reshape(1, 256)
+    model = tf.keras.Sequential([tf.keras.Input(shape=(256,)),
+                                 tf.keras.layers.Activation({"tanh": "tanh", "logistic": "sigmoid"}[op])])
+    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = lambda: iter([[grid]])
+    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    conv.inference_input_type = tf.int8
+    conv.inference_output_type = tf.int8
+    interp = tf.lite.Interpreter(model_content=conv.convert(),
+                                 experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    interp.allocate_tensors()
+    ops = {d["op_name"] for d in interp._get_ops_details()}
+    assert ops == {op.upper()}, f"expected one int8 {op.upper()} op, got {ops}"
+    i, o = interp.get_input_details()[0], interp.get_output_details()[0]
+    want = {"tanh": (1 / 128, 0), "logistic": (1 / 256, -128)}[op]
+    assert abs(o["quantization"][0] - want[0]) < 1e-12 and o["quantization"][1] == want[1], o["quantization"]
+    interp.set_tensor(i["index"], np.arange(-128, 128, dtype=np.int8).reshape(1, 256))
+    interp.invoke()
+    s, z = i["quantization"]
+    return interp.get_tensor(o["index"]).reshape(256).astype(np.int64), float(s), int(z)
+
+
 if __name__ == "__main__":
     main()

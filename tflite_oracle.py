@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 import tensorflow as tf
+import tflite
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tflite_ref as ref  # noqa: E402
@@ -18,7 +19,11 @@ MODELS = {  # name: (layer, fused activation); seed 0 of each is saved for G4
     "fc64x16_relu": ("fc", "relu"),
     "conv3x3_8x8x16_linear": ("conv", "none"),
     "conv3x3_8x8x16_relu6": ("conv", "relu6"),
+    "conv3x3_8x8x16_relu6_wide": ("conv", "relu6"),
 }
+OUT_RANGE = {"conv3x3_8x8x16_relu6_wide": (-1.0, 8.0)}  # output fake-quantized wider than relu6, so the fused clamp is not int8's
+FUSED = {"none": tflite.ActivationFunctionType.NONE, "relu": tflite.ActivationFunctionType.RELU,
+         "relu6": tflite.ActivationFunctionType.RELU6}
 OP_NAME = {"fc": "FULLY_CONNECTED", "conv": "CONV_2D"}
 ACT_FN = {"none": tf.identity, "relu": tf.nn.relu, "relu6": tf.nn.relu6}
 ROUNDINGS = ("DOUBLE", "SINGLE")
@@ -29,7 +34,7 @@ N_SAVED = 64  # test inputs and interpreter outputs kept per npz for G4
 MIN_SAVED_DISC = {"fc": 1, "conv": 50}  # discriminating outputs each saved npz must hold, so G4 sees a wrong rounding
 
 
-def build_model(layer, act, seed):
+def build_model(layer, act, seed, out_range=None):
     """One layer: per-channel weight magnitudes over two decades; input range with max >= 1.5 |min|, so the zero point is not 0."""
     rng = np.random.default_rng(seed)
     lo = -rng.uniform(0.2, 2.0)
@@ -49,7 +54,8 @@ def build_model(layer, act, seed):
     @tf.function(input_signature=[tf.TensorSpec(in_shape, tf.float32)])
     def layer_fn(x):
         y = tf.matmul(x, wc) if layer == "fc" else tf.nn.conv2d(x, wc, strides=1, padding="SAME")
-        return act_fn(tf.nn.bias_add(y, bc))
+        y = act_fn(tf.nn.bias_add(y, bc))
+        return y if out_range is None else tf.quantization.fake_quant_with_min_max_args(y, *out_range, num_bits=8)
 
     rep_rng = np.random.default_rng(seed + 1000)
 
@@ -84,12 +90,23 @@ def invoke_all(it, xs):
     return np.stack(ys)
 
 
-def extract(it, layer, act):
+def fused_activation(model):
+    """The fused activation of the model's only operator, read from the flatbuffer."""
+    op = tflite.Model.GetRootAsModel(model, 0).Subgraphs(0).Operators(0)
+    opt = (tflite.Conv2DOptions if op.BuiltinOptionsType() == tflite.BuiltinOptions.Conv2DOptions else tflite.FullyConnectedOptions)()
+    t = op.BuiltinOptions()
+    opt.Init(t.Bytes, t.Pos)
+    return opt.FusedActivationFunction()
+
+
+def extract(it, model, layer, act):
     """The op's tensors and quantization; stops unless the graph is one int8 FULLY_CONNECTED or CONV_2D with fused activation."""
     ops = it._get_ops_details()  # private in TF 2.x: op_name, inputs, outputs per op
     names = [o["op_name"] for o in ops]
     if names != [OP_NAME[layer]]:
         sys.exit(f"G0: FAIL, expected one {OP_NAME[layer]}, the converter produced {names}")
+    if fused_activation(model) != FUSED[act]:
+        sys.exit(f"G0: FAIL, fused activation {fused_activation(model)}, expected {act} ({FUSED[act]})")
     xi, wi, bi = (int(i) for i in ops[0]["inputs"][:3])
     oi = int(ops[0]["outputs"][0])
     td = {t["index"]: t for t in it.get_tensor_details()}
@@ -156,12 +173,12 @@ def main() -> None:
     lines = [f"G0 TFLite oracle: TensorFlow {tf.__version__}, numpy {np.__version__}, op resolver BUILTIN_REF, "
              f"{a.seeds} seeds x {len(MODELS)} models, {a.inputs} inputs each"]
     tot = {"outputs": 0, "DOUBLE": 0, "SINGLE": 0, "disc": 0, "folded": 0}
-    problems, keep = [], {}
+    problems, keep, clamp_models = [], {}, []
     for name, (layer, act) in MODELS.items():
         for seed in range(a.seeds):
-            model, lo, hi = build_model(layer, act, seed)
+            model, lo, hi = build_model(layer, act, seed, OUT_RANGE.get(name))
             it = interpreter(model, REF)
-            p = extract(it, layer, act)
+            p = extract(it, model, layer, act)
             xs = test_inputs(p, lo, hi, a.inputs, np.random.default_rng(seed + 2000))
             ys = invoke_all(it, xs)
             ys_default = invoke_all(interpreter(model, tf.lite.experimental.OpResolverType.AUTO), xs)
@@ -170,6 +187,9 @@ def main() -> None:
             dflt = {r: int(np.sum(ys_default != want[r])) for r in ROUNDINGS}
             disc_in = (want["DOUBLE"] != want["SINGLE"]).reshape(len(xs), -1).sum(axis=1)
             disc = int(disc_in.sum())
+            nontrivial = p["amin"] > -128 or p["amax"] < 127
+            full = dict(p, amin=-128, amax=127)
+            act_hits = {r: int(np.sum(reference(full, xs, r) != want[r])) for r in ROUNDINGS} if nontrivial else None
             fold = sum(int(np.sum(reference(p, xs, r, folded=True) != want[r])) for r in ROUNDINGS)
             unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
             _, shifts = ref.layer_multipliers(layer, p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], "DOUBLE")
@@ -179,7 +199,11 @@ def main() -> None:
                          f"{'per-channel' if per_ch else 'per-tensor'} ({p['w_scales'].size}), shifts [{shifts.min()}, "
                          f"{shifts.max()}], outputs {ys.size}, mismatches DOUBLE {mism['DOUBLE']} SINGLE {mism['SINGLE']}, "
                          f"discriminating {disc}, folded {fold}, unclamped {100 * unclamped:.1f}%, "
-                         f"default resolver (info) DOUBLE {dflt['DOUBLE']} SINGLE {dflt['SINGLE']}")
+                         f"default resolver (info) DOUBLE {dflt['DOUBLE']} SINGLE {dflt['SINGLE']}"
+                         + (f", outputs the fused clamp changes DOUBLE {act_hits['DOUBLE']} SINGLE {act_hits['SINGLE']}"
+                            if nontrivial else ""))
+            if nontrivial:
+                clamp_models.append((f"{name} seed {seed}", act_hits))
             if layer == "fc" and not per_ch and min(mism.values()) > 0:
                 alt = {r: int(np.sum(ys != reference(p, xs, r, scale_product="double"))) for r in ROUNDINGS}
                 lines.append(f"  diagnostic: per-tensor FC with a double scale product: DOUBLE {alt['DOUBLE']} SINGLE {alt['SINGLE']}")
@@ -208,6 +232,8 @@ def main() -> None:
     winners = [r for r in ROUNDINGS if tot[r] == 0]
     if len(winners) != 1:
         problems.append(f"{len(winners)} roundings match every output; exactly one must")
+    elif not any(h[winners[0]] > 0 for _, h in clamp_models):
+        problems.append(f"no model has a non-trivial fused clamp that changes an output ({len(clamp_models)} non-trivial)")
     if tot["disc"] < MIN_DISCRIMINATING:
         problems.append(f"only {tot['disc']} discriminating outputs (need {MIN_DISCRIMINATING})")
     if tot["folded"]:

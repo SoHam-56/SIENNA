@@ -5,7 +5,7 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 
 # SIENNA: the int8 build (sub-project 2a)
 
-**Status: design approved in conversation 2026-09-29; spec written, awaiting Soham's review. NOT implemented.**
+**Status: spec approved 2026-09-29. NOT implemented.**
 Update this line as pieces land.
 
 **REQUIRED BACKGROUND:** the `sienna-uniform-format` skill (one number format per build; this is its sub-project 2)

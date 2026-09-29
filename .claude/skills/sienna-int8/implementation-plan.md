@@ -22,7 +22,7 @@
 - Verification order: G0 oracle, G1 AriL, G2 GPNAE, G3 mesh, G4 SIENNA; a gate passes and is reported before the next level starts; every gate reruns the fp32 and bf16 suites, requiring identical results and cycle counts (G3 reruns the ruled subset, Task 15).
 - The oracle is TensorFlow's interpreter with `experimental_op_resolver_type = tf.lite.experimental.OpResolverType.BUILTIN_REF` (reference kernels, never the optimized ones).
 - Work in `/proj/work/spramanik/SIENNA_int8` on branch `int8` (off `bf16`) in all four repos; the bf16 checkout `/proj/work/spramanik/SIENNA` stays clean for fp32 / bf16 reruns.
-- Every build and simulation runs on the farm: `TREE=/proj/work/spramanik/SIENNA_int8 $J/snap_launch_tree.sh NAME MEM_GB HOURS cmd...` with `J=/proj/work/spramanik/sienna_jobs` (output in `$J/runs/NAME/`); 32 GB minimum; multi-command jobs are scripts in `$J/cmds/`, never `bash -c "..."`. N >= 32 builds use `TRACE=0 OPT_FAST=-O0`.
+- Every build and simulation runs on the farm: `TREE=/proj/work/spramanik/SIENNA_int8 $J/snap_launch_tree.sh NAME MEM_GB HOURS cmd...` with `J=/proj/work/spramanik/sienna_jobs` (output in `$J/runs/NAME/`); 32 GB minimum; multi-command jobs are scripts in `$J/cmds/`, never `bash -c "..."`. N >= 32 builds use `TRACE=0 OPT_FAST=-O0`: SIENNA launches through `$J/cmds/int8_O0.sh` (Task 0) or `int8_ck0_O0.sh`, mesh launches through `mesh_notrace_O0.sh`.
 - Every level's commands assume `J=/proj/work/spramanik/sienna_jobs`, `T=/proj/work/spramanik/SIENNA_int8` and `export TREE=$T` (Level 4 wraps the launch in `L` and `B`). A launch meant for the bf16 tree (a reference run) sets `TREE=/proj/work/spramanik/SIENNA` on its own command line. A launch without `TREE` snapshots the bf16 tree and silently re-tests bf16.
 - Nothing a later job reads lives under a `results/` directory: `snap_launch_tree.sh` leaves every path component named `results` out of a snapshot, and `run_snap.sh` copies the snapshot's `testbenches/results/` back to `$J/runs/NAME/results/`. Files a later task needs are copied from there into the tree by hand, after checking the target does not exist.
 - Unit latencies come from `sienna_fmt_pkg` (`mul_lat`, `add_lat`, `fx_lat()` = 2, `req_lat()` = 3) and the requantize rounding from `sienna_fmt_pkg::REQ_ROUNDING` in RTL and from `testbenches/tflite_int8/rounding.txt` in Python (`ipu.REQ_ROUNDING`, `tflite_ref.ROUNDING`); outside the package no RTL writes either as a literal.
@@ -33,7 +33,7 @@
 
 ## Review Focus
 
-1. **Requantize corners TFLite defines and random data never hits:** `acc = INT32_MIN` with `mult = INT32_MIN` (the one saturating case of SaturatingRoundingDoublingHighMul), negative values exactly halfway in RoundingDivideByPOT (TFLite rounds them away from zero), and left shifts (`shift > 0`). A reasonable person expects the RTL to equal TFLite on every one. Pinned in Task 1 (known values), Task 7 (corner vectors) and Task 2 (the oracle confirms the model on them).
+1. **Requantize corners TFLite defines and random data never hits:** `acc = INT32_MIN` with `mult = INT32_MIN` (the one saturating case of SaturatingRoundingDoublingHighMul), negative values exactly halfway in RoundingDivideByPOT (TFLite rounds them away from zero), and left shifts (`shift > 0`). A reasonable person expects the RTL to equal TFLite on every one. What confirms the corners: Task 1 (hand-derived known values of each one, worked from TFLite's C, and the C transcribed line for line) and Task 7 (the corner vectors through the RTL in both roundings, bit for bit against `ipu.requant`). Task 2's oracle confirms only layer-level agreement with the interpreter, on converter-made parameters that never reach these corners (see the Limits after Task 7).
 2. **A padded conv with a non-zero input zero point.** Padding must be the input zero point, not 0, or border outputs differ from TFLite. Pinned in Task 2 (a 3x3 SAME conv model with z_a != 0) and Task 21 (the same model through the RTL).
 3. **Per-channel parameters landing on the wrong channel** (a set's column c using channel c+1's multiplier after a tile or set boundary). Pinned in Task 20 (a test with a distinct random multiplier per channel, and a negative control with every lane one channel off), Task 21, and Task 22 (`gemm_sweep` int8 layers with 40 output channels at N = 16, so the per-channel words cross column blocks).
 4. **An unsupported format** (for example `EXP_W = 0, MAN_W = 15`, an int16 attempt) must fail elaboration in every block that picks a unit, not build with int8 or float units. Pinned in Tasks 3, 9, 11, 13, 18 and 19 with a lint build that must fail with the block's message.
@@ -98,7 +98,7 @@ there and copied into the tree by hand afterwards, after checking the target doe
 
 **Files:**
 - Create: `/proj/work/spramanik/SIENNA_int8` (clone of the four repos, branch `int8` in each)
-- Create: `/proj/work/spramanik/sienna_jobs/cmds/int8_tree.sh`, `int8_aril.sh`, `int8_fpref.sh` (the shared job scripts)
+- Create: `/proj/work/spramanik/sienna_jobs/cmds/int8_tree.sh`, `int8_aril.sh`, `int8_fpref.sh`, `int8_O0.sh` (the shared job scripts)
 - Modify: `/proj/work/spramanik/sienna_jobs/venv` (TensorFlow installed)
 
 **Interfaces:**
@@ -112,6 +112,8 @@ there and copied into the tree by hand afterwards, after checking the target doe
     beside it, and fails when the log holds `RESULT: FAILED` or, for a target other than `lint*`, no `RESULT: PASSED`.
   - `$J/cmds/int8_fpref.sh`: the five fp32 / bf16 GPNAE runs (poly, poly range 8, Taylor, bf16 hw, bf16 hw range 8) into
     `testbenches/results/int8/fpref/<tag>/`.
+  - `$J/cmds/int8_O0.sh cmd...`: runs `cmd` with `TRACE=0 OPT_FAST=-O0` exported (the SIENNA Makefile's `OPT_FAST ?= -Os`
+    and `TRACE ?= 0` take them from the environment), the Global Constraint's flags for every N >= 32 SIENNA build.
   - The reference runs every gate compares against: `i0_sienna_fp32`, `i0_sienna_bf16` (SIENNA N = 16),
     `i0_reg32_fp32`, `i0_reg32_bf16` (SIENNA N = 32), `i0_multi_fp32` (`sienna_multi`), `i0_fpref` (GPNAE, on the bf16
     tree), and the bf16 branch's gate runs listed in Step 6.
@@ -177,6 +179,16 @@ grep -q "RESULT: FAILED\|^FAILURE:" $LOG && rc=1  # testbenches finish with stat
 exit $rc
 ```
 
+`/proj/work/spramanik/sienna_jobs/cmds/int8_O0.sh`, the N >= 32 build flags for any SIENNA command (cycles do not
+depend on them; `-Os` takes hours on thousands of PEs):
+
+```bash
+#!/bin/bash
+# Runs a command with TRACE=0 OPT_FAST=-O0, the flags every N >= 32 SIENNA build uses; args: the command and its arguments.
+export TRACE=0 OPT_FAST=-O0
+exec "$@"
+```
+
 `/proj/work/spramanik/sienna_jobs/cmds/int8_fpref.sh`, the fp32 and bf16 GPNAE runs every int8 GPNAE step compares:
 
 ```bash
@@ -205,8 +217,8 @@ The int8 tree still holds the bf16 branch's code here, so these runs are the fp3
 J=/proj/work/spramanik/sienna_jobs
 $J/cmds/int8_tree.sh i0_sienna_fp32 64 6 bash $J/cmd_sienna_fmt.sh reg 16 4 fp32
 $J/cmds/int8_tree.sh i0_sienna_bf16 64 6 bash $J/cmd_sienna_fmt.sh reg 16 4 bf16
-$J/cmds/int8_tree.sh i0_reg32_fp32 32 12 $J/cmd_sienna_fmt.sh reg 32 4 fp32
-$J/cmds/int8_tree.sh i0_reg32_bf16 32 12 $J/cmd_sienna_fmt.sh reg 32 4 bf16
+$J/cmds/int8_tree.sh i0_reg32_fp32 32 12 $J/cmds/int8_O0.sh $J/cmd_sienna_fmt.sh reg 32 4 fp32   # N >= 32: -O0
+$J/cmds/int8_tree.sh i0_reg32_bf16 32 12 $J/cmds/int8_O0.sh $J/cmd_sienna_fmt.sh reg 32 4 bf16
 $J/cmds/int8_tree.sh i0_multi_fp32 32 4 $J/cmd_multi.sh matmul_random_tanh 2 32 1 16
 TREE=/proj/work/spramanik/SIENNA $J/snap_launch_tree.sh i0_fpref 32 6 $J/cmds/int8_fpref.sh
 ```
@@ -254,6 +266,10 @@ Report to Soham: the int8 tree and branches (commits), TensorFlow version, the r
     build) or "SINGLE" (`TFLITE_SINGLE_ROUNDING`), `shift` in [-31, 30]
   - `ipu.requant(acc, mult, shift, zp, amin, amax, rounding)`: `min(max(wrap32(mbqm + zp), amin), amax)`; `zp`, `amin`,
     `amax` are 8-bit (tfliteRequant)
+  - `ipu.round_half_away(v) -> int` (TfLiteRound, `std::round` on a double) and `ipu.quantize_multiplier(real,
+    rounding="DOUBLE") -> (mult, shift)` (TFLite's QuantizeMultiplier, whose C Task 2 quotes; SINGLE caps the shift at 30),
+    plain Python on scalars: the one copy, which `tflite_ref` (SIENNA) re-exports and `gpnae_model` (GPNAE, through its
+    own `ArithmeticLibrary` submodule) imports
 
 The C sources these transcribe, so a reviewer can check them line by line:
 
@@ -409,6 +425,18 @@ FX_MAC = [  # a, x, c, floor((a * x) / 2^11) + c saturated to int16 (Q4.11, 1.0 
     (32767, 32767, 0, 32767), (-32768, 32767, 0, -32768), (-32768, -32768, 0, 32767), (2048, 2048, 32767, 32767),
     (-2048, 2048, -32768, -32768),
 ]
+QM = [  # real -> (mult, shift): frexp, then the mantissa * 2^31 rounded half away from zero
+    (0.5, (1 << 30, 0)),
+    (1.0, (1 << 30, 1)),
+    (0.75, (1610612736, 0)),
+    (0.1, (1717986918, -3)),  # 0.8 * 2^31 = 1717986918.4
+    (2.0 ** -32, (1 << 30, -31)),  # shift -31 is kept
+    (2.0 ** -33, (0, 0)),  # shift -32 flushes to zero
+    (0.0, (0, 0)),
+    (1.0 - 2.0 ** -40, (1 << 30, 1)),  # the mantissa rounds to 2^31: halved, shift + 1
+    (1.0 / 255.0, (1077952576, -7)),
+    (0.5 + 2.0 ** -32, ((1 << 30) + 1, 0)),  # 2^30 + 0.5 rounds away from zero; numpy.round would give 2^30
+]
 
 
 def wrap32(v):
@@ -462,6 +490,11 @@ def main() -> None:
         check(f"int_add({a}, {b})", ipu.int_add(a, b), w)
     for a, x, c, w in FX_MAC:
         check(f"fx_mac({a}, {x}, {c})", ipu.fx_mac(a, x, c), w)
+    for real, want in QM:
+        check(f"quantize_multiplier({real!r})", ipu.quantize_multiplier(real), want)
+    check("quantize_multiplier(2^31, SINGLE)", ipu.quantize_multiplier(2.0 ** 31, "SINGLE"), ((1 << 31) - 1, 30))
+    check("quantize_multiplier(2^31, DOUBLE)", ipu.quantize_multiplier(2.0 ** 31, "DOUBLE"), (1 << 30, 32))
+    check("round_half_away", [ipu.round_half_away(v) for v in (2.5, -2.5, 0.49999999999999994, -0.5)], [3, -3, 0, -1])  # 0.5 - 2^-54: floor(v + 0.5) would give 1
 
     # Exhaustive int8 products, as values and as 8-bit patterns.
     g = np.arange(-128, 128, dtype=np.int64)
@@ -572,9 +605,9 @@ target `ipu`; `$J/runs/i1_ipu.out` shows `exit=1` (the make error, and no verdic
 `Common/models/ipu.py`:
 
 ```python
-"""Bit-exact models of AriL's integer units (intMultiplier, intAdder, fxMac, tfliteRequant) and TFLite's int8 requantize,
-vectorized over int64 numpy arrays with broadcasting; no TensorFlow. Operands are signed values or raw bit patterns (the low
-w bits read as two's complement); results are signed values. int32 intermediates wrap mod 2^32 as TFLite's compiled C does."""
+"""Bit-exact numpy models of AriL's integer units and TFLite's int8 requantize; int64 arrays, int32 intermediates wrap as TFLite's C does."""
+import math
+
 import numpy as np
 
 INT32_MIN, INT32_MAX = -(1 << 31), (1 << 31) - 1
@@ -610,8 +643,7 @@ def fx_mac(a, x, c, w=16, frac=11):
 
 
 def srdhm(a, b):
-    """gemmlowp SaturatingRoundingDoublingHighMul: (a*b + nudge) / 2^31 with C's truncating divide, nudge 2^30 for a
-    non-negative product and 1 - 2^30 otherwise; INT32_MIN * INT32_MIN saturates to INT32_MAX."""
+    """gemmlowp SaturatingRoundingDoublingHighMul: (a*b + nudge) / 2^31 with C's truncating divide; INT32_MIN * INT32_MIN saturates."""
     a, b = sx(a, 32), sx(b, 32)
     ab = a * b
     n = ab + np.where(ab >= 0, np.int64(1 << 30), np.int64(1 - (1 << 30)))
@@ -630,8 +662,7 @@ def rdbpot(x, exp):
 
 
 def mbqm(acc, mult, shift, rounding):
-    """TFLite MultiplyByQuantizedMultiplier; shift > 0 shifts left, < 0 right, in [-31, 30].
-    DOUBLE: RoundingDivideByPOT(SRDHM(acc * 2^left wrapped to int32, mult), right). SINGLE: (acc*mult + 2^(30-shift)) >> (31-shift)."""
+    """TFLite MultiplyByQuantizedMultiplier in either rounding; shift in [-31, 30], positive shifts left."""
     acc, mult = sx(acc, 32), sx(mult, 32)
     shift = np.asarray(shift, dtype=np.int64)
     assert np.all((shift >= -31) & (shift <= 30)), "shift outside [-31, 30]"
@@ -648,12 +679,38 @@ def requant(acc, mult, shift, zp, amin, amax, rounding):
     """tfliteRequant, TFLite's conv / FC epilogue: y = mbqm + zp in int32, then max(y, amin), then min(y, amax)."""
     y = sx(mbqm(acc, mult, shift, rounding) + sx(zp, 8), 32)
     return np.minimum(np.maximum(y, sx(amin, 8)), sx(amax, 8))
+
+
+def round_half_away(v: float) -> int:
+    """TfLiteRound (std::round) on a double: nearest, ties away from zero, exact (a - floor(a) is exact, unlike floor(a + 0.5))."""
+    a = abs(v)
+    f = math.floor(a)
+    r = f + (1 if a - f >= 0.5 else 0)
+    return -r if v < 0 else r
+
+
+def quantize_multiplier(real: float, rounding: str = "DOUBLE"):
+    """TFLite QuantizeMultiplier: real = mult * 2^(shift - 31), mult in [2^30, 2^31); below 2^-32 flushes to (0, 0)."""
+    if real == 0.0:
+        return 0, 0
+    q, shift = math.frexp(real)
+    q_fixed = round_half_away(q * (1 << 31))
+    assert q_fixed <= (1 << 31)
+    if q_fixed == (1 << 31):
+        q_fixed //= 2
+        shift += 1
+    if shift < -31:
+        return 0, 0
+    if rounding == "SINGLE" and shift > 30:  # TFLITE_SINGLE_ROUNDING saturates the shift
+        return (1 << 31) - 1, 30
+    return q_fixed, shift
 ```
 
 - [ ] **Step 4: Run it to see it pass**
 
 Run: `$J/snap_launch_tree.sh i1_ipu 32 1 $J/cmds/int8_aril.sh Common ipu`
-Expected: `test_ipu: 254 checks, 0 failures` and `RESULT: PASSED` in
+Expected: `test_ipu: 267 checks, 0 failures` (254 for the integer units and the requantize, 13 for QuantizeMultiplier and
+TfLiteRound) and `RESULT: PASSED` in
 `$J/runs/i1_ipu/results/int8/Common_ipu.log`. A failing known value means the model or the derivation in the comment is
 wrong: recompute that case by hand from the C above before touching either. A random mismatch against the scalar
 transcription is a numpy issue (an int64 overflow or a broadcast), since the transcription is the C line for line.
@@ -662,7 +719,7 @@ transcription is a numpy issue (an int64 overflow or a broadcast), since the tra
 
 ```bash
 cd /proj/work/spramanik/SIENNA_int8/SystolicMesh/ArithmeticLibrary
-git add Common/models/ipu.py && git commit -m "ipu.py: bit-exact models of the integer units and TFLite's requantize, both roundings"
+git add Common/models/ipu.py && git commit -m "ipu.py: bit-exact models of the integer units and TFLite's requantize, both roundings; QuantizeMultiplier"
 git add Common/models/test_ipu.py Common/Makefile && git commit -m "test_ipu.py: hand-derived TFLite values and scalar transcriptions of the C"
 git push git@github.com:SoHam-56/ArithmeticLibrary.git int8
 ```
@@ -679,13 +736,13 @@ Leave the untracked `Common/models/__pycache__/` alone.
 - Modify: `SystolicMesh` (ArithmeticLibrary pointer), SIENNA (SystolicMesh pointer)
 
 **Interfaces:**
-- Consumes: `ipu.sx`, `ipu.requant`, `ipu.ROUNDINGS` (Task 1); TensorFlow in `$J/venv` (Task 0: `$J/venv/bin/python3 -c
+- Consumes: `ipu.sx`, `ipu.requant`, `ipu.ROUNDINGS`, `ipu.round_half_away`, `ipu.quantize_multiplier` (Task 1); TensorFlow in `$J/venv` (Task 0: `$J/venv/bin/python3 -c
   "import tensorflow"` works on a farm node).
 - Produces:
   - `tflite_ref.ROUNDING`: the pinned variant, `"SINGLE"` or `"DOUBLE"`, read from `testbenches/tflite_int8/rounding.txt`
     (None until G0 has written it)
-  - `tflite_ref.round_half_away(v) -> int` (TfLiteRound on a double)
-  - `tflite_ref.quantize_multiplier(real, rounding="DOUBLE") -> (mult, shift)` (QuantizeMultiplier; SINGLE caps shift at 30)
+  - `tflite_ref.round_half_away(v) -> int` and `tflite_ref.quantize_multiplier(real, rounding="DOUBLE") -> (mult, shift)`:
+    `ipu`'s (Task 1), re-exported, not a second copy
   - `tflite_ref.effective_scale(in_scale, w_scale, out_scale, product) -> float`, `product` "double" or "float32"
   - `tflite_ref.layer_multipliers(layer, w_scales, in_scale, out_scale, cout, rounding, scale_product=None) -> (mults, shifts)`
     int64 arrays of length `cout`; `layer` "fc" or "conv"
@@ -794,8 +851,7 @@ def main() -> None:
                 check(f"fc b={b} {r} folded={folded}",
                       ref.fc_int8(x, w, np.array([b]), -2, [0.25], 0.5, 1.0, 3, -128, 127, r, folded=folded), [[want]])
 
-    # Conv 3x3 SAME on a 2x2 image: in-image taps of (x - 1) = [[0, 1], [2, 3]] give [[49, 43], [31, 25]];
-    # scale 0.5 * 1 / 1 (QM (2^30, 0)) makes every one a positive tie, rounded up in both; out zp -3.
+    # Conv 3x3 SAME on 2x2: in-image taps of (x - 1) give [[49, 43], [31, 25]]; QM (2^30, 0) makes each a positive tie; out zp -3.
     xc = np.array([1, 2, 3, 4]).reshape(1, 2, 2, 1)
     wc = np.arange(1, 10).reshape(1, 3, 3, 1)
     for r in ("DOUBLE", "SINGLE"):
@@ -825,9 +881,7 @@ Expected: `ModuleNotFoundError: No module named 'tflite_ref'` in `$J/runs/i2_ref
 `tflite_ref.py`:
 
 ```python
-"""numpy-only int8 FC and conv2d as TFLite's reference kernels compute them, on ipu.requant; tflite_oracle.py checks them
-against the TFLite interpreter bit for bit. Layouts are TFLite's: FC weights [out, in], conv weights OHWI, data NHWC."""
-import math
+"""numpy-only int8 FC and conv2d as TFLite's reference kernels compute them, on ipu.requant; TFLite layouts (FC [out, in], OHWI, NHWC)."""
 import os
 import sys
 
@@ -835,32 +889,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
 import ipu  # noqa: E402
+from ipu import quantize_multiplier, round_half_away  # noqa: E402,F401  re-exported: TFLite's QuantizeMultiplier and TfLiteRound, one copy in AriL
 
 ROUNDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "tflite_int8", "rounding.txt")
 ROUNDING = open(ROUNDING_FILE).read().strip() if os.path.exists(ROUNDING_FILE) else None  # G0's pinned variant; None before G0
-
-
-def round_half_away(v: float) -> int:
-    """TfLiteRound (std::round) on a double: nearest, ties away from zero; exact for |v| < 2^52."""
-    r = math.floor(abs(v) + 0.5)
-    return -r if v < 0 else r
-
-
-def quantize_multiplier(real: float, rounding: str = "DOUBLE"):
-    """TFLite QuantizeMultiplier: real = mult * 2^(shift - 31), mult in [2^30, 2^31); below 2^-32 flushes to (0, 0)."""
-    if real == 0.0:
-        return 0, 0
-    q, shift = math.frexp(real)
-    q_fixed = round_half_away(q * (1 << 31))
-    assert q_fixed <= (1 << 31)
-    if q_fixed == (1 << 31):
-        q_fixed //= 2
-        shift += 1
-    if shift < -31:
-        return 0, 0
-    if rounding == "SINGLE" and shift > 30:  # TFLITE_SINGLE_ROUNDING saturates the shift
-        return (1 << 31) - 1, 30
-    return q_fixed, shift
 
 
 def effective_scale(in_scale, w_scale, out_scale, product: str) -> float:
@@ -913,8 +945,7 @@ def im2col_same(x_q, kh, kw, pad_value):
 
 def fc_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False,
             scale_product=None):
-    """reference_integer_ops::FullyConnected(PerChannel): acc = sum w * (x - in_zp) + b in int32, requantized per channel.
-    folded=True: sum w * x + fold_input_zp(b), SIENNA's algebra."""
+    """reference_integer_ops::FullyConnected(PerChannel), requantized per channel; folded=True is SIENNA's algebra (fold_input_zp bias)."""
     x = np.asarray(x_q, dtype=np.int64)
     w = np.asarray(w_q, dtype=np.int64)
     b = np.zeros(w.shape[0], dtype=np.int64) if b_q is None else np.asarray(b_q, dtype=np.int64)
@@ -924,8 +955,7 @@ def fc_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, a
 
 
 def conv2d_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False):
-    """reference_integer_ops::ConvPerChannel, stride 1, SAME: out-of-image taps skipped, i.e. (x - in_zp) padded with 0.
-    folded=True: im2col padded with in_zp, sum w * x + fold_input_zp(b), SIENNA's algebra."""
+    """reference_integer_ops::ConvPerChannel, stride 1, SAME (outside taps skipped); folded=True pads with in_zp and folds the bias."""
     x = np.asarray(x_q, dtype=np.int64)
     w = np.asarray(w_q, dtype=np.int64)
     bsz, h, wd, _ = x.shape
@@ -952,9 +982,7 @@ Expected: `test_tflite_ref: 34 checks, 0 failures` and `RESULT: PASSED`.
 
 ```python
 #!/usr/bin/env python3
-"""Gate G0: single-layer int8 TFLite models (FC, Conv2D 3x3 SAME) from the TF converter, run on the interpreter's reference
-kernels (BUILTIN_REF), compared bit for bit with tflite_ref in both roundings; pins the rounding TFLite uses and saves the
-G4 test models with their quantization. Needs TensorFlow (sienna_jobs/venv); runs on the farm."""
+"""Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against tflite_ref in both roundings; pins the rounding."""
 import argparse
 import os
 import sys
@@ -1207,15 +1235,14 @@ Never loosen a criterion to pass.
 
 ```bash
 M=/proj/work/spramanik/SIENNA_int8/testbenches/tflite_int8
-ls $M 2>/dev/null && echo "EXISTS: look before copying"   # expect nothing: the copy must not overwrite unseen files
-mkdir -p $M && cp $J/runs/g0_oracle/results/int8/tflite_int8/* $M/
+G=/proj/work/spramanik/SIENNA_int8/testbenches/results/int8
+test ! -e $M && mkdir -p $M && cp $J/runs/g0_oracle/results/int8/tflite_int8/* $M/ || echo "EXISTS: $M, look before copying"
 ls $M; cat $M/rounding.txt
-mkdir -p /proj/work/spramanik/SIENNA_int8/testbenches/results/int8
-cp $J/runs/g0_oracle/results/int8/g0_oracle.log /proj/work/spramanik/SIENNA_int8/testbenches/results/int8/
+mkdir -p $G && test ! -e $G/g0_oracle.log && cp $J/runs/g0_oracle/results/int8/g0_oracle.log $G/ || echo "EXISTS: $G/g0_oracle.log, look before copying"
 ```
 
-Expected: eight model files (four `.tflite`, four `.npz`) and `rounding.txt`; the variant matches the report's
-`ROUNDING:` line.
+Expected: no `EXISTS` line (the copy never overwrites unseen files); eight model files (four `.tflite`, four `.npz`)
+and `rounding.txt`; the variant matches the report's `ROUNDING:` line.
 
 - [ ] **Step 8: Commit (SystolicMesh pointer, then SIENNA)**
 
@@ -1778,8 +1805,7 @@ The digest's sums stay exact in int64: `s2 <= 65535 * 65535 * 65536 < 2^48`. A s
 ```systemverilog
 `timescale 1ns / 100ps
 
-// intMultiplier against the C reference (int_ref_core.h) through DPI, bit for bit: every signed pair at W = 8 (65,536), every corner
-// pair and RANDOM random pairs at W = 16 (GPNAE's width), idle cycles between some; latency sienna_fmt_pkg::mul_lat(0, 7). +DUMP=<file> writes every result.
+// intMultiplier against the C reference through DPI: every pair at W = 8, corners and RANDOM pairs at W = 16; +DUMP=<file> writes results.
 module TB_intMultiplier #(
     parameter int W      = 8,
     parameter int RANDOM = 1000000
@@ -1976,8 +2002,7 @@ Expected: Verilator stops with `Cannot find file containing module` naming `src/
 ```systemverilog
 `timescale 1ns / 100ps
 
-// Signed integer multiplier for the int8 build's mesh: result_o = A * B, the full 2W-bit two's-complement product (no rounding, no overflow).
-// valid_i at t, done_o at t+1 (one registered multiply); only done_o is reset, result_o loads on valid_i and holds otherwise.
+// Signed integer multiplier: result_o = A * B, the full 2W-bit product; done_o one cycle after valid_i; only done_o is reset (D-8).
 module intMultiplier #(
     parameter int W = 8
 ) (
@@ -2215,8 +2240,7 @@ Expected: `PUSHED`.
 ```systemverilog
 `timescale 1ns / 100ps
 
-// intAdder against the C reference (int_ref_core.h) through DPI, bit for bit: wrap corners worked by hand, every corner pair, carry
-// chains of every length, then random pairs (one in four next to a rail), with idle cycles between some. +DUMP=<file> writes every result.
+// intAdder against the C reference through DPI: wrap corners, corner pairs, carry chains, random pairs; +DUMP=<file> writes results.
 module TB_intAdder #(
     parameter int W      = 32,
     parameter int RANDOM = 1000000
@@ -2403,8 +2427,7 @@ Expected: Verilator stops with `Cannot find file containing module` naming `src/
 ```systemverilog
 `timescale 1ns / 100ps
 
-// Signed integer adder for the int8 build's int32 accumulation: result_o = A + B modulo 2^W (two's-complement wrap, as TFLite's sums).
-// valid_i at t, done_o at t+1 (one registered add); only done_o is reset, result_o loads on valid_i and holds otherwise.
+// Signed integer adder: result_o = A + B mod 2^W (two's-complement wrap); done_o one cycle after valid_i; only done_o is reset (D-8).
 module intAdder #(
     parameter int W = 32
 ) (
@@ -2554,10 +2577,7 @@ Not covered exhaustively: products outside int16 against middle values of C for 
 ```systemverilog
 `timescale 1ns / 100ps
 
-// fxMac against the C reference (int_ref_core.h) through DPI, bit for bit. Default: triples worked by hand, corner triples, triples whose
-// sum lands on a saturation bound or next to it, random triples, idle cycles between some. +MODE=AX|XC +FIXED=<hex> +LO=<n> +HI=<n>:
-// every inner pattern for each outer pattern in [LO, HI) (AX: outer A, inner X, C fixed; XC: outer X, inner C, A fixed), and with
-// +DIGEST=<file> per outer value the sums check_ipu.py --digest recomputes from ipu.py. +DUMP=<file> writes every result.
+// fxMac against the C reference through DPI: default triples, or +MODE/+FIXED/+LO/+HI sweep slices with a +DIGEST for check_ipu.py.
 module TB_fxMac #(
     parameter int W      = 16,
     parameter int FRAC   = 11,
@@ -2811,9 +2831,7 @@ Expected: Verilator stops with `Cannot find file containing module` naming `src/
 ```systemverilog
 `timescale 1ns / 100ps
 
-// Fixed-point multiply-add, one Horner step of the int8 GPNAE lane: result_o = sat_W(floor(A * X / 2^FRAC) + C); Q4.11 at the defaults.
-// Full 2W-bit signed product, arithmetic shift right by FRAC (floor, D-1), 2W-bit add of C, one saturation to W bits after the add.
-// valid_i at t, done_o at t+2 (product registered, then shift, add and saturate registered); only the valid bits are reset.
+// Fixed-point multiply-add, one Horner step: result_o = sat_W(floor(A * X / 2^FRAC) + C); done_o at t+2; only valid bits reset (D-8).
 module fxMac #(
     parameter int W    = 16,
     parameter int FRAC = 11
@@ -2999,12 +3017,13 @@ Report the six sweeps' totals (6 x 4,294,967,296 results, errors, digest mismatc
 - Consumes: `ipu.requant`, `ipu.bits`, `ipu.ROUNDINGS`, `ipu.INT32_MIN/MAX` (Task 1); `$J/cmds/int8_aril.sh` (Task 0);
   `sienna_fmt_pkg::req_lat()` (Task 3), which the testbench checks the latency against.
 - Produces:
-  - `module tfliteRequant #(parameter string ROUNDING = "DOUBLE") (input clk_i, rstn_i, valid_i, input signed [31:0]
+  - `module tfliteRequant #(parameter string ROUNDING = sienna_fmt_pkg::REQ_ROUNDING) (input clk_i, rstn_i, valid_i, input signed [31:0]
     acc_i, mult_i, input signed [7:0] shift_i, zp_i, act_min_i, act_max_i, output [7:0] result_o, output done_o)`;
     `result_o = clamp(MultiplyByQuantizedMultiplier(acc_i, mult_i, shift_i) + zp_i, act_min_i, act_max_i)` as
     `ipu.requant`; one result per cycle; valid_i at t, done_o at t + `sienna_fmt_pkg::req_lat()` (3); only the valid
     bits are reset (D-8); `shift_i` in [-31, 30] (a simulation assertion checks it); `ROUNDING` other than "SINGLE" or
-    "DOUBLE" fails elaboration. Its users instantiate `.ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)`; the DV runs both.
+    "DOUBLE" fails elaboration. The default is `sienna_fmt_pkg::REQ_ROUNDING`, so every compile of the unit lists the
+    package first; its users still write `.ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)`; the DV overrides it to run both.
   - Vector line format (TB input and the committed `.mem` files): `acc mult shift zp act_min act_max expected`, hex,
     8 8 2 2 2 2 2 digits, the low bits of each value.
   - `gen_requant_vectors.py OUT --rounding SINGLE|DOUBLE [--random N] [--seed S]`: 33,718 corners, up to 2,000 vectors
@@ -3023,9 +3042,7 @@ no second (C) implementation needs its own proof; the same TB with the committed
 
 ```python
 #!/usr/bin/env python3
-"""Writes tfliteRequant vectors from ipu.requant, one per line in hex: acc mult shift zp act_min act_max expected.
-Corners first (every shift against int32 and multiplier extremes, output ties, zero points and clamps, vectors where the two
-roundings differ), then random vectors, three quarters of them aimed at outputs near the int8 range."""
+"""Writes tfliteRequant vectors from ipu.requant in hex (acc mult shift zp act_min act_max expected): corners, discriminators, random."""
 import argparse
 import itertools
 import os
@@ -3115,8 +3132,7 @@ if __name__ == "__main__":
 ```systemverilog
 `timescale 1ns / 100ps
 
-// tfliteRequant against ipu.requant's vectors (gen_requant_vectors.py): every result bit for bit, latency 3, one vector per
-// cycle with a bubble of random inputs every 64 vectors; no DPI, so it also runs in Vivado. +VEC=<file> picks the vectors.
+// tfliteRequant against ipu.requant's vectors, bit for bit, latency 3, a bubble every 64 vectors; no DPI, so Vivado runs it too.
 module TB_tfliteRequant #(
     parameter string ROUNDING = "DOUBLE"
 );
@@ -3256,10 +3272,10 @@ vectors:
 
 lint:
 	for r in DOUBLE SINGLE; do \
-	  verilator --lint-only -Wall -Wno-fatal -DSYNTHESIS --top-module tfliteRequant -GROUNDING="\"$$r\"" $(DESIGN) || exit 1; done
+	  verilator --lint-only -Wall -Wno-fatal -DSYNTHESIS --top-module tfliteRequant -GROUNDING="\"$$r\"" $(PKG) $(DESIGN) || exit 1; done
 
 lint_bad:
-	verilator --lint-only -Wno-fatal -Werror-USERFATAL --top-module tfliteRequant -GROUNDING='"NEAREST"' $(DESIGN) \
+	verilator --lint-only -Wno-fatal -Werror-USERFATAL --top-module tfliteRequant -GROUNDING='"NEAREST"' $(PKG) $(DESIGN) \
 	  > $(PRJ_DIR)/Verilator/lint_bad.txt 2>&1; rc=$$?; cat $(PRJ_DIR)/Verilator/lint_bad.txt; \
 	  if grep -q "tfliteRequant: unsupported ROUNDING" $(PRJ_DIR)/Verilator/lint_bad.txt && [ $$rc -ne 0 ]; then echo REJECTED; \
 	  else echo NOT-REJECTED; echo "RESULT: FAILED"; exit 1; fi
@@ -3279,11 +3295,9 @@ Expected: the generator prints `... 33718 corners, ...`, then a Verilator error 
 ```systemverilog
 `timescale 1ns / 100ps
 
-// TFLite's int8 requantize, bit-exact: clamp(MultiplyByQuantizedMultiplier(acc, mult, shift) + zp, act_min, act_max).
-// ROUNDING "DOUBLE": gemmlowp SaturatingRoundingDoublingHighMul then RoundingDivideByPOT; "SINGLE": TFLITE_SINGLE_ROUNDING.
-// int32 intermediates wrap as TFLite's C does; shift_i in [-31, 30]; valid_i at t, done_o at t+3; only valid bits reset.
+// TFLite's int8 requantize, bit-exact (DOUBLE: SRDHM then RoundingDivideByPOT; SINGLE: TFLITE_SINGLE_ROUNDING), 3 stages.
 module tfliteRequant #(
-    parameter string ROUNDING = "DOUBLE"
+    parameter string ROUNDING = sienna_fmt_pkg::REQ_ROUNDING  // G0's variant; the DV overrides it to run both
 ) (
     input  logic               clk_i,
     input  logic               rstn_i,
@@ -3422,13 +3436,12 @@ cd SystolicMesh/ArithmeticLibrary/Requant && make vectors && cp testbenches/vect
 ```bash
 $J/snap_launch_tree.sh i7_vec 32 1 $J/cmds/int8_req_vec.sh
 V=/proj/work/spramanik/SIENNA_int8/SystolicMesh/ArithmeticLibrary/Requant/testbenches
-ls $V/vectors_*.mem 2>/dev/null && echo "EXISTS: look before copying"   # expect nothing
-cp $J/runs/i7_vec/results/int8/vectors_double.mem $J/runs/i7_vec/results/int8/vectors_single.mem $V/
+for f in vectors_double.mem vectors_single.mem; do test ! -e $V/$f && cp $J/runs/i7_vec/results/int8/$f $V/ || echo "EXISTS: $V/$f, look before copying"; done
 wc -l $V/vectors_*.mem
 $J/snap_launch_tree.sh i7_viv 32 1 $J/cmds/int8_aril.sh Requant vivado_tb
 ```
 
-Expected: each file has 33,718 + discriminators + 10,000 lines (about 45,700, about 1.4 MB); the testbench prints
+Expected: no `EXISTS` line; each file has 33,718 + discriminators + 10,000 lines (about 45,700, about 1.4 MB); the testbench prints
 `tfliteRequant ROUNDING=DOUBLE: N vectors from vectors_double.mem, 0 errors, latency 3` and the same for SINGLE, both
 `RESULT: PASSED`.
 
@@ -3540,7 +3553,7 @@ done
 echo "compared $n logs with runs/g1b: $bad differ"
 ```
 
-Then check that the float RTL and its DV are those of the bf16 branch (AriL `d97e270`, which the bf16 SIENNA pins) apart from the D-7 guards, and that the fxMac RTL is the one the sweeps proved:
+Then check that the float RTL and its DV are those of the bf16 branch (AriL `d97e270`, which the bf16 SIENNA pins) apart from the D-7 guards (Task 3) and Task 1's `ipu` target in `Common/Makefile`, and that the fxMac RTL is the one the sweeps proved:
 
 ```bash
 $J/cmds/int8_g1_compare.sh i8_g1
@@ -3553,7 +3566,7 @@ git diff d97e270 -- Common/src/sienna_fmt_pkg.sv
 for s in $J/snaps/i6_[AX][XC]_*_[0-3].tar; do tar -xOf $s ./SystolicMesh/ArithmeticLibrary/Multipliers/Fx/src/fxMac.sv | command cmp -s - Multipliers/Fx/src/fxMac.sv || echo "fxMac differs from sweep $(basename $s)"; done
 ```
 
-Expected: `compared 15 logs with runs/g1b: 0 differ`. Both runs use Verilator's default seed, so even the random power-up logs (the D-1 count of the bf16 plan in `Adders_FP_randinit.log`) must match; a difference there is investigated, not waived. The first `git diff --stat` shows only `Multipliers/FP/src/fpMultiplier.sv` and `Adders/FP/src/fpAdder.sv`, 5 insertions each (Task 3's guard and the blank line before it). The package diff shows only Task 3's int8 additions (`is_int`, `acc_w`, the int8 latencies, `fx_lat`, `req_lat`, `REQ_ROUNDING`): the fp32 and bf16 branches of `supported`, `mul_lat` and `add_lat` still return what they did, which `Common_pkg.log` confirms. The sweep loop prints nothing: all 24 sweep snapshots hold the fxMac RTL that is being gated. `Common_pkg.log` is among the compared logs, and its summary line (`TB_sienna_fmt_pkg: 0 errors`) must still match. If it prints a line, relaunch the 24 sweeps of Task 6 Step 7 on the new RTL before writing the report.
+Expected: `compared 15 logs with runs/g1b: 0 differ`. Both runs use Verilator's default seed, so even the random power-up logs (the D-1 count of the bf16 plan in `Adders_FP_randinit.log`) must match; a difference there is investigated, not waived. The first `git diff --stat` shows exactly three files: `Multipliers/FP/src/fpMultiplier.sv` and `Adders/FP/src/fpAdder.sv`, 5 insertions each (Task 3's guard and the blank line before it), and `Common/Makefile`, 5 insertions and 2 deletions (Task 1: the header comment, the `ipu` target and its `.PHONY` entry); `git diff d97e270 -- Common/Makefile` shows nothing else, so the `pkg` and `dump32` recipes are unchanged. The package diff shows only Task 3's int8 additions (`is_int`, `acc_w`, the int8 latencies, `fx_lat`, `req_lat`, `REQ_ROUNDING`): the fp32 and bf16 branches of `supported`, `mul_lat` and `add_lat` still return what they did, which `Common_pkg.log` confirms. The sweep loop prints nothing: all 24 sweep snapshots hold the fxMac RTL that is being gated. `Common_pkg.log` is among the compared logs, and its summary line (`TB_sienna_fmt_pkg: 0 errors`) must still match. If it prints a line, relaunch the 24 sweeps of Task 6 Step 7 on the new RTL before writing the report.
 
 - [ ] **Step 4: Write the gate report**
 
@@ -3566,7 +3579,7 @@ Write `$T/testbenches/results/int8/aril_gate.log` by hand from the job outputs, 
 - 3, intAdder: sums, errors, latency, the six wrap corners by name; model mismatches; Vivado; random power-up; lint;
 - 4, fxMac: default-stimulus results, errors, latency; model mismatches; Vivado; random power-up; lint; the six sweeps (a table: sweep, results, errors, digest mismatches, slice times from `runs/i6_*`), with the fxMac commit the sweeps proved and the Step 3 check that every sweep snapshot holds the gated RTL; what the sweeps do not cover (Task 6);
 - 5, tfliteRequant (Task 7): vectors per rounding (corners, discriminators, random), errors, latency; Vivado; random power-up; lint; `lint_bad` rejected;
-- 6, fp32 / bf16 units unchanged: the RTL diff against `d97e270` (the D-7 guards only); `int8_g1_compare.sh` (N logs, 0 differ); the fp32 unit TBs' `SUCCESS` counts (2003 / 2007 in g1b), fpMulWiden;
+- 6, fp32 / bf16 units unchanged: the diff against `d97e270` (the D-7 guards in the RTL, and Task 1's `ipu` target in `Common/Makefile`); `int8_g1_compare.sh` (N logs, 0 differ); the fp32 unit TBs' `SUCCESS` counts (2003 / 2007 in g1b), fpMulWiden;
 - 7, findings in ipu.py or the published units, reported and not changed (none expected);
 - NOT RUN AT THIS LEVEL: VCS; Vivado itself (the Vivado testbenches ran in Verilator); synthesis of the new units; the other AriL copy, `GPNAE/ArithmeticLibrary`, which stays at `d97e270` until Level 2 moves its pointer.
 
@@ -3582,7 +3595,7 @@ git push git@github.com:SoHam-56/ArithmeticLibrary.git int8
 test "$(git ls-remote git@github.com:SoHam-56/ArithmeticLibrary.git refs/heads/int8 | cut -f1)" = "$(git rev-parse HEAD)" && echo PUSHED
 ```
 
-Expected: `PUSHED`. `git log` lists Task 3's, Task 4's, Task 5's, Task 6's and Task 7's commits and nothing else. The SystolicMesh and GPNAE pointers to AriL move in Levels 3 and 2, not here.
+Expected: `PUSHED`. `git log` lists Task 1's two commits (`ipu.py`, `test_ipu.py` with `Common/Makefile`), Task 3's five (the package, the two D-7 guards, the package TB, `ipu.py`'s `REQ_ROUNDING`), Task 4's, Task 5's, Task 6's and Task 7's commits, any gate fix from this task, and nothing else. The SystolicMesh and GPNAE pointers to AriL move in Levels 3 and 2, not here.
 
 - [ ] **Step 6: Report to Soham and wait**
 
@@ -4050,7 +4063,8 @@ git push origin int8
 
 **Interfaces:**
 - Consumes: `ipu.fx_mac`, `ipu.int_mul(a, b, w)`, `ipu.requant(acc, mult, shift, zp, amin, amax, rounding)`,
-  `ipu.REQ_ROUNDING` (Tasks 1 and 3).
+  `ipu.quantize_multiplier` (Task 1), `ipu.REQ_ROUNDING` (Tasks 1 and 3), all through GPNAE's own
+  `ArithmeticLibrary/Common/models`, so the GPNAE clone needs nothing from SIENNA.
 - Produces (in `gpnae_model`):
   - `INT8` (name `"int8"`, `w = 8`, `frac = 11`, `iw = 16`, `eps = 2^-7`); `FORMATS = dict(fpu.FORMATS, int8=INT8)`.
   - `Lane(FORMATS["int8"], rom, sets=None, thresh=None)` returns a `LaneInt8`: `.run(q, code, par) -> np.ndarray`
@@ -4061,7 +4075,8 @@ git push origin int8
   - `Int8Params(mx, shx, zin, mout, shout, zout)`; `Case(s_in, z_in, s_out, z_out, gated)`; `INT8_CASES` (five cases
     per activation name); `int8_params(case, code)`; `exact_lsb(q, code, case) -> (y, z)` (the exact function in output
     LSB before zero point, rounding and clamp, and the output zero point); `exact_int8(q, code, case)`;
-    `rescale_params(s_in) -> (mx, shx)`; `quantize_multiplier(real) -> (mult, shift)` (TFLite's QuantizeMultiplier);
+    `rescale_params(s_in) -> (mx, shx)`; `quantize_multiplier(real) -> (mult, shift)` (TFLite's QuantizeMultiplier,
+    `ipu.quantize_multiplier` imported from GPNAE's AriL submodule, not a second copy);
     `calib_out`, `selu_case`.
   - The tolerance (L2-4): `REL_TOL_INT8` (= `number_formats.suggested_rel_tol(INT8)` = 0.0625), `ABS_TOL_LSB` (= 1);
     `Acc(ok, fail, worst_rel, worst_lsb, real_lsb, differ)`; `accuracy_int8(out, q, code, case) -> Acc` (one case:
@@ -4125,7 +4140,7 @@ eq("SELU -4 <= x < 0: x * P = 0 with a zero table", zero.run(np.array([-5]), 1, 
 p3 = gm.Int8Params(mx=26214, shx=7, zin=0, mout=1 << 30, shout=-20, zout=3)  # s_in = 0.1
 eq("SELU x = -4 inside, x < -4: -lambda*alpha, requantized", zero.run(np.array([-40, -41, -71]), 1, p3), [3, -25, -25])
 eq("ReLU and linear pass through", [int(v) for v in zero.run(np.array([-5, 7]), 4, p)] + [int(v) for v in zero.run(np.array([-5, 7]), 5, p)], [-5, 7, -5, 7])
-eq("every case's rescale fits", [int(0 <= gm.int8_params(c, 3).mx <= 32767) for a in ("tanh", "sigmoid", "selu") for c in gm.INT8_CASES[a]], [1] * 15)
+eq("every case's rescale is normalized and within half a step", [int((16384 <= p.mx <= 32767 or p.shx == 31) and abs(p.mx - c.s_in * 2048 * 2.0 ** p.shx) <= 0.5) for a in ("tanh", "sigmoid", "selu") for c in gm.INT8_CASES[a] for p in [gm.int8_params(c, 3)]], [1] * 15)
 eq("REL_TOL_INT8 is GPNAE's max(1%, 8 * 2^-7)", (gm.REL_TOL_INT8, gm.ABS_TOL_LSB), (0.0625, 1))
 ct = gm.Case(1 / 32, 0, 1 / 128, 0, True)  # tanh golden: q = 0 -> 0, q = 32 -> 97, q = 1 -> 4
 a = gm.accuracy_int8(np.array([1, 98, 99, 110, 5, 6]), np.array([0, 32, 32, 32, 1, 1]), 3, ct)
@@ -4156,7 +4171,9 @@ Tolerance: tanh at s_in = 1/32 has goldens `round(128 tanh(q / 32))` = 0, 97 and
 and 5 are 1 LSB off (pass on the absolute bound; q = 0's zero golden has no relative bound), 99 is 2/97 = 2.1% (pass),
 110 is 13/97 = 13.4% and 6 is 2/4 = 50% (fail), so 2 fail, the worst relative error is 0.5, the worst `abs(d)` 13, and
 `110 - 128 tanh(1) = 12.516` LSB against the unquantized function. Sigmoid at q = 0: golden 0, 128 LSB above the zero
-point -128, so 4 off is 3.1% (pass) and 9 off is 9/128 = 0.0703125 (fail).
+point -128, so 4 off is 3.1% (pass) and 9 off is 9/128 = 0.0703125 (fail). The rescale row recomputes L2-2 for every
+case: a `shx` below 31 means `shx + 1` overflowed 15 bits, so `mx >= 2^14` (relative precision 2^-15 or better), and
+`mx` is `s_in * 2^11 * 2^shx` rounded, within half a step; a search that stopped early or rounded wrongly fails it.
 
 `$J/cmds/int8_py.sh`:
 
@@ -4175,9 +4192,16 @@ Expected: `AttributeError: module 'gpnae_model' has no attribute 'rescale'`.
 - [ ] **Step 3: Write the int8 lane model**
 
 In `gpnae_model.py`, extend the docstring's first line with `; the int8 lane (gpnae_poly_int8) on AriL's ipu.py.`,
-add `from collections import namedtuple` to the imports, and `import ipu  # noqa: E402` and
-`from number_formats import suggested_rel_tol  # noqa: E402` (GPNAE root, the float regression's tolerance rule) after
-`import fpu`. Add this
+add `from collections import namedtuple` to the imports, and after `import fpu`:
+
+```python
+import ipu  # noqa: E402
+from ipu import quantize_multiplier  # noqa: E402,F401  TFLite's QuantizeMultiplier, AriL's one copy
+from number_formats import suggested_rel_tol  # noqa: E402  GPNAE root, the float regression's tolerance rule
+```
+
+Both come through the `ArithmeticLibrary/Common/models` path `gpnae_model` already puts on `sys.path` for `fpu`, so
+GPNAE keeps working in its own clone, fp32 included; nothing is imported from the SIENNA root. Add this
 method at the top of `class Lane`:
 
 ```python
@@ -4261,20 +4285,6 @@ def rescale_params(s_in):
     raise ValueError(f"input scale {s_in} is too large for Q4.11")
 
 
-def quantize_multiplier(real):
-    """TFLite's QuantizeMultiplier: real = mult * 2^shift / 2^31, mult in [2^30, 2^31)."""
-    if real == 0.0:
-        return 0, 0
-    q, shift = np.frexp(real)
-    qf = int(np.floor(q * (1 << 31) + 0.5))  # TfLiteRound: half away from zero, q > 0
-    if qf == 1 << 31:
-        qf //= 2
-        shift += 1
-    if shift < -31:
-        return 0, 0
-    return qf, int(shift)
-
-
 def calib_out(y_lo, y_hi):
     """TFLite-style int8 output quantization of [y_lo, y_hi], widened to hold 0."""
     lo, hi = min(y_lo, 0.0), max(y_hi, 0.0)
@@ -4290,8 +4300,7 @@ def selu_case(s_in, z_in, gated=True):
     return Case(s_in, z_in, s_out, z_out, gated)
 
 
-# Scales put the fitted range (the float lane's thresholds) at 128, 32 and 8 int8 steps (SELU: 128, 64, 256).
-# The SELU case at 7/32 reaches x = 27.8, past Q4.11; it is checked bit-exact only (not gated for accuracy).
+# Scales put the fitted range at 128, 32 and 8 int8 steps (SELU 128, 64, 256); SELU at 7/32 passes Q4.11 and is checked bit-exact only.
 INT8_CASES = {
     "tanh": [Case(4.0 / n, z, 1 / 128, 0, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, -37), (64, 100))],
     "sigmoid": [Case(3.5 / n, z, 1 / 256, -128, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, 25), (64, -100))],
@@ -4650,15 +4659,13 @@ the whole-table rows; a `VERDICT:` line; `guard fp32 exit=1`, `guard bf16 exit=1
 
 ```bash
 cd /proj/work/spramanik/SIENNA_int8/GPNAE
-ls poly_coeffs_int8.mem src/TYTAN/Memory/poly_coeffs_int8.mem   # must not exist yet
-cp $J/runs/i10_fit/results/int8/poly_coeffs_int8.mem poly_coeffs_int8.mem
-cp $J/runs/i10_fit/results/int8/poly_coeffs_int8.mem src/TYTAN/Memory/poly_coeffs_int8.mem
+for f in poly_coeffs_int8.mem src/TYTAN/Memory/poly_coeffs_int8.mem; do test ! -e $f && cp $J/runs/i10_fit/results/int8/poly_coeffs_int8.mem $f || echo "EXISTS: $f, look before copying"; done
 wc -l poly_coeffs_int8.mem && awk '{ print length($0) }' poly_coeffs_int8.mem | sort -u
 git status --short
 cmp poly_coeffs_bf16.mem /proj/work/spramanik/SIENNA/GPNAE/poly_coeffs_bf16.mem && cmp poly_coeffs.mem /proj/work/spramanik/SIENNA/GPNAE/poly_coeffs.mem && echo PUBLISHED-UNCHANGED
 ```
 
-Expected: `32` lines, all of length `16`; `git status` shows the two new table files as untracked and the model and fit
+Expected: no `EXISTS` line; `32` lines, all of length `16`; `git status` shows the two new table files as untracked and the model and fit
 script as modified; `PUBLISHED-UNCHANGED`. After a `SETS_INT8` update, rerun the model check:
 `$J/snap_launch_tree.sh i10_check 32 1 $J/cmds/int8_py.sh check_gpnae_model_int8.py` (expected `RESULT: PASSED`; the
 checks use a zero table and do not depend on the layout).
@@ -5290,7 +5297,7 @@ Starts after Task 10's table (`fit exit=0`) and Task 11.
 
 **Files:**
 - Modify: `testbenches/TB_gpnae_poly.sv` (int8 mode), `regression.py` (`--format int8`, `REQ_ROUNDING` in the header)
-- Modify (SIENNA): `tflite_oracle.py` (append `activation_int8`)
+- Modify (SIENNA): `tflite_oracle.py` (`activation_int8`, above the `if __name__ == "__main__":` guard)
 - Create (SIENNA): `gpnae_int8_tflite.py`
 - Create (no repo): `$J/cmds/int8_tfl_act.sh`, `$J/cmds/int8_gpnae_gate.sh`
 - Create (SIENNA, untracked): `testbenches/results/int8/gpnae_gate.log`
@@ -5298,7 +5305,7 @@ Starts after Task 10's table (`fit exit=0`) and Task 11.
   report builder reads in Task 22; outside `results/`)
 
 **Interfaces:**
-- Consumes: everything above; `tflite_oracle.py`, `tflite_ref.quantize_multiplier` (Task 2); TensorFlow in
+- Consumes: everything above; `tflite_oracle.py` (Task 2); TensorFlow in
   `$J/venv` (Task 0).
 - Produces:
   - `python3 regression.py --lane poly --format int8 [--seed S]`: every int8 input once per case of
@@ -5557,13 +5564,12 @@ accuracy item for Soham (Step 7), and the gate goes on. Figures that differ from
 
 - [ ] **Step 5: Add the TFLite helper and the agreement report**
 
-Append to `tflite_oracle.py` (SIENNA root):
+In `tflite_oracle.py` (SIENNA root), insert between the end of `main()` and the `if __name__ == "__main__":` guard
+(the module already imports numpy and tensorflow at the top), with two blank lines on each side:
 
 ```python
 def activation_int8(op, in_scale, in_zp):
     """TFLite's int8 TANH or LOGISTIC (reference kernels) on every int8 input; returns (outputs, input scale, input zero point)."""
-    import numpy as np
-    import tensorflow as tf
     lo, hi = in_scale * (-128 - in_zp), in_scale * (127 - in_zp)
     grid = np.linspace(lo, hi, 256, dtype=np.float32).reshape(1, 256)
     model = tf.keras.Sequential([tf.keras.Input(shape=(256,)),
@@ -5603,7 +5609,6 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "GPNAE"))
 import gpnae_model as gm  # noqa: E402
 import tflite_oracle  # noqa: E402
-import tflite_ref  # noqa: E402
 
 
 def main():
@@ -5623,13 +5628,9 @@ def main():
             d = np.abs(hw - tfl)
             L.append(f"{op:<9}{s:>11.6f}{z:>6}{int((d == 0).sum()):>7}{int((d == 1).sum()):>7}{int(d.max()):>8}"
                      f"{int(np.abs(tfl - ex).max()):>13}{int(np.abs(hw - ex).max()):>11}")
-    reals = 10.0 ** np.random.RandomState(1).uniform(-9, 0, 10000)
-    bad = [r for r in reals if tuple(gm.quantize_multiplier(r)) != tuple(int(v) for v in tflite_ref.quantize_multiplier(r))]
-    L.append(f"quantize_multiplier: gpnae_model against tflite_ref on {len(reals)} reals in [1e-9, 1): {len(bad)} differ")
     os.makedirs(os.path.dirname(os.path.abspath(a.report)), exist_ok=True)
     open(a.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L))
-    sys.exit(1 if bad else 0)
 
 
 if __name__ == "__main__":
@@ -5646,10 +5647,10 @@ $J/venv/bin/python3 gpnae_int8_tflite.py --report $R/gpnae_vs_tflite.log
 ```
 
 Run: `$J/snap_launch_tree.sh i12_tfl 32 2 $J/cmds/int8_tfl_act.sh`
-Expected: `runs/i12_tfl/results/int8/gpnae_vs_tflite.log` with ten rows (5 tanh, 5 logistic) and
-`quantize_multiplier: ... 0 differ`, exit 0. The agreement counts are reported as they come; they are not gated. A
-non-zero `differ` is a bug in `gm.quantize_multiplier`: make it follow `tflite_ref`'s (Task 2 validated that one against
-the interpreter). If the converter does not give a single int8 op (the `assert`), record the op list in the report
+Expected: `runs/i12_tfl/results/int8/gpnae_vs_tflite.log` with ten rows (5 tanh, 5 logistic), exit 0. The agreement
+counts are reported as they come; they are not gated. (No multiplier cross-check: `gm.quantize_multiplier` and
+`tflite_ref.quantize_multiplier` are both `ipu.quantize_multiplier`, so there is nothing independent to compare; Task 1's
+known values and G0 check that one copy.) If the converter does not give a single int8 op (the `assert`), record the op list in the report
 instead and tell Soham; do not work around it silently.
 
 - [ ] **Step 6: The gate job**
@@ -5739,12 +5740,11 @@ does not exist:
 
 ```bash
 D=/proj/work/spramanik/SIENNA_int8/testbenches/int8
-ls $D/gpnae_int8_accuracy.json 2>/dev/null && echo "EXISTS: look before copying"   # expect nothing
-mkdir -p $D && cp $J/runs/i12_g2/results/int8/g2/int8_seed1/gpnae_int8_accuracy.json $D/
+mkdir -p $D && test ! -e $D/gpnae_int8_accuracy.json && cp $J/runs/i12_g2/results/int8/g2/int8_seed1/gpnae_int8_accuracy.json $D/ || echo "EXISTS: $D/gpnae_int8_accuracy.json, look before copying"
 python3 -c "import json; d = json.load(open('$D/gpnae_int8_accuracy.json')); print({k: (v['pass'], v['rel_tol'], v['abs_tol_lsb'], round(100 * v['worst_rel'], 2), v['worst_lsb']) for k, v in d['activations'].items()})"
 ```
 
-Expected: `selu`, `sigmoid` and `tanh`, each with `rel_tol` 0.0625, `abs_tol_lsb` 1, and the pass flag, worst relative
+Expected: no `EXISTS` line; `selu`, `sigmoid` and `tanh`, each with `rel_tol` 0.0625, `abs_tol_lsb` 1, and the pass flag, worst relative
 error and worst LSB of the seed-1 run's per-activation tolerance lines.
 
 - [ ] **Step 8: Commit and report**
@@ -5811,7 +5811,7 @@ every float netlist keeps the same widths and the same units, and only the int8 
     `ProcessingElement.partial_o` are `[U-1:0][ACC_W-1:0]`. `AccumulationUnit`: its `DATA_WIDTH` parameter is replaced by
     `ACC_W` (every port and the tree). In int8, `U = min(K, add_lat + 1) = min(K, 2)`.
   - Elaboration fails with `$fatal` for an unsupported format (PE, reducer) and for an `ACC_W` other than `acc_w(EXP_W, MAN_W)` (PE, reducer).
-  - `$J/cmds/int8_mesh.sh lintall | lintref | pe | unit | same | slint` (results in `testbenches/results/int8/` of the snapshot, copied to `$J/runs/NAME/results/int8/`).
+  - `$J/cmds/int8_mesh.sh lintall | lintref | pe | unit | same` (results in `testbenches/results/int8/` of the snapshot, copied to `$J/runs/NAME/results/int8/`). SIENNA's own lint is not run at this level: GPNAE's working tree already instantiates `fxMac`, `tfliteRequant` and `gpnae_poly_int8` (Tasks 9, 11), which SIENNA's file lists gain only in Task 16, so it runs there (Task 16 Step 10).
 
 - [ ] **Step 1: Write the failing test and the job script**
 
@@ -5925,7 +5925,7 @@ endmodule
 
 ```bash
 #!/bin/bash
-# int8 mesh checks on a snapshot; args: lintall | lintref | pe | unit | same | slint; results in testbenches/results/int8; run from a snapshot root.
+# int8 mesh checks on a snapshot; args: lintall | lintref | pe | unit | same; results in testbenches/results/int8; run from a snapshot root.
 export VERILATOR_ROOT="$HOME/.local/share/verilator"
 J=/proj/work/spramanik/sienna_jobs
 ROOT=$(pwd); R=$ROOT/testbenches/results/int8; mkdir -p "$R"
@@ -5972,14 +5972,7 @@ case $1 in
       if command diff -rq $W/old/$FMT$N$CK $W/new/$FMT$N$CK; then echo "IDENTICAL $FMT N=$N ck=$CK"; else echo "DIFFERENT $FMT N=$N ck=$CK"; rc=1; fi
     done; done; done
     exit $rc ;;
-  slint)
-    cd "$ROOT" || exit 1
-    make lint > $R/sienna_make_lint.txt 2>&1
-    echo "SIENNA make lint: exit=$?, $(command grep -c '^%Error' $R/sienna_make_lint.txt) errors"
-    verilator --lint-only -Wall -Wno-fatal -DSYNTHESIS --top-module sienna_layer -Isrc -f synth/sienna_rtl.f -GN=16 -GNUM_LANES=32 \
-      > $R/sienna_rtl_f_lint.txt 2>&1
-    echo "sienna_rtl.f lint: exit=$?, $(command grep -c '^%Error' $R/sienna_rtl_f_lint.txt) errors" ;;
-  *) echo "usage: int8_mesh.sh lintall|lintref|pe|unit|same|slint"; exit 2 ;;
+  *) echo "usage: int8_mesh.sh lintall|lintref|pe|unit|same"; exit 2 ;;
 esac
 ```
 
@@ -6371,7 +6364,10 @@ In `/proj/work/spramanik/SIENNA_int8/synth/sienna_rtl.f`, insert
 `SystolicMesh/ArithmeticLibrary/Multipliers/Int/src/intMultiplier.sv` after the `fpMultiplier.sv` line and
 `SystolicMesh/ArithmeticLibrary/Adders/Int/src/intAdder.sv` after the `fpAdder.sv` line.
 
-Without them, every SIENNA build (fp32 and bf16 too) fails to link the PE and reducer, for the reason in Step 3.
+Without them, every SIENNA build (fp32 and bf16 too) fails to link the PE and reducer, for the reason in Step 3. No
+SIENNA lint or build runs before Task 16: GPNAE's working tree (Tasks 9 and 11) instantiates `fxMac`, `tfliteRequant`
+and `gpnae_poly_int8`, which SIENNA's lists gain only in Task 16 Step 6, so SIENNA's lint is Task 16 Step 10; Levels 2
+and 3 build only GPNAE's and SystolicMesh's own Makefiles and scripts.
 
 - [ ] **Step 8: Run the checks**
 
@@ -6379,7 +6375,6 @@ Without them, every SIENNA build (fp32 and bf16 too) fails to link the PE and re
 $J/snap_launch_tree.sh m13_pe 32 1 $J/cmds/int8_mesh.sh pe
 $J/snap_launch_tree.sh m13_lint 32 1 $J/cmds/int8_mesh.sh lintall
 TREE=/proj/work/spramanik/SIENNA $J/snap_launch_tree.sh m13_lintref 32 1 $J/cmds/int8_mesh.sh lintref   # the bf16 tree, read-only
-$J/snap_launch_tree.sh m13_slint 32 1 $J/cmds/int8_mesh.sh slint
 for F in fp32 bf16; do for C in 1 0; do
   $J/snap_launch_tree.sh m13_${F}_ck$C 64 12 $J/cmds/mesh_notrace.sh reg 16 $F $C
 done; done
@@ -6409,7 +6404,6 @@ Expected:
   with `unsupported format`; `bad_acc_int8` and `bad_acc_bf16` end in `REJECTED` with `ACC_W=16 is not` and
   `ACC_W=32 is not`. The int8 lint has no `WIDTH` warning on a line this task changed (read the `mesh_lint_int8*.txt` files).
 - `bf16 lint warnings unchanged` and `fp32 lint warnings unchanged`: the float netlists gained no warning class or count.
-- `m13_slint`: `SIENNA make lint: exit=0, 0 errors` and `sienna_rtl.f lint: exit=0, 0 errors`.
 - Each `m13_{fp32,bf16}_ck{1,0}` regression 72/72 (18 tests x 4 tiles) and `cycles identical` for all four. The TB is
   still the bf16 branch's here, so these runs compare the RTL alone.
 
@@ -6642,9 +6636,7 @@ Append to `mesh_model.py`:
 
 
 def matmul_int(passes, N, bias=None):
-    """The int8 mesh: int8 x int8 products summed in int32 two's complement, wrapping, over a set's passes, plus the bias.
-    Addition is associative mod 2^32, so the PE slots and the reduce tree's order do not change the result.
-    Operands are int8 values (not bit patterns), the bias N int32 values; returns int32 values as int64."""
+    """The int8 mesh: int8 x int8 products over a set's passes plus the bias, summed in wrapping int32; int8 values in, int64 out."""
     acc = np.zeros((N, N), dtype=np.int64)
     for A, B in passes:
         A = np.asarray(A, dtype=np.int64)
@@ -6882,8 +6874,7 @@ In `MATMUL_TESTS`, the two descriptions become `"Values ±100; int8 -128/127  (a
 `"Values ±1e-6; int8 -1/0/1  (underflow stress)"`. In `matmul_tests.py`'s module docstring, after the catalogue, add:
 
 ```
-int8 (stim_format.configure("int8", ...)): stim_format.rand draws the whole int8 range, mm_large_values uses
--128 and 127, mm_small_values -1, 0 and 1, and mm_signed_zero's rows are plain zeros.
+int8: stim_format.rand draws the whole int8 range; mm_large_values uses -128 and 127, mm_small_values -1, 0 and 1, mm_signed_zero zeros.
 ```
 
 In `conv_tests.py`'s module docstring, after `Supported matrix sizes`, add:
@@ -7089,21 +7080,24 @@ is reported "passed, no cycle reference".
 
 ```bash
 cd /proj/work/spramanik/SIENNA_int8
-for r in . SystolicMesh SystolicMesh/ArithmeticLibrary GPNAE; do echo "== $r"; git -C $r status -sb | head -3; done
+for r in . SystolicMesh SystolicMesh/ArithmeticLibrary GPNAE GPNAE/ArithmeticLibrary; do echo "== $r"; git -C $r status -sb; done
 command du -sh $J/runs $J/snaps
 ```
 
-Every repo shows its `int8` branch with no `ahead` and no modified tracked file, except SIENNA's uncommitted `Makefile`
-and `synth/sienna_rtl.f` (Task 13 Step 7); the only untracked SIENNA path is `.claude/scratch/`. Both AriL checkouts
+Every repo shows its `int8` branch with no `ahead`. SystolicMesh, GPNAE and both AriL checkouts have no modified tracked
+file. SIENNA shows exactly four modified paths, all expected here: ` M GPNAE` (Tasks 9 to 12's commits; SIENNA's GPNAE
+pointer moves in Task 16), ` M SystolicMesh` (Tasks 13 and 14's commits; the pointer moves in Step 5 below), and the
+uncommitted ` M Makefile` and ` M synth/sienna_rtl.f` (Task 13 Step 7, committed with the pointer in Step 5); any other
+modified path is a stop. The only untracked SIENNA path is `.claude/scratch/`. Both AriL checkouts
 must be on the same commit, and the SystolicMesh and GPNAE pointers must name it:
 
 ```bash
 a=$(git -C SystolicMesh/ArithmeticLibrary rev-parse HEAD); b=$(git -C GPNAE/ArithmeticLibrary rev-parse HEAD)
 [ "$a" = "$b" ] && echo "SAME-ARIL $a" || echo "DIFFERENT-ARIL $a $b"
 git -C SystolicMesh ls-tree HEAD ArithmeticLibrary; git -C GPNAE ls-tree HEAD ArithmeticLibrary   # both name $a
-``` The snapshots taken
-below are of this state. The sweep takes about 100
-snapshots of about 25 MB each (2.5 GB) plus small run directories; if `/proj/work` looks near its quota, stop and ask
+```
+
+The snapshots taken below are of this state. The sweep takes about 100 snapshots of about 25 MB each (2.5 GB) plus small run directories; if `/proj/work` looks near its quota, stop and ask
 Soham before anything is deleted (a full quota truncates Verilator output silently).
 
 Set `NOT_BUILDABLE` in `g3i_summary.py` from Task 0's record of the points the bf16 branch could not build. At the time
@@ -7117,9 +7111,7 @@ the summary uses them to say why.
 
 ```python
 #!/usr/bin/env python3
-"""Builds the int8 G3 mesh gate report from the g3i_* farm runs and prints it: tests passed per N, format and collapse-k;
-fp32 and bf16 cycles test by test against the bf16 branch's G3 runs; int8 cycles against fp32's with the difference the
-unit latencies predict; random power-up; points not run and why; exit, wall time and peak memory per run."""
+"""Builds and prints the int8 G3 mesh gate report from the g3i_* runs: passes, fp32 / bf16 cycles against the bf16 branch, int8 against fp32."""
 import glob
 import os
 import re
@@ -7441,7 +7433,8 @@ pad (17) and dropout (18); until then int8 is checked by unit testbenches, and f
 
 **Files:**
 - Create: `src/requant_lanes.sv`, `testbenches/TB_requant_lanes.sv`, `testbenches/gen_rq_lanes.py`
-- Create (no repo): `$J/cmds/int8_unit.sh`, `$J/cmds/int8_rq_lanes.sh`, `$J/cmds/int8_cmp_reg.py`
+- Create (no repo): `$J/cmds/int8_unit.sh`, `$J/cmds/int8_pkg.sh`, `$J/cmds/int8_rq_lanes.sh`, `$J/cmds/int8_cmp_reg.py`,
+  `$J/cmds/int8_slint.sh`
 - Modify: `GPNAE` (pointer to the G2 tip; SystolicMesh's moved to the G3 tip in Task 15), `Makefile`, `synth/sienna_rtl.f`,
   `src/sienna_top.sv`
 
@@ -7468,6 +7461,12 @@ pad (17) and dropout (18); until then int8 is checked by unit testbenches, and f
     `testbenches/results/int8/TOP.log`, exit 0 only on `RESULT: PASSED`.
   - `$J/cmds/int8_cmp_reg.py REF_RUN NEW_RUN`: test-by-test result and cycles (single set and the three streamed passes)
     of two regression runs; exit 1 on any difference. Importable: `compare(ref, new) -> (ok, lines)`.
+  - `$J/cmds/int8_pkg.sh FMT TEST`: writes `testbenches/test_config_pkg.sv` and the stimulus of one `PIPELINE_TESTS`
+    test in FMT (N = 16, T = 4, 32 lanes) on a snapshot. The committed package is stale (it lacks `EXP_W`,
+    `SETS_IN_FLIGHT`, `EXACT_GOLDEN`, `MIXED_*`), and every launch snapshots the tree afresh, so any SIENNA build that is
+    not a `regression.py` run generates its package with this first (Tasks 16, 19, 20).
+  - `$J/cmds/int8_slint.sh FMT`: SIENNA `make lint` on a generated FMT package, then `cmd_sienna_fmt.sh lint` (both tops
+    through `synth/sienna_rtl.f`); Step 10.
 
 - [ ] **Step 1: Shared job scripts**
 
@@ -7490,8 +7489,7 @@ command grep -q "RESULT: PASSED" testbenches/results/int8/$top.log
 
 ```python
 #!/usr/bin/env python3
-"""Compares two SIENNA regression runs test by test: result, single-set cycles and the cycles of each streamed pass;
-args: REF_RUN NEW_RUN (names under sienna_jobs/runs); exit 1 if a reference test differs or is missing."""
+"""Compares two SIENNA regression runs test by test (result, single-set and streamed cycles); args: REF_RUN NEW_RUN; exit 1 on a difference."""
 import glob
 import os
 import re
@@ -7530,6 +7528,19 @@ if __name__ == "__main__":
     sys.exit(0 if ok else 1)
 ```
 
+`$J/cmds/int8_pkg.sh` (`chmod +x`), the generate-first step every non-regression SIENNA build uses:
+
+```bash
+#!/bin/bash
+# Writes testbenches/test_config_pkg.sv and one pipeline test's stimulus in FMT, so no build sees the stale committed package; args: FMT TEST; run from a snapshot root.
+python3 -c "
+import sys, regression as r
+t = next(x for x in r.PIPELINE_TESTS if x['name'] == sys.argv[2])
+r.generate_vectors({'n': 16, 'tile_size': 4, 'lanes': 32, 'host_words': 16, 'fmt_name': sys.argv[1], **t})" "$1" "$2" \
+  || { echo "PACKAGE GENERATION FAILED: $1 $2"; exit 1; }
+command grep -q "EXP_W" testbenches/test_config_pkg.sv || { echo "PACKAGE STALE: no EXP_W"; exit 1; }
+```
+
 The fp32 / bf16 references of this task are Task 0's `i0_sienna_fp32` and `i0_sienna_bf16` (`Passed : 29 / 29` each).
 
 - [ ] **Step 2: Write the failing unit test**
@@ -7538,8 +7549,7 @@ The fp32 / bf16 references of this task are Task 0's `i0_sienna_fp32` and `i0_si
 
 ```python
 #!/usr/bin/env python3
-"""Vectors for TB_requant_lanes: random sets of wide-read beats through requant_lanes' channel map, expected values from
-ipu.requant in the variant tflite_ref pins; arg: output .mem path (32-bit hex words)."""
+"""Vectors for TB_requant_lanes through its channel map, expected values from ipu.requant in tflite_ref's rounding; arg: output .mem path."""
 import os
 import sys
 
@@ -7589,8 +7599,7 @@ if __name__ == "__main__":
 ```systemverilog
 `timescale 1ns / 100ps
 
-// requant_lanes against ipu.requant: per-channel parameters, lane k's channel (k*PER_LANE + b) % N, 3-cycle latency.
-// rq_lanes.mem (gen_rq_lanes.py): SETS; per set zp, min, max, N multipliers, N shifts, then per beat NUM_LANES sums and NUM_LANES results.
+// requant_lanes against ipu.requant (rq_lanes.mem): per-channel words, lane k's channel (k*PER_LANE + b) % N, 3-cycle latency.
 module TB_requant_lanes;
   localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;
@@ -7723,8 +7732,7 @@ package, `ipu.REQ_ROUNDING` and `tflite_ref.ROUNDING` disagree.
 ```systemverilog
 `timescale 1ns / 100ps
 
-// int8: one tfliteRequant per lane on the mesh's wide read. Lane k's word at beat b is element k*PER_LANE + b of the
-// row-major N x N result, so its output channel is that element's column, (k*PER_LANE + b) % N.
+// int8: one tfliteRequant per lane on the wide read; lane k's word at beat b takes its column's channel, (k*PER_LANE + b) % N.
 module requant_lanes #(
     parameter int    NUM_LANES = 32,
     parameter int    N         = 16,
@@ -7909,8 +7917,7 @@ with
 8. After the stage controllers' `always_ff` (the block ending with `p_next_id <= p_next_id + 1'b1;`) add:
 
 ```systemverilog
-  // int8: requantize and GPNAE parameters travel with each set, indexed by its id like set_act (D-2). At g_accept the
-  // activation stage copies its set's per-channel words, so each lane chooses among N words, not NUM_IDS * N.
+  // int8 (D-2): parameters per set id; at g_accept the stage copies its set's per-channel words, so a lane picks among N, not NUM_IDS * N.
   if (IS_INT) begin : G_REQ_SETS
     logic [N-1:0][31:0] s_mult [NUM_IDS];
     logic [N-1:0][7:0]  s_shift[NUM_IDS];
@@ -8024,14 +8031,59 @@ python3 $J/cmds/int8_cmp_reg.py i0_sienna_bf16 s16_bf16
 Expected: 29/29 in both formats, and `IDENTICAL` for both comparisons (the same result, single-set cycles and streamed
 cycles for every test).
 
-- [ ] **Step 9: Commit (SIENNA) and push**
+- [ ] **Step 9: Commit (SIENNA)**
+
+The file lists are committed before the GPNAE bump, so no SIENNA commit fails to link: the bf16 branch's GPNAE links
+with the extra `fxMac`, `tfliteRequant` and `requant_lanes` files listed, while the new GPNAE's `barrel_mac` and
+`gpnae_poly_int8` need them. The two `gpnae_poly_int8.sv` lines are the exception and go into the bump commit itself:
+the old GPNAE has no such file and the new `gpnae_poly` instantiates it, so they are valid only with the new pointer.
+`git apply --cached --recount` stages the list edits without those two lines, non-interactively.
 
 ```bash
-git add GPNAE && git commit -m "Bump GPNAE: the fixed-point int8 lane (G2)"
+cd /proj/work/spramanik/SIENNA_int8
 git add src/requant_lanes.sv && git commit -m "requant_lanes: one tfliteRequant per lane on the wide read, channel from the element's column"
+git diff -- Makefile synth/sienna_rtl.f | command grep -v '^+.*gpnae_poly_int8\.sv' | git apply --cached --recount
+git diff --cached --stat                                                  # Makefile and synth/sienna_rtl.f only
+git diff -- Makefile synth/sienna_rtl.f | command grep '^[+-][^+-]'      # unstaged: exactly the two gpnae_poly_int8.sv lines
+git commit -m "File lists: fxMac, tfliteRequant, requant_lanes"
+git add GPNAE Makefile synth/sienna_rtl.f && git commit -m "Bump GPNAE: the fixed-point int8 lane (G2), with gpnae_poly_int8 in the file lists"
 git add src/sienna_top.sv && git commit -m "sienna_top: int8 requantize at the lane feed, per-set parameters (D-2), int32 bias and results"
-git add Makefile synth/sienna_rtl.f && git commit -m "File lists: fxMac, tfliteRequant, requant_lanes, gpnae_poly_int8"
 git add testbenches/TB_requant_lanes.sv testbenches/gen_rq_lanes.py && git commit -m "TB_requant_lanes: per-channel requantize against ipu.requant"
+git status -s   # no modified tracked file; push after Step 10
+```
+
+- [ ] **Step 10: SIENNA lint on the committed tree, then push**
+
+`$J/cmds/int8_slint.sh` (`chmod +x`):
+
+```bash
+#!/bin/bash
+# SIENNA make lint (TB_sienna_top) on a freshly generated package, then both tops through sienna_rtl.f; args: fp32 | bf16; run from a snapshot root.
+export VERILATOR_ROOT="$HOME/.local/share/verilator"
+J=/proj/work/spramanik/sienna_jobs; R=$(pwd)/testbenches/results/int8; mkdir -p $R
+case $1 in fp32) E=8; M=23 ;; bf16) E=8; M=7 ;; *) echo "usage: int8_slint.sh fp32|bf16"; exit 2 ;; esac
+bash $J/cmds/int8_pkg.sh $1 matmul_relu_nopool > $R/slint_pkg_$1.txt 2>&1 || { cat $R/slint_pkg_$1.txt; exit 1; }
+make lint > $R/sienna_make_lint_$1.txt 2>&1; rc=$?
+echo "SIENNA make lint ($1): exit=$rc, $(command grep -c '^%Error' $R/sienna_make_lint_$1.txt) errors"
+command grep -hE "^%Error" $R/sienna_make_lint_$1.txt | head -5 | cut -c1-200
+bash $J/cmd_sienna_fmt.sh lint $E $M
+exit $rc
+```
+
+int8 is not linted here: an int8 `sienna_top` first elaborates in Task 19 (it needs Tasks 17 and 18), and
+`generate_vectors` writes int8 packages only from Task 20.
+
+```bash
+L s16_slint32 32 1 $J/cmds/int8_slint.sh fp32
+L s16_slint16 32 1 $J/cmds/int8_slint.sh bf16
+```
+
+Expected in each `stdout.log`: `SIENNA make lint (<fmt>): exit=0, 0 errors`, and `sienna_layer (...)` and
+`sienna_top (...)` with `exit=0` and `0 errors`, no `LATCH`, `MULTIDRIVEN` or `UNOPTFLAT`: every unit GPNAE's and
+SystolicMesh's trees instantiate is in both file lists. A `Cannot find file containing module` names a list entry that
+is missing; fix it with a new commit (the lists, or the bump if it is `gpnae_poly_int8`) and rerun. Then push:
+
+```bash
 git push origin int8 && git status -sb | head -1   # no "ahead"
 ```
 
@@ -8058,8 +8110,7 @@ also replicates by zero.
 ```systemverilog
 `timescale 1ns / 1ps
 
-// Maxpool_2D in int8 (EXP_W = 0): two's-complement order in the streaming window sienna_top uses and in the batch path
-// with padding. Both DUTs leave IS_FP32 at 1, so EXP_W = 0 alone must select the integer compare.
+// Maxpool_2D in int8: two's-complement order in the streaming window and the padded batch path; IS_FP32 stays 1, so EXP_W = 0 must decide.
 module TB_maxpool_int8;
   localparam int W = 8;
   logic clk = 0, rst_n = 0;
@@ -8220,6 +8271,7 @@ git push origin int8
 **Files:**
 - Modify: `Dropout/dropout.sv` (CRLF line endings: keep them), `src/sienna_top.sv` (`p_zp` per D-5, one connection)
 - Create: `testbenches/TB_dropout_int8.sv`
+- Create (no repo): `$J/cmds/int8_rej.sh` (the unsupported-format rejection lint of one block)
 
 **Interfaces:**
 - Consumes: `p_zp`, `G_REQ_SETS`' `s_zp` and `s_zout` in `sienna_top` (Task 16); `set_act[p_set_id]` (existing).
@@ -8229,6 +8281,8 @@ git push origin int8
   software's: it is folded into the next layer's scale. fp32 and bf16 unchanged; they ignore `zero_point_i`.
   `sienna_top` drives it with `p_zp`, the output zero point of the pooled set's activation (D-5): `req_zp` after ReLU
   or linear, 0 after tanh, -128 after sigmoid, `gp_zout` after SELU.
+  - `$J/cmds/int8_rej.sh TOP "GENERICS" MESSAGE FILES...`: `REJECTED` only when elaboration stops on the block's own
+    `$fatal` message; used here for `dropout` at (0, 15) and (5, 10), Review Focus item 4.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -8237,8 +8291,7 @@ git push origin int8
 ```systemverilog
 `timescale 1ns / 1ps
 
-// dropout in int8 (D-5): inference passes every beat; training keeps a beat unchanged or drops it to zero_point_i in the
-// same cycle, deciding on the LFSR word the beat advances to, replayed here from the seed.
+// dropout in int8 (D-5): inference passes every beat; training keeps a beat or drops it to zero_point_i, on the LFSR word replayed here.
 module TB_dropout_int8;
   localparam int W = 8;
   localparam logic [31:0] SEED = 32'h2ACE002A;
@@ -8365,13 +8418,32 @@ makes the same choice (`drop_zp`).
 
 - [ ] **Step 3: Run it, bf16 unchanged, bad format still rejected**
 
+`$J/cmds/int8_rej.sh` (`chmod +x`), the rejection lint in the form of Tasks 3, 9, 11 and 13:
+
+```bash
+#!/bin/bash
+# One block elaborated at a format it must refuse: REJECTED only if Verilator stops on the block's own $fatal; args: TOP "GENERICS" MESSAGE then the sources; run from a snapshot root.
+export VERILATOR_ROOT="$HOME/.local/share/verilator"
+top=$1; gen=$2; msg=$3; shift 3
+R=$(pwd)/testbenches/results/int8; mkdir -p $R
+L=$R/rej_${top}_$(echo "$gen" | tr -c 'A-Za-z0-9\n' '_').txt
+verilator --lint-only -Wno-fatal -Werror-USERFATAL -DSYNTHESIS --top-module $top $gen "$@" > $L 2>&1; rc=$?
+if [ $rc -ne 0 ] && command grep -q "$msg" $L; then echo "REJECTED $top $gen"; exit 0; fi
+echo "NOT-REJECTED $top $gen (exit=$rc)"; command grep -h "^%Error" $L | head -3 | cut -c1-200; exit 1
+```
+
 ```bash
 L s18_do 32 1 $J/cmds/int8_unit.sh TB_dropout_int8 $DO testbenches/TB_dropout_int8.sv
 L s18_dobf 32 1 $J/cmds/int8_unit.sh TB_dropout_fmt $DO testbenches/TB_dropout_fmt.sv
+L s18_bad 32 1 $J/cmds/int8_rej.sh dropout "-GEXP_W=0 -GMAN_W=15" "dropout: unsupported format" $DO
+L s18_bad2 32 1 $J/cmds/int8_rej.sh dropout "-GEXP_W=5 -GMAN_W=10" "dropout: unsupported format" $DO
 ```
 
 Expected: `TB_dropout_int8: <k> training beats kept of 64, 0 errors` with 0 < k < 64, `RESULT: PASSED`; and
-`TB_dropout_fmt: 64 outputs, <k> kept, 0 errors`, `RESULT: PASSED`. The bf16 testbench does not connect `zero_point_i`,
+`TB_dropout_fmt: 64 outputs, <k> kept, 0 errors`, `RESULT: PASSED`; `s18_bad` prints `REJECTED dropout -GEXP_W=0
+-GMAN_W=15` (an int16 attempt must not build the new `G_INT` branch) and `s18_bad2` `REJECTED dropout -GEXP_W=5
+-GMAN_W=10`. A `NOT-REJECTED` whose log shows another error before the `$fatal` means the `G_BAD_FORMAT` check must
+move above the declaration that errors; the check must be what stops the build. The bf16 testbench does not connect `zero_point_i`,
 which Verilator ties to zero with a PINMISSING warning that is off by default; if the build stops on it, add
 `.zero_point_i('0)` to `TB_dropout_fmt.sv`'s instantiation and commit that with the testbench below.
 
@@ -8389,12 +8461,14 @@ git push origin int8
 **Files:**
 - Modify: `src/sienna_layer.sv`, `src/sienna_multi.sv`
 - Modify: `testbenches/TB_sienna_top.sv`, `TB_sienna_layer.sv`, `TB_sienna_multi.sv`, `TB_sienna_model.sv`
+- Create: `testbenches/int8_tb_util.svh` (the int8 word reader and requantize-word unpacking the three TBs share)
 - Modify: `regression.py` (package items only)
-- Modify (no repo): `$J/cmd_multi.sh` (optional format argument); create `$J/cmds/int8_stim_same.sh`, `$J/cmds/int8_cmp_gemm.py`
+- Modify (no repo): `$J/cmd_multi.sh` (optional format argument); create `$J/cmds/int8_stim_same.sh`, `$J/cmds/int8_cmp_gemm.py`,
+  `$J/cmds/int8_model_build.sh` (generate-first TB_sienna_model build, used again in Task 20)
 
 **Interfaces:**
-- Consumes: Task 16's `sienna_top` ports and `ACC_W`; Tasks 17 and 18; `int8_cmp_reg.py` (Task 16); the references
-  `i0_sienna_fp32`, `i0_sienna_bf16`, `i0_multi_fp32` (Task 0).
+- Consumes: Task 16's `sienna_top` ports and `ACC_W`; Tasks 17 and 18; `int8_cmp_reg.py`, `int8_pkg.sh` (Task 16); the
+  references `i0_sienna_fp32`, `i0_sienna_bf16`, `i0_multi_fp32` (Task 0).
 - Produces:
   - `sienna_layer #(... ACC_W = sienna_fmt_pkg::acc_w(EXP_W, MAN_W))` with int8 inputs (ignored in other formats):
     `cfg_req_zp_i, cfg_req_min_i, cfg_req_max_i [7:0], cfg_gp_mx_i [15:0], cfg_gp_shx_i [4:0], cfg_gp_mout_i [31:0],
@@ -8413,6 +8487,11 @@ git push origin int8
   - `$J/cmds/int8_stim_same.sh OLD_REGRESSION_COPY FMT [N] [T]`: every test's generated files from this tree and from
     the older copy, compared byte for byte (the package may differ only by `ACC_W` and `IS_INT` lines).
   - `$J/cmds/int8_cmp_gemm.py REF_RUN NEW_RUN [N]`: sets and cycles per GEMM shape; importable `compare()`.
+  - `testbenches/int8_tb_util.svh`, included inside a TB module after its D-2 signals: `read_word_file(fn, q)`,
+    `unpack_requant(q)` (drives the ten D-2 signals from one set's 8 + 2N words) and `apply_requant(k)` (reads
+    `requant_<k>.mem`, checks its size, unpacks it; nothing outside int8). TB_sienna_top, TB_sienna_multi and
+    TB_sienna_model include it; none keeps its own copy.
+  - `$J/cmds/int8_model_build.sh FMT`: `int8_pkg.sh FMT matmul_relu_nopool`, then builds TB_sienna_model on that package.
 
 - [ ] **Step 1: Write the failing checks**
 
@@ -8432,8 +8511,7 @@ In `src/sienna_layer.sv`:
 1. Header comment: after the line `// Activation stream, ...` add
 
 ```systemverilog
-// int8: every block has the bias beat (its bias carries the folded input zero point); its int32 bias, requantize
-// multipliers and shifts come on w_bias_i, w_req_mult_i and w_req_shift_i beside it, and w_data_i is ignored.
+// int8: every block has a bias beat, its int32 bias and requantize words on w_bias_i, w_req_mult_i, w_req_shift_i (w_data_i ignored).
 ```
 
 2. After the `DATA_WIDTH` parameter line add
@@ -8706,10 +8784,12 @@ becomes
     gp_zout_i = '0;
 ```
 
-4. After `read_mem_file` add a 32-bit reader:
+4. Create `testbenches/int8_tb_util.svh`, the one copy of the int8 file helpers (the Makefile's `-I$(TB_DIR)` finds it):
 
 ```systemverilog
-  // ── 32-bit word reader: int32 biases and requantize words (8 digits), or narrower words zero-extended ──
+// int8 testbench helpers, included inside a TB module after its D-2 signals (no include guard: one copy per module).
+
+  // 32-bit word reader: int32 biases and requantize words (8 digits), or narrower words zero-extended.
   task automatic read_word_file(input string fn, output logic [31:0] q[$]);
     integer fh, rc;
     logic [31:0] w;
@@ -8725,31 +8805,9 @@ becomes
     end
     $fclose(fh);
   endtask
-```
 
-5. `apply_bias` reads 32-bit words and narrows them to `ACC_W` (fp32: the same word; bf16: the same 16 bits), and a new
-task follows it:
-
-```systemverilog
-  task automatic apply_bias(input int k);
-    logic [31:0] q[$];
-    bias_valid_i = (HAS_BIAS != 0) && ((k % ACCUM_PASSES) == 0);
-    bias_i = '0;
-    if (bias_valid_i) begin
-      read_word_file($sformatf("bias_%0d.mem", k), q);
-      for (int c = 0; c < N; c++) bias_i[c] = ACC_W'(q[c]);
-    end
-  endtask
-
-  // int8: set k's requantize and GPNAE parameters from requant_<k>.mem: 8 layer-wide words, N multipliers, N shifts.
-  task automatic apply_requant(input int k);
-    logic [31:0] q[$];
-    if (!IS_INT) return;
-    read_word_file($sformatf("requant_%0d.mem", k), q);
-    if (q.size() != 8 + 2 * N) begin
-      $display("[FATAL] requant_%0d.mem holds %0d words, expected %0d", k, q.size(), 8 + 2 * N);
-      $finish;
-    end
+  // One set's 8 + 2N words onto the D-2 signals: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout, N multipliers, N shifts.
+  task automatic unpack_requant(input logic [31:0] q[$]);
     req_zp_i   = q[0][7:0];
     req_min_i  = q[1][7:0];
     req_max_i  = q[2][7:0];
@@ -8763,18 +8821,53 @@ task follows it:
       req_shift_i[c] = q[8+N+c][7:0];
     end
   endtask
+
+  // int8: set k's requantize and GPNAE parameters from requant_<k>.mem; nothing in other formats.
+  task automatic apply_requant(input int k);
+    logic [31:0] q[$];
+    if (!IS_INT) return;
+    read_word_file($sformatf("requant_%0d.mem", k), q);
+    if (q.size() != 8 + 2 * N) begin
+      $display("[FATAL] requant_%0d.mem holds %0d words, expected %0d", k, q.size(), 8 + 2 * N);
+      $finish;
+    end
+    unpack_requant(q);
+  endtask
+```
+
+In `TB_sienna_top.sv`, after `read_mem_file` add
+
+```systemverilog
+  `include "int8_tb_util.svh"  // read_word_file, unpack_requant, apply_requant
+```
+
+5. `apply_bias` reads 32-bit words and narrows them to `ACC_W` (fp32: the same word; bf16: the same 16 bits):
+
+```systemverilog
+  task automatic apply_bias(input int k);
+    logic [31:0] q[$];
+    bias_valid_i = (HAS_BIAS != 0) && ((k % ACCUM_PASSES) == 0);
+    bias_i = '0;
+    if (bias_valid_i) begin
+      read_word_file($sformatf("bias_%0d.mem", k), q);
+      for (int c = 0; c < N; c++) bias_i[c] = ACC_W'(q[c]);
+    end
+  endtask
 ```
 
 6. After each of the four calls of `apply_bias` (single-set pass `apply_bias(0);`, `BACK_TO_BACK` pass `apply_bias(1);`,
 streaming producer and `reset_mid_stream`, both `apply_bias(k);`), add the matching `apply_requant(0);`,
 `apply_requant(1);`, `apply_requant(k);`, `apply_requant(k);`. Check:
-`command grep -c "apply_requant(" testbenches/TB_sienna_top.sv` prints 5 (the task and four calls).
+`command grep -c "apply_requant(" testbenches/TB_sienna_top.sv` prints 4 (the four calls; the task is in
+`int8_tb_util.svh`), and `command grep -c "task automatic read_word_file\|task automatic apply_requant" testbenches/TB_sienna_*.sv`
+prints 0 for every TB.
 
 - [ ] **Step 6: `TB_sienna_model`, `TB_sienna_multi`, `TB_sienna_layer`**
 
 `testbenches/TB_sienna_model.sv`:
-- `logic [N-1:0][DATA_WIDTH-1:0] bias_i;` becomes the declarations of `TB_sienna_top` Step 5.1, and the DUT gets the
-  same ten connections after `.bias_i`;
+- `logic [N-1:0][DATA_WIDTH-1:0] bias_i;` becomes the declarations of `TB_sienna_top` Step 5.1, followed by
+  `` `include "int8_tb_util.svh"  // unpack_requant `` on the next line, and the DUT gets the same ten connections after
+  `.bias_i`;
 - in the `initial` block, add `logic [31:0] w32;` beside `logic [DATA_WIDTH-1:0] w;`, zero the ten D-2 signals next to
   `bias_i = '0;` in the initialization, and replace the bias read
 
@@ -8797,20 +8890,13 @@ with
           bias_i[c] = ACC_W'(w32);
         end
       if (IS_INT) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
-        logic [31:0] q[8+2*N];
-        for (int i = 0; i < 8 + 2 * N; i++) rc = $fscanf(fin, "%h", q[i]);
-        req_zp_i   = q[0][7:0];
-        req_min_i  = q[1][7:0];
-        req_max_i  = q[2][7:0];
-        gp_mx_i    = q[3][15:0];
-        gp_shx_i   = q[4][4:0];
-        gp_mout_i  = q[5];
-        gp_shout_i = q[6][7:0];
-        gp_zout_i  = q[7][7:0];
-        for (int c = 0; c < N; c++) begin
-          req_mult_i[c]  = q[8+c];
-          req_shift_i[c] = q[8+N+c][7:0];
+        logic [31:0] q[$];
+        q.delete();  // a static block: the queue would otherwise keep the previous set's words
+        for (int i = 0; i < 8 + 2 * N; i++) begin
+          rc = $fscanf(fin, "%h", w32);
+          q.push_back(w32);
         end
+        unpack_requant(q);
       end
 ```
 
@@ -8829,7 +8915,7 @@ with
   logic [31:0] gp_mout_i = '0;
 ```
 
-- add `read_word_file` (Step 5.4) after `read_mem_file`, and `apply_requant` (the second task of Step 5.5);
+- after `read_mem_file` add `` `include "int8_tb_util.svh"  // read_word_file, unpack_requant, apply_requant `` (Step 5.4);
 - in the set loop, after `dropout_seed_i = set_seed(k);` add
 
 ```systemverilog
@@ -8846,8 +8932,7 @@ with
 
 `testbenches/TB_sienna_layer.sv`:
 - header comment: after the `Layer file:` line add
-  `// int8 (IS_INT): a line "Q zp min max mx shx mout shout zout" after it, and after the rows one epilogue per column`
-  `// block (N biases, N multipliers, N shifts, 8 hex digits each), driven beside the block's bias beat.`
+  `// int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).`
 - after `logic [N-1:0][DATA_WIDTH-1:0] a_data_i = '0, w_data_i = '0;` add
 
 ```systemverilog
@@ -8967,6 +9052,16 @@ exit $bad
 `regression.TB_DIR` is read at call time by every writer, `write_sv_package` and `_check_mem_widths`, so each side
 writes into its own new directory and no stale file can hide a difference.
 
+`$J/cmds/int8_model_build.sh` (`chmod +x`), the generate-first build of TB_sienna_model (Task 20 runs it in int8):
+
+```bash
+#!/bin/bash
+# TB_sienna_model built and started on a freshly generated package, never the stale committed one; args: FMT; run from a snapshot root.
+export VERILATOR_ROOT="$HOME/.local/share/verilator"
+bash /proj/work/spramanik/sienna_jobs/cmds/int8_pkg.sh "${1:-fp32}" matmul_relu_nopool || exit 1
+make verilator TOP_MODULE=TB_sienna_model TESTBENCH=TB_sienna_model.sv TRACE=0
+```
+
 `$J/cmds/int8_cmp_gemm.py`:
 
 ```python
@@ -9014,11 +9109,12 @@ L s19_stim16 32 2 $J/cmds/int8_stim_same.sh .claude/scratch/regression_bf16.py b
 L s19_gemm32 64 6 $J/venv/bin/python gemm_sweep.py --n 16 --format fp32 --quick
 L s19_gemm16 64 6 $J/venv/bin/python gemm_sweep.py --n 16 --format bf16 --quick
 L s19_multi 32 4 $J/cmd_multi.sh matmul_random_tanh 2 32 1 16 fp32
-L s19_model 32 2 make verilator TOP_MODULE=TB_sienna_model TESTBENCH=TB_sienna_model.sv TRACE=0
+L s19_model 32 2 $J/cmds/int8_model_build.sh fp32
 ```
 
-(`s19_model` builds on the package the snapshot's last regression wrote, an fp32 one; it only has to build and print
-`[MODEL] no +sets= and +out= given`.) Then, on the login node (log parsing only):
+(`s19_model` generates an fp32 package on its own snapshot first, since each launch snapshots the tree afresh and the
+committed package is stale; it only has to build and print `[MODEL] no +sets= and +out= given`.) Then, on the login
+node (log parsing only):
 
 ```bash
 python3 $J/cmds/int8_cmp_reg.py i0_sienna_fp32 s19_fp32
@@ -9047,8 +9143,8 @@ files; they run there.
 ```bash
 git add src/sienna_layer.sv && git commit -m "sienna_layer: int8 parameters with the configuration, int32 bias and requantize words beside each block's bias beat"
 git add src/sienna_multi.sv && git commit -m "sienna_multi: int32 bias and the int8 requantize inputs to every copy"
-git add testbenches/TB_sienna_top.sv testbenches/TB_sienna_model.sv testbenches/TB_sienna_multi.sv testbenches/TB_sienna_layer.sv \
-  && git commit -m "Testbenches: int32 bias words, per-set requantize files, int8 layer epilogues"
+git add testbenches/int8_tb_util.svh testbenches/TB_sienna_top.sv testbenches/TB_sienna_model.sv testbenches/TB_sienna_multi.sv testbenches/TB_sienna_layer.sv \
+  && git commit -m "Testbenches: int32 bias words, per-set requantize files in one shared include, int8 layer epilogues"
 git add regression.py && git commit -m "regression: package items in one function; IS_INT and ACC_W"
 git push origin int8
 ```
@@ -9057,7 +9153,7 @@ git push origin int8
 
 **Files:**
 - Modify: `regression.py`
-- Create (no repo): `$J/cmds/int8_seed.sh`, `$J/cmds/int8_neg_channel.sh`, `$J/cmds/int8_model_build.sh`
+- Create (no repo): `$J/cmds/int8_seed.sh`, `$J/cmds/int8_neg_channel.sh` (`$J/cmds/int8_model_build.sh` is Task 19's)
 
 **Interfaces:**
 - Consumes: `mesh_model.matmul_int(passes, N, bias)` (Task 14); `ipu.requant`, `ipu.REQ_ROUNDING` (Tasks 1, 3);
@@ -9140,9 +9236,7 @@ In `op_hex`, after `v = op_round(...)` add
 After `_golden_bits` add:
 
 ```python
-# =============================================================================
-# int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden
-# =============================================================================
+# ===== int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden =====
 
 REQ_HEAD = 8  # layer-wide words heading requant_<k>.mem: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout
 
@@ -9158,8 +9252,7 @@ def imatmul(a, b) -> np.ndarray:
 
 
 def quant_act(x) -> tuple:
-    """(q, scale, zero point) of an activation tensor as TFLite post-training quantization chooses them: asymmetric int8
-    over the tensor's range widened to hold 0, so real 0 is exactly the zero point."""
+    """(q, scale, zero point) of an activation tensor as TFLite PTQ picks them: asymmetric int8 over its range widened to hold 0."""
     x = np.asarray(x, dtype=np.float64)
     lo, hi = min(0.0, float(x.min())), max(0.0, float(x.max()))
     scale = (hi - lo) / 255.0 if hi > lo else 1.0
@@ -9168,8 +9261,7 @@ def quant_act(x) -> tuple:
 
 
 def quant_weights(w) -> tuple:
-    """(q, per-column scales) of a weight matrix as TFLite quantizes conv and FC weights: symmetric per output channel,
-    zero point 0, codes -127..127."""
+    """(q, per-column scales) of a weight matrix as TFLite quantizes weights: symmetric per output channel, zero point 0, codes -127..127."""
     w = np.asarray(w, dtype=np.float64)
     s = np.max(np.abs(w), axis=0) / 127.0
     s = np.where(s > 0, s, 1.0)
@@ -9177,8 +9269,7 @@ def quant_weights(w) -> tuple:
 
 
 def fold_bias(bias, s_a: float, s_w, z_a: int, B_q) -> np.ndarray:
-    """The int32 bias the mesh adds: TFLite's bias (scale s_a * s_w[c], zero point 0) minus z_a * sum_k B_q[k, c], which
-    turns the mesh's sum of a * w into TFLite's sum of (a - z_a) * w."""
+    """The mesh's int32 bias: TFLite's bias minus z_a * sum_k B_q[k, c], so the mesh's sum of a * w is TFLite's sum of (a - z_a) * w."""
     B_q = np.asarray(B_q, np.int64)
     b_q = np.zeros(B_q.shape[1], np.int64) if bias is None else \
         np.rint(np.asarray(bias, np.float64) / (s_a * np.asarray(s_w, np.float64))).astype(np.int64)
@@ -9194,11 +9285,7 @@ def requantize(acc, rq: dict) -> np.ndarray:
 
 
 def requant_params(acc, s_a: float, s_w, act: str, rng=None) -> dict:
-    """Requantize and GPNAE parameters for int32 sums acc (rows x channels), chosen as TFLite PTQ would: output scale and
-    zero point from the range of the real outputs (after ReLU for a ReLU layer), M_c = s_a * s_w[c] / s_out through
-    QuantizeMultiplier, a fused ReLU as the clamp's minimum. With rng the multipliers and shifts are random per channel.
-    The lane's input scale is s_out (gpnae_model.rescale_params); SELU's output scale comes from the range of SELU over the
-    lane's real inputs, and its multiplier from QuantizeMultiplier(2^-25 / s_selu)."""
+    """Requantize and GPNAE parameters for int32 sums acc (rows x channels) as TFLite PTQ picks them; with rng, random words per channel."""
     acc = np.asarray(acc, np.int64)
     s_w = np.asarray(s_w, np.float64)
     real = acc * (s_a * s_w)[None, :]
@@ -9227,8 +9314,7 @@ def int8_lane():
 
 
 def activate_int8(R, act: str, rq: dict) -> np.ndarray:
-    """The lane stage in int8: ReLU and linear pass the requantized value through (the clamp already applied ReLU), the
-    others run the fixed-point lane with the set's GPNAE parameters and the requantize zero point as its input's."""
+    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters."""
     code = activation_to_code(act)
     R = np.asarray(R, np.int64)
     if code in (4, 5):
@@ -9238,8 +9324,7 @@ def activate_int8(R, act: str, rq: dict) -> np.ndarray:
 
 
 def drop_zp(act: str, rq: dict) -> int:
-    """D-5: dropout drops to the output zero point of the set's activation: SELU gp_zout, sigmoid -128, ReLU and linear the
-    requantize zero point, tanh (and every other code, which the lane runs as tanh) 0; sienna_top's p_zp makes the same choice."""
+    """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
     return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
 
 
@@ -9254,8 +9339,7 @@ def _maxpool_int(x, ph: int, pw: int, pad: int) -> np.ndarray:
 
 
 def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int) -> tuple:
-    """Bit-exact int8 set (D-6): the mesh's int32 sums, requantize per column, the lane, integer max pooling, dropout with
-    dropped values at the output zero point of the set's activation (D-5); passes are (A codes, B codes) in order."""
+    """Bit-exact int8 set (D-6): int32 sums, per-column requantize, the lane, integer max pooling, dropout (D-5); passes are (A, B) codes."""
     N = cfg.get("n", 16)
     C = mesh_model.matmul_int([(_pad_square(a, N), _pad_square(b, N)) for a, b in passes], N, hw_bias)
     R = requantize(C, rq)
@@ -9268,15 +9352,13 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
 
 
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
-    """sienna_layer's int8 output for one product: int32 sums (integer addition is associative, so tiles and depth
-    passes do not change them), requantize per output column, the lane; the layer engine neither pools nor drops out."""
+    """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
     return activate_int8(requantize(acc, rq), act, rq)
 
 
 def _check_rounding() -> None:
-    """sienna_fmt_pkg::REQ_ROUNDING (every tfliteRequant instance) must be the variant G0 pinned, as ipu and tflite_ref read it,
-    or golden and RTL round apart in the last bit."""
+    """sienna_fmt_pkg::REQ_ROUNDING must be the variant G0 pinned, as ipu and tflite_ref read it, or golden and RTL round apart."""
     pkg = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
     m = re.search(r'localparam string REQ_ROUNDING\s*=\s*"(\w+)"', open(pkg).read())
     rtl = m.group(1) if m else "(no REQ_ROUNDING)"
@@ -9308,8 +9390,7 @@ def _requant_words(rq: dict) -> list:
 
 
 def _generate_vectors_int8(cfg: dict) -> None:
-    """int8 stimulus and bit-exact golden: the float tests' real matrices, quantized per accumulate group as TFLite PTQ
-    would, with each set's requantize and GPNAE parameters in requant_<k>.mem."""
+    """int8 stimulus and bit-exact golden: the float tests' matrices quantized as TFLite PTQ would, each set's parameters in requant_<k>.mem."""
     os.makedirs(TB_DIR, exist_ok=True)
     _check_rounding()
     N, mode = cfg.get("n", 16), cfg.get("mode", "matmul")
@@ -9398,9 +9479,8 @@ At the top of `generate_vectors`, before `os.makedirs(TB_DIR, exist_ok=True)`, a
 
 ```python
 def _check_mem_widths(fmt: str, num_sets: int) -> None:
-    """Every operand, bias and expected word the TB reads must be the format's width: a stale fp32 file would be truncated.
-    int8: operands and results 2 digits, the int32 bias and the requantize words 8."""
-    d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4
+    """Every operand, bias and expected word the TB reads must be the format's width: a stale fp32 file would be truncated."""
+    d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4  # int8: operands and results 2 digits; int32 bias and requantize words 8
     per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
     names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output")]
     names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
@@ -9475,18 +9555,8 @@ EOF
 python3 regression.py --n 16 --tile-size 4 --format int8 --test int8_perchannel_random_linear_nopool
 ```
 
-`$J/cmds/int8_model_build.sh` (`chmod +x`):
-
-```bash
-#!/bin/bash
-# TB_sienna_model built and started in int8 on an int8 package; run from a snapshot root.
-export VERILATOR_ROOT="$HOME/.local/share/verilator"
-python3 -c "
-import regression as r
-t = next(x for x in r.PIPELINE_TESTS if x['name'] == 'matmul_relu_nopool')
-r.generate_vectors({'n': 16, 'tile_size': 4, 'lanes': 32, 'host_words': 16, 'fmt_name': 'int8', **t})" || exit 1
-make verilator TOP_MODULE=TB_sienna_model TESTBENCH=TB_sienna_model.sv TRACE=0
-```
+`$J/cmds/int8_model_build.sh FMT` is Task 19's (it generates the FMT package first, through `int8_pkg.sh`); here it runs
+with `int8`, which `generate_vectors` now writes.
 
 - [ ] **Step 6: Run int8, the controls, and fp32 / bf16 unchanged**
 
@@ -9494,7 +9564,7 @@ make verilator TOP_MODULE=TB_sienna_model TESTBENCH=TB_sienna_model.sv TRACE=0
 L s20_int8 32 6 $J/cmd_sienna_fmt.sh reg 16 4 int8
 L s20_int8s3 32 6 $J/cmds/int8_seed.sh 3 reg 16 4 int8
 L s20_neg 32 2 $J/cmds/int8_neg_channel.sh
-L s20_model 32 2 $J/cmds/int8_model_build.sh
+L s20_model 32 2 $J/cmds/int8_model_build.sh int8
 L s20_fp32 32 4 $J/cmd_sienna_fmt.sh reg 16 4 fp32
 L s20_bf16 32 4 $J/cmd_sienna_fmt.sh reg 16 4 bf16
 L s20_stim32 32 2 $J/cmds/int8_stim_same.sh .claude/scratch/regression_t19.py fp32
@@ -9532,7 +9602,9 @@ git push origin int8
 - Consumes: Task 2's models, `testbenches/tflite_int8/<name>.tflite` (one `CONV_2D` or `FULLY_CONNECTED` with int8 input,
   filter and output; `conv3x3_8x8x16_*` are SAME-padded per-channel convs with a non-zero input zero point) each with
   `<name>.npz` in Task 2's keys, of which this task reads `x_test` (the 64 saved int8 inputs, NHWC for conv, `[64, 64]`
-  for FC) and `y_test` (the `BUILTIN_REF` interpreter's int8 outputs for them); `tflite_ref.quantize_multiplier`;
+  for FC), `y_test` (the `BUILTIN_REF` interpreter's int8 outputs for them), `mults` and `shifts` (G0's per-channel
+  requantize words, the ones the interpreter matched), `rounding`, `act_min` and `act_max`; `tflite_ref.layer_multipliers`,
+  `tflite_ref.activation_range` and `tflite_ref.ROUNDING` (Task 2);
   Task 19's layer file format; Task 20's `wrap32`, `op_hex(…, "int8")`, `int8_layer_exact`; the `tflite` schema package
   in `$J/venv` (Task 0).
 - Produces:
@@ -9549,9 +9621,14 @@ git push origin int8
 
 The host lowers a layer exactly as TFLite's reference kernels compute it. The operands are the raw int8 codes. SAME
 padding pads the im2col with the input zero point, which is real 0, so a padded tap adds (z_in - z_in) * w = 0 as
-TFLite's skipped tap does. The term -z_in * sum_k w[k, c] is folded into the int32 bias. Channel c's multiplier comes
-from `QuantizeMultiplier(double(s_in) * double(s_w[c]) / double(s_out))`. The fused activation becomes the clamp through
-TFLite's `CalculateActivationRangeQuantized`, and the lane stage runs linear, which passes int8 through. The mesh wraps
+TFLite's skipped tap does. The term -z_in * sum_k w[k, c] is folded into the int32 bias. Channel c's multiplier and
+shift are the npz's `mults` and `shifts`, which G0 wrote with `tflite_ref.layer_multipliers` in the pinned rounding (the
+double scale product per channel, float32 for a per-tensor FC, or whatever G0 corrected it to) and which the interpreter
+matched bit for bit; the runner never forms its own scale product. It recomputes them with
+`tflite_ref.layer_multipliers` from the `.tflite`'s scales only to check that the model and its npz belong together.
+The fused activation becomes the clamp through `tflite_ref.activation_range` (TFLite's
+`CalculateActivationRangeQuantized`), checked against the npz's `act_min`/`act_max`, and the lane stage runs linear,
+which passes int8 through. The mesh wraps
 at 32 bits and TFLite's int32 accumulate does not overflow on these layers, so both give the same sum.
 
 - [ ] **Step 1: Write the runner and see it fail**
@@ -9560,10 +9637,7 @@ at 32 bits and TFLite's int32 accumulate does not overflow on these layers, so b
 
 ```python
 #!/usr/bin/env python3
-"""Runs the single-layer TFLite int8 models of testbenches/tflite_int8/ through sienna_layer built in int8 and compares
-every output with the TFLite interpreter's (reference kernels, saved by tflite_oracle.py), bit for bit. The host lowers
-each layer with TFLite's own algebra: raw int8 codes, SAME padding with the input zero point, the zero-point term folded
-into the int32 bias, TFLite's per-channel multipliers, and the fused activation as the requantize clamp."""
+"""Runs testbenches/tflite_int8/'s single-layer int8 models through sienna_layer in int8, bit for bit against the interpreter's saved outputs."""
 import argparse
 import glob
 import os
@@ -9579,11 +9653,6 @@ import tflite_ref  # noqa: E402
 
 reg = mr.regression
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
-
-
-def round_away(x) -> int:
-    """TfLiteRound (std::round): halves away from zero."""
-    return int(np.sign(x) * np.floor(abs(float(x)) + 0.5))
 
 
 def load_layer(path: str) -> dict:
@@ -9631,25 +9700,29 @@ def load_layer(path: str) -> dict:
         if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
             raise ValueError(f"{path}: dilation is not supported")
         d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
-    s_out, z_out = out["scale"][0], int(out["zp"][0])
-    qz = lambda f: z_out + round_away(np.float32(f) / s_out)  # CalculateActivationRangeQuantized, float32 division
     fa = opt.FusedActivationFunction()
-    ranges = {AF.NONE: (-128, 127), AF.RELU: (max(-128, qz(0.0)), 127),
-              AF.RELU6: (max(-128, qz(0.0)), min(127, qz(6.0))), AF.RELU_N1_TO_1: (max(-128, qz(-1.0)), min(127, qz(1.0)))}
-    if fa not in ranges:
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations tflite_ref.activation_range defines
+    if fa not in acts:
         raise ValueError(f"{path}: fused activation {fa} is not supported")
-    d["act_range"] = ranges[fa]
+    d["act_range"] = tflite_ref.activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
     return d
 
 
-def job_of(layer: dict, x: np.ndarray) -> tuple:
-    """(int8 job for LayerSim, output shape) of one layer on the interpreter's input codes x."""
+def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
+    """(int8 job for LayerSim, output shape) of one layer on the interpreter's input codes x; saved is the layer's G0 npz."""
     inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
-    z_in, s_in = int(inp["zp"][0]), float(inp["scale"][0])
-    s_out, z_out = float(out["scale"][0]), int(out["zp"][0])
+    z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
     w = flt["data"].astype(np.int64)
     cout = w.shape[0]
-    s_w = flt["scale"].astype(np.float64) if flt["scale"].size > 1 else np.full(cout, float(flt["scale"][0]))
+    if str(saved["rounding"]) != tflite_ref.ROUNDING:
+        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {tflite_ref.ROUNDING}")
+    mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
+    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
+    rm, rs = tflite_ref.layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, tflite_ref.ROUNDING)
+    if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
+        raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
+    if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):
+        raise ValueError(f"clamp {layer['act_range']} differs from the npz's ({int(saved['act_min'])}, {int(saved['act_max'])})")
     if layer["kind"] == "CONV_2D":
         cols = [mr.im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
                           pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
@@ -9662,10 +9735,8 @@ def job_of(layer: dict, x: np.ndarray) -> tuple:
         shape = (X.shape[0], cout)
     bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
     hw_bias = reg.wrap32(bq - z_in * W.sum(axis=0))
-    qm = [tflite_ref.quantize_multiplier(s_in * float(s) / s_out) for s in s_w]
     amin, amax = layer["act_range"]
-    req = dict(mult=np.array([m for m, _ in qm], np.int64), shift=np.array([e for _, e in qm], np.int64), zp=z_out,
-               amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
+    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
     job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
            "req": req}
     return job, shape
@@ -9701,7 +9772,7 @@ def main():
         ref = np.load(path[:-len(".tflite")] + ".npz")
         x, y = ref["x_test"], ref["y_test"].astype(np.int64)
         layer = load_layer(path)
-        job, shape = job_of(layer, x)
+        job, shape = job_of(layer, x, ref)
         X, W = job["terms"][0]
         low = reg.int8_layer_exact(X.astype(np.int64), W.astype(np.int64), job["bias"], job["req"], "linear").reshape(shape)
         got, sets, cyc = sim.run_job(job, name)
@@ -9755,8 +9826,7 @@ Q line` (a dense model first).
 
 ```python
 def im2col(x, kh, kw, stride, same, channel_major=False, pad_value=0.0):
-    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major. SAME padding takes
-    pad_value: 0 for floats, the input zero point (real 0) for int8 codes."""
+    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major; SAME pads with pad_value."""
 ```
 
 and its `xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)))` becomes
@@ -9796,8 +9866,7 @@ The return value keeps its four fields (`layer_stalls.py` unpacks them).
 
 ```python
 def layer_epilogue(job, N):
-    """int8: per column block, the words beside its bias beat: N int32 biases, N multipliers, N shifts, zero past the
-    layer's columns; an int64 array of shape (column blocks, 3, N)."""
+    """int8: the words beside each column block's bias beat (N biases, N multipliers, N shifts, zero-padded), shape (blocks, 3, N)."""
     q, b = job["req"], np.asarray(job["bias"], np.int64)
     C = b.size
     ct = -(-C // N)
@@ -10056,9 +10125,7 @@ After `exact_layer` add:
 
 ```python
 def run_int8(a, sim, shapes) -> None:
-    """int8 on the layer engine: A and B quantized as TFLite PTQ would, each product requantized per output channel; every
-    output must equal the model (int32 sums, ipu.requant, the int8 lane). The dequantized output's error against float64
-    on the unquantized inputs is the quantization error, reported and not gated."""
+    """int8 on the layer engine: TFLite-PTQ-quantized products must equal the model bit for bit; the quantization error is reported, not gated."""
     reg = mr.regression
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n
@@ -10339,24 +10406,25 @@ done
 # int8 regressions: both mesh modes at N = 16 and 32, and random power-up
 L g8r16_int8 32 6 $J/cmd_sienna_fmt.sh reg 16 4 int8
 L g8r16ck0_int8 32 6 $J/cmds/sienna_ck0.sh 16 4 int8
-L g8r32_int8 32 12 $J/cmd_sienna_fmt.sh reg 32 4 int8
+L g8r32_int8 32 12 $J/cmds/int8_O0.sh $J/cmd_sienna_fmt.sh reg 32 4 int8   # every N >= 32 build: int8_O0.sh or int8_ck0_O0.sh
 L g8r32ck0_int8 64 24 $J/cmds/int8_ck0_O0.sh 32 4 int8
 L g8ri_int8 32 6 $J/cmd_randinit.sh --n 16 --tile-size 4 --format int8
 # fp32 and bf16 on this tree, against Task 0's references (i0_sienna_*, i0_reg32_*)
 for F in fp32 bf16; do
   L g8r16_$F 32 4 $J/cmd_sienna_fmt.sh reg 16 4 $F
-  L g8r32_$F 32 12 $J/cmd_sienna_fmt.sh reg 32 4 $F
+  L g8r32_$F 32 12 $J/cmds/int8_O0.sh $J/cmd_sienna_fmt.sh reg 32 4 $F
   L g8ri_$F 32 6 $J/cmd_randinit.sh --n 16 --tile-size 4 --format $F
 done
 # TFLite int8 models end to end, two mesh points
 L g8_tfl_N16_T4 32 4 $J/cmds/int8_tflite.sh 16 4 32
-L g8_tfl_N32_T8 32 12 $J/cmds/int8_tflite.sh 32 8 32
+L g8_tfl_N32_T8 32 12 $J/cmds/int8_O0.sh $J/cmds/int8_tflite.sh 32 8 32
 # the N / T sweep, one job per point and format
 PAIRS="8,2 8,4 8,8 16,2 16,4 16,8 16,16 32,2 32,4 32,8 32,16 32,32 64,2 64,4 64,8 64,16 64,32 64,64"
 for NT in $PAIRS; do
-  N=${NT%,*}; T=${NT#*,}; LN=32; MEM=32
+  N=${NT%,*}; T=${NT#*,}; LN=32; MEM=32; O=
   [ $N = 64 ] && LN=128 && MEM=64
-  for F in int8 fp32 bf16; do L g8p_N${N}_T${T}_$F $MEM 12 $J/cmds/g4_perf.sh $N $T $F $LN; done
+  [ $N -ge 32 ] && O=$J/cmds/int8_O0.sh
+  for F in int8 fp32 bf16; do L g8p_N${N}_T${T}_$F $MEM 12 $O $J/cmds/g4_perf.sh $N $T $F $LN; done
 done
 # GEMM, models, sienna_multi, lint
 L g8_gemm_int8 64 12 $J/venv/bin/python gemm_sweep.py --n 16 --format int8
@@ -10378,9 +10446,7 @@ with twice the memory under the same name, and the report says so.
 
 ```python
 #!/usr/bin/env python3
-"""Gate G4 of SIENNA's int8 build (2a) from the g8* farm runs: int8 regressions, fp32 / bf16 against the bf16 tree, TFLite
-end to end, the int8 N / T sweep, GEMM, models, sienna_multi, lint, and a size estimate of the requantize stage;
-arg: output .log path. Parses run logs only."""
+"""Gate G4 of SIENNA's int8 build from the g8* farm runs (regressions, fp32 / bf16, TFLite, sweep, GEMM, models, lint); arg: output .log."""
 import glob
 import json
 import os

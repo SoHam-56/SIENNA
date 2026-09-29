@@ -16,7 +16,7 @@
 - Accumulate width `ACC_W` = 32 for int8, `DATA_WIDTH` for floats: PE partial sums, reducer tree, bias input, mesh result memory, wide read into requantize.
 - Mesh: int8 x int8 -> int16 sign-extended into an int32 two's-complement accumulate (wraps like TFLite); no zero-point hardware (the input zero-point term is folded into the int32 bias by software; conv padding with z_a in the software im2col).
 - Requantize: TFLite's conv / FC epilogue exactly (`MultiplyByQuantizedMultiplier`, + z_out, clamp to [act_min, act_max]); the rounding variant is whichever TFLite's reference kernels use, found and pinned by a test in Task 2, never assumed; one unit per GPNAE lane at the lane feed; result memory stays int32.
-- GPNAE in int8: the same Horner polynomial and barrel_mac / gpnae_poly structure on 16-bit fixed point (Q4.11), coefficients re-encoded into `poly_coeffs_int8.mem`, saturation beyond the fitted range, `gpnae_tail` not instantiated; tanh y*128 zp 0, sigmoid y*256 zp -128 (TFLite's fixed output quantization); SELU per-layer output rescale; fp32 / bf16 coefficient files never change.
+- GPNAE in int8: the same Horner polynomial and barrel_mac / gpnae_poly structure on 16-bit fixed point (Q4.11), coefficients re-encoded into `poly_coeffs_int8.mem`, the float lane's fitted ranges (SELU x >= -4, sigmoid abs(x) <= 3.5, tanh abs(x) <= 4) with the saturated int8 value beyond them, `gpnae_tail` not instantiated; tanh y*128 zp 0, sigmoid y*256 zp -128 (TFLite's fixed output quantization); SELU per-layer output rescale; fp32 / bf16 coefficient files never change. Accuracy is judged by GPNAE's regression tolerance (relative error <= 6.25% or absolute error <= 1 output LSB, L2-4), reported and never a stop; the RTL lane must equal the model bit for bit on every input.
 - Pooling: Maxpool_2D's integer compare, pad -128. Dropout: inference bypass; training keeps values, dropped ones become the output zero point of the set's activation (D-5), 1/keep folded into the output scale.
 - One MAC per PE per cycle, as today (MAC packing is out of scope).
 - Verification order: G0 oracle, G1 AriL, G2 GPNAE, G3 mesh, G4 SIENNA; a gate passes and is reported before the next level starts; every gate reruns the fp32 and bf16 suites, requiring identical results and cycle counts (G3 reruns the ruled subset, Task 15).
@@ -59,8 +59,9 @@ Cited as D-1 .. D-8 in the tasks; flag them at review.
 - **D-4: GPNAE int8 output.** tanh `y * 128`, zero point 0; sigmoid `y * 256`, zero point -128; SELU
   `tfliteRequant(v, gp_mout, gp_shout, gp_zout)` with v in units of 2^-25 and `(gp_mout, gp_shout)` =
   QuantizeMultiplier(2^-25 / s_out); ReLU and linear pass the requantized input through. Beyond the fitted range the
-  lane outputs the saturated value (tanh past |x| = 3.125, sigmoid past |x| = 6.25, SELU below x = -7); `gpnae_tail`
-  is not instantiated and rejects int8 (Tasks 10, 11).
+  lane outputs the saturated value (tanh past |x| = 4, sigmoid past |x| = 3.5, SELU below x = -4: the float lane's
+  thresholds, Soham 2026-09-29); `gpnae_tail` is not instantiated and rejects int8. Accuracy against the exact
+  functions is judged by GPNAE's tolerance (L2-4) and reported, not a stop (Tasks 10, 11, 12).
 - **D-5 (corrected): dropout in int8.** Inference: bypass. Training: kept values unchanged; a dropped value becomes the
   zero point of the value dropout sees, the output zero point of the set's activation: ReLU and linear `req_zp`,
   tanh 0, sigmoid -128, SELU `gp_zout`. The 1/keep factor is folded into the next layer's scale (Tasks 18, 20).
@@ -2984,7 +2985,7 @@ Expected, for each of the 24 runs: `fxMac W=16 FRAC=11: 1073741824 results again
 
 - [ ] **Step 8: Report Task 6**
 
-Report the six sweeps' totals (6 x 4,294,967,296 results, errors, digest mismatches), the slice times, and the fxMac commit from Step 6. Nothing to commit. The choice of the six sweeps is in the plan's Open for Soham section.
+Report the six sweeps' totals (6 x 4,294,967,296 results, errors, digest mismatches), the slice times, and the fxMac commit from Step 6. Nothing to commit. Soham approved the six sweeps on 2026-09-29 (Open for Soham, item 1).
 
 ### Task 7: `tfliteRequant` and its DV
 
@@ -3614,27 +3615,40 @@ Q4.11 (D-1: floor), integer multiplies for the post stage, then int8 quantizatio
 
 | Activation | MAC operand (Q4.11) | Polynomial | Post stage (as the float lane) | Past the fitted range | Output (int8) |
 |---|---|---|---|---|---|
-| SELU (001), x < 0 | x | `P(x) ~ lambda*alpha*(e^x - 1)/x` on [-7, 0] | `x * P` (32-bit product, 2^-22) | x < -7: `-lambda*alpha` | `tfliteRequant(v, gp_mout, gp_shout, gp_zout)`, v in 2^-25 |
+| SELU (001), x < 0 | x | `P(x) ~ lambda*alpha*(e^x - 1)/x` on [-4, 0] | `x * P` (32-bit product, 2^-22) | x < -4: `-lambda*alpha` | `tfliteRequant(v, gp_mout, gp_shout, gp_zout)`, v in 2^-25 |
 | SELU, x >= 0 | (discarded) | none | `x * lambda` (Q1.14, exact product, 2^-25) | none | same requantize |
-| sigmoid (010) | `abs(x)` | `P(|x|) ~ sig` on [0, 6.25] | x >= 0: `P`; x < 0: `1 - P` (`2048 - P`, exact) | abs(x) > 6.25: 127 / -128 | `round(256 y) - 128 = ((y + 4) >> 3) - 128`, clamped |
-| tanh (011) | `u = sat((x * x) >>> 11)` (an fxMac with C = 0) | `P(u) ~ tanh(sqrt u)/sqrt u` on u in [0, 9.77] | `x * P` (32-bit product, 2^-22) | abs(x) > 3.125: 127 / -128 | `round(128 y) = (x*P + 2^14) >> 15`, clamped |
+| sigmoid (010) | `abs(x)` | `P(|x|) ~ sig` on [0, 3.5] | x >= 0: `P`; x < 0: `1 - P` (`2048 - P`, exact) | abs(x) > 3.5: 127 / -128 | `round(256 y) - 128 = ((y + 4) >> 3) - 128`, clamped |
+| tanh (011) | `u = sat((x * x) >>> 11)` (an fxMac with C = 0) | `P(u) ~ tanh(sqrt u)/sqrt u` on u in [0, 16] | `x * P` (32-bit product, 2^-22) | abs(x) > 4: 127 / -128 | `round(128 y) = (x*P + 2^14) >> 15`, clamped |
 | ReLU (100), linear (101) | none | none | none | none | the input, unchanged (D-4) |
 
 Input rescale for every activation: `x = sat16(round_half_up((q - z_in) * gp_mx / 2^gp_shx))`, Q4.11.
 
-Fitted ranges. The float lane hands inputs past SELU -4, sigmoid 3.5 and tanh 4 to gpnae_tail; int8 has no tail, so
-its polynomial must reach the point where the exact int8 output is already the saturated value. tanh: `128 tanh(x)`
-passes 127.5 at 3.1182, so 3.125 (narrower than the float lane's 4). sigmoid: `256 sig(x)` passes 255.5 at 6.2364, so
-6.25 (wider than 3.5: saturating at 3.5 would give 255 where the exact value is 248.5). SELU: `lambda*alpha*e^-7 =
-0.0016`, 0.19 LSB at the tightest test case (s_out 0.0085), where -4 would leave 0.032, 3.8 LSB. Task 10 also measures
-the float lane's ranges, for the record.
+Fitted ranges (Soham, 2026-09-29): the float lane's own, `gpnae_model.Lane.in_tail`: SELU x >= -4, sigmoid
+abs(x) <= 3.5, tanh abs(x) <= 4. Past them the float lane calls gpnae_tail; the int8 lane has no tail and outputs the
+saturated value. What saturating costs against the exact function quantized to int8 (hand estimates, Task 10
+measures them): tanh past 4, nothing (`128 tanh(4) = 127.9` already rounds to the clamp, 127); sigmoid just past 3.5,
+127 where the exact value is 120 (`256 sig(3.5) = 248.5`), 7 LSB but 2.8% relative, inside the tolerance; SELU just
+below -4, `lambda*alpha*e^-4 = 0.032`, about 4 LSB at the tightest gated case (s_out 0.0078) but 1.9% relative, inside
+the tolerance. tanh's operand `u = x^2` reaches 16 at abs(x) = 4, one step past Q4.11: `8192^2 >>> 11 = 32768`
+saturates to 32767 (15.9995), only at x = +/-8192.
 
-Degrees are free (Task 10 picks the lowest that meets the target, 2 to 12 measured). The coefficient ROM keeps the fp32
-layout (SELU base 0, sigmoid base 9, tanh base 16) when the chosen degrees fit it (at most 8, 6 and 15), else the three
-sets are packed in that order; the layout is `gpnae_model.SETS_INT8` and gpnae_poly_int8's `BASE_*`/`DEG_*`.
+Degrees are free (Task 10 picks, per activation, the lowest degree that meets the tolerance on every gated case,
+2 to 12 measured; where none does, the best one measured). The coefficient ROM keeps the fp32 layout (SELU base 0,
+sigmoid base 9, tanh base 16) when the chosen degrees fit it (at most 8, 6 and 15), else the three sets are packed in
+that order; the layout is `gpnae_model.SETS_INT8` and gpnae_poly_int8's `BASE_*`/`DEG_*`.
 
-Task 10 measures first. If a form cannot reach at most 1 int8 LSB on every input of every gated test case, Task 10
-stops with a report for Soham (measured errors and three options) and nothing further in this level is built.
+Accuracy (Soham, 2026-09-29: the tolerance the fp32 and bf16 lanes are judged by, not a strict 1-LSB target and not a
+stop). The golden is the exact function quantized to the case's output (`gpnae_model.exact_int8`), as GPNAE's float
+golden is the exact function rounded to the format. With d = lane - golden in output LSB, an output passes if
+`abs(d) / abs(golden - z_out)` <= `REL_TOL_INT8` = max(1%, 8 eps) with eps = 2^-7 (6.25%, GPNAE's
+`number_formats.suggested_rel_tol` rule, bf16's value) or `abs(d)` <= `ABS_TOL_LSB` = 1 output LSB (the int8 analog of
+GPNAE's `--abs-tol`, whose 1e-6 default means nothing in int8); a golden equal to the zero point has only the
+absolute bound, as in TB_gpnae_poly. Reported per activation: the worst relative error over the outputs whose
+`abs(d)` exceeds 1 LSB (where the relative bound decides; 0 if none), the worst `abs(d)` in LSB (the figure the
+earlier 1-LSB target used), and, for information, the worst error in LSB against the unquantized function. An
+activation that misses the tolerance at every degree keeps its best degree, Task 12's gate report records it as an
+open accuracy item for Soham (as the bf16 G2 gate recorded bf16's activation accuracy), and Level 2 goes on. The
+hardware check does not change: the RTL lane equals the model bit for bit on every input.
 
 ### Decisions this level makes (flag at review)
 
@@ -3646,9 +3660,10 @@ stops with a report for Soham (measured errors and three options) and nothing fu
   largest `shx <= 31` with `mx <= 32767` (relative precision at worst 2^-15).
 - **L2-3: the post-stage products are full 32-bit products** (intMultiplier), quantized once (tanh) or requantized
   (SELU), rather than shifted back to Q4.11 first; the MAC and the tanh squarer are fxMac (Q4.11, floor).
-- **L2-4: the target** is at most 1 int8 LSB after output quantization on every int8 input of every gated case in
-  `gpnae_model.INT8_CASES`; the error over every Q4.11 input of the fitted range is reported beside it (SELU in LSB of
-  the tightest gated case).
+- **L2-4: the accuracy criterion** (decided 2026-09-29) is GPNAE's tolerance above, relative error <= 6.25% or absolute
+  error <= 1 output LSB against `exact_int8`, on every int8 input of every gated case in `gpnae_model.INT8_CASES`;
+  reported (Tasks 10 and 12), never a stop. The error over every Q4.11 input of the fitted range is reported beside it
+  (SELU in LSB of the tightest gated case).
 - **L2-5: `fit_poly_coeffs.py` refuses bf16 as well as fp32**, so the published bf16 table cannot be rewritten.
 
 ---
@@ -4029,27 +4044,36 @@ git push origin int8
 
 **Files:**
 - Modify: `gpnae_model.py` (int8 lane), `fit_poly_coeffs.py` (`--format int8`, bf16 refused)
-- Create: `check_gpnae_model_int8.py`; if the target is met, `poly_coeffs_int8.mem`, `src/TYTAN/Memory/poly_coeffs_int8.mem`
+- Create: `check_gpnae_model_int8.py`, `poly_coeffs_int8.mem`, `src/TYTAN/Memory/poly_coeffs_int8.mem` (written whatever
+  the tolerance verdict)
 - Create (no repo): `$J/cmds/int8_py.sh`, `$J/cmds/int8_fit.sh`
-- Create (untracked, only if the target is missed): `testbenches/results/int8/gpnae_int8_stop.log` (SIENNA root)
 
 **Interfaces:**
 - Consumes: `ipu.fx_mac`, `ipu.int_mul(a, b, w)`, `ipu.requant(acc, mult, shift, zp, amin, amax, rounding)`,
   `ipu.REQ_ROUNDING` (Tasks 1 and 3).
 - Produces (in `gpnae_model`):
-  - `INT8` (name `"int8"`, `w = 8`, `frac = 11`, `iw = 16`); `FORMATS = dict(fpu.FORMATS, int8=INT8)`.
+  - `INT8` (name `"int8"`, `w = 8`, `frac = 11`, `iw = 16`, `eps = 2^-7`); `FORMATS = dict(fpu.FORMATS, int8=INT8)`.
   - `Lane(FORMATS["int8"], rom, sets=None, thresh=None)` returns a `LaneInt8`: `.run(q, code, par) -> np.ndarray`
     (int8 values, any shape), `.element(q, code, par) -> int`, `.poly(x, code)` (P at the float lane's MAC operand),
     `.value(x, code)` (the unsaturated path as a real number before quantizing). Codes 1 SELU, 2 sigmoid, 3 tanh,
     4 ReLU, 5 linear; others run tanh. `sets`/`thresh` override the layout and the saturation thresholds (the fit uses
-    them for candidates).
+    `sets` for candidates).
   - `Int8Params(mx, shx, zin, mout, shout, zout)`; `Case(s_in, z_in, s_out, z_out, gated)`; `INT8_CASES` (five cases
-    per activation name); `int8_params(case, code)`; `exact_int8(q, code, case)`; `rescale_params(s_in) -> (mx, shx)`;
-    `quantize_multiplier(real) -> (mult, shift)` (TFLite's QuantizeMultiplier); `calib_out`, `selu_case`.
+    per activation name); `int8_params(case, code)`; `exact_lsb(q, code, case) -> (y, z)` (the exact function in output
+    LSB before zero point, rounding and clamp, and the output zero point); `exact_int8(q, code, case)`;
+    `rescale_params(s_in) -> (mx, shx)`; `quantize_multiplier(real) -> (mult, shift)` (TFLite's QuantizeMultiplier);
+    `calib_out`, `selu_case`.
+  - The tolerance (L2-4): `REL_TOL_INT8` (= `number_formats.suggested_rel_tol(INT8)` = 0.0625), `ABS_TOL_LSB` (= 1);
+    `Acc(ok, fail, worst_rel, worst_lsb, real_lsb, differ)`; `accuracy_int8(out, q, code, case) -> Acc` (one case:
+    every output within the tolerance, how many are not, the worst relative error where `abs(d)` > 1 LSB, the worst
+    `abs(d)` in LSB, the worst error in LSB against the unquantized function, how many differ from `exact_int8`);
+    `merge_acc(accs) -> Acc`.
   - Functions `rescale`, `mac_operand`, `horner`, `quant_sig`, `quant_tanh`; constants `Q, SETS_INT8, THRESH, T_SELU,
     T_SIG, T_TANH, SELU_SAT, ONE_Q11, LAMBDA_Q14, LAMBDA_F, LA_F`. Task 11's RTL uses the same constants.
-  - `python3 fit_poly_coeffs.py --format int8 [--report FILE]`: exit 0, target met and the table written; 3, target
-    met but `SETS_INT8` must be updated to the printed layout (table written); 2, target missed, no table, stop report.
+  - `python3 fit_poly_coeffs.py --format int8 [--report FILE]`: always writes the table; exit 0, `SETS_INT8` matches
+    the chosen layout; 3, `SETS_INT8` must be updated to the printed layout. Each activation's line says
+    `MEETS TOLERANCE` or `MISSES TOLERANCE`, and the `VERDICT:` line names any activation that misses (an open
+    accuracy item, not a stop).
 
 - [ ] **Step 1: Write the failing model test**
 
@@ -4081,7 +4105,7 @@ eq("rescale subtracts the zero point", gm.rescale(np.array([5]), 5, 1000, 3), [0
 eq("rescale by 2^31", gm.rescale(np.array([127]), -128, 32767, 31), [0])
 eq("SELU MAC operand is x", gm.mac_operand(np.array([-5, 7]), 1), [-5, 7])
 eq("sigmoid MAC operand is |x|, saturated", gm.mac_operand(np.array([-32768, -5, 5]), 2), [32767, 5, 5])
-eq("tanh MAC operand is x^2 on fxMac", gm.mac_operand(np.array([2048, -2048, 6400, 32767]), 3), [2048, 2048, 20000, 32767])
+eq("tanh MAC operand is x^2 on fxMac", gm.mac_operand(np.array([2048, -2048, 6400, 8192, 32767]), 3), [2048, 2048, 20000, 32767, 32767])
 eq("sigmoid output rounding and clamp", gm.quant_sig(np.array([2048, 0, 4, 3, -9])), [127, -128, -127, -128, -128])
 eq("tanh output from x*P", gm.quant_tanh(np.array([16384, 16383, -16384, -16385, 1 << 30])), [1, 0, 0, -1, 127])
 eq("rescale_params(1/128)", gm.rescale_params(1 / 128), (16384, 10))
@@ -4093,15 +4117,24 @@ eq("16-bit ROM words read as two's complement", gm.Lane(gm.INT8, [0xFFFF] + [0] 
 
 zero = gm.Lane(gm.INT8, [0] * 32)  # P = 0 everywhere, so only the non-polynomial paths show
 p = gm.Int8Params(mx=26214, shx=8, zin=0, mout=0, shout=0, zout=0)  # s_in = 0.05: x = 102.4 q in Q4.11
-eq("tanh, zero table: x * 0 inside +/-3.125, saturated outside", zero.run(np.array([0, 62, 63, -62, -63]), 3, p), [0, 0, 127, 0, -128])
-eq("sigmoid, zero table: P = 0, 1 - P = 1 inside +/-6.25, saturated outside", zero.run(np.array([124, 126, -124, -126]), 2, p), [-128, 127, 127, -128])
+eq("tanh, zero table: x * 0 inside +/-4, saturated outside", zero.run(np.array([0, 80, 81, -80, -81]), 3, p), [0, 0, 127, 0, -128])
+eq("sigmoid, zero table: P = 0, 1 - P = 1 inside +/-3.5, saturated outside", zero.run(np.array([70, 71, -70, -71]), 2, p), [-128, 127, 127, -128])
 p2 = gm.Int8Params(mx=26214, shx=8, zin=0, mout=1 << 30, shout=-20, zout=3)  # output multiplier 2^-21
 eq("SELU x >= 0: lambda x, requantized", zero.run(np.array([10, 0]), 1, p2), [11, 3])
-eq("SELU -7 <= x < 0: x * P = 0 with a zero table", zero.run(np.array([-5]), 1, p2), [3])
+eq("SELU -4 <= x < 0: x * P = 0 with a zero table", zero.run(np.array([-5]), 1, p2), [3])
 p3 = gm.Int8Params(mx=26214, shx=7, zin=0, mout=1 << 30, shout=-20, zout=3)  # s_in = 0.1
-eq("SELU x < -7: -lambda*alpha, requantized", zero.run(np.array([-71]), 1, p3), [-25])
+eq("SELU x = -4 inside, x < -4: -lambda*alpha, requantized", zero.run(np.array([-40, -41, -71]), 1, p3), [3, -25, -25])
 eq("ReLU and linear pass through", [int(v) for v in zero.run(np.array([-5, 7]), 4, p)] + [int(v) for v in zero.run(np.array([-5, 7]), 5, p)], [-5, 7, -5, 7])
 eq("every case's rescale fits", [int(0 <= gm.int8_params(c, 3).mx <= 32767) for a in ("tanh", "sigmoid", "selu") for c in gm.INT8_CASES[a]], [1] * 15)
+eq("REL_TOL_INT8 is GPNAE's max(1%, 8 * 2^-7)", (gm.REL_TOL_INT8, gm.ABS_TOL_LSB), (0.0625, 1))
+ct = gm.Case(1 / 32, 0, 1 / 128, 0, True)  # tanh golden: q = 0 -> 0, q = 32 -> 97, q = 1 -> 4
+a = gm.accuracy_int8(np.array([1, 98, 99, 110, 5, 6]), np.array([0, 32, 32, 32, 1, 1]), 3, ct)
+eq("tolerance: 1 LSB passes, 2/97 passes, 13/97 and 2/4 fail", (a.ok, a.fail, a.worst_rel, a.worst_lsb, round(a.real_lsb, 3), a.differ), (False, 2, 0.5, 13, 12.516, 6))
+m = gm.merge_acc([a, a])
+eq("merge_acc sums counts, keeps the worst", (m.ok, m.fail, m.worst_rel, m.worst_lsb, m.differ), (False, 4, 0.5, 13, 12))
+cs = gm.Case(1 / 32, 0, 1 / 256, -128, True)  # sigmoid golden at q = 0: 0, i.e. 128 LSB above the zero point -128
+a = gm.accuracy_int8(np.array([4, 9]), np.array([0, 0]), 2, cs)
+eq("tolerance measured from the output zero point", (a.ok, a.fail, a.worst_rel, a.worst_lsb), (False, 1, 0.0703125, 9))
 
 print(f"check_gpnae_model_int8: {errs} errors")
 print(f"RESULT: {'PASSED' if errs == 0 else 'FAILED'}")
@@ -4109,13 +4142,21 @@ sys.exit(1 if errs else 0)
 ```
 
 Where the expected values come from: `(3 + 1) >> 1 = 2`, `(-3 + 1) >> 1 = -1`; `(8355585 + 2^30) >> 31 = 0`;
-`6400^2 >> 11 = 20000`, `32767^2 >> 11 = 524255 -> 32767`; `(2048 + 4) >> 3 - 128 = 128 -> 127`,
+`6400^2 >> 11 = 20000`, `8192^2 >> 11 = 32768 -> 32767` (abs(x) = 4, the one in-range input whose u saturates),
+`32767^2 >> 11 = 524255 -> 32767`; `(2048 + 4) >> 3 - 128 = 128 -> 127`,
 `(-9 + 4) >> 3 - 128 = -129 -> -128`; `(-16385 + 2^14) >> 15 = -1`. tanh at s_in = 0.05:
-`(62 * 26214 + 128) >> 8 = 6349` (inside), `(63 * 26214 + 128) >> 8 = 6451` (saturated). Sigmoid:
-`(124 * 26214 + 128) >> 8 = 12697` (inside: P = 0 gives -128, 1 - P gives 127), `126` gives 12902 (saturated).
+`(80 * 26214 + 128) >> 8 = 8192` (inside: the threshold itself), `(81 * 26214 + 128) >> 8 = 8294` (saturated),
+`-80` gives -8192 (inside), `-81` gives -8294 (saturated). Sigmoid: `(70 * 26214 + 128) >> 8 = 7168` (inside: P = 0
+gives -128, 1 - P gives 127), `71` gives 7270 (saturated), and the negatives mirror them.
 SELU at q = 10: x = `(262140 + 128) >> 8 = 1024`, v = `1024 * 17215 = 17628160`, `v * 2^-21 = 8.41 -> 8`, plus 3
-is 11 in both rounding variants. SELU at q = -71, s_in = 0.1: x = `(-1861194 + 64) >> 7 = -14541 < -14336`, so
-v = `(-3601 * 2048) << 3 = -58998784`, `v * 2^-21 = -28.13 -> -28` in both variants, plus 3 is -25.
+is 11 in both rounding variants. SELU at s_in = 0.1: q = -40 gives x = `(-1048560 + 64) >> 7 = -8192`, not below
+-8192, so the zero table gives 3; q = -41 gives -8397 and q = -71 gives `(-1861194 + 64) >> 7 = -14541`, both
+saturated, so v = `(-3601 * 2048) << 3 = -58998784`, `v * 2^-21 = -28.13 -> -28` in both variants, plus 3 is -25.
+Tolerance: tanh at s_in = 1/32 has goldens `round(128 tanh(q / 32))` = 0, 97 and 4 at q = 0, 32 and 1; outputs 1, 98
+and 5 are 1 LSB off (pass on the absolute bound; q = 0's zero golden has no relative bound), 99 is 2/97 = 2.1% (pass),
+110 is 13/97 = 13.4% and 6 is 2/4 = 50% (fail), so 2 fail, the worst relative error is 0.5, the worst `abs(d)` 13, and
+`110 - 128 tanh(1) = 12.516` LSB against the unquantized function. Sigmoid at q = 0: golden 0, 128 LSB above the zero
+point -128, so 4 off is 3.1% (pass) and 9 off is 9/128 = 0.0703125 (fail).
 
 `$J/cmds/int8_py.sh`:
 
@@ -4134,7 +4175,9 @@ Expected: `AttributeError: module 'gpnae_model' has no attribute 'rescale'`.
 - [ ] **Step 3: Write the int8 lane model**
 
 In `gpnae_model.py`, extend the docstring's first line with `; the int8 lane (gpnae_poly_int8) on AriL's ipu.py.`,
-add `from collections import namedtuple` to the imports and `import ipu  # noqa: E402` after `import fpu`. Add this
+add `from collections import namedtuple` to the imports, and `import ipu  # noqa: E402` and
+`from number_formats import suggested_rel_tol  # noqa: E402` (GPNAE root, the float regression's tolerance rule) after
+`import fpu`. Add this
 method at the top of `class Lane`:
 
 ```python
@@ -4151,16 +4194,18 @@ Append to the end of the file:
 
 
 class Int8Fmt:
-    """The int8 build as the lane sees it: 8-bit ports, Q4.11 inside."""
-    name, w, frac, iw = "int8", 8, 11, 16
+    """The int8 build as the lane sees it: 8-bit ports, Q4.11 inside; eps 2^-7 for GPNAE's tolerance rule."""
+    name, w, frac, iw, eps = "int8", 8, 11, 16, 2.0 ** -7
 
 
 INT8 = Int8Fmt()
 FORMATS = dict(fpu.FORMATS, int8=INT8)
+REL_TOL_INT8 = suggested_rel_tol(INT8)  # max(1%, 8 eps) = 6.25%, bf16's value (L2-4)
+ABS_TOL_LSB = 1  # the int8 analog of --abs-tol: one output LSB
 
 Q = 11  # Q4.11
 SETS_INT8 = {1: (0, 8), 2: (9, 6), 3: (16, 8)}  # (ROM base, degree) per control word; Task 10's fit sets it
-T_SELU, T_SIG, T_TANH = -14336, 12800, 6400  # saturation in Q4.11: SELU x < -7, sigmoid |x| > 6.25, tanh |x| > 3.125
+T_SELU, T_SIG, T_TANH = -8192, 7168, 8192  # the float lane's thresholds in Q4.11: SELU x < -4, sigmoid |x| > 3.5, tanh |x| > 4
 THRESH = {1: T_SELU, 2: T_SIG, 3: T_TANH}
 SELU_SAT, ONE_Q11, LAMBDA_Q14 = -3601, 2048, 17215  # -lambda*alpha and 1.0 in Q4.11, lambda in Q1.14
 LAMBDA_F, LA_F = 1.0507009873554805, 1.7580993408473766
@@ -4245,12 +4290,12 @@ def selu_case(s_in, z_in, gated=True):
     return Case(s_in, z_in, s_out, z_out, gated)
 
 
-# Scales put the fitted range at 128, 32 and 8 int8 steps (SELU: 128, 64, 256, since its x must stay within +/-16).
+# Scales put the fitted range (the float lane's thresholds) at 128, 32 and 8 int8 steps (SELU: 128, 64, 256).
 # The SELU case at 7/32 reaches x = 27.8, past Q4.11; it is checked bit-exact only (not gated for accuracy).
 INT8_CASES = {
-    "tanh": [Case(3.125 / n, z, 1 / 128, 0, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, -37), (64, 100))],
-    "sigmoid": [Case(6.25 / n, z, 1 / 256, -128, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, 25), (64, -100))],
-    "selu": [selu_case(7 / 128, 0), selu_case(7 / 64, 0), selu_case(7 / 256, 0), selu_case(7 / 128, 120),
+    "tanh": [Case(4.0 / n, z, 1 / 128, 0, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, -37), (64, 100))],
+    "sigmoid": [Case(3.5 / n, z, 1 / 256, -128, True) for n, z in ((128, 0), (32, 0), (8, 0), (32, 25), (64, -100))],
+    "selu": [selu_case(4 / 128, 0), selu_case(4 / 64, 0), selu_case(4 / 256, 0), selu_case(4 / 128, 120),
              selu_case(7 / 32, 0, gated=False)],
     "relu": [Case(0.05, z, 0.05, z, False) for z in (0, -20, 20, 100, -100)],
     "linear": [Case(0.05, z, 0.05, z, False) for z in (0, -20, 20, 100, -100)],
@@ -4266,19 +4311,49 @@ def int8_params(case, code):
     return Int8Params(mx, shx, case.z_in, 0, 0, 0)
 
 
-def exact_int8(q, code, case):
-    """The exact function at the real input, quantized with round half up and clamped: what the lane approximates."""
+def exact_lsb(q, code, case):
+    """The exact function at the real input in output LSB, before zero point, rounding and clamp; and the output zero point."""
     q = np.asarray(q, dtype=np.int64)
     r = case.s_in * (q.astype(float) - case.z_in)
     if code == 3:
-        y, s, z = np.tanh(r), 1 / 128, 0
-    elif code == 2:
-        y, s, z = 1 / (1 + np.exp(-r)), 1 / 256, -128
-    elif code == 1:
-        y, s, z = np.where(r >= 0, LAMBDA_F * r, LA_F * np.expm1(r)), case.s_out, case.z_out
-    else:
-        return q.copy()
-    return np.clip(np.floor(y / s + 0.5) + z, -128, 127).astype(np.int64)
+        return np.tanh(r) / (1 / 128), 0
+    if code == 2:
+        return (1 / (1 + np.exp(-r))) / (1 / 256), -128
+    if code == 1:
+        return np.where(r >= 0, LAMBDA_F * r, LA_F * np.expm1(r)) / case.s_out, case.z_out
+    return q.astype(float), 0
+
+
+def exact_int8(q, code, case):
+    """The exact function at the real input, quantized with round half up and clamped: the golden the lane is judged against."""
+    if code not in (1, 2, 3):
+        return np.asarray(q, dtype=np.int64).copy()
+    y, z = exact_lsb(q, code, case)
+    return np.clip(np.floor(y + 0.5) + z, -128, 127).astype(np.int64)
+
+
+Acc = namedtuple("Acc", "ok fail worst_rel worst_lsb real_lsb differ")
+
+
+def accuracy_int8(out, q, code, case):
+    """One case against GPNAE's tolerance: d = out - exact_int8 passes if abs(d) <= 1 LSB or abs(d) / abs(golden - z) <= 6.25%."""
+    y, z = exact_lsb(q, code, case)
+    g = exact_int8(q, code, case)
+    out = np.asarray(out, dtype=np.int64)
+    d = np.abs(out - g)
+    mag = np.abs(g - z)
+    rel = np.where(mag > 0, d / np.maximum(mag, 1), np.where(d > 0, np.inf, 0.0))  # a zero golden: the absolute bound only, as TB_gpnae_poly
+    ok = (d <= ABS_TOL_LSB) | (rel <= REL_TOL_INT8)
+    far = rel[d > ABS_TOL_LSB]  # the outputs where the relative bound decides
+    return Acc(bool(ok.all()), int((~ok).sum()), float(far.max()) if far.size else 0.0, int(d.max()),
+               float(np.abs(out - z - y).max()), int((d > 0).sum()))
+
+
+def merge_acc(accs):
+    """Several cases' Acc as one: every output within the tolerance, counts summed, worst values the maximum."""
+    a = list(accs)
+    return Acc(all(x.ok for x in a), sum(x.fail for x in a), max(x.worst_rel for x in a), max(x.worst_lsb for x in a),
+               max(x.real_lsb for x in a), sum(x.differ for x in a))
 
 
 class LaneInt8(Lane):
@@ -4345,7 +4420,7 @@ Expected now: `argument --format: invalid choice: 'int8'`.
 - [ ] **Step 6: Add the int8 fit: the float forms, measured**
 
 In `fit_poly_coeffs.py`: extend the docstring's last line to `Writes poly_coeffs_<fmt>.mem in the GPNAE root and in
-src/TYTAN/Memory. Never writes the fp32 or bf16 files; int8 fits the same forms in Q4.11 and measures them first.`
+src/TYTAN/Memory. Never writes the fp32 or bf16 files; int8 fits the same forms in Q4.11 and measures them against GPNAE's tolerance.`
 Change the `--format` choices to `sorted(gpnae_model.FORMATS)`, and replace the fp32 guard in `main()` with:
 
 ```python
@@ -4362,19 +4437,19 @@ Change the `--format` choices to `sorted(gpnae_model.FORMATS)`, and replace the 
 
 ```python
 NAME_INT8 = {1: "selu", 2: "sigmoid", 3: "tanh"}
-RANGES_INT8 = {1: (4.0, 7.0), 2: (3.5, 6.25), 3: (3.125,)}  # the float lane's threshold where it differs, then the implemented range
+RANGE_INT8 = {c: abs(gpnae_model.THRESH[c]) / 2048 for c in (1, 2, 3)}  # the float lane's thresholds: SELU 4, sigmoid 3.5, tanh 4
 DEGREES_INT8 = range(2, 13)
 OPTIONS_INT8 = [
     "",
-    "OPTIONS FOR SOHAM (none implemented; the lane keeps the float lanes' forms until Soham decides):",
-    "A. Centred, scaled operands. Evaluate each function directly on t = (x - c) / h with |t| < 1: tanh P((|x| - 1.5625) / 2)",
-    "   on [0, 3.125] with the sign restored; SELU P((x + 3.5) / 4) on [-7, 0]; sigmoid as tanh at x/2, exact for the int8",
-    "   output since round(256 sig(x)) - 128 = round(128 tanh(x/2)). Why: fixed-point Horner multiplies each step's floor",
-    "   error by the operand in every later step (bound: the sum of |t|^j ULP), and the float forms' operands reach 9.77",
-    "   (tanh u), 6.25 (sigmoid) and 7 (SELU); with |t| < 1 the bound is at most degree + 1 ULP, and the power coefficients",
-    "   stay within Q4.11 because each function's nearest singularity is farther from the interval's centre than its",
-    "   half-length (estimate, not measured). RTL: a constant subtract and a shift on the MAC operand in place of the",
-    "   squarer and abs; sigmoid adds 1 to the rescale shift; the rest of the lane is unchanged.",
+    "OPTIONS FOR SOHAM for an activation outside the tolerance (none implemented; the lane keeps the float lanes' forms):",
+    "A. Centred, scaled operands. Evaluate each function directly on t = (x - c) / h with |t| <= 1: tanh P((|x| - 2) / 2)",
+    "   on [0, 4] with the sign restored; SELU P((x + 2) / 2) on [-4, 0]; sigmoid P((|x| - 1.75) / 1.75) on [0, 3.5].",
+    "   Why: fixed-point Horner multiplies each step's floor error by the operand in every later step (bound: the sum of",
+    "   |t|^j ULP), and one Q4.11 step in coefficient k moves P by 2^-11 |t|^k at the range's end; the float forms'",
+    "   operands reach 16 (tanh u), 3.5 (sigmoid) and 4 (SELU). With |t| <= 1 the bound is at most degree + 1 ULP, and the",
+    "   power coefficients stay within Q4.11 because each function's nearest singularity is farther from the interval's",
+    "   centre than its half-length (estimate, not measured). RTL: a constant subtract and a shift on the MAC operand in",
+    "   place of the squarer and abs; the rest of the lane is unchanged.",
     "B. Higher degree. The rows above cover degrees 2 to 12; where the error stops falling with degree, more terms do not",
     "   help at Q4.11. Degrees past the ROM's 32 entries need a 64-entry ROM, whose address width the lane now shares",
     "   with its FIFO depth (ADDR_LINES), so the two would have to be split.",
@@ -4383,6 +4458,7 @@ OPTIONS_INT8 = [
     "   coefficient and post-stage scaling change only; it gains 3 bits everywhere but not the operand's amplification,",
     "   and needs the partial sums within +/-2 (the max |c| column shows the coefficients' size). Or a 32-bit",
     "   accumulator (fxMac W = 32), which changes Level 1's unit and DV.",
+    "D. Accept the measured accuracy for int8.",
 ]
 
 
@@ -4395,13 +4471,11 @@ def fit_form(code, r, deg):
     return ints if all(-32768 <= v <= 32767 for v in ints) else None
 
 
-def lane_for(code, r, coeffs):
-    """The bit-exact lane with one coefficient set at base 0 and saturation at the candidate range."""
+def lane_for(code, coeffs):
+    """The bit-exact lane with one coefficient set at base 0 and the model's saturation thresholds (THRESH)."""
     rom = [0] * 32
     rom[:len(coeffs)] = coeffs
-    th = int(round(r * 2048))
-    return gpnae_model.Lane(gpnae_model.INT8, [v & 0xFFFF for v in rom], sets={code: (0, len(coeffs) - 1)},
-                            thresh={code: -th if code == 1 else th})
+    return gpnae_model.Lane(gpnae_model.INT8, [v & 0xFFFF for v in rom], sets={code: (0, len(coeffs) - 1)})
 
 
 def lsb(code):
@@ -4415,19 +4489,15 @@ def measure_cont(code, r, coeffs):
     """Worst and mean error, in output LSB, of the unsaturated path over every Q4.11 input of the fitted range."""
     th = int(round(r * 2048))
     x = np.arange(-th, 1 if code == 1 else th + 1, dtype=np.int64)
-    e = np.abs(lane_for(code, r, coeffs).value(x, code) - exact_act(code, x / 2048.0)) * lsb(code)
+    e = np.abs(lane_for(code, coeffs).value(x, code) - exact_act(code, x / 2048.0)) * lsb(code)
     return float(e.max()), float(e.mean())
 
 
 def measure_cases(lane, code):
-    """Every int8 input of every gated case: max |lane - exact| in int8 LSB, and how many inputs differ."""
+    """Every int8 input of every gated case against GPNAE's tolerance (gpnae_model.accuracy_int8), merged into one Acc."""
     q = np.arange(-128, 128, dtype=np.int64)
-    dmax, ndiff = 0, 0
-    for case in gpnae_model.INT8_CASES[NAME_INT8[code]]:
-        if case.gated:
-            d = np.abs(lane.run(q, code, gpnae_model.int8_params(case, code)) - gpnae_model.exact_int8(q, code, case))
-            dmax, ndiff = max(dmax, int(d.max())), ndiff + int((d > 0).sum())
-    return dmax, ndiff
+    return gpnae_model.merge_acc(gpnae_model.accuracy_int8(lane.run(q, code, gpnae_model.int8_params(c, code)), q, code, c)
+                                 for c in gpnae_model.INT8_CASES[NAME_INT8[code]] if c.gated)
 
 
 def refine_int8(code, r, c, passes=10):
@@ -4449,6 +4519,12 @@ def refine_int8(code, r, c, passes=10):
     return c
 
 
+def pick_int8(cands):
+    """The lowest degree within the tolerance, else the best measured: fewest outputs outside, then worst relative error."""
+    ok = [c for c in cands if c[2].ok]
+    return min(ok, key=lambda c: c[0]) if ok else min(cands, key=lambda c: (c[2].fail, c[2].worst_rel, c[0]))
+
+
 def layout_int8(deg):
     """The fp32 table's layout when the degrees fit it, else the three sets packed in order; None if they exceed 32 entries."""
     d1, d2, d3 = deg[1], deg[2], deg[3]
@@ -4462,67 +4538,69 @@ def layout_int8(deg):
 def main_int8(a):
     out = gpnae_model.coeff_file(gpnae_model.INT8)
     assert out not in ("poly_coeffs.mem", "poly_coeffs_bf16.mem", "taylor_coeffs.mem")
-    L, chosen = [], {}
-    L.append("gpnae_poly int8: the float lanes' forms in Q4.11 (fxMac Horner, floor; integer post products), bit-exact model.")
-    L.append("cases: max |lane - exact| in int8 LSB over every int8 input of every gated case (target 1); inputs differing.")
-    L.append("range: max and mean error of the unsaturated path over every Q4.11 input of the fitted range, in output LSB")
-    L.append("(SELU in LSB of the tightest gated case). Candidate ranges: the float lane's threshold, then the implemented one.")
-    L.append(f"{'activation':<10}{'range':>7}{'degree':>7}{'cases max':>10}{'differ':>8}{'range max':>10}{'mean':>7}{'max |c|':>9}")
+    tol = f"rel <= {100 * gpnae_model.REL_TOL_INT8:.2f}% or abs <= {gpnae_model.ABS_TOL_LSB} LSB"
+    L, cands, chosen = [], {}, {}
+    L.append("gpnae_poly int8: the float lanes' forms in Q4.11 (fxMac Horner, floor; integer post products), bit-exact model;")
+    L.append("the float lane's ranges (SELU x >= -4, sigmoid |x| <= 3.5, tanh |x| <= 4), the saturated value beyond them.")
+    L.append(f"cases: every int8 input of every gated case against exact_int8 with GPNAE's tolerance ({tol}): fail, outputs")
+    L.append("outside it; rel, the worst relative error where |d| > 1 LSB; LSB, the worst |d|; real, the worst error against the")
+    L.append("unquantized function; differ, outputs not equal to exact_int8. range: max and mean error of the unsaturated path")
+    L.append("over every Q4.11 input of the range, in output LSB (SELU in LSB of the tightest gated case).")
+    L.append(f"{'activation':<10}{'range':>6}{'degree':>7}{'fail':>6}{'rel %':>8}{'LSB':>5}{'real':>7}{'differ':>7}"
+             f"{'range max':>10}{'mean':>7}{'max |c|':>9}")
     for code in (1, 2, 3):
-        impl, best = RANGES_INT8[code][-1], None
-        for r in RANGES_INT8[code]:
-            for d in DEGREES_INT8:
-                c = fit_form(code, r, d)
-                if c is None:
-                    L.append(f"{NAME_INT8[code]:<10}{r:>7}{d:>7}  coefficients beyond Q4.11")
-                    continue
-                if r == impl:
-                    c = refine_int8(code, r, c)
-                cw, cm = measure_cont(code, r, c)
-                dmax, ndiff = measure_cases(lane_for(code, r, c), code)
-                L.append(f"{NAME_INT8[code]:<10}{r:>7}{d:>7}{dmax:>10}{ndiff:>8}{cw:>10.2f}{cm:>7.2f}"
-                         f"{max(abs(v) for v in c) / 2048:>9.3f}")
-                if r == impl:
-                    if best is None or (dmax, cw) < (best[1], best[2]):
-                        best = (d, dmax, cw)
-                    if dmax <= 1 and code not in chosen:
-                        chosen[code] = (d, c)
-        if code in chosen:
-            L.append(f"{NAME_INT8[code]:<10} chosen: range {impl}, degree {chosen[code][0]} (the lowest within 1 LSB): TARGET MET")
-        elif best is None:
-            L.append(f"{NAME_INT8[code]:<10} no degree fits Q4.11: TARGET MISSED")
+        r, cands[code] = RANGE_INT8[code], []
+        for d in DEGREES_INT8:
+            c = fit_form(code, r, d)
+            if c is None:
+                L.append(f"{NAME_INT8[code]:<10}{r:>6}{d:>7}  coefficients beyond Q4.11")
+                continue
+            c = refine_int8(code, r, c)
+            cw, cm = measure_cont(code, r, c)
+            acc = measure_cases(lane_for(code, c), code)
+            cands[code].append((d, c, acc))
+            L.append(f"{NAME_INT8[code]:<10}{r:>6}{d:>7}{acc.fail:>6}{100 * acc.worst_rel:>8.2f}{acc.worst_lsb:>5}"
+                     f"{acc.real_lsb:>7.2f}{acc.differ:>7}{cw:>10.2f}{cm:>7.2f}{max(abs(v) for v in c) / 2048:>9.3f}")
+        assert cands[code], f"{NAME_INT8[code]}: no degree from 2 to 12 has coefficients within Q4.11"
+        chosen[code] = pick_int8(cands[code])
+    while layout_int8({k: v[0] for k, v in chosen.items()}) is None:  # more than the ROM's 32 entries
+        k = max(chosen, key=lambda c: (not chosen[c][2].ok, chosen[c][0]))  # one outside the tolerance first, then the highest degree
+        lower = [c for c in cands[k] if c[0] < chosen[k][0]]
+        assert lower, "degree 2 everywhere fits the ROM"
+        L.append(f"{NAME_INT8[k]:<10} degree {chosen[k][0]} does not fit the 32-entry ROM beside the others: lowered")
+        cands[k], chosen[k] = lower, pick_int8(lower)
+    missed = [NAME_INT8[c] for c in (1, 2, 3) if not chosen[c][2].ok]
+    for code in (1, 2, 3):
+        d, _, acc = chosen[code]
+        if acc.ok:
+            L.append(f"{NAME_INT8[code]:<10} chosen: degree {d}, the lowest within the tolerance: MEETS TOLERANCE")
         else:
-            L.append(f"{NAME_INT8[code]:<10} TARGET MISSED: best degree {best[0]}, {best[1]} LSB on the cases, "
-                     f"{best[2]:.2f} LSB over the range")
-    lay = layout_int8({k: v[0] for k, v in chosen.items()}) if len(chosen) == 3 else None
-    if lay is None:
-        if len(chosen) == 3:
-            L.append("the chosen degrees do not fit the 32-entry ROM: TARGET MISSED")
-        L.append("VERDICT: STOP (no table written)")
-        stop = os.path.join(os.path.dirname(os.path.abspath(a.report)), "gpnae_int8_stop.log")
-        os.makedirs(os.path.dirname(stop), exist_ok=True)
-        open(a.report, "w").write("\n".join(L) + "\n")
-        open(stop, "w").write("\n".join(L + OPTIONS_INT8) + "\n")
-        print("\n".join(L + OPTIONS_INT8))
-        print(f"STOP: report for Soham in {stop}")
-        return 2
+            L.append(f"{NAME_INT8[code]:<10} chosen: degree {d}, the best measured: MISSES TOLERANCE ({acc.fail} outputs outside, "
+                     f"worst {100 * acc.worst_rel:.2f}% where |d| > 1 LSB, worst {acc.worst_lsb} LSB): open accuracy item")
+    lay = layout_int8({k: v[0] for k, v in chosen.items()})
     table = [0] * 32
     for code, (base, d) in lay.items():
         table[base:base + d + 1] = chosen[code][1]
     lane = gpnae_model.Lane(gpnae_model.INT8, [v & 0xFFFF for v in table], sets=lay)
     L.append("")
-    L.append(f"whole table, SETS_INT8 = {lay}: every int8 input of every case (int8 LSB)")
-    L.append(f"{'activation':<10}{'s_in':>11}{'z_in':>6}{'s_out':>11}{'z_out':>6}{'max':>5}{'differ':>8}{'gated':>7}")
+    L.append(f"whole table, SETS_INT8 = {lay}: every int8 input of every case against the tolerance (int8 LSB)")
+    L.append(f"{'activation':<10}{'s_in':>11}{'z_in':>6}{'s_out':>11}{'z_out':>6}{'fail':>6}{'rel %':>8}{'LSB':>5}"
+             f"{'real':>7}{'differ':>7}{'gated':>7}")
     q = np.arange(-128, 128, dtype=np.int64)
-    ok = True
     for code in (1, 2, 3):
+        gated = []
         for case in gpnae_model.INT8_CASES[NAME_INT8[code]]:
-            d = np.abs(lane.run(q, code, gpnae_model.int8_params(case, code)) - gpnae_model.exact_int8(q, code, case))
-            L.append(f"{NAME_INT8[code]:<10}{case.s_in:>11.6f}{case.z_in:>6}{case.s_out:>11.6f}{case.z_out:>6}"
-                     f"{int(d.max()):>5}{int((d > 0).sum()):>8}{'yes' if case.gated else 'no':>7}")
-            ok = ok and (int(d.max()) <= 1 or not case.gated)
-    assert ok, "a per-activation choice within 1 LSB must stay within 1 LSB in the packed table"
-    L.append("VERDICT: PASS")
+            acc = gpnae_model.accuracy_int8(lane.run(q, code, gpnae_model.int8_params(case, code)), q, code, case)
+            L.append(f"{NAME_INT8[code]:<10}{case.s_in:>11.6f}{case.z_in:>6}{case.s_out:>11.6f}{case.z_out:>6}{acc.fail:>6}"
+                     f"{100 * acc.worst_rel:>8.2f}{acc.worst_lsb:>5}{acc.real_lsb:>7.2f}{acc.differ:>7}"
+                     f"{'yes' if case.gated else 'no':>7}")
+            if case.gated:
+                gated.append(acc)
+        assert gpnae_model.merge_acc(gated) == chosen[code][2], "the packed table must reproduce each activation's measurement"
+    L.append("VERDICT: TOLERANCE MET for every activation" if not missed else
+             f"VERDICT: TOLERANCE MISSED for {', '.join(missed)}: best degrees kept; open accuracy item for Soham, not a stop")
+    if missed:
+        L += OPTIONS_INT8
     for path in (os.path.join(ROOT, out), os.path.join(ROOT, "src", "TYTAN", "Memory", out)):
         with open(path, "w") as fh:
             fh.write("".join(format(v & 0xFFFF, "016b") + "\n" for v in table))
@@ -4536,14 +4614,16 @@ def main_int8(a):
 ```
 
 `target` and `exact_act` are the script's existing functions (the float lane's fitted functions and the exact
-activations). The float-lane-range rows are fitted without refinement and are there to show what the float lane's
-thresholds would cost without a tail; only the implemented range is chosen from.
+activations). Every degree is refined before it is measured, so the choice is among refined candidates. The fit range
+comes from `gpnae_model.THRESH`, so the model, the fit and (by Task 11's constants) the RTL saturate at the same
+inputs. The per-case tolerance is `gpnae_model.accuracy_int8`, which Task 12's regression uses too, so the fit's
+figures and the gate's must agree exactly.
 
 `$J/cmds/int8_fit.sh`:
 
 ```bash
 #!/bin/bash
-# Fits and measures poly_coeffs_int8.mem, keeps the table, the report and any stop report; run from a snapshot root.
+# Fits and measures poly_coeffs_int8.mem against GPNAE's tolerance, keeps the table and the report; run from a snapshot root.
 R=$(pwd)/testbenches/results/int8; mkdir -p $R
 cd GPNAE && python3 fit_poly_coeffs.py --format int8 --report $R/poly_coeffs_int8_fit.log; rc=$?
 cp poly_coeffs_int8.mem $R/ 2>/dev/null
@@ -4555,14 +4635,15 @@ echo "fit exit=$rc"; exit $rc
 
 Run: `$J/snap_launch_tree.sh i10_fit 32 4 $J/cmds/int8_fit.sh`
 
-Expected in `runs/i10_fit/stdout.log`: a row per activation, range and degree; one `chosen:` or `TARGET MISSED` line per
-activation; a `VERDICT:` line; `guard fp32 exit=1`, `guard bf16 exit=1`; `fit exit=` 0, 2 or 3. Then:
+Expected in `runs/i10_fit/stdout.log`: a row per activation and degree (fail, rel %, LSB, real, differ, range max,
+mean, max |c|); one `chosen:` line per activation ending `MEETS TOLERANCE` or `MISSES TOLERANCE ... open accuracy item`;
+the whole-table rows; a `VERDICT:` line; `guard fp32 exit=1`, `guard bf16 exit=1`; `fit exit=` 0 or 3. Then:
 
-- **`fit exit=2` (VERDICT: STOP).** This task stops here and Level 2 does not go on. Copy
-  `runs/i10_fit/results/int8/gpnae_int8_stop.log` to `testbenches/results/int8/gpnae_int8_stop.log` (SIENNA root) and give
-  it to Soham: the measured errors per activation, range and degree, and options A (centred, scaled operands),
-  B (higher degree) and C (a Q-format change). Implement none of them. Commit only the model, its check and the fit
-  script (Step 8, first three commits), and wait for Soham's decision.
+- **`VERDICT: TOLERANCE MISSED for ...`.** Not a stop: the table is written with each missing activation's best degree,
+  and Level 2 goes on. Record, for Task 12's gate report, each missing activation's chosen degree, outputs outside the
+  tolerance, worst relative error, worst LSB and worst error against the unquantized function, and the options the
+  report prints (A centred operands, B higher degree, C a Q-format change, D accept); implement none of them. Then
+  handle the exit code as below.
 - **`fit exit=3`.** Set `SETS_INT8` in `gpnae_model.py` to the printed layout, rerun `i10_check` below, then rerun
   `i10_fit`; it must now end with `fit exit=0` and the same table. Task 11 uses the same layout.
 - **`fit exit=0`.** Bring the table back and check nothing published moved:
@@ -4587,16 +4668,17 @@ checks use a zero table and do not depend on the layout).
 ```bash
 git add gpnae_model.py && git commit -m "gpnae_model: bit-exact int8 lane, the float lanes' forms on fx_mac and integer products, int8 quantize"
 git add check_gpnae_model_int8.py && git commit -m "check_gpnae_model_int8: known values for the int8 lane model"
-git add fit_poly_coeffs.py && git commit -m "fit_poly_coeffs: int8 fit and measurement of the float forms in Q4.11; bf16 table refused like fp32"
+git add fit_poly_coeffs.py && git commit -m "fit_poly_coeffs: int8 fit of the float forms in Q4.11, lowest degree within GPNAE's tolerance; bf16 table refused like fp32"
 git add poly_coeffs_int8.mem src/TYTAN/Memory/poly_coeffs_int8.mem && git commit -m "poly_coeffs_int8.mem: gpnae_poly's Q4.11 table for int8"
 git push origin int8
 ```
 
-The fourth commit only when the verdict is PASS.
+The fourth commit whatever the tolerance verdict: the table is the lane's, and a miss is an accuracy item, not a
+reason to hold it back.
 
 ### Task 11: `gpnae_poly` int8
 
-Starts only after Task 10's `VERDICT: PASS` (`fit exit=0`).
+Starts after Task 10 has written `poly_coeffs_int8.mem` and ended with `fit exit=0`, whatever its tolerance verdict.
 
 **Files:**
 - Create: `src/gpnae_poly_int8.sv`
@@ -4677,9 +4759,9 @@ module gpnae_poly_int8 #(
   localparam int RQ_LAT = sienna_fmt_pkg::req_lat();  // tfliteRequant
   localparam int PS_LAT = MUL_LAT + RQ_LAT;  // SELU post stage: multiply, then requantize
 
-  localparam logic signed [W-1:0] T_SELU = -16'sd14336;  // saturation in Q4.11: SELU x < -7
-  localparam logic signed [W-1:0] T_SIG = 16'sd12800;  // sigmoid |x| > 6.25
-  localparam logic signed [W-1:0] T_TANH = 16'sd6400;  // tanh |x| > 3.125
+  localparam logic signed [W-1:0] T_SELU = -16'sd8192;  // saturation in Q4.11, the float lane's thresholds: SELU x < -4
+  localparam logic signed [W-1:0] T_SIG = 16'sd7168;  // sigmoid |x| > 3.5
+  localparam logic signed [W-1:0] T_TANH = 16'sd8192;  // tanh |x| > 4
   localparam logic signed [W-1:0] SELU_SAT = -16'sd3601;  // -lambda*alpha in Q4.11
   localparam logic signed [W-1:0] ONE_Q11 = 16'sd2048;  // 1.0 in Q4.11
   localparam logic signed [W-1:0] LAMBDA_Q14 = 16'sd17215;  // lambda in Q1.14
@@ -5204,7 +5286,7 @@ git push origin int8
 
 ### Task 12: TB_gpnae_poly int8 mode, TFLite agreement, gate G2
 
-Starts only after Task 10's `VERDICT: PASS` and Task 11.
+Starts after Task 10's table (`fit exit=0`) and Task 11.
 
 **Files:**
 - Modify: `testbenches/TB_gpnae_poly.sv` (int8 mode), `regression.py` (`--format int8`, `REQ_ROUNDING` in the header)
@@ -5221,10 +5303,15 @@ Starts only after Task 10's `VERDICT: PASS` and Task 11.
 - Produces:
   - `python3 regression.py --lane poly --format int8 [--seed S]`: every int8 input once per case of
     `gpnae_model.INT8_CASES` (5 cases x 256 per activation, SELU, sigmoid, tanh, ReLU, linear), bit-exact; prints and
-    reports `ACCURACY: PASS|MISSED`; exit 1 on any mismatch. Report `testbenches/results/gpnae_int8_report.log`, raw TB
-    output `testbenches/results/int8_exhaustive.log`, and `testbenches/results/gpnae_int8_accuracy.json`:
-    `{"seed", "bitexact", "activations": {selu|sigmoid|tanh: {"worst_lsb", "cases": [{s_in, z_in, s_out, z_out,
-    max_lsb, differ, gated}]}}}`, `worst_lsb` the worst int8 LSB over the gated cases.
+    reports the accuracy against GPNAE's tolerance (L2-4), `ACCURACY: PASS|MISSED`, reported and never the exit code;
+    exit 1 on any mismatch. Report `testbenches/results/gpnae_int8_report.log`, raw TB output
+    `testbenches/results/int8_exhaustive.log`, and `testbenches/results/gpnae_int8_accuracy.json`:
+    `{"seed", "bitexact", "activations": {selu|sigmoid|tanh: {"rel_tol", "abs_tol_lsb", "pass", "fail", "worst_rel",
+    "worst_lsb", "real_lsb", "differ", "cases": [{s_in, z_in, s_out, z_out, gated, pass, fail, worst_rel, worst_lsb,
+    real_lsb, differ}]}}}`: per activation the tolerance (`rel_tol` 0.0625, `abs_tol_lsb` 1) and `gpnae_model.Acc`'s
+    fields over the gated cases (`pass` every gated output within the tolerance, `fail` outputs outside it,
+    `worst_rel` the worst relative error where `abs(d)` > 1 LSB, `worst_lsb` the worst `abs(d)`, `real_lsb` the worst
+    error against the unquantized function, `differ` outputs not equal to `exact_int8`), and the same per case.
   - Header item `localparam string REQ_ROUNDING` (every format). Stimulus `<act>_par.mem`: one 80-bit word per batch,
     `{mx[15:0], shx[7:0], zin[7:0], mout[31:0], shout[7:0], zout[7:0]}`.
   - `tflite_oracle.activation_int8(op, in_scale, in_zp) -> (outputs[256] int64, in_scale, in_zp)` for `op` in
@@ -5395,8 +5482,7 @@ def run_int8(args) -> int:
             gold += [int(v) for v in y]
             par += [p] * (256 // per)
             if code <= 3:
-                d = np.abs(y - gm.exact_int8(q, code, case))
-                rows.append((act, case, p, int(d.max()), int((d > 0).sum())))
+                rows.append((act, case, p, gm.accuracy_int8(y, q, code, case)))
         with open(os.path.join(STIM_DIR, f"{act}_in.mem"), "w") as fh:
             fh.write("".join(f"{v & 0xFF:02x}\n" for v in stim))
         with open(os.path.join(STIM_DIR, f"{act}_exp.mem"), "w") as fh:
@@ -5413,25 +5499,33 @@ def run_int8(args) -> int:
     for act, a in parsed["per_act"].items():
         print_activation(act, a)
     exact_ok = parsed["status"] == "PASS"
-    worst = max(r[3] for r in rows if r[1].gated)
-    L = [f"GPNAE int8 lane, seed {args.seed}: bit-exact against gpnae_model, then the lane against the exact functions",
+    tot = {act: gm.merge_acc(a for x, c, _, a in rows if x == act and c.gated) for act, _ in INT8_ACTS[:3]}
+    tol = f"rel <= {100 * gm.REL_TOL_INT8:.2f}% or abs <= {gm.ABS_TOL_LSB} LSB"
+    L = [f"GPNAE int8 lane, seed {args.seed}: bit-exact against gpnae_model, then the lane against exact_int8 with GPNAE's tolerance",
          f"BITEXACT: {'PASS' if exact_ok else parsed['status']}  "
          + "  ".join(f"{a} {v['exact']}/{v['total']}" for a, v in parsed["per_act"].items()),
          f"{'act':<8}{'s_in':>10}{'z_in':>6}{'mx':>7}{'shx':>4}{'s_out':>10}{'z_out':>6}{'mout':>12}{'shout':>6}"
-         f"{'max LSB':>8}{'differ':>7}{'gated':>6}"]
-    for act, case, p, dmax, ndiff in rows:
+         f"{'fail':>6}{'rel %':>8}{'LSB':>5}{'real':>7}{'differ':>7}{'gated':>6}"]
+    for act, case, p, a in rows:
         L.append(f"{act:<8}{case.s_in:>10.6f}{case.z_in:>6}{p.mx:>7}{p.shx:>4}{case.s_out:>10.6f}{case.z_out:>6}"
-                 f"{p.mout:>12}{p.shout:>6}{dmax:>8}{ndiff:>7}{'yes' if case.gated else 'no':>6}")
-    L.append(f"ACCURACY: {'PASS' if worst <= 1 else 'MISSED'} (worst {worst} int8 LSB on gated cases, target 1)")
+                 f"{p.mout:>12}{p.shout:>6}{a.fail:>6}{100 * a.worst_rel:>8.2f}{a.worst_lsb:>5}{a.real_lsb:>7.2f}"
+                 f"{a.differ:>7}{'yes' if case.gated else 'no':>6}")
+    for act, a in tot.items():
+        L.append(f"{act:<8} {'within' if a.ok else 'OUTSIDE'} tolerance ({tol}): {a.fail} gated outputs outside, worst "
+                 f"{100 * a.worst_rel:.2f}% where |d| > 1 LSB, worst {a.worst_lsb} LSB, {a.real_lsb:.2f} LSB against the "
+                 f"unquantized function")
+    missed = [act for act, a in tot.items() if not a.ok]
+    L.append(f"ACCURACY: {'PASS' if not missed else 'MISSED'} ({tol} on every gated output"
+             + (f"; outside: {', '.join(missed)}, an open accuracy item" if missed else "") + "; reported, not gated)")
     with open(os.path.join(RESULTS_DIR, "gpnae_int8_report.log"), "w") as fh:
         fh.write("\n".join(L) + "\n")
-    summary = {}  # per activation: the worst int8 LSB over the gated cases, and every case
-    for act, case, p, dmax, ndiff in rows:
-        s = summary.setdefault(act, {"worst_lsb": 0, "cases": []})
-        s["cases"].append({"s_in": float(case.s_in), "z_in": int(case.z_in), "s_out": float(case.s_out),
-                           "z_out": int(case.z_out), "max_lsb": dmax, "differ": ndiff, "gated": bool(case.gated)})
-        if case.gated:
-            s["worst_lsb"] = max(s["worst_lsb"], dmax)
+    fields = lambda a: {"pass": a.ok, "fail": a.fail, "worst_rel": a.worst_rel, "worst_lsb": a.worst_lsb,
+                        "real_lsb": a.real_lsb, "differ": a.differ}
+    summary = {act: {"rel_tol": gm.REL_TOL_INT8, "abs_tol_lsb": gm.ABS_TOL_LSB, **fields(a), "cases": []}
+               for act, a in tot.items()}  # per activation: the tolerance, the gated cases merged, and every case
+    for act, case, p, a in rows:
+        summary[act]["cases"].append({"s_in": float(case.s_in), "z_in": int(case.z_in), "s_out": float(case.s_out),
+                                      "z_out": int(case.z_out), "gated": bool(case.gated), **fields(a)})
     with open(os.path.join(RESULTS_DIR, "gpnae_int8_accuracy.json"), "w") as fh:
         json.dump({"seed": args.seed, "bitexact": exact_ok, "activations": summary}, fh, indent=1)
     print("\n".join(L[1:]))
@@ -5439,7 +5533,9 @@ def run_int8(args) -> int:
     return 0 if exact_ok else 1
 ```
 
-The accuracy numbers come from the model; they are the RTL's because the run is bit-exact first.
+The accuracy numbers come from the model; they are the RTL's because the run is bit-exact first. They use
+`gm.accuracy_int8`, as Task 10's fit does, on the same inputs (every int8 input of every case, in another order), so
+each activation's figures equal the fit report's whole-table rows.
 
 - [ ] **Step 4: Run the int8 lane**
 
@@ -5448,13 +5544,16 @@ $J/snap_launch_tree.sh i12_int8 32 2 $J/cmd_gpnae_reg.sh --lane poly --format in
 ```
 
 Expected in `runs/i12_int8/stdout.log`: five activation lines with `fail 0 miss 0` and exact 100%, `BITEXACT: PASS`
-with `1280/1280` each, `ACCURACY: PASS (worst 1 int8 LSB ...)` or better, and no `$fatal`.
+with `1280/1280` each, three per-activation tolerance lines with the figures of Task 10's whole-table rows, an
+`ACCURACY:` line (`PASS`, or `MISSED` naming the activations Task 10's verdict named), exit 0, and no `$fatal`.
 
 A mismatch is a bug in `gpnae_poly_int8.sv` (Task 11) or in the model (Task 10); the units under both are proven
 (Tasks 4 to 7, TB_barrel_mac_int8). The failure print gives batch `b` (case `b // 8`), the input and both outputs:
 recompute that element with `gm.rescale`, `gm.mac_operand`, `gm.horner` and the post step in Python and compare with the RTL
 signals (`+dump` scopes the VCD to the DUT). A latency `$fatal` names the unit whose Level 1 latency changed.
-`ACCURACY: MISSED` with `BITEXACT: PASS` is an accuracy result, not a bug: report it (Task 10's fit already gated it).
+`ACCURACY: MISSED` with `BITEXACT: PASS` is an accuracy result, not a bug: it goes to the gate report as an open
+accuracy item for Soham (Step 7), and the gate goes on. Figures that differ from Task 10's fit report are a bug in
+`run_int8` or in the table brought back from `i10_fit`.
 
 - [ ] **Step 5: Add the TFLite helper and the agreement report**
 
@@ -5603,7 +5702,8 @@ Expected:
 - `SAME-ARIL` (both AriL checkouts on the G1 tip, which the snapshot carried);
 - no `RUN-FAIL` in `runs/i12_g2/stdout.log`;
 - the compare: `IDENTICAL` for poly32, poly32_r8, taylor32, bf16_hw, bf16_hw_r8 (results and cycles);
-- the four int8 seeds and `int8_randinit`: `BITEXACT: PASS` and `ACCURACY: PASS`; `bf16_hw_randinit` and
+- the four int8 seeds and `int8_randinit`: `BITEXACT: PASS`, and the same `ACCURACY:` line in all five (the model's
+  accuracy depends on neither the seed nor power-up), with Task 10's verdict; `bf16_hw_randinit` and
   `poly32_randinit`: `RESULT: PASSED`; both barrel MAC runs `RESULT: PASSED`;
 - five `REJECTED` lines, no `NOT-REJECTED`;
 - lint: no `LATCH`, `MULTIDRIVEN`, `UNOPTFLAT` or `%Error` in any of the three formats;
@@ -5614,12 +5714,18 @@ Expected:
 Write `testbenches/results/int8/gpnae_gate.log` (SIENNA root) by hand from `runs/i12_g2/`, `runs/i12_tfl/`,
 `runs/i10_fit/` and `runs/i0_fpref/`, in the layout of `2026-09-28_gpnae_gate.txt` (sienna-report history):
 - the commits (GPNAE, its ArithmeticLibrary, SIENNA);
-- verdict;
+- verdict, in the bf16 G2 gate's form: `VERDICT: PASS for correctness` when fp32 and bf16 are unchanged and int8 is
+  bit-exact everywhere (else FAIL), followed by the int8 accuracy against the tolerance per activation (within or
+  outside); accuracy never turns the verdict to FAIL;
 - fp32 and bf16 unchanged: the compare output, and the random power-up runs;
 - int8 bit-exact: per activation and seed, exact over total; the barrel MAC TB (groups, errors, cycles);
-- int8 accuracy: from `poly_coeffs_int8_fit.log`, per activation and candidate range the cases' worst LSB and the
-  range's worst and mean error by degree, the chosen degrees and `SETS_INT8`; the float-lane-range rows as the cost of
-  having no tail; and the per-case int8 table (worst LSB, count differing) from `gpnae_int8_report.log`;
+- int8 accuracy against GPNAE's tolerance (relative error <= 6.25% or absolute error <= 1 output LSB against
+  `exact_int8`, L2-4): from `poly_coeffs_int8_fit.log`, per activation and degree the outputs outside the tolerance, the
+  worst relative error where `abs(d)` > 1 LSB, the worst LSB, the worst error against the unquantized function and the
+  range's worst and mean error, the chosen degrees and `SETS_INT8`; and the per-case table from `gpnae_int8_report.log`;
+- `OPEN ITEM FOR SOHAM: int8 activation accuracy`, only when an activation is outside the tolerance: per such
+  activation its chosen degree (the best measured), outputs outside, worst relative error, worst LSB, and the options
+  the fit report printed (A to D), none implemented; it does not hold up Level 3;
 - agreement with TFLite (`gpnae_vs_tflite.log`), labelled "reported, not gated";
 - cycles per input for int8 against fp32 and bf16 (the `CYCLES` lines);
 - rejections and lint counts;
@@ -5635,17 +5741,18 @@ does not exist:
 D=/proj/work/spramanik/SIENNA_int8/testbenches/int8
 ls $D/gpnae_int8_accuracy.json 2>/dev/null && echo "EXISTS: look before copying"   # expect nothing
 mkdir -p $D && cp $J/runs/i12_g2/results/int8/g2/int8_seed1/gpnae_int8_accuracy.json $D/
-python3 -c "import json; d = json.load(open('$D/gpnae_int8_accuracy.json')); print({k: v['worst_lsb'] for k, v in d['activations'].items()})"
+python3 -c "import json; d = json.load(open('$D/gpnae_int8_accuracy.json')); print({k: (v['pass'], v['rel_tol'], v['abs_tol_lsb'], round(100 * v['worst_rel'], 2), v['worst_lsb']) for k, v in d['activations'].items()})"
 ```
 
-Expected: `selu`, `sigmoid` and `tanh` with the worst LSB the seed-1 run's `ACCURACY:` line reports (at most 1).
+Expected: `selu`, `sigmoid` and `tanh`, each with `rel_tol` 0.0625, `abs_tol_lsb` 1, and the pass flag, worst relative
+error and worst LSB of the seed-1 run's per-activation tolerance lines.
 
 - [ ] **Step 8: Commit and report**
 
 ```bash
 cd /proj/work/spramanik/SIENNA_int8/GPNAE
 git add testbenches/TB_gpnae_poly.sv && git commit -m "TB_gpnae_poly: int8 mode, per-batch lane parameters, int8 ROM and rounding checks, ReLU and linear"
-git add regression.py && git commit -m "regression: --format int8, every int8 input per case bit-exact, accuracy against the exact functions"
+git add regression.py && git commit -m "regression: --format int8, every int8 input per case bit-exact, accuracy against GPNAE's tolerance"
 git push origin int8
 cd /proj/work/spramanik/SIENNA_int8
 git add tflite_oracle.py && git commit -m "tflite_oracle: activation_int8, TFLite's int8 TANH and LOGISTIC on every input"
@@ -5654,8 +5761,9 @@ git add testbenches/int8/gpnae_int8_accuracy.json && git commit -m "G2: the int8
 git push origin int8
 ```
 
-SIENNA's GPNAE submodule pointer moves in Level 4 (Task 16), with the lane's new ports. Give Soham the gate summary
-and the report's path; Level 3 starts after Soham has seen G2.
+SIENNA's GPNAE submodule pointer moves in Level 4 (Task 16), with the lane's new ports. Give Soham the gate summary,
+the report's path and any open accuracy item; Level 3 starts after Soham has seen G2 (an open accuracy item does not
+hold it up).
 
 ---
 
@@ -10084,11 +10192,11 @@ def load_gemm_int8():
 
 G8 = load_int8()
 GEMM8 = load_gemm_int8()
-# The int8 lane's worst error against the exact functions, in int8 LSB, from Task 12's G2 summary; None: pending.
+# The int8 lane's accuracy against GPNAE's tolerance per activation (pass, worst_rel, worst_lsb, rel_tol, abs_tol_lsb), from Task 12's G2 summary; None: pending.
 ACC8 = "/proj/work/spramanik/SIENNA_int8/testbenches/int8/gpnae_int8_accuracy.json"
 INT8_ACT = {"selu": None, "sigmoid": None, "tanh": None}
 if os.path.exists(ACC8):
-    INT8_ACT.update({k: v["worst_lsb"] for k, v in json.load(open(ACC8))["activations"].items() if k in INT8_ACT})
+    INT8_ACT.update({k: v for k, v in json.load(open(ACC8))["activations"].items() if k in INT8_ACT})
 ```
 
 2. Replace `section_formats` with
@@ -10141,19 +10249,23 @@ def section_formats():
     k1024 = [r["err"] for r in GEMM8 if r.get("K") == 1024]
     exact8 = bool(GEMM8) and all(r.get("mism", 1) == 0 for r in GEMM8)
     g8 = lambda v: f"exact; {100 * max(v):.1f}% quantization" if v and exact8 else "pending"
-    lsb = lambda k: "pending" if INT8_ACT[k] is None else f"{INT8_ACT[k]} LSB"
+    acc8 = lambda k: "pending" if INT8_ACT[k] is None else (
+        f"{100 * INT8_ACT[k]['worst_rel']:.1f}%, {INT8_ACT[k]['worst_lsb']} LSB "
+        f"({'within' if INT8_ACT[k]['pass'] else 'outside'} tolerance)")
     o.append("<h3>What bf16 and int8 cost in accuracy</h3>")
     o.append(table([[("measure", 1), ("fp32", 1), ("bf16", 1), ("int8", 1)]], [
         ["GEMM error, depth K = 256", "&le; 1e-6", "6-8%", g8(k256)],
         ["GEMM error, depth K = 1024", "&le; 5e-6", "17-30%", g8(k1024)],
-        ["SELU worst relative error (target 6.25%)", "0.006%", "2.8%", lsb("selu")],
-        ["sigmoid worst relative error", "0.06%", "7.2%", lsb("sigmoid")],
-        ["tanh worst relative error", "0.39%", "8.6%", lsb("tanh")],
+        ["SELU worst relative error (tolerance 6.25%)", "0.006%", "2.8%", acc8("selu")],
+        ["sigmoid worst relative error", "0.06%", "7.2%", acc8("sigmoid")],
+        ["tanh worst relative error", "0.39%", "8.6%", acc8("tanh")],
     ], align="lrrr", note="Every bf16 output equals the bit-exact model of the hardware, so these are bf16's own errors "
                          "(truncating arithmetic, bf16 accumulation), not hardware bugs. Open decision: the activation error target. "
                          "int8: every output equals the bit-exact model; its GEMM figure is the output's quantization error against "
                          "float64 on the unquantized inputs (int8 inputs, int32 sums, one int8 output), and its activation "
-                         "figures are the lane's worst error in int8 LSB against the exact functions (G2; target 1 LSB)."))
+                         "figures are, against the exact functions quantized to int8 (G2), the worst relative error where the "
+                         "error exceeds 1 LSB and the worst error in LSB, judged by GPNAE's tolerance: 6.25% relative or 1 LSB "
+                         "absolute, either bound passing."))
     return "\n".join(o)
 ```
 
@@ -10166,7 +10278,8 @@ python3 /proj/work/spramanik/sienna_jobs/report/build_report.py /proj/work/spram
 ```
 
 Expected: the path and size print, and section 4 shows `pending` in every int8 performance and GEMM cell (no `g8p_*`
-run exists yet); the three activation rows show G2's LSB values from `gpnae_int8_accuracy.json`.
+run exists yet); the three activation rows show G2's worst relative error, worst LSB and tolerance verdict from
+`gpnae_int8_accuracy.json`.
 
 - [ ] **Step 6: Commit (SIENNA) and push**
 
@@ -10435,8 +10548,8 @@ def main(out: str) -> None:
                  f"fp32, 8 x 8 in bf16)")
     L += ["  Per-set parameter storage in sienna_top is NUM_IDS x (40 N + 93) bits plus a 40 N-bit copy at g_accept, about",
           "  45,000 flops at N = 64 (an estimate, not synthesis). A FIFO of SETS_IN_FLIGHT entries would save one entry; sharing",
-          "  the storage with set_act would not shrink it. Flagged for Soham's area review with the spec's Risk 2 (the fallback",
-          "  there: time-share the requantizers across lanes, at a known throughput cost)."]
+          "  the storage with set_act would not shrink it. For information only: area is a synthesis matter, no decision now",
+          "  (Soham, 2026-09-29); the spec's Risk 2 fallback (time-share the requantizers across lanes) is not implemented."]
 
     L += ["", "11. Not run: synthesis, timing and area (every TOPS figure assumes 950 MHz); the four MLPerf Tiny int8 models",
           "    (sub-project 2b); agreement of the int8 lane with TFLite's int8 tanh / logistic is G2's report."]
@@ -10490,8 +10603,8 @@ rebuilt in Task 24 Step 2.
 - [ ] **Step 5: Report to Soham**
 
 Send the gate report's path and its last line, the int8 TOPS at the best tile size for N = 16 and 64 (section 4, marked
-as at an assumed 950 MHz), the requantize and per-set storage size estimate (section 10, marked as an estimate, for the
-area item of the plan's Open for Soham list), and anything relaunched. No repository changes in this task.
+as at an assumed 950 MHz), the requantize and per-set storage size estimate (section 10, marked as an estimate, for
+information only; no decision is asked), and anything relaunched. No repository changes in this task.
 
 ### Task 24: Close out
 
@@ -10523,7 +10636,7 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
 
 followed by one line per earlier gate, each with its verdict, its headline numbers as the report states them and its
 history file: G0 `<date>_g0_oracle_int8.txt` (Task 2: the pinned rounding, the outputs compared), G1
-`<date>_aril_gate_int8.txt` (Task 8), G2 `<date>_gpnae_gate_int8.txt` (Task 12: bit-exact, the worst LSB per activation),
+`<date>_aril_gate_int8.txt` (Task 8), G2 `<date>_gpnae_gate_int8.txt` (Task 12: bit-exact, the accuracy per activation against GPNAE's tolerance, any open accuracy item),
 G3 `<date>_mesh_gate_int8.txt` (Task 15). Copy the three reports not yet in `history/`, each dated by its gate:
 
 ```bash
@@ -10575,7 +10688,7 @@ google-chrome --headless=new --window-size=1100,9000 --screenshot=/proj/work/spr
 
 Open `int8_check.png` and check section 4: the int8 columns hold numbers (no `pending` except where Task 23's report
 lists a missing run), the int8 speedup chart is present, and the accuracy table's int8 column shows the GEMM figures
-and the G2 LSB values.
+and G2's accuracy figures with their tolerance verdicts.
 
 - [ ] **Step 3: Commit (SIENNA) and push, innermost first**
 
@@ -10601,21 +10714,12 @@ Merging `int8` into `bf16` or `main` is Soham's decision and not part of this pl
 
 ## Open for Soham
 
-1. **fxMac coverage (Task 6).** "Exhaustive where feasible" is six 2^32 sweeps, not the 2^48 triples: C in {0, -1,
-   32767, -32768} over every A x X, and A in {1.0, 2.0} over every X x C (24 farm slices), plus corners, saturation
-   boundaries and random triples. Approve the set or name other fixed values; each extra sweep is 4 more slices.
-2. **The GPNAE stop condition (Task 10).** Task 10 measures the float lanes' forms in Q4.11 before anything else in
-   Level 2 is built. If any activation misses 1 int8 LSB on a gated case, it stops with `gpnae_int8_stop.log` (measured
-   errors by range and degree, and options A: centred operands, B: higher degree, C: a Q-format change) and nothing
-   further in Level 2 is built until Soham decides.
-3. **Fitted ranges wider than the float lane's (Tasks 10, 11).** int8 has no tail, so the polynomial must reach the
-   point where the exact int8 output saturates: sigmoid to |x| = 6.25 (the float lane hands |x| > 3.5 to the tail;
-   saturating there gives 255 where the exact value is 248.5) and SELU to x = -7 (float lane -4; 3.8 LSB off at the tightest test case); tanh is
-   narrower, 3.125 against 4. Task 10 also reports what the float lanes' ranges would cost.
-4. **Per-set parameter area (Tasks 16, 23).** `sienna_top` holds each set's requantize and GPNAE parameters by set id:
-   NUM_IDS x (40 N + 93) bits plus a 40 N-bit copy, about 45,000 flops at N = 64 (estimate), beside the 128 per-lane
-   32 x 32 requantize multipliers at N = 64. Task 23 section 10 prints the estimate; synthesis is not run. The spec's
-   Risk 2 fallback (time-share the requantizers) is not implemented.
+Decided by Soham on 2026-09-29; no items are open.
+
+1. **fxMac coverage (Task 6):** the six 2^32 sweeps are approved as drafted.
+2. **GPNAE accuracy (Tasks 10 to 12):** GPNAE's regression tolerance (relative error <= 6.25% or absolute error <= 1 output LSB) replaces the 1-LSB target; a miss is an open accuracy item in the G2 report, not a stop.
+3. **Fitted ranges (Tasks 10, 11):** the float lane's (SELU x >= -4, sigmoid abs(x) <= 3.5, tanh abs(x) <= 4), saturated beyond; the extended ranges are removed.
+4. **Per-set parameter area (Tasks 16, 23):** a synthesis matter, not decided now; Task 23 section 10 prints the estimate for information only.
 
 ## Self-review against the spec
 
@@ -10634,7 +10738,7 @@ Merging `int8` into `bf16` or `main` is Soham's decision and not part of this pl
 | Activation engine: GPNAE in fixed point, same Horner / barrel_mac / gpnae_poly structure, 16-bit integer units | 9 (`barrel_mac` on `fxMac`), 10 (model), 11 (`gpnae_poly_int8`), 12 |
 | GPNAE number format: input rescale to Q4.11 (saturating), 16 x 16 -> 32-bit products, 32-bit add | 1 (`fx_mac`), 6 (`fxMac`, D-1), 4 (W = 16 multiplier), 10, 11 |
 | GPNAE coefficients: `poly_coeffs_int8.mem` from `fit_poly_coeffs.py`; fp32 / bf16 tables never change | 10 (fit, `PUBLISHED-UNCHANGED`, bf16 refused), 12 (fit guard in the gate) |
-| Beyond the fitted range: saturated int8 value; `gpnae_tail` not instantiated | 10, 11 (`gpnae_tail` rejects int8), 12 |
+| Beyond the fitted range: saturated int8 value; `gpnae_tail` not instantiated | 10, 11 (`gpnae_tail` rejects int8), 12; ranges are the float lane's (SELU -4, sigmoid 3.5, tanh 4, decided 2026-09-29), which supersede the spec's saturation points |
 | GPNAE output: tanh y*128 zp 0, sigmoid y*256 zp -128, SELU per-layer `(M_out, sh_out, z_out)`, ReLU / linear pass through (D-4) | 10, 11, 12 (every int8 input per case, bit-exact; TFLite agreement reported) |
 | GPNAE per-layer parameters `M_x, sh_x` and SELU's with the set's configuration | 11 (ports), 16 (per-set storage, `gp_zin_i` from `req_zp`), 19, 20 (`rescale_params`, `quantize_multiplier`) |
 | Max pooling: integer compare, pad -128 | 17, 20 (`_maxpool_int`) |
@@ -10642,14 +10746,14 @@ Merging `int8` into `bf16` or `main` is Soham's decision and not part of this pl
 | Throughput: one MAC per PE per cycle | 13 (no packing), 22 (TOPS at the assumed clock) |
 | G0: requantize and FC / conv reference bit-exact against the interpreter, rounding recorded, G4 models generated | 1, 2 |
 | G1: each new unit with the float units' DV; multiplier exhaustive, adder corners, fixed-point sweeps, requantize corners and 10^6 random; fp32 / bf16 unchanged | 3 to 8 |
-| G2: lane bit-exact on all 256 inputs at several scales; <= 1 LSB target; TFLite tanh / logistic reported; fp32 / bf16 unchanged | 9 to 12 |
+| G2: lane bit-exact on all 256 inputs at several scales; <= 1 LSB target; TFLite tanh / logistic reported; fp32 / bf16 unchanged | 9 to 12; the 1-LSB target is replaced by GPNAE's tolerance (6.25% relative or 1 LSB absolute, decided 2026-09-29), reported with worst relative error, worst LSB and pass per activation, never a stop |
 | G3: int8 bit-exact at N = 8..64, every T, both collapse modes, random power-up; fp32 / bf16 cycles identical | 13 to 15 (fp32 / bf16 rerun as the ruled subset: collapse-k 1 everywhere, collapse-k 0 at N <= 32 and N = 64 T >= 16) |
 | G4: regression with the bit-exact golden; single-layer TFLite models through the RTL; N / T sweep; report section 4 in TOPS; fp32 / bf16 unchanged | 16 to 23, 24 (report) |
 | Working setup: `int8` branch off `bf16` in all four repos, separate checkout, push innermost first | 0, every commit step |
 | Out of scope (2b): MLPerf int8 models, residual rescale, MAC packing, LUT activations, other quantization | 19 (residual adds raw codes), 21 (`model_runner` rejects `--format int8`); not planned otherwise |
 | Risk 1: optimized kernels round differently | 2 (the oracle forces `BUILTIN_REF`; the default resolver's mismatches are reported for information) |
-| Risk 2: per-lane requantize multiplier area | 23 (section 10 estimate); Open for Soham 4 |
-| Risk 3: 1-LSB target may need higher degree or fail | 10 (degrees 2 to 12 measured; stop report); Open for Soham 2 |
+| Risk 2: per-lane requantize multiplier area | 23 (section 10 estimate, information only; no decision, 2026-09-29) |
+| Risk 3: 1-LSB target may need higher degree or fail | 10 (degrees 2 to 12 measured against GPNAE's tolerance; the lowest degree within it, else the best, kept), 12 (a miss is an open accuracy item in the G2 report; Level 2 goes on) |
 | Risk 4: SELU output scale calibrated from the data | 10 (`selu_case`), 20 (`requant_params`) |
 | Risk 5: fp32 and bf16 must not move | 3, 8, 9, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23 (every gate reruns and compares) |
 | Risk 6: `/proj/work` quota | 0 (quota check), 6 (before the sweeps), 15 (before the G3 sweep) |

@@ -1,0 +1,93 @@
+---
+name: sienna-int8
+description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the TFLite-exact requantize stage, fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 matches TFLite, why GPNAE is fixed point in int8, or what 2a covers against 2b.
+---
+
+# SIENNA: the int8 build (sub-project 2a)
+
+**Status: design approved in conversation 2026-09-29; spec written, awaiting Soham's review. NOT implemented.**
+Update this line as pieces land.
+
+**REQUIRED BACKGROUND:** the `sienna-uniform-format` skill (one number format per build; this is its sub-project 2)
+and the `sienna-rtl` skill.
+
+## Goal (agreed with Soham, 2026-09-29)
+
+An int8 build of SIENNA whose results are **bit-exact against TFLite's own int8 kernels** wherever TFLite defines the
+operation: conv and fully connected layers with per-channel symmetric int8 weights, int8 activations with zero points,
+int32 bias, TFLite's fixed-point requantize, and ReLU / ReLU6 fused as the requantize clamp. Results are then
+comparable with published MLPerf Tiny int8 numbers.
+
+Split in two: **2a** (this spec) is the hardware and its DV, proven on the regressions and on single-layer TFLite
+int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 models end to end.
+
+## Decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Reference (oracle) | TensorFlow installed into `sienna_jobs/venv`; its interpreter with the reference kernels (`BUILTIN_REF` op resolver); its converter for single-layer int8 test models | Soham: TFLite's own kernels, not our reading of them |
+| Format selection | `EXP_W = 0, MAN_W = 7` is int8; `DATA_WIDTH = 1 + EXP_W + MAN_W = 8` unchanged; `sienna_fmt_pkg::is_int(exp_w)`; `supported()` accepts (0, 7); anything else fails elaboration with `$fatal` | same two knobs as fp32 / bf16 |
+| Accumulate width | `ACC_W` = 32 for int8, `DATA_WIDTH` for floats: PE partial sums, reducer tree, bias input, mesh result memory, wide read into requantize | a dot product of int8 needs int32; the uniform principle's one exception |
+| Storage | int8 for host operands, staging banks, weight cache; int8 again from requantize on (lanes, activation banks, pooling, dropout, output) | where int8 saves area and bandwidth |
+| Mesh arithmetic | int8 x int8 -> int16 sign-extended into an int32 two's-complement accumulate (wraps like TFLite); 1-cycle registered multiply and add, latencies from `sienna_fmt_pkg`, so U follows | no float unit needed; overflow impossible for K <= 133,000 (127 x 127 per product), documented, no saturation logic |
+| Zero points | none in the mesh: weights are symmetric (zero point 0); the input zero-point term -z_a * sum(w_c) is folded into the int32 bias by software; conv padding with z_a is done in the software im2col | TFLite's own algebra; keeps the mesh a plain integer array |
+| Requantize | new stage, generated only when `is_int`: per int32 output of channel c, `y = MultiplyByQuantizedMultiplier(acc, M_c, shift_c) + z_out`, then `clamp(y, act_min, act_max)` (int8 range, ReLU, ReLU6 in one clamp) | exactly TFLite's conv / FC epilogue |
+| Requantize rounding | whichever of TFLite's two variants (single or double rounding) the installed reference kernels use; found and pinned by a test at G0, never assumed | the variants differ in the last bit |
+| Requantize placement | at the GPNAE lane feed: one pipelined unit per lane (~3 stages, 32 x 32 multiplier) on the wide read; result memory stays int32 | unit count independent of T (32 lanes at N <= 32, 128 at N = 64); at the reducers it would be (N/T)^2 units (1,024 at N=64 T=2) |
+| Requantize parameters | per set, like the bias: `M_c`, `shift_c` for the set's N output channels; layer-wide `z_out`, `act_min`, `act_max` in the set's configuration | sets of one layer share them; channels are the set's columns |
+| Activation engine | GPNAE, fixed point (Soham's choice over a 256-entry LUT): the same Horner polynomial and barrel_mac / gpnae_poly structure, with 16-bit integer multiply and add units | one activation engine for every format |
+| GPNAE number format | input int8 q -> `x = round(((q - z_in) * M_x) >> sh_x)`, int16 Q4.11 (range +/-16, saturating); 16 x 16 -> 32-bit products shifted back to Q4.11; 32-bit add | 8-bit intermediates cannot hold a polynomial's terms; 16 bits is 8x finer than any int8 output |
+| GPNAE coefficients | re-encoded to 16-bit fixed point by `fit_poly_coeffs.py` into a new `poly_coeffs_int8.mem` (degree as the fit needs, as bf16 needed); fp32 / bf16 tables never change | published work; same kind of change as bf16's refit |
+| Beyond the fitted range | the lane outputs the saturated int8 value (tanh +/-127/128 past abs(x) ~2.8, sigmoid 0 / 255/256 past ~6.2, SELU -lambda*alpha); `gpnae_tail` not instantiated in int8 builds | Soham 2026-09-29: an exact computation rounds to the same values; the tail's squaring step would need wider than 16 bits |
+| GPNAE output | tanh: y * 128, zero point 0; sigmoid: y * 256, zero point -128 (TFLite's fixed output quantization); SELU: negative branch from the polynomial, positive branch lambda * x exact, per-layer `(M_out, sh_out, z_out)`; ReLU and linear pass through (already clamped) | TFLite's conventions where it has the op; SELU is not a TFLite op |
+| GPNAE per-layer parameters | `M_x, sh_x` (input rescale) and SELU's `M_out, sh_out, z_out`, carried with the set's configuration | fixed per layer |
+| Max pooling | Maxpool_2D's existing integer compare, pad -128 | exact: max commutes with monotonic requantize and activation |
+| Dropout | inference: bypass; training: kept values unchanged, dropped values become the zero point, the 1/keep factor folded into the output scale (the next requantize absorbs it) | Soham 2026-09-29: a literal x2 shift saturates half the int8 range |
+| Throughput | one MAC per PE per cycle, as today; int8 alone gives area and power | MAC packing is a later architectural step |
+
+## Verification (bottom-up, a gate per level; the order of the bf16 work)
+
+- **G0, oracle:** TensorFlow installed (quota checked first); requantize and int8 conv / FC Python reference, bit-exact
+  against the TFLite interpreter (reference kernels) on thousands of random cases; the rounding variant recorded;
+  single-layer int8 TFLite models (3x3 conv, fully connected) with known quantization generated for G4.
+- **G1, ArithmeticLibrary:** each new unit gets the float units' DV (DPI reference TB, Vivado vectors, Makefile).
+  int8 x int8 multiplier exhaustive (65,536 pairs); int32 adder corners incl. wrap plus random; 16-bit fixed-point
+  multiply / add exhaustive where feasible; requantize unit corners (INT_MIN, largest multiplier, every shift) plus
+  10^6 random against the G0 reference. fp32 / bf16 units unchanged.
+- **G2, GPNAE:** the fixed-point lane bit-exact against `gpnae_model.py`'s int8 extension; every int8 input (256)
+  for tanh, sigmoid, SELU at several input scales; accuracy target at most 1 int8 LSB against the exact functions;
+  agreement with TFLite's int8 tanh / logistic reported, not gated. fp32 / bf16 lanes unchanged.
+- **G3, mesh:** int8 bit-exact against an integer mesh model (numpy int64 matmul, int32 wrap; integer addition is
+  associative, so order does not matter) at N = 8..64, every tile size, both collapse modes, random power-up.
+  fp32 / bf16 cycles identical.
+- **G4, SIENNA:** the regression in int8 with a bit-exact golden (mesh, requantize, GPNAE, pooling, dropout); the
+  single-layer TFLite int8 models through the RTL equal the TFLite interpreter's outputs bit for bit; N / T
+  performance sweep; the report's section 4 int8 columns (TOPS = 2 x MACs per second at the assumed clock).
+  fp32 / bf16 unchanged.
+
+## Working setup
+
+An `int8` branch off `bf16` in all four repos, in a separate checkout at `/proj/work/spramanik/SIENNA_int8`, so fp32
+and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE`). Push innermost first, as always.
+
+## Out of scope (2a)
+
+- 2b: the four MLPerf Tiny int8 models end to end (residual ADD rescale, average pooling, depthwise conv, softmax,
+  obtaining the official int8 models).
+- Packing several int8 MACs per PE per cycle.
+- LUT activations (declined 2026-09-29).
+- Quantization other than TFLite's standard one: per-channel symmetric weights, asymmetric int8 activations.
+  No uint8, no int16 activations.
+
+## Risks
+
+1. The interpreter's optimized kernels can round differently from its reference kernels: the oracle forces
+   `BUILTIN_REF`.
+2. The per-lane 32 x 32 requantize multiplier is the largest new unit (128 at N = 64); G4 reports its area estimate
+   next to fp32 / bf16. Fallback if too large: time-share it across lanes, at a known throughput cost.
+3. The 1-LSB GPNAE target may need a higher polynomial degree (longer rounds); if 16 bits cannot reach it for an
+   activation, G2 reports the best achieved error and Soham decides.
+4. SELU has no TFLite op: its output scale in the regression tests is calibrated from each test's data range, as
+   TFLite post-training quantization would.
+5. fp32 and bf16 must not move: every int8 path is under generate blocks, every gate reruns both suites.
+6. `/proj/work` quota: TensorFlow (~600 MB) and a second checkout; a full quota once truncated builds.

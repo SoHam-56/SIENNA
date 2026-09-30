@@ -8,7 +8,7 @@ module TB_dropout_fmt;
   always #5 clk = ~clk;
   dropout #(.EXP_W(EXP_W), .MAN_W(MAN_W), .LFSR_WIDTH(32)) dut (
       .clk(clk), .rst_n(rst_n), .in_valid(in_valid), .training_mode(1'b1), .data_in(data_in), .reseed_i(reseed),
-      .seed_i(32'h2ACE002A), .data_out(data_out), .valid_out(valid_out));
+      .seed_i(32'h2ACE002A), .zero_point_i('0), .data_out(data_out), .valid_out(valid_out));
 
   logic [W-1:0] q[$];
   int errs = 0, n = 0, kept = 0;

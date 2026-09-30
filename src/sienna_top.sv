@@ -379,6 +379,7 @@ module sienna_top #(
           .data_in      (dropout_data_in[g]),
           .reseed_i     (p_accept),
           .seed_i       (lane_seed),
+          .zero_point_i (p_zp),
           .data_out     (dropout_data_out[g]),
           .valid_out    (dropout_valid_out[g])
       );
@@ -646,7 +647,14 @@ module sienna_top #(
     assign g_mout  = s_mout[g_set_id];
     assign g_shout = s_shout[g_set_id];
     assign g_zout  = s_zout[g_set_id];
-    assign p_zp    = s_zp[p_set_id];  // Task 18 replaces this with D-5's choice per activation
+    // D-5: a dropped value is the output zero point of the pooled set's activation (tanh, and every code the lane runs as tanh: 0).
+    always_comb
+      case (set_act[p_set_id])
+        CONTROL_WIDTH'(3'b001): p_zp = s_zout[p_set_id];  // SELU: its requantized output's zero point
+        CONTROL_WIDTH'(3'b010): p_zp = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
+        CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp = s_zp[p_set_id];  // ReLU, linear: the requantize output's
+        default: p_zp = 8'h00;  // tanh: zero point 0
+      endcase
   end else begin : G_NO_REQ_SETS
     assign g_mult  = '0;
     assign g_shift = '0;

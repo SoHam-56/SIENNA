@@ -89,7 +89,8 @@ module sienna_top #(
   end
 
   localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
-  localparam logic [DATA_WIDTH-1:0] NEG_INF = {1'b1, {EXP_W{1'b1}}, {MAN_W{1'b0}}};  // pooling pad: -infinity in the format
+  localparam logic [DATA_WIDTH-1:0] NEG_INF = IS_INT ? {1'b1, {(DATA_WIDTH - 1) {1'b0}}}  // pooling pad: -128 in int8
+                                                     : DATA_WIDTH'({DATA_WIDTH{1'b1}} << MAN_W);  // -infinity in a float format
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
@@ -343,7 +344,7 @@ module sienna_top #(
           .STRIDE_ROWS(POOL_H),
           .STRIDE_COLS(POOL_W),
           .PADDING    (0),
-          .IS_FP32    (1),
+          .IS_FP32    (!IS_INT),
           .EXP_W      (EXP_W),
           .MAN_W      (MAN_W)
       ) maxpool_inst (

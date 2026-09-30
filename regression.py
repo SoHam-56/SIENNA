@@ -534,6 +534,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
     starts = list(range(0, num_sets, passes))
     acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
     zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
+    sat = [0, 0]  # activated SELU sets: lane inputs at or above 16, and all their lane inputs
     for g, g0 in enumerate(starts):
         ks = list(range(g0, min(g0 + passes, num_sets)))
         act_g = acts_g[g]
@@ -542,8 +543,13 @@ def _generate_vectors_int8(cfg: dict) -> None:
         bias_real = np.random.RandomState(seed + 5000 + g0).uniform(-1.0, 1.0, N) * scale if use_bias else None
         hw_bias = fold_bias(bias_real, s_a, s_w, z_a, B_q)
         parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(len(ks))]
-        rq = requant_params(wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :]), s_a, s_w, act_g, req_rng, zqs[g])
+        acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
+        rq = requant_params(acc, s_a, s_w, act_g, req_rng, zqs[g])
         complete = len(ks) == passes  # a trailing short group has only partial passes, as in the float tests
+        if act_g == "selu" and complete:
+            R = requantize(acc, rq)
+            sat[0] += int(np.sum(selu_saturates(rq["mx"], rq["shx"], rq["zp"], R)))
+            sat[1] += R.size
         for i, k in enumerate(ks):
             last = complete and i == len(ks) - 1
             rq_k = rq if last else _decoy_params(N)
@@ -557,6 +563,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
             _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F))
             if k == 0:
                 first = (parts[0][0], parts[0][1], hw_bias, rq_k)
+    if sat[1]:
+        print(f"      SELU saturation: {sat[0]} of {sat[1]} lane inputs >= 16 (bit-exact against the saturating golden)")
     # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
     a0, b0, hb0, rq0 = first
     C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)

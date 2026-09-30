@@ -28,7 +28,14 @@ module TB_sienna_top;
   logic                     training_mode_i;
   logic                     accumulate_i;  // this set is a partial sum
   logic                     bias_valid_i;  // this set carries a bias row
-  logic [N-1:0][DATA_WIDTH-1:0] bias_i;
+  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point
+  // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
+  logic [N-1:0][31:0] req_mult_i;
+  logic [N-1:0][7:0]  req_shift_i;
+  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_shout_i, gp_zout_i;
+  logic [15:0]        gp_mx_i;
+  logic [4:0]         gp_shx_i;
+  logic [31:0]        gp_mout_i;
   localparam int WC_TILES = 128;
   logic                     weight_cached_i;  // this set takes B from cache tile weight_tile_i
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
@@ -103,16 +110,16 @@ module TB_sienna_top;
       .accumulate_i               (accumulate_i),
       .bias_valid_i               (bias_valid_i),
       .bias_i                     (bias_i),
-      .req_mult_i                 ('0),  // int8 (D-2): tied off until Task 19 connects it
-      .req_shift_i                ('0),
-      .req_zp_i                   ('0),
-      .req_min_i                  ('0),
-      .req_max_i                  ('0),
-      .gp_mx_i                    ('0),
-      .gp_shx_i                   ('0),
-      .gp_mout_i                  ('0),
-      .gp_shout_i                 ('0),
-      .gp_zout_i                  ('0),
+      .req_mult_i                 (req_mult_i),
+      .req_shift_i                (req_shift_i),
+      .req_zp_i                   (req_zp_i),
+      .req_min_i                  (req_min_i),
+      .req_max_i                  (req_max_i),
+      .gp_mx_i                    (gp_mx_i),
+      .gp_shx_i                   (gp_shx_i),
+      .gp_mout_i                  (gp_mout_i),
+      .gp_shout_i                 (gp_shout_i),
+      .gp_zout_i                  (gp_zout_i),
       .weight_cached_i            (weight_cached_i),
       .weight_tile_i              (weight_tile_i),
       .wc_write_enable_i          (wc_write_enable_i),
@@ -232,6 +239,8 @@ module TB_sienna_top;
     $fclose(fh);
   endtask
 
+  `include "int8_tb_util.svh"  // read_word_file, unpack_requant, apply_requant
+
   // ── Helper: print current DUT status signals ──────────────────────────
   // Armed for the back-to-back pass only: every outer-FSM transition with its timestamp.
   logic trace_states = 0;
@@ -261,6 +270,16 @@ module TB_sienna_top;
     accumulate_i = 1'b0;
     bias_valid_i = 1'b0;
     bias_i = '0;
+    req_mult_i = '0;
+    req_shift_i = '0;
+    req_zp_i = '0;
+    req_min_i = '0;
+    req_max_i = '0;
+    gp_mx_i = '0;
+    gp_shx_i = '0;
+    gp_mout_i = '0;
+    gp_shout_i = '0;
+    gp_zout_i = '0;
     weight_cached_i = 1'b0;
     weight_tile_i = '0;
     wc_write_enable_i = 1'b0;
@@ -522,12 +541,12 @@ module TB_sienna_top;
 
   // Set k's bias: with HAS_BIAS, the first pass of each group reads bias_<k>.mem.
   task automatic apply_bias(input int k);
-    logic [DATA_WIDTH-1:0] q[$];
+    logic [31:0] q[$];
     bias_valid_i = (HAS_BIAS != 0) && ((k % ACCUM_PASSES) == 0);
     bias_i = '0;
     if (bias_valid_i) begin
-      read_mem_file($sformatf("bias_%0d.mem", k), q);
-      for (int c = 0; c < N; c++) bias_i[c] = q[c];
+      read_word_file($sformatf("bias_%0d.mem", k), q);
+      for (int c = 0; c < N; c++) bias_i[c] = ACC_W'(q[c]);
     end
   endtask
 
@@ -695,6 +714,7 @@ module TB_sienna_top;
               activation_function_i = act_of(k);
               num_terms_i = terms_of(k);
               apply_bias(k);
+              apply_requant(k);
               apply_weight(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
@@ -805,6 +825,7 @@ module TB_sienna_top;
           activation_function_i = act_of(k);
           num_terms_i = terms_of(k);
           apply_bias(k);
+          apply_requant(k);
           apply_weight(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
@@ -926,6 +947,7 @@ module TB_sienna_top;
     activation_function_i = act_of(0);
     num_terms_i           = terms_of(0);
     apply_bias(0);
+    apply_requant(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
@@ -958,6 +980,7 @@ module TB_sienna_top;
       activation_function_i = act_of(1);
       num_terms_i = terms_of(1);
       apply_bias(1);
+      apply_requant(1);
       apply_weight(1);
       trace_states = 1;
       actual_results.delete();

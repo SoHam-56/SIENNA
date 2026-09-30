@@ -3,6 +3,7 @@
 import test_config_pkg::*;
 
 // Streams one network layer's sets from +sets=<file> through sienna_top back to back and writes every set's outputs to +out=<file>.
+// int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
 module TB_sienna_model;
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
@@ -15,7 +16,15 @@ module TB_sienna_model;
   logic                     training_mode_i;
   logic                     accumulate_i;
   logic                     bias_valid_i;
-  logic [N-1:0][DATA_WIDTH-1:0] bias_i;
+  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point
+  // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
+  logic [N-1:0][31:0] req_mult_i;
+  logic [N-1:0][7:0]  req_shift_i;
+  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_shout_i, gp_zout_i;
+  logic [15:0]        gp_mx_i;
+  logic [4:0]         gp_shx_i;
+  logic [31:0]        gp_mout_i;
+  `include "int8_tb_util.svh"  // unpack_requant
   localparam int WC_TILES = 128;
   logic weight_cached_i, wc_write_enable_i;
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
@@ -72,16 +81,16 @@ module TB_sienna_model;
       .accumulate_i               (accumulate_i),
       .bias_valid_i               (bias_valid_i),
       .bias_i                     (bias_i),
-      .req_mult_i                 ('0),  // int8 (D-2): tied off until Task 19 connects it
-      .req_shift_i                ('0),
-      .req_zp_i                   ('0),
-      .req_min_i                  ('0),
-      .req_max_i                  ('0),
-      .gp_mx_i                    ('0),
-      .gp_shx_i                   ('0),
-      .gp_mout_i                  ('0),
-      .gp_shout_i                 ('0),
-      .gp_zout_i                  ('0),
+      .req_mult_i                 (req_mult_i),
+      .req_shift_i                (req_shift_i),
+      .req_zp_i                   (req_zp_i),
+      .req_min_i                  (req_min_i),
+      .req_max_i                  (req_max_i),
+      .gp_mx_i                    (gp_mx_i),
+      .gp_shx_i                   (gp_shx_i),
+      .gp_mout_i                  (gp_mout_i),
+      .gp_shout_i                 (gp_shout_i),
+      .gp_zout_i                  (gp_zout_i),
       .weight_cached_i            (weight_cached_i),
       .weight_tile_i              (weight_tile_i),
       .wc_write_enable_i          (wc_write_enable_i),
@@ -205,6 +214,7 @@ module TB_sienna_model;
     int n_sets, acc, act, terms, has_bias, bad_ids;
     bit host_gaps;
     logic [DATA_WIDTH-1:0] w;
+    logic [31:0] w32;
     longint t0, waited;
 
     rstn_i = 0;
@@ -213,6 +223,16 @@ module TB_sienna_model;
     accumulate_i = 0;
     bias_valid_i = 0;
     bias_i = '0;
+    req_mult_i = '0;
+    req_shift_i = '0;
+    req_zp_i = '0;
+    req_min_i = '0;
+    req_max_i = '0;
+    gp_mx_i = '0;
+    gp_shx_i = '0;
+    gp_mout_i = '0;
+    gp_shout_i = '0;
+    gp_zout_i = '0;
     weight_cached_i = 0;
     weight_tile_i = '0;
     wc_write_enable_i = 0;
@@ -265,9 +285,18 @@ module TB_sienna_model;
       bias_i = '0;
       if (has_bias != 0)
         for (int c = 0; c < N; c++) begin
-          rc = $fscanf(fin, "%h", w);
-          bias_i[c] = w;
+          rc = $fscanf(fin, "%h", w32);
+          bias_i[c] = ACC_W'(w32);
         end
+      if (IS_INT) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
+        logic [31:0] q[$];
+        q.delete();  // a static block: the queue would otherwise keep the previous set's words
+        for (int i = 0; i < 8 + 2 * N; i++) begin
+          rc = $fscanf(fin, "%h", w32);
+          q.push_back(w32);
+        end
+        unpack_requant(q);
+      end
       waited = 0;
       while (!pipeline_ready_o) begin
         @(posedge clk_i);

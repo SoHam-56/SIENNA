@@ -24,6 +24,7 @@ GPNAE/src/TYTAN/LZC.v
 GPNAE/src/TYTAN/barrel_mac.sv
 GPNAE/src/fp32_down.sv
 GPNAE/src/gpnae_tail.sv
+GPNAE/src/gpnae_poly_int8.sv
 GPNAE/src/gpnae_poly.sv
 Maxpool/Maxpool_2D.sv
 Dropout/dropout.sv

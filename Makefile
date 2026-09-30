@@ -65,6 +65,7 @@ GPNAE_FILES = \
 	sigtan.sv \
 	gpnae.sv \
 	gpnae_tail.sv \
+	gpnae_poly_int8.sv \
 	gpnae_poly.sv
 
 GPNAE_LIB_FILES = \

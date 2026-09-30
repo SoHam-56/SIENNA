@@ -16,6 +16,7 @@ module sienna_top #(
     parameter int    EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
     parameter int    MAN_W             = 23,
     parameter int    DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, results, activations
+    parameter int    ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // sums, bias, mesh results: int32 in int8, DATA_WIDTH otherwise
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -39,7 +40,17 @@ module sienna_top #(
     input logic                     training_mode_i,  // dropout mode for the set being started
     input logic                     accumulate_i,     // 1: add this set's product to the running sum and output nothing
     input logic                     bias_valid_i,     // with the start: add bias_i[c] to column c of this set's product
-    input logic [N-1:0][DATA_WIDTH-1:0] bias_i,
+    input logic [N-1:0][ACC_W-1:0]  bias_i,
+    input logic [N-1:0][31:0]       req_mult_i,   // int8, with the start: requantize multiplier (Q0.31) of each output channel (column)
+    input logic [N-1:0][7:0]        req_shift_i,  // int8: its shift, signed
+    input logic [7:0]               req_zp_i,     // int8, layer-wide: output zero point; dropout drops to it after ReLU or linear (D-5)
+    input logic [7:0]               req_min_i,    // int8: clamp, signed; the fused ReLU or ReLU6 lives here
+    input logic [7:0]               req_max_i,
+    input logic [15:0]              gp_mx_i,      // int8 GPNAE: rescale of the lane input to Q4.11
+    input logic [4:0]               gp_shx_i,
+    input logic [31:0]              gp_mout_i,    // int8 GPNAE: SELU's output requantize
+    input logic [7:0]               gp_shout_i,
+    input logic [7:0]               gp_zout_i,
     input logic                     weight_cached_i,  // with the start: B is cache tile weight_tile_i, only A is written
     input logic [WCTW-1:0]          weight_tile_i,
     input logic                     wc_write_enable_i,  // weight cache write of north_write_data_i at word wc_write_addr_i
@@ -68,6 +79,14 @@ module sienna_top #(
     output logic intermediate_buffer_full_o,
     output logic intermediate_buffer_empty_o
 );
+
+  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: int32 sums, requantized at the lane feed
+
+  if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
+    $fatal(1, "sienna_top: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
+  end else if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC
+    $fatal(1, "sienna_top: ACC_W=%0d, but the format accumulates in %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end
 
   localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
   localparam logic [DATA_WIDTH-1:0] NEG_INF = {1'b1, {EXP_W{1'b1}}, {MAN_W{1'b0}}};  // pooling pad: -infinity in the format
@@ -129,6 +148,13 @@ module sienna_top #(
   logic [CONTROL_WIDTH-1:0] set_act[NUM_IDS];  // activation each set asked for, so layers in flight keep their own
   logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with set_act
   logic [CRW-1:0] gp_sets;  // sets past the activation stage and not yet complete; pooling takes them in id order
+  // int8: the requantize and GPNAE parameters of the set the activation stage holds (g_*); p_zp: dropout's drop value for the pooled set.
+  logic [N-1:0][31:0] g_mult;
+  logic [N-1:0][7:0]  g_shift;
+  logic [7:0]         g_zp, g_min, g_max, g_shout, g_zout, p_zp;
+  logic [15:0]        g_mx;
+  logic [4:0]         g_shx;
+  logic [31:0]        g_mout;
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -139,7 +165,7 @@ module sienna_top #(
   logic                  systolic_start;
   logic systolic_read_enable;
   logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_addr;  // wide read index, 0 .. PER_LANE-1
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] wide_rd_data;  // element k of lane k's block
+  logic [NUM_LANES-1:0][ACC_W-1:0] wide_rd_data;  // element k of lane k's block; int32 sums in int8
   logic                                 wide_rd_valid;
   logic                  systolic_mult_complete;
   logic                  systolic_collection_complete;
@@ -280,6 +306,12 @@ module sienna_top #(
           .last_i        (gpnae_start[g]),
           .terms_i       (gpnae_terms[g]),
           .control_word_i(gpnae_ctrl[g]),
+          .gp_mx_i       (g_mx),
+          .gp_shx_i      (g_shx),
+          .gp_zin_i      (g_zp),     // int8: the lane's input is the requantize output, whose zero point is req_zp_i
+          .gp_mout_i     (g_mout),
+          .gp_shout_i    (g_shout),
+          .gp_zout_i     (g_zout),
           .full_o        (gpnae_full[g]),
           .empty_o       (gpnae_empty_o[g]),
           .idle_o        (gpnae_idle[g]),
@@ -374,7 +406,7 @@ module sienna_top #(
     // Beat b of the wide read holds element k*PER_LANE + b in word k, the element lane k would have taken.
     if (g_state != G_IDLE && act_bypass && fill_v)
       for (int k = 0; k < NUM_LANES; k++)
-        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (!IS_INT && act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
     if (g_state == G_ROUND && !act_bypass) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
@@ -579,6 +611,55 @@ module sienna_top #(
     end
   end
 
+  // int8 (D-2): parameters per set id; at g_accept the stage copies its set's per-channel words, so a lane picks among N, not NUM_IDS * N.
+  if (IS_INT) begin : G_REQ_SETS
+    logic [N-1:0][31:0] s_mult [NUM_IDS];
+    logic [N-1:0][7:0]  s_shift[NUM_IDS];
+    logic [7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_shout[NUM_IDS], s_zout[NUM_IDS];
+    logic [15:0] s_mx[NUM_IDS];
+    logic [4:0]  s_shx[NUM_IDS];
+    logic [31:0] s_mout[NUM_IDS];
+    always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
+      if (host_accept) begin
+        s_mult[host_next_id]  <= req_mult_i;
+        s_shift[host_next_id] <= req_shift_i;
+        s_zp[host_next_id]    <= req_zp_i;
+        s_min[host_next_id]   <= req_min_i;
+        s_max[host_next_id]   <= req_max_i;
+        s_mx[host_next_id]    <= gp_mx_i;
+        s_shx[host_next_id]   <= gp_shx_i;
+        s_mout[host_next_id]  <= gp_mout_i;
+        s_shout[host_next_id] <= gp_shout_i;
+        s_zout[host_next_id]  <= gp_zout_i;
+      end
+      if (g_accept) begin
+        g_mult  <= s_mult[g_next_id];
+        g_shift <= s_shift[g_next_id];
+      end
+    end
+    assign g_zp    = s_zp[g_set_id];
+    assign g_min   = s_min[g_set_id];
+    assign g_max   = s_max[g_set_id];
+    assign g_mx    = s_mx[g_set_id];
+    assign g_shx   = s_shx[g_set_id];
+    assign g_mout  = s_mout[g_set_id];
+    assign g_shout = s_shout[g_set_id];
+    assign g_zout  = s_zout[g_set_id];
+    assign p_zp    = s_zp[p_set_id];  // Task 18 replaces this with D-5's choice per activation
+  end else begin : G_NO_REQ_SETS
+    assign g_mult  = '0;
+    assign g_shift = '0;
+    assign g_zp    = '0;
+    assign g_min   = '0;
+    assign g_max   = '0;
+    assign g_mx    = '0;
+    assign g_shx   = '0;
+    assign g_mout  = '0;
+    assign g_shout = '0;
+    assign g_zout  = '0;
+    assign p_zp    = '0;
+  end
+
   // =========================================================================
   // PARALLEL LANE FILL: each wide read gives every lane its next element at once
   // =========================================================================
@@ -606,8 +687,31 @@ module sienna_top #(
 
   logic fill_v;
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
-  assign fill_v = wide_rd_valid;
-  assign fill_d = wide_rd_data;
+  // int8: the lanes, the bypass write and every fill counter see requantized int8 beats, REQ_LAT cycles after the wide read.
+  if (IS_INT) begin : G_REQ
+    requant_lanes #(
+        .NUM_LANES(NUM_LANES),
+        .N        (N),
+        .PER_LANE (PER_LANE),
+        .ROUNDING (sienna_fmt_pkg::REQ_ROUNDING)
+    ) rq (
+        .clk_i   (clk_i),
+        .rstn_i  (rstn_i),
+        .clear_i (g_state == G_IDLE),
+        .valid_i (wide_rd_valid),
+        .acc_i   (wide_rd_data),
+        .mult_i  (g_mult),
+        .shift_i (g_shift),
+        .zp_i    (g_zp),
+        .min_i   (g_min),
+        .max_i   (g_max),
+        .valid_o (fill_v),
+        .result_o(fill_d)
+    );
+  end else begin : G_NO_REQ
+    assign fill_v = wide_rd_valid;
+    assign fill_d = wide_rd_data;
+  end
 
   always_comb begin
     filled_total_n = filled_total;

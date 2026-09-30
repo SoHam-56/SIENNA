@@ -42,9 +42,11 @@ SM_LIB_FILES = \
 	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
 	Multipliers/FP32/src/fp32Multiplier.sv \
 	Multipliers/FP/src/fpMultiplier.sv \
+	Multipliers/Int/src/intMultiplier.sv \
 	Adders/FP32/src/LZC.sv \
 	Adders/FP32/src/fp32Adder.sv \
-	Adders/FP/src/fpAdder.sv
+	Adders/FP/src/fpAdder.sv \
+	Adders/Int/src/intAdder.sv
 
 GPNAE_FILES = \
 	TYTAN/Memory/CoeffROM.v \

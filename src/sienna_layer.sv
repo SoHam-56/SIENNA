@@ -7,6 +7,7 @@
 // ceil(cfg_kb_i/N) weight tiles of N rows each, once if the block is cached, else once per row tile.
 // A block is cached when it has more than one row tile and at most WC_TILES/2 weight tiles.
 // Activation stream, per column block, per row tile: the depth tiles of A (N rows each), then the residual tile if cfg_residual_i.
+// int8: every block has a bias beat, its int32 bias and requantize words on w_bias_i, w_req_mult_i, w_req_shift_i (w_data_i ignored).
 // Results leave per output tile, column blocks outer and row tiles inner, N x N row-major.
 module sienna_layer #(
     parameter int NUM_LANES         = 32,
@@ -20,6 +21,7 @@ module sienna_layer #(
     parameter int EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
     parameter int MAN_W             = 23,
     parameter int DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, bias, results
+    parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // bias and sums: int32 in int8, DATA_WIDTH otherwise
     parameter int CONTROL_WIDTH     = 3,
     parameter int LFSR_WIDTH        = 32,
     parameter int POOL_H            = 1,
@@ -43,6 +45,15 @@ module sienna_layer #(
     input logic [CONTROL_WIDTH-1:0] cfg_act_i,
     input logic                     cfg_train_i,
     input logic [LFSR_WIDTH-1:0]    cfg_seed_i,
+    // int8 only, taken with cfg_load_i: the layer's requantize and GPNAE parameters (D-2)
+    input logic [7:0]               cfg_req_zp_i,
+    input logic [7:0]               cfg_req_min_i,
+    input logic [7:0]               cfg_req_max_i,
+    input logic [15:0]              cfg_gp_mx_i,
+    input logic [4:0]               cfg_gp_shx_i,
+    input logic [31:0]              cfg_gp_mout_i,
+    input logic [7:0]               cfg_gp_shout_i,
+    input logic [7:0]               cfg_gp_zout_i,
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
@@ -52,6 +63,10 @@ module sienna_layer #(
     input  logic                              w_valid_i,
     input  logic [N-1:0][DATA_WIDTH-1:0]            w_data_i,
     output logic                              w_ready_o,
+    // int8 only: beside each block's bias beat on the weight stream
+    input  logic [N-1:0][ACC_W-1:0]           w_bias_i,
+    input  logic [N-1:0][31:0]                w_req_mult_i,
+    input  logic [N-1:0][7:0]                 w_req_shift_i,
 
     output logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
     output logic [NUM_LANES-1:0]                 result_valid_o,
@@ -63,13 +78,19 @@ module sienna_layer #(
   localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);
   localparam int ADDR_LINES = $clog2(N * N);
   localparam int RW = (N > 1) ? $clog2(N) : 1;  // row within a tile
-  localparam logic [DATA_WIDTH-1:0] ONE = {1'b0, EXP_W'((1 << (EXP_W - 1)) - 1), MAN_W'(0)};  // 1.0 in the format
+  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);
+  localparam logic [DATA_WIDTH-1:0] ONE = IS_INT ? DATA_WIDTH'(1)  // int8: a residual adds its raw codes into the int32 sum
+                                                 : DATA_WIDTH'(((1 << (EXP_W > 0 ? EXP_W - 1 : 0)) - 1) << MAN_W);  // 1.0 in the format
 
   // ── Configuration and what follows from it ────────────────────────────
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
   logic [LFSR_WIDTH-1:0] seed_q;
+  logic [7:0] rq_zp_q, rq_min_q, rq_max_q, gp_shout_q, gp_zout_q;  // int8 layer-wide parameters
+  logic [15:0] gp_mx_q;
+  logic [4:0] gp_shx_q;
+  logic [31:0] gp_mout_q;
   logic [31:0] total_sets;
   logic active;
 
@@ -89,7 +110,9 @@ module sienna_layer #(
 
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_ready, p_complete, p_wc_we;
-  logic [N-1:0][DATA_WIDTH-1:0]  p_bias;
+  logic [N-1:0][ACC_W-1:0]       p_bias;
+  logic [N-1:0][31:0]            p_mult;   // int8: the requantize words of the set being started
+  logic [N-1:0][7:0]             p_shift;
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
   logic [WCTW-1:0]               p_tile;
   logic [WCAW-1:0]               p_wc_addr;
@@ -111,6 +134,7 @@ module sienna_layer #(
       .EXP_W            (EXP_W),
       .MAN_W            (MAN_W),
       .DATA_WIDTH       (DATA_WIDTH),
+      .ACC_W            (ACC_W),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (N),
       .IN_COLS          (N),
@@ -129,16 +153,16 @@ module sienna_layer #(
       .accumulate_i               (p_acc),
       .bias_valid_i               (p_bias_v),
       .bias_i                     (p_bias),
-      .req_mult_i                 ('0),  // int8 (D-2): tied off until Task 19 connects it
-      .req_shift_i                ('0),
-      .req_zp_i                   ('0),
-      .req_min_i                  ('0),
-      .req_max_i                  ('0),
-      .gp_mx_i                    ('0),
-      .gp_shx_i                   ('0),
-      .gp_mout_i                  ('0),
-      .gp_shout_i                 ('0),
-      .gp_zout_i                  ('0),
+      .req_mult_i                 (p_mult),
+      .req_shift_i                (p_shift),
+      .req_zp_i                   (rq_zp_q),
+      .req_min_i                  (rq_min_q),
+      .req_max_i                  (rq_max_q),
+      .gp_mx_i                    (gp_mx_q),
+      .gp_shx_i                   (gp_shx_q),
+      .gp_mout_i                  (gp_mout_q),
+      .gp_shout_i                 (gp_shout_q),
+      .gp_zout_i                  (gp_zout_q),
       .weight_cached_i            (p_cached),
       .weight_tile_i              (p_tile),
       .wc_write_enable_i          (p_wc_we),
@@ -168,7 +192,9 @@ module sienna_layer #(
   assign set_done_o = p_complete;
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
-  logic [N-1:0][DATA_WIDTH-1:0] bias_buf[2];
+  logic [N-1:0][ACC_W-1:0] bias_buf[2];
+  logic [N-1:0][31:0] mult_buf[2];  // int8: the requantize words of the block each half holds
+  logic [N-1:0][7:0] shift_buf[2];
   logic [DIM_W-1:0] wl_blk;  // block the loader works on
   logic wl_bias_done;  // its bias row is in
   logic [DIM_W-1:0] wl_tile;  // tiles of it complete
@@ -221,6 +247,8 @@ module sienna_layer #(
     p_acc      = (is_p != np - 1);
     p_bias_v   = bias_q && (is_p == 0);
     p_bias     = bias_buf[is_blk[0]];
+    p_mult     = mult_buf[is_blk[0]];
+    p_shift    = shift_buf[is_blk[0]];
     p_cached   = is_cached_pass;
     p_tile     = WCTW'(int'(is_blk[0]) * HALF + int'(is_p));
     p_seed     = LFSR_WIDTH'(seed_q ^ (32'h85EBCA6B * n_issued));
@@ -239,6 +267,14 @@ module sienna_layer #(
       train_q <= 1'b0;
       act_q <= '0;
       seed_q <= '0;
+      rq_zp_q <= '0;
+      rq_min_q <= '0;
+      rq_max_q <= '0;
+      gp_mx_q <= '0;
+      gp_shx_q <= '0;
+      gp_mout_q <= '0;
+      gp_shout_q <= '0;
+      gp_zout_q <= '0;
       total_sets <= '0;
       wl_blk <= '0;
       wl_bias_done <= 1'b0;
@@ -265,11 +301,19 @@ module sienna_layer #(
         dt <= d;
         np <= d + DIM_W'(cfg_residual_i);
         res_q <= cfg_residual_i;
-        bias_q <= cfg_bias_i;
+        bias_q <= cfg_bias_i || IS_INT;  // int8: every block's bias beat carries its requantize words
         cached <= (r > 1) && (d <= DIM_W'(HALF));
         train_q <= cfg_train_i;
         act_q <= cfg_act_i;
         seed_q <= cfg_seed_i;
+        rq_zp_q <= cfg_req_zp_i;
+        rq_min_q <= cfg_req_min_i;
+        rq_max_q <= cfg_req_max_i;
+        gp_mx_q <= cfg_gp_mx_i;
+        gp_shx_q <= cfg_gp_shx_i;
+        gp_mout_q <= cfg_gp_mout_i;
+        gp_shout_q <= cfg_gp_shout_i;
+        gp_zout_q <= cfg_gp_zout_i;
         total_sets <= 32'(r) * 32'(c) * 32'(d + DIM_W'(cfg_residual_i));
         wl_blk <= '0;
         wl_bias_done <= 1'b0;
@@ -292,7 +336,9 @@ module sienna_layer #(
           automatic logic last_row = wl_take_tile && (wl_row == RW'(N - 1));
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
-            bias_buf[wl_blk[0]] <= w_data_i;
+            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= IS_INT ? w_bias_i[c] : ACC_W'(w_data_i[c]);
+            mult_buf[wl_blk[0]] <= w_req_mult_i;
+            shift_buf[wl_blk[0]] <= w_req_shift_i;
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;

@@ -58,6 +58,66 @@ def exact_layer(A, B, bias, act, N, fmt):
     return Y[:M, :C]
 
 
+def run_int8(a, sim, shapes) -> None:
+    """int8 on the layer engine: TFLite-PTQ-quantized products must equal the model bit for bit; the quantization error is reported, not gated."""
+    reg = mr.regression
+    rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
+    peak = a.n * a.n
+    head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
+            f"{'slot use':>8} {'mism':>6} {'q err':>8} {'wall s':>6}")
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
+                 f"peak {peak} MAC/cycle", head):
+        print(line, flush=True)
+        rep.write(line + "\n")
+    cases = [(name, m, k, n, "linear") for name, m, k, n in shapes]
+    cases += [(f"layer_{act}_bias", 64, 48, 40, act) for act in ("tanh", "sigmoid", "selu")]
+    rows, bad = [], 0
+    for name, m, k, n, act in cases:
+        rng = np.random.RandomState(m * 7 + k * 13 + n)
+        A, B = rng.uniform(-1, 1, (m, k)), rng.uniform(-1, 1, (k, n))
+        bias = None if act == "linear" else rng.uniform(-0.5, 0.5, n)
+        A_q, s_a, z_a = reg.quant_act(A)
+        B_q, s_w = reg.quant_weights(B)
+        hw_bias = reg.fold_bias(bias, s_a, s_w, z_a, B_q)
+        req = reg.requant_params(reg.wrap32(reg.imatmul(A_q, B_q) + hw_bias[None, :]), s_a, s_w, act)
+        job = {"terms": [(A_q.astype(np.float32), B_q.astype(np.float32))], "bias": hw_bias, "act": act,
+               "shape": (m, n), "req": req}
+        t0 = time.time()
+        y, sets, cyc = sim.run_job(job, name)
+        mism = int(np.sum(y != reg.int8_layer_exact(A_q, B_q, hw_bias, req, act)))
+        ref = A @ B + (0.0 if bias is None else bias[None, :])
+        if act != "linear":
+            ref = reg.apply_activation(ref.astype(np.float32), act).astype(np.float64)
+        if act == "tanh":
+            deq = y / 128.0  # D-4: tanh y * 128, zero point 0
+        elif act == "sigmoid":
+            deq = (y + 128) / 256.0  # sigmoid y * 256, zero point -128
+        elif act == "selu":
+            deq = (y - req["zout"]) * req["s_selu"]
+        else:
+            deq = (y - req["zp"]) * req["s_out"]
+        err = float(np.max(np.abs(deq - ref)) / (np.max(np.abs(ref)) or 1.0))
+        macs = m * k * n
+        r = {"shape": name, "M": m, "K": k, "N": n, "act": act, "sets": sets, "cycles": cyc, "macs": macs,
+             "mac_per_cycle": macs / cyc if cyc else 0, "pe_use": macs / (cyc * peak) if cyc else 0,
+             "slot_use": macs / (sets * a.n ** 3), "mism": mism, "err": err, "wall": time.time() - t0}
+        rows.append(r)
+        line = (f"{name:<22} {m:>5} {k:>5} {n:>5} {sets:>7} {cyc:>10} {r['mac_per_cycle']:>9.1f} {100 * r['pe_use']:>6.1f}% "
+                f"{100 * r['slot_use']:>7.1f}% {mism:>6} {err:>8.1e} {r['wall']:>6.0f}")
+        print(line, flush=True)
+        rep.write(line + "\n")
+        rep.flush()
+        json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
+        if mism:
+            print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
+            bad += 1
+    line = f"GEMM int8: {len(rows)} cases, {bad} with outputs that differ from the bit-exact model"
+    print(line, flush=True)
+    rep.write(line + "\n")
+    if bad:
+        sys.exit(1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n", type=int, default=16)
@@ -68,9 +128,11 @@ def main():
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
                     help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(mr.regression.FORMATS),
-                    help="format of A and B on the layer engine; sums stay fp32, and the error is judged on the rounded inputs")
+                    help="format of A and B on the layer engine; int8 sums in int32 and requantizes")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
+    if a.fmt_name == "int8" and (a.emulate or a.engine != "layer"):
+        ap.error("int8 runs on the layer engine only")
     os.makedirs(a.work, exist_ok=True)
     if a.emulate:
         sim = mr.EmuSim(a.n, a.lanes, a.work)
@@ -82,6 +144,9 @@ def main():
     shapes = [(f"grid_{m}x{k}x{n}", m, k, n) for m in GRID_M for k in GRID_K for n in GRID_N] + TRANSFORMER
     if a.quick:
         shapes = [s for s in shapes if s[1] * s[2] * s[3] <= 64 * 64 * 64][:6]
+    if a.fmt_name == "int8":
+        run_int8(a, sim, shapes)
+        return
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"

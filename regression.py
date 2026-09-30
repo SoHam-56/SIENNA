@@ -389,6 +389,12 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
     return rq
 
 
+def selu_saturates(mx: int, shx: int, z_in: int, q) -> np.ndarray:
+    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in) to 16 or more, where Q4.11 saturates SELU's positive branch."""
+    p = (np.asarray(q, np.int64) - int(z_in)) * int(mx)
+    return (p if shx == 0 else (p + (1 << (shx - 1))) >> shx) >= 1 << (4 + gpnae_model.Q)
+
+
 def int8_lane():
     f = gpnae_model.FORMATS["int8"]
     return gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))

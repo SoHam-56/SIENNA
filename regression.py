@@ -26,6 +26,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPN
 import mesh_model  # noqa: E402
 import gpnae_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
+import ipu  # noqa: E402
+import tflite_ref  # noqa: E402
 
 COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for the bit-exact golden
 
@@ -65,7 +68,7 @@ SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its bank
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
 
 # Number formats a build may use, as (exponent bits, mantissa bits); every word of the pipeline is in the build's format.
-FORMATS = {"fp32": (8, 23), "bf16": (8, 7)}
+FORMATS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # int8: EXP_W = 0, 8-bit two's-complement codes
 
 
 def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
@@ -73,6 +76,8 @@ def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
     x = np.asarray(x, dtype=np.float32)
     if fmt == "fp32":
         return x
+    if fmt == "int8":  # int8 codes, as float32 values holding integers
+        return np.clip(np.rint(x), -128, 127).astype(np.float32)
     if fmt == "bf16":
         u = x.view(np.uint32).astype(np.uint64)
         u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
@@ -86,6 +91,8 @@ def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
 def op_hex(data, fmt: str) -> list:
     """Values as hex words of the operand format, after rounding: 8 digits for fp32, 4 for bf16 and fp16."""
     v = op_round(np.asarray(data, dtype=np.float32).flatten(), fmt)
+    if fmt == "int8":
+        return [f"{int(b) & 0xFF:02x}" for b in v.astype(np.int64)]
     if fmt == "fp32":
         return [f"{int(b):08x}" for b in v.view(np.uint32)]
     bits = (v.view(np.uint32) >> 16) if fmt == "bf16" else v.astype(np.float16).view(np.uint16)
@@ -308,16 +315,265 @@ def _golden_bits(passes, bias, cfg: dict, act: str, drop_seed: int, fmt: str) ->
     return C, A, P, F.reshape(P.shape)
 
 
+# ===== int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden =====
+
+REQ_HEAD = 8  # layer-wide words heading requant_<k>.mem: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout
+
+
+def wrap32(x) -> np.ndarray:
+    """int64 values wrapped to int32, as the mesh's two's-complement accumulate does."""
+    return ((np.asarray(x, dtype=np.int64) + (1 << 31)) % (1 << 32)) - (1 << 31)
+
+
+def imatmul(a, b) -> np.ndarray:
+    """Exact integer product: int8 x int8 terms and their sums stay below 2^53, so float64 holds every partial sum."""
+    return np.rint(np.asarray(a, np.float64) @ np.asarray(b, np.float64)).astype(np.int64)
+
+
+def quant_act(x) -> tuple:
+    """(q, scale, zero point) of an activation tensor as TFLite PTQ picks them: asymmetric int8 over its range widened to hold 0."""
+    x = np.asarray(x, dtype=np.float64)
+    lo, hi = min(0.0, float(x.min())), max(0.0, float(x.max()))
+    scale = (hi - lo) / 255.0 if hi > lo else 1.0
+    zp = int(np.clip(np.rint(-128.0 - lo / scale), -128, 127))
+    return np.clip(np.rint(x / scale) + zp, -128, 127).astype(np.int64), scale, zp
+
+
+def quant_weights(w) -> tuple:
+    """(q, per-column scales) of a weight matrix as TFLite quantizes weights: symmetric per output channel, zero point 0, codes -127..127."""
+    w = np.asarray(w, dtype=np.float64)
+    s = np.max(np.abs(w), axis=0) / 127.0
+    s = np.where(s > 0, s, 1.0)
+    return np.clip(np.rint(w / s[None, :]), -127, 127).astype(np.int64), s
+
+
+def fold_bias(bias, s_a: float, s_w, z_a: int, B_q) -> np.ndarray:
+    """The mesh's int32 bias: TFLite's bias minus z_a * sum_k B_q[k, c], so the mesh's sum of a * w is TFLite's sum of (a - z_a) * w."""
+    B_q = np.asarray(B_q, np.int64)
+    b_q = np.zeros(B_q.shape[1], np.int64) if bias is None else \
+        np.rint(np.asarray(bias, np.float64) / (s_a * np.asarray(s_w, np.float64))).astype(np.int64)
+    return wrap32(b_q - z_a * B_q.sum(axis=0))
+
+
+def requantize(acc, rq: dict) -> np.ndarray:
+    """ipu.requant of int32 sums (rows x channels) with channel c's multiplier and shift on column c."""
+    acc = np.asarray(acc, np.int64)
+    m = np.broadcast_to(np.asarray(rq["mult"], np.int64)[None, :acc.shape[1]], acc.shape)
+    s = np.broadcast_to(np.asarray(rq["shift"], np.int64)[None, :acc.shape[1]], acc.shape)
+    return np.asarray(ipu.requant(acc, m, s, rq["zp"], rq["amin"], rq["amax"], tflite_ref.ROUNDING), np.int64)
+
+
+def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
+    """Requantize and GPNAE parameters for int32 sums acc (rows x channels) as TFLite PTQ picks them; with rng, random words per channel."""
+    acc = np.asarray(acc, np.int64)
+    s_w = np.asarray(s_w, np.float64)
+    real = acc * (s_a * s_w)[None, :]
+    if act == "relu":
+        real = np.maximum(real, 0.0)
+    _, s_out, z_out = quant_act(real)
+    qm = [tflite_ref.quantize_multiplier(s_a * float(s) / s_out) for s in s_w]
+    mult = np.array([m for m, _ in qm], np.int64)
+    shift = np.array([e for _, e in qm], np.int64)
+    if rng is not None:  # every normalized multiplier, and right shifts 0..12 (TFLite's left shift can overflow int32)
+        mult = rng.randint(1 << 30, 1 << 31, s_w.size).astype(np.int64)
+        shift = rng.randint(-12, 1, s_w.size).astype(np.int64)
+    mx, shx = gpnae_model.rescale_params(s_out)
+    rq = dict(mult=mult, shift=shift, zp=z_out, amin=max(-128, z_out) if act == "relu" else -128, amax=127,
+              mx=mx, shx=shx, s_out=s_out)
+    if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
+        rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
+    x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
+    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, 16.0).astype(np.float32), "selu"))
+    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -25 / s_selu)  # the lane's SELU value, in units of 2^-25, to its int8 code (D-4)
+    rq.update(mout=int(mout), shout=int(shout), zout=z_selu, s_selu=s_selu)
+    return rq
+
+
+def int8_lane():
+    f = gpnae_model.FORMATS["int8"]
+    return gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+
+
+def activate_int8(R, act: str, rq: dict) -> np.ndarray:
+    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters."""
+    code = activation_to_code(act)
+    R = np.asarray(R, np.int64)
+    if code in (4, 5):
+        return R.copy()
+    par = gpnae_model.Int8Params(mx=rq["mx"], shx=rq["shx"], zin=rq["zp"], mout=rq["mout"], shout=rq["shout"], zout=rq["zout"])
+    return np.asarray(int8_lane().run(R, code, par), np.int64)
+
+
+def drop_zp(act: str, rq: dict) -> int:
+    """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
+    return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
+
+
+def _maxpool_int(x, ph: int, pw: int, pad: int) -> np.ndarray:
+    """Integer max pooling with -128 outside the input, stride = window, as sienna_top dispatches it."""
+    x = np.asarray(x, np.int64)
+    H, W = x.shape
+    xp = np.full((H + 2 * pad, W + 2 * pad), -128, dtype=np.int64)
+    xp[pad:pad + H, pad:pad + W] = x
+    oh, ow = (H + 2 * pad - ph) // ph + 1, (W + 2 * pad - pw) // pw + 1
+    return np.array([[xp[i * ph:i * ph + ph, j * pw:j * pw + pw].max() for j in range(ow)] for i in range(oh)], np.int64)
+
+
+def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int) -> tuple:
+    """Bit-exact int8 set (D-6): int32 sums, per-column requantize, the lane, integer max pooling, dropout (D-5); passes are (A, B) codes."""
+    N = cfg.get("n", 16)
+    for a, b in passes:  # matmul_int truncates non-integer operands silently, so only int64 int8 codes may reach it
+        assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
+                   for m in (a, b)), "int8 golden: operands must be int64 arrays of int8 values"
+    C = mesh_model.matmul_int([(_pad_square(a, N), _pad_square(b, N)) for a, b in passes], N, hw_bias)
+    R = requantize(C, rq)
+    A = activate_int8(R, act, rq)
+    P = _maxpool_int(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1))
+    if not cfg.get("training", False):
+        return C, R, A, P, P.copy()
+    keep = dropout_keep(P.size, cfg.get("dropout_p", 0.5), drop_seed, cfg.get("lanes", 32))
+    return C, R, A, P, np.where(keep, P.flatten(), drop_zp(act, rq)).reshape(P.shape)
+
+
+def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
+    """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
+    acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
+    return activate_int8(requantize(acc, rq), act, rq)
+
+
+def _check_rounding() -> None:
+    """sienna_fmt_pkg::REQ_ROUNDING must be the variant G0 pinned, as ipu and tflite_ref read it, or golden and RTL round apart."""
+    pkg = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
+    m = re.search(r'localparam string REQ_ROUNDING\s*=\s*"(\w+)"', open(pkg).read())
+    rtl = m.group(1) if m else "(no REQ_ROUNDING)"
+    if tflite_ref.ROUNDING is None or rtl != tflite_ref.ROUNDING or ipu.REQ_ROUNDING != tflite_ref.ROUNDING:
+        raise ValueError(f"sienna_fmt_pkg rounds {rtl}, ipu.REQ_ROUNDING is {ipu.REQ_ROUNDING}, "
+                         f"tflite_ref.ROUNDING (rounding.txt) is {tflite_ref.ROUNDING}")
+
+
+def _decoy_params(N: int) -> dict:
+    """A partial pass's requantize words: the activated pass's are the ones used, so these must never show in a result."""
+    return dict(mult=np.full(N, 1 << 30, np.int64), shift=np.full(N, -1, np.int64), zp=5, amin=-100, amax=100,
+                mx=1, shx=0, mout=1 << 30, shout=-1, zout=5)
+
+
+def _write_s8(path: str, v) -> None:
+    with open(path, "w") as fh:
+        fh.write("".join(f"{int(x) & 0xFF:02x}\n" for x in np.asarray(v).flatten()))
+
+
+def _write_w32(path: str, v) -> None:
+    with open(path, "w") as fh:
+        fh.write("".join(f"{int(x) & 0xFFFFFFFF:08x}\n" for x in np.asarray(v).flatten()))
+
+
+def _requant_words(rq: dict) -> list:
+    """requant_<k>.mem's words: the REQ_HEAD layer-wide words, then N multipliers, then N shifts."""
+    return [rq["zp"], rq["amin"], rq["amax"], rq["mx"], rq["shx"], rq["mout"], rq["shout"], rq["zout"]] + \
+        [int(v) for v in rq["mult"]] + [int(v) for v in rq["shift"]]
+
+
+def _zp_draws(rng, groups: int, acts: list) -> list:
+    """zp_random: per group a distinct non-zero zero point, the clamp minimum (the zero point after ReLU) and maximum around it."""
+    zps = rng.choice([z for z in range(-100, 101) if z != 0], groups, replace=False)
+    out = []
+    for z, act in zip(zps, acts):
+        z = int(z)
+        out.append((z, z if act == "relu" else int(rng.randint(-128, z)), int(rng.randint(z + 1, 128))))
+    return out
+
+
+def _generate_vectors_int8(cfg: dict) -> None:
+    """int8 stimulus and bit-exact golden: the float tests' matrices quantized as TFLite PTQ would, each set's parameters in requant_<k>.mem."""
+    os.makedirs(TB_DIR, exist_ok=True)
+    _check_rounding()
+    N, mode = cfg.get("n", 16), cfg.get("mode", "matmul")
+    act_type = cfg.get("activation", cfg.get("act", "idle"))
+    seed = cfg.get("seed", 42) + int(os.environ.get("SIENNA_SEED", "0"))  # unset keeps the fixed stimulus
+    test_name = cfg.get("name", "manual_gen")
+    lo, hi = cfg.get("a_range", (-1.0, 1.0))  # a range not centred on 0 gives a non-zero input zero point
+    scale = float(cfg.get("scale", 1.0))
+    if mode == "conv":
+        A0, B0 = build_conv_matrices(N, cfg.get("conv_type", "basic"), seed, cfg.get("conv_stride"))
+    else:
+        np.random.seed(seed)
+        m_type = cfg.get("matrix_type", "random")
+        if m_type == "identity":
+            A0 = B0 = np.eye(N)
+        elif m_type == "ones":
+            A0 = B0 = np.ones((N, N))
+        elif m_type == "small_exact":
+            A0 = B0 = np.random.randint(-3, 4, (N, N))
+        else:
+            A0, B0 = np.random.uniform(lo, hi, (N, N)), np.random.uniform(-1.0, 1.0, (N, N))
+    A0, B0 = np.array(A0, np.float64), np.array(B0, np.float64)  # copies: identity and ones share one array
+    if cfg.get("zero_rows"):
+        A0[0::4, :] = 0.0
+        A0[1::4, :] = 0.0
+    drop_seed = 0x2ACE0000 + seed
+    passes = cfg.get("accum_passes", 1)
+    mixed = cfg.get("mixed_acts", [])
+    assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
+    credits = cfg.get("credits", SETS_IN_FLIGHT)
+    num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    use_bias = bool(cfg.get("bias", False))
+    req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
+    reals = [(A0 * scale, B0 * scale)]
+    for k in range(1, num_sets):
+        rng = np.random.RandomState(seed + 1000 + k)
+        reals.append((rng.uniform(lo, hi, (N, N)) * scale, rng.uniform(-1.0, 1.0, (N, N)) * scale))
+    first = None
+    starts = list(range(0, num_sets, passes))
+    acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
+    zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
+    for g, g0 in enumerate(starts):
+        ks = list(range(g0, min(g0 + passes, num_sets)))
+        act_g = acts_g[g]
+        A_q, s_a, z_a = quant_act(np.hstack([reals[k][0] for k in ks]))
+        B_q, s_w = quant_weights(np.vstack([reals[k][1] for k in ks]))
+        bias_real = np.random.RandomState(seed + 5000 + g0).uniform(-1.0, 1.0, N) * scale if use_bias else None
+        hw_bias = fold_bias(bias_real, s_a, s_w, z_a, B_q)
+        parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(len(ks))]
+        rq = requant_params(wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :]), s_a, s_w, act_g, req_rng, zqs[g])
+        complete = len(ks) == passes  # a trailing short group has only partial passes, as in the float tests
+        for i, k in enumerate(ks):
+            last = complete and i == len(ks) - 1
+            rq_k = rq if last else _decoy_params(N)
+            write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), parts[i][0], "int8")
+            write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), parts[i][1], "int8")
+            _write_w32(os.path.join(TB_DIR, f"bias_{k}.mem"), hw_bias if i == 0 else np.zeros(N, np.int64))
+            _write_w32(os.path.join(TB_DIR, f"requant_{k}.mem"), _requant_words(rq_k))
+            F = _golden_int8(parts, hw_bias, rq, cfg, act_g, set_dropout_seed(drop_seed, k))[4] if last \
+                else np.zeros(0, np.int64)
+            _write_s8(os.path.join(TB_DIR, f"expected_output_{k}.mem"), F)  # empty for a partial set
+            _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F))
+            if k == 0:
+                first = (parts[0][0], parts[0][1], hw_bias, rq_k)
+    # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
+    a0, b0, hb0, rq0 = first
+    C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)
+    write_op_mem(os.path.join(TB_DIR, "matrix_west.mem"), a0, "int8")
+    write_op_mem(os.path.join(TB_DIR, "matrix_north.mem"), b0, "int8")
+    _write_s8(os.path.join(TB_DIR, "expected_output.mem"), F0)
+    _write_s8(os.path.join(TB_DIR, "bound_output.mem"), np.zeros_like(F0))
+    dump_golden_trace(test_name, C0.astype(np.float32), A0q.astype(np.float32), P0.astype(np.float32))
+    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                     _config_items(cfg, "int8", act_type, num_sets, credits, passes, mixed, True, drop_seed))
+    _check_mem_widths("int8", num_sets)
+
+
 def _check_mem_widths(fmt: str, num_sets: int) -> None:
     """Every operand, bias and expected word the TB reads must be the format's width: a stale fp32 file would be truncated."""
-    d = (fpu.FORMATS[fmt].w + 3) // 4
+    d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4  # int8: operands and results 2 digits; int32 bias and requantize words 8
+    per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
     names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output")]
-    names += [f"{b}_{k}.mem" for k in range(num_sets) for b in ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output")]
+    names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
     for fn in names:
+        want = 8 if fmt == "int8" and fn.startswith(("bias_", "requant_")) else d
         if os.path.exists(os.path.join(TB_DIR, fn)):
             for i, ln in enumerate(open(os.path.join(TB_DIR, fn))):
-                if ln.strip() and len(ln.strip()) != d:
-                    raise ValueError(f"{fn}:{i + 1}: word '{ln.strip()}' is not {d} hex digits ({fmt})")
+                if ln.strip() and len(ln.strip()) != want:
+                    raise ValueError(f"{fn}:{i + 1}: word '{ln.strip()}' is not {want} hex digits ({fmt})")
 
 
 def build_conv_matrices(N: int, conv_type: str, seed: int, stride=None) -> tuple:
@@ -454,6 +710,8 @@ def fp32_error_bound(S: np.ndarray, products: int, cfg: dict, act_type: str, C: 
 
 
 def generate_vectors(cfg: dict) -> None:
+    if cfg.get("fmt_name", "fp32") == "int8":
+        return _generate_vectors_int8(cfg)
     os.makedirs(TB_DIR, exist_ok=True)
     N, tile_size, mode = (
         cfg.get("n", 16),
@@ -779,6 +1037,22 @@ PIPELINE_TESTS = [
      "pool_h": 1, "pool_w": 1, "padding": 0},
     {"name": "matmul_accum2_cached_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "cached": True,
      "bias": True, "accum_passes": 2},
+    # int8 only: per-channel random requantize multipliers and shifts, and inputs whose zero point is far from 0.
+    {"name": "int8_perchannel_random_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
+     "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "formats": ("int8",)},
+    {"name": "int8_input_zp_bias_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "bias": True,
+     "a_range": (-0.25, 1.0), "pool_h": 1, "pool_w": 1, "padding": 0, "formats": ("int8",)},
+    {"name": "int8_input_zp_perchannel_accum3_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh",
+     "bias": True, "a_range": (0.0, 1.0), "req_random": True, "accum_passes": 3, "formats": ("int8",)},
+    {"name": "int8_input_zp_selu_train", "mode": "matmul", "matrix_type": "random", "act": "selu",
+     "a_range": (-0.1, 1.0), "training": True, "formats": ("int8",)},
+    # int8 only: mixed activations in training, every set with its own zero point, clamps and multipliers; 24 sets reuse the 16 set ids.
+    {"name": "int8_mixed_act_train", "mode": "matmul", "matrix_type": "random", "act": "sigmoid",
+     "mixed_acts": ["sigmoid", "relu", "selu", "tanh", "linear", "selu"], "training": True, "req_random": True,
+     "zp_random": True, "num_sets": 24, "formats": ("int8",)},
+    # int8 only: all-negative A drives whole columns to tanh's -128, so edge windows hold only -128 beside the -128 pad.
+    {"name": "int8_pad_negative_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "a_range": (-1.0, -0.5),
+     "scale": 2.5, "formats": ("int8",)},
 ]
 
 
@@ -835,10 +1109,10 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
                    fmt_name: str = "fp32"):
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
-    tests_to_run = PIPELINE_TESTS
+    tests_to_run = [t for t in PIPELINE_TESTS if fmt_name in t.get("formats", tuple(FORMATS))]  # int8-only tests skip the floats
 
     if target_test:
-        tests_to_run = [t for t in PIPELINE_TESTS if target_test in t["name"]]
+        tests_to_run = [t for t in tests_to_run if target_test in t["name"]]
         if not tests_to_run:
             print(f"  {_R}[ERROR] No tests found containing '{target_test}'{_X}")
             return

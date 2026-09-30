@@ -15,7 +15,13 @@ module TB_sienna_multi #(
   always #5 clk_i = ~clk_i;
 
   logic start_pipeline_i = 0, training_mode_i = TRAINING_MODE, accumulate_i = 0, bias_valid_i = 0;
-  logic [N-1:0][DATA_WIDTH-1:0] bias_i = '0;
+  logic [N-1:0][ACC_W-1:0] bias_i = '0;
+  logic [N-1:0][31:0] req_mult_i = '0;  // int8 (D-2)
+  logic [N-1:0][7:0] req_shift_i = '0;
+  logic [7:0] req_zp_i = '0, req_min_i = '0, req_max_i = '0, gp_shout_i = '0, gp_zout_i = '0;
+  logic [15:0] gp_mx_i = '0;
+  logic [4:0] gp_shx_i = '0;
+  logic [31:0] gp_mout_i = '0;
   logic weight_cached_i = 0, wc_write_enable_i = 0;
   logic [$clog2(128)-1:0] weight_tile_i = '0;
   logic [$clog2(128*N*N)-1:0] wc_write_addr_i = '0;
@@ -95,6 +101,8 @@ module TB_sienna_multi #(
     $fclose(fh);
   endtask
 
+  `include "int8_tb_util.svh"  // read_word_file, unpack_requant, apply_requant
+
   function automatic logic [LFSR_WIDTH-1:0] set_seed(input int k);
     return LFSR_WIDTH'(DROPOUT_SEED ^ (32'h85EBCA6B * k));
   endfunction
@@ -158,6 +166,13 @@ module TB_sienna_multi #(
         end
       join
       dropout_seed_i = set_seed(k);
+      bias_valid_i = (HAS_BIAS != 0);  // this TB streams no accumulate groups: every set carries its own bias
+      if (bias_valid_i) begin
+        logic [31:0] bw[$];
+        read_word_file($sformatf("bias_%0d.mem", k), bw);
+        for (int c = 0; c < N; c++) bias_i[c] = ACC_W'(bw[c]);
+      end
+      apply_requant(k);
       copy_sets[int'(copy_sel_o)].push_back(k);
       $display("  [start] set %0d to copy %0d at cycle %0d", k, copy_sel_o, cyc);
       t_start[k] = cyc;

@@ -101,8 +101,8 @@ def _same_pad(n, k, s):
     return out, total // 2, total - total // 2
 
 
-def im2col(x, kh, kw, stride, same, channel_major=False):
-    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major."""
+def im2col(x, kh, kw, stride, same, channel_major=False, pad_value=0.0):
+    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major; SAME pads with pad_value."""
     H, W, C = x.shape
     sh, sw = stride
     if same:
@@ -110,7 +110,7 @@ def im2col(x, kh, kw, stride, same, channel_major=False):
         ow, pl, pr = _same_pad(W, kw, sw)
     else:
         oh, ow, pt, pb, pl, pr = (H - kh) // sh + 1, (W - kw) // sw + 1, 0, 0, 0, 0
-    xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)))
+    xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)), constant_values=pad_value)
     cols = np.empty((oh, ow, kh, kw, C), dtype=np.float32)
     for ky in range(kh):
         for kx in range(kw):
@@ -244,7 +244,16 @@ def write_sets(path, groups, act):
 
 
 def read_outputs(path, fmt="fp32"):
-    """Output sets as float32; words are in the build's format, a narrow one widened exactly."""
+    """Output sets as float32; words are in the build's format, a narrow one widened exactly; int8 as signed integer codes."""
+    if fmt == "int8":  # two's-complement codes
+        sets, cur = [], None
+        for line in open(path):
+            if line.startswith("S "):
+                cur = []
+                sets.append(cur)
+            else:
+                cur.append(int(line, 16))
+        return [((np.array(s, np.int64) + 128) % 256) - 128 for s in sets]
     sh = 23 - regression.FORMATS[fmt][1]
     sets = []
     cur = None
@@ -347,7 +356,8 @@ def format_layer(job, N):
     """The configuration and the two input streams sienna_layer expects for a job, in its fixed order.
 
     Terms whose weight is an identity become the residual input; the rest are one product with their depths side by side.
-    A depthwise layer gives each column block only its own channels' depth."""
+    A depthwise layer gives each column block only its own channels' depth.
+    A job with "req" is int8: every column block gets its bias beat, whose side words layer_epilogue gives; the beat's weight row is zeros."""
     res = [X for X, W in job["terms"] if W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))]
     dense = [(X, W) for X, W in job["terms"] if not any(X is r for r in res)]
     if len(res) > 1 or not dense:
@@ -358,7 +368,8 @@ def format_layer(job, N):
     kk = job.get("kk")
     kb = kk * min(N, C) if kk else X.shape[1]  # depthwise: the taps of one block's channels, fewer when C < N
     rt, ct, dt = -(-M // N), -(-C // N), -(-kb // N)
-    bias = job["bias"] if job["bias"] is not None and np.any(job["bias"]) else None
+    int8 = job.get("req") is not None  # int8: every block has its bias beat, and the int32 bias rides beside it
+    bias = job["bias"] if job["bias"] is not None and (int8 or np.any(job["bias"])) else None
     cached = rt > 1 and dt <= WC_TILES // 2
 
     def pad(a, rows, cols):
@@ -370,7 +381,7 @@ def format_layer(job, N):
     Wp = pad(W, max(W.shape[0], ct * N * (kk or 0)) if kk else dt * N, ct * N)
     Rp = pad(res[0], rt * N, ct * N) if res else None
     bp = np.zeros(ct * N, np.float32)
-    if bias is not None:
+    if bias is not None and not int8:
         bp[: bias.size] = bias
     a_rows, w_rows = [], []
     for c in range(ct):
@@ -378,7 +389,7 @@ def format_layer(job, N):
         A_c = pad(Xp[:, k0 : k0 + kb], rt * N, dt * N)
         W_c = pad(Wp[k0 : k0 + kb, c * N : (c + 1) * N], dt * N, N)
         if bias is not None:
-            w_rows.append(bp[c * N : (c + 1) * N][None, :])
+            w_rows.append(np.zeros((1, N), np.float32) if int8 else bp[c * N : (c + 1) * N][None, :])
         w_rows += [W_c] * (1 if cached else rt)
         for r in range(rt):
             for t in range(dt):  # the depth tiles of this row tile, N rows of N words each
@@ -387,6 +398,16 @@ def format_layer(job, N):
                 a_rows.append(Rp[r * N : (r + 1) * N, c * N : (c + 1) * N])
     cfg = dict(m=M, kb=kb, n=C, residual=int(Rp is not None), bias=int(bias is not None), act=ACT_CODES[job["act"]])
     return cfg, np.vstack(a_rows), np.vstack(w_rows), (M, C, rt, ct)
+
+
+def layer_epilogue(job, N):
+    """int8: the words beside each column block's bias beat (N biases, N multipliers, N shifts, zero-padded), shape (blocks, 3, N)."""
+    q, b = job["req"], np.asarray(job["bias"], np.int64)
+    C = b.size
+    ct = -(-C // N)
+    pad = lambda v: np.concatenate([np.asarray(v, np.int64), np.zeros(ct * N - C, np.int64)])
+    bb, mm, ss = pad(b), pad(q["mult"]), pad(q["shift"])
+    return np.stack([np.stack([v[c * N:(c + 1) * N] for v in (bb, mm, ss)]) for c in range(ct)])
 
 
 class LayerSim:
@@ -409,16 +430,25 @@ class LayerSim:
 
     def run_job(self, job, tag):
         N = self.N
+        int8 = self.fmt_name == "int8"
+        if int8 and job.get("req") is None:
+            raise ValueError(f"{tag}: an int8 job needs its requantize parameters (job['req'])")
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
         with open(lf, "w") as f:
             f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)}\n")
+            if int8:
+                q = job["req"]
+                f.write(f"Q {q['zp']} {q['amin']} {q['amax']} {q['mx']} {q['shx']} {q['mout']} {q['shout']} {q['zout']}\n")
             f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
             f.write("\n")
+            if int8:
+                f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in layer_epilogue(job, N).ravel()))
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
-        if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7):
+        e = re.search(r"epilogues=(\d+)/(\d+)", r.stdout)
+        if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: layer simulation failed")
         outs = read_outputs(of, self.fmt_name)
@@ -426,7 +456,7 @@ class LayerSim:
         os.remove(of)
         if len(outs) != rt * ct:
             raise RuntimeError(f"{tag}: {len(outs)} output tiles, expected {rt * ct}")
-        Y = np.zeros((rt * N, ct * N), np.float32)
+        Y = np.zeros((rt * N, ct * N), np.int64 if int8 else np.float32)
         k = 0
         for c in range(ct):  # the spec's output order: column blocks outer, row tiles inner
             for r_ in range(rt):
@@ -590,6 +620,8 @@ def main():
                     help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     a = ap.parse_args()
+    if a.fmt_name == "int8":
+        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with tflite_int8_run.py")
     os.makedirs(a.work, exist_ok=True)
     report = os.path.join(a.work, f"model_report_N{a.n}.log")
     js = os.path.join(a.work, f"model_results_N{a.n}.json")

@@ -27,6 +27,7 @@ ACTIVATION ?= tanh
 
 TOP_FILES = \
 	sienna_top.sv \
+	requant_lanes.sv \
 	sienna_multi.sv \
 	sienna_layer.sv
 
@@ -46,7 +47,9 @@ SM_LIB_FILES = \
 	Adders/FP32/src/LZC.sv \
 	Adders/FP32/src/fp32Adder.sv \
 	Adders/FP/src/fpAdder.sv \
-	Adders/Int/src/intAdder.sv
+	Adders/Int/src/intAdder.sv \
+	Multipliers/Fx/src/fxMac.sv \
+	Requant/src/tfliteRequant.sv
 
 GPNAE_FILES = \
 	TYTAN/Memory/CoeffROM.v \

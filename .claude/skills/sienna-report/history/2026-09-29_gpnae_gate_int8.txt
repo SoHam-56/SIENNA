@@ -1,0 +1,137 @@
+GATE G2 (int8): GPNAE poly lane (gpnae_poly G_INT8 -> gpnae_poly_int8, barrel_mac int8) against gpnae_model.LaneInt8
+=====================================================================================================================
+GPNAE int8 ec7f69c (pushed; TB 19f6797, regression 7ddbce5, fit ec7f69c), its ArithmeticLibrary c80b8cd (SAME-ARIL: the
+SystolicMesh checkout is on c80b8cd too), SIENNA int8 4c2d29e (pushed; GPNAE and SystolicMesh pointers not moved, Task 16).
+Gate run: sienna_jobs/runs/i12_g2 (job 5338268, exit=0, no RUN-FAIL). The snapshot's TB, regression.py and fit_poly_coeffs.py
+have the committed files' md5 (sienna_jobs/i12/g2_launch_md5.txt). Below, G = sienna_jobs/runs/i12_g2/results/int8.
+
+VERDICT: PASS for correctness: fp32 and bf16 unchanged, int8 bit-exact everywhere (every INT8_CASES case on every int8
+input, 32 random parameter sets per activation, the protocol-edge stream), in four seeds and a random power-up.
+int8 ACCURACY against GPNAE's tolerance (relative error <= 6.25% or absolute error <= 1 output LSB against exact_int8, L2-4):
+SELU within, tanh within, sigmoid OUTSIDE (open accuracy item below). Accuracy does not change the verdict.
+
+1. fp32 AND bf16 UNCHANGED
+   int8_cmp_gpnae.sh runs/i0_fpref2/results/int8/fpref G/fpref (RESULT, ERRSTAT and CYCLES lines, tag by tag):
+     IDENTICAL bf16_hw (90 lines)   IDENTICAL bf16_hw_r8 (90 lines)   IDENTICAL poly32 (90 lines)
+     IDENTICAL poly32_r8 (90 lines) IDENTICAL taylor32 (90 lines)                                        (exit 0)
+   Random power-up (-DNO_ZERO_INIT --x-initial unique --x-assign unique, +verilator+rand+reset+2):
+     bf16_hw_randinit: 10 of 10 patterns RESULT: PASSED (G/g2/bf16_hw_randinit/*.log), All patterns passed
+     poly32_randinit : 10 of 10 patterns RESULT: PASSED (G/g2/poly32_randinit/*.log), All patterns passed
+
+2. int8 BIT-EXACT (TB_gpnae_poly int8 mode, EXACT_MATCH, against gpnae_model.LaneInt8; G/g2/int8_*/gpnae_int8_report.log)
+   Per activation, exact over total (INT8_CASES 5 cases x 256; random 32 sets x 256; stream 11 segments, 161 groups):
+     run            selu        sigmoid     tanh        relu        linear      stream     group starts
+     seed 1         9472/9472   9472/9472   9472/9472   9472/9472   9472/9472   2098/2098  238/238, 0 wrong, 0 edge errors
+     seed 101       9472/9472   9472/9472   9472/9472   9472/9472   9472/9472   2098/2098  238/238, 0 wrong, 0 edge errors
+     seed 202       9472/9472   9472/9472   9472/9472   9472/9472   9472/9472   2098/2098  238/238, 0 wrong, 0 edge errors
+     seed 303       9472/9472   9472/9472   9472/9472   9472/9472   9472/9472   2098/2098  238/238, 0 wrong, 0 edge errors
+     randinit (7)   9472/9472   9472/9472   9472/9472   9472/9472   9472/9472   2098/2098  238/238, 0 wrong, 0 edge errors
+   Split, every run: INT8_CASES 1280/1280 per activation; random sets 8192/8192 per activation, 8 of 32 saturate the
+   rescale (mx / 2^shx >= 256). The random sets are seeded from --seed and are bit-exact only (not in the accuracy).
+   The protocol stream (no reset between groups; per segment one control word and one parameter set) drives:
+     - G_NEXT with the next group already queued (20 -> 16+4, 17 -> 16+1, 32 -> 16+16)
+     - last_i while the lane is busy (the next group written after the previous one left G_CAP; the lane ignores last_i
+       outside G_IDLE and G_NEXT takes the group); the TB checks the lane was busy when last_i arrived
+     - last_i in the same cycle as the last wr_en (G_IDLE counts the FIFO before that write: 16 -> 15+1, 5 -> 4+1,
+       2 -> 1+1, 32 -> 16+16; a lone element waits in the FIFO, checked, until the next last_i)
+     - one-element groups from G_IDLE and from G_NEXT; back-to-back chains 16, 16, 16, 5 with no G_IDLE between them
+     - every control word: 1-5, and 0, 6, 7 (which run tanh); a gated case and a saturating random set per activation
+   Each group start is checked against the expected size and the state it came from (G_IDLE or G_NEXT).
+   Coefficient ROM check (poly_coeffs_int8.mem) and REQ_ROUNDING check (sienna_fmt_pkg DOUBLE = model DOUBLE) ran, no $fatal.
+   Barrel MAC TB (TB_barrel_mac_int8): seed 5 256 groups, 0 errors, 17317 cycles, RESULT: PASSED (G/g2/bm_int8.txt);
+     random power-up seed 11 256 groups, 0 errors, 17455 cycles, RESULT: PASSED (G/g2/bm_int8_randinit.txt).
+   RED (sienna_jobs/runs/i12_mut_*, gpnae_poly_int8.sv mutated in the snapshot only): Task 11's one-element fix removed:
+     cases and random sets 9472/9472 each, stream 36/2098, 2062 missing, 234 wrong group starts, regression exit 1;
+     sigmoid rounding +4 -> +3: sigmoid 8857/9472 (cases 1209/1280, random 7648/8192), stream 2067/2098, exit 1.
+
+3. int8 ACCURACY AGAINST GPNAE'S TOLERANCE (reported, not gated)
+   Full Q4.11 range, every input x in [-32768, 32767] after an identity rescale (the fit's dense sweep; SELU at each
+   gated case's output quantization). Fit log: G/g2/poly_coeffs_int8_fit.log (= runs/i12_fit, fit exit=0):
+     activation  degree  inputs  outside  worst rel (|d| > 1 LSB)  worst LSB  real LSB  differ  lane rail  exact rail
+     selu        2       262144  0        5.56%                    10         2128.19   28948   0.2114     0.2114
+     sigmoid     3        65536  3370     100.00%                  8          7.50      15170   3.5005     5.1343
+     tanh        3 (fitted at 4) 65536  0  6.06%                   3          3.13      9423    2.1138     2.5674
+   (SELU "real" is the int8 clamp at large x, where exact_int8 rails too.) SETS_INT8 = {1: (0, 2), 2: (9, 3), 3: (16, 3)};
+   the table written by the full-range fit is byte-identical to the committed one (FIT-TABLE IDENTICAL, both copies).
+   Per degree: SELU meets at degrees 2-5 and 8-12; tanh meets at degrees 4-10 (effective 3-4); sigmoid misses at
+   every degree (fewest: degree 3, 3370). The range [-4, 4] sweep of Task 10 gave sigmoid 1048 of 16385; the extra 2322
+   are inputs in [-5.14, -4) (my calculation of where exact sigmoid comes within 1 LSB of -128), saturated to -128.
+   Per case, every int8 input (G/g2/int8_seed1/gpnae_int8_report.log; equals the fit log's grid rows):
+     act      s_in      z_in  s_out     z_out fail  rel %   LSB  real    differ gated
+     selu     0.031250    0  0.023121  -53    0    4.29    3    3.47    94     yes
+     selu     0.062500    0  0.039598  -84    0    4.88    2    2.19    40     yes
+     selu     0.015625    0  0.014138  -20    0    3.49    3    2.58    88     yes
+     selu     0.031250  120  0.007793   98    0    4.25    9    9.47    232    yes
+     selu     0.218750    0  0.121364 -114    49   42.32   102  101.51  58     no  (7/32 passes Q4.11; bit-exact only)
+     sigmoid  0.027344    0  0.003906 -128    1    25.00   2    1.66    105    yes
+     sigmoid  0.109375    0  0.003906 -128    15   100.00  7    6.75    65     yes
+     sigmoid  0.437500    0  0.003906 -128    3    100.00  5    4.90    13     yes
+     sigmoid  0.109375   25  0.003906 -128    15   100.00  7    6.75    65     yes
+     sigmoid  0.054688 -100  0.003906 -128    0    2.41    6    6.12    74     yes
+     tanh     0.031250    0  0.007812    0    0    3.09    3    3.06    141    yes
+     tanh     0.125000    0  0.007812    0    0    3.09    3    2.52    38     yes
+     tanh     0.500000    0  0.007812    0    0    3.09    3    2.52    11     yes
+     tanh     0.125000  -37  0.007812    0    0    3.09    3    2.52    38     yes
+     tanh     0.062500  100  0.007812    0    0    3.09    3    2.79    62     yes
+   Gated cases merged: selu within (0 outside, 4.88%, 9 LSB); sigmoid OUTSIDE (34 of 1280 outside, 100.00%, 7 LSB);
+   tanh within (0 outside, 3.09%, 3 LSB). The same ACCURACY line in all five int8 runs (seeds 1, 101, 202, 303, randinit).
+
+OPEN ITEM FOR SOHAM: int8 sigmoid accuracy (does not hold up Level 3)
+   - sigmoid, degree 3 (the best measured): full Q4.11 range [-32768, 32767] 3370 of 65536 inputs outside, worst 100.00%
+     where |d| > 1 LSB, worst 8 LSB; gated cases 34 of 1280 outside, worst 100.00%, worst 7 LSB.
+   - Nearly all of it is the saturation threshold, not the polynomial: past x = -3.5 the lane outputs -128, while exact
+     sigmoid is up to 7.5 LSB above it until about x = -5.14 (Task 10's split: 1024 of the 1048 misses in [-4, 4] are in
+     [-4, -3.5); the other 24 are in range, worst 2 LSB on small goldens). No degree fixes it.
+   - Options the fit printed (none implemented): A centred, scaled operands; B higher degree; C Q-format change (Q1.14
+     coefficients or a 32-bit accumulator); D accept. For sigmoid the lever is the negative threshold or a tail, which
+     the fit's options do not cover (Task 10's reading).
+
+4. AGREEMENT WITH TFLITE (reported, not gated; runs/i12_tfl2/results/int8/gpnae_vs_tflite.log, TensorFlow venv, BUILTIN_REF)
+   The converter's input quantization equals each case's to the 6 printed decimals; one int8 op (TANH or LOGISTIC) each time.
+     op        s_in      z_in  equal  |d|=1  max |d|  TFLite-exact  lane-exact
+     tanh      0.031250    0   115    81     3        0             3
+     tanh      0.125000    0   218    23     3        0             3
+     tanh      0.500000    0   245    5      3        0             3
+     tanh      0.125000  -37   218    23     3        0             3
+     tanh      0.062500  100   194    33     3        0             3
+     logistic  0.027344    0   151    103    2        0             2
+     logistic  0.109375    0   191    40     7        0             7
+     logistic  0.437500    0   243    8      5        0             5
+     logistic  0.109375   25   191    40     7        0             7
+     logistic  0.054688 -100   182    53     6        0             6
+   TFLite's reference int8 TANH and LOGISTIC equal exact_int8 on all 2560 outputs, so the lane's distance to TFLite is its
+   distance to exact_int8.
+
+5. CYCLES PER INPUT (TB-measured, including the TB's write pacing and per-batch reset; not comparable one to one)
+   fp32 (poly32, act_normal, 8 x 30): selu 18, sigmoid 16, tanh 20.  bf16 (bf16_hw, act_normal, 8 x 30): 18, 16, 19.
+   int8 (seed 1, 296 x 32, two groups per batch): selu 13, sigmoid 14, tanh 14, relu 6, linear 6; stream 22486 cycles
+   for 2098 elements. (G/fpref/*/act_normal.log, G/g2/int8_seed1/int8_exhaustive.log)
+
+6. REJECTIONS AND LINT
+   REJECTED (5 of 5, no NOT-REJECTED): barrel_mac EXP_W=5 MAN_W=10; barrel_mac int8 DATA_WIDTH=8 ("int8 evaluates in
+   Q4.11"); gpnae_poly EXP_W=5 MAN_W=10; gpnae_poly_int8 DATA_WIDTH=16; gpnae_tail EXP_W=0 MAN_W=7 (G/g2/rej_*.txt).
+   -Wall lint of gpnae_poly (SYNTHESIS): int8 0/7 71 warnings, bf16 8/7 79, fp32 8/23 94; 0 errors; no LATCH,
+   MULTIDRIVEN or UNOPTFLAT. Classes: DECLFILENAME, PINCONNECTEMPTY, SYNCASYNCNET (RAM.v, known), UNUSEDPARAM,
+   UNUSEDSIGNAL (int8: terms_i, mac_busy and the units' done_o, used only by the non-SYNTHESIS latency checks),
+   VARHIDDEN, WIDTHEXPAND; fp32 also BLKSEQ (R4Booth, known) and WIDTHTRUNC. (G/g2/lint_*.txt)
+   Fit guard: fit fp32 exit=1, fit bf16 exit=1 (published tables refused); fit int8 exit=0 (G/g2/fit_guard.txt, fit_int8.txt).
+
+FINDINGS (reported, not changed)
+   P-1  last_i with the last wr_en: G_IDLE reads the FIFO count before that write, so a group of n splits into n-1 and a
+        one-element group (an extra group pass), and a lone element written with last_i waits until the next last_i.
+        Outputs stay correct and in order. The float lane has the same G_IDLE. sienna_top raises last_i the cycle after
+        the last write (read, not run), so SIENNA does not hit it today.
+   P-2  The published float lane's G_RUN has the one-element-group hang Task 11 fixed in the int8 lane (reported by
+        Task 11; the stream's RED run shows the int8 lane hangs the same way without the fix).
+   T-1  With 32 signals per batch the FIFO fills, and the TB's zero-delay write drive tripped "Writing when module is
+        full!" at the 32nd write of every batch (sienna_jobs/runs/i12_fulldiag: 1480 of 1480 batches; a plain clocked
+        monitor saw no write while full, and all outputs were exact). int8 now drives 1 ns after each edge; float
+        unchanged. Float runs use 30 signals, so the float TB never fills the FIFO and never exercised this assertion.
+
+DECISIONS OF THIS LEVEL (L2-1 to L2-5): gpnae_poly_int8 is its own module under gpnae_poly's G_INT8, float body wrapped
+unchanged in G_FLOAT; gp_mx_i < 2^15 (intMultiplier W=16 rescale); full 32-bit post products, quantized once (tanh) or
+requantized (SELU); accuracy by GPNAE's tolerance, reported, never a stop; fit_poly_coeffs.py refuses fp32 and bf16.
+
+NOT RUN: the Taylor lane (gpnae.sv) in int8; SIENNA-level int8 (Level 4); timing of the lane's rescale path; SELU inputs
+past Q4.11 for accuracy (bit-exact only); the float lane on one-element groups or the protocol stream (float TB paths
+unchanged by ruling).

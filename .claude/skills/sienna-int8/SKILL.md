@@ -129,6 +129,9 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
 - Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
   skip them when bisecting.
+- Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches 16; the regression's
+  SELU tests report their saturated inputs and check them bit-exact against the saturating golden. The one check is
+  `regression.selu_saturates(mx, shx, z_in, q)`, the lane's own rescale of code q reaching 2^15, positive side only.
 
 ## Out of scope (2a)
 

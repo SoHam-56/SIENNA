@@ -14,8 +14,12 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
 - G3 SystolicMesh: `2026-09-29_mesh_gate_int8.txt` (Task 15; VERDICT: PASS at N = 8-32, every tile size, both collapse
   modes, random power-up; fp32 / bf16 cycles identical; N = 64 deferred to the final sweep)
 - G2 GPNAE: `2026-09-29_gpnae_gate_int8.txt` (Task 12; VERDICT: PASS for correctness, the lane bit-exact everywhere;
-  accuracy against GPNAE's tolerance over the full Q4.11 range: SELU 0/262144 and tanh 0/65536 outside, sigmoid
-  3370/65536 outside, the open accuracy item, from saturation below x = -3.5)
+  accuracy against GPNAE's tolerance over the full Q4.11 range: SELU 0/262144 (over the Q4.11 range only) and tanh
+  0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5; SELU lane inputs at or above 16 saturate
+  to 16 * lambda (about 16.8), as the gate's not-gated SELU case s_in = 0.21875 shows: 49 of 256 outside, worst 102 LSB.
+  Open accuracy items: sigmoid below x = -3.5, and SELU at or above 16; the int8 regression's `matmul_large_selu`
+  reaches lane inputs of 19-68 at N = 8-64, default seed (113 of 4352 at or above 16 at N = 16), exact because its golden
+  saturates too)
 - G1 ArithmeticLibrary: `2026-09-29_aril_gate_int8.txt` (Task 8; VERDICT: PASS, all units bit-exact; fxMac sweeps
   2.58e10 results, 0 errors)
 - G0 oracle: `2026-09-29_g0_oracle_int8.txt` (Task 2; G0: PASS, ROUNDING: DOUBLE pinned; 24,832,000 outputs,
@@ -94,7 +98,8 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `regression._check_rounding()` checks that the
   package, `ipu.REQ_ROUNDING` and `rounding.txt` agree.
 - `sienna_layer` in int8 always takes a bias beat per column block; its int32 bias, multipliers and shifts come on
-  `w_bias_i`, `w_req_mult_i`, `w_req_shift_i` beside it. A residual pass adds raw int8 codes (no rescale: 2b).
+  `w_bias_i`, `w_req_mult_i`, `w_req_shift_i` beside it. A residual pass adds raw int8 codes (no rescale: 2b); in
+  simulation an int8 layer configured with `cfg_residual_i` fails the assertion `a_int_no_residual` (final fix).
 - Dropout in training drops to the output zero point of the set's activation (D-5 as corrected: `req_zp_i` after ReLU
   or linear, 0 after tanh, -128 after sigmoid, `gp_zout_i` after SELU).
 - Test stimulus is quantized per accumulate group as TFLite PTQ would (zero points by `rint`, not the converter's nudging);
@@ -119,6 +124,11 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   time by 50-76 cycles per set in every format, which predates the int8 work and was not retuned.
 - N = 64 (Soham 2026-09-29): skipped while testing; G3 and G4 ran N = 8-32, and every N = 64 run (int8 and the fp32 /
   bf16 references, both collapse modes) is one final sweep after check-in.
+- Final fix: int8 ReLU relies on the host clamp. `sienna_top` (its `!IS_INT &&` ReLU bypass) and `gpnae_poly_int8` both
+  pass ReLU through unchanged, so the requantize clamp must be `[max(req_min, req_zp), req_max]`. The TFLite flow and
+  `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
+- Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
+  skip them when bisecting.
 
 ## Out of scope (2a)
 

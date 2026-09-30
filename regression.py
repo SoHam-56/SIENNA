@@ -437,6 +437,8 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
 
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
     """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
+    assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
+               for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
     return activate_int8(requantize(acc, rq), act, rq)
 

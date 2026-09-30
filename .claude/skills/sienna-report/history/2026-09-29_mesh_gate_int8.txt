@@ -22,7 +22,21 @@ fp32 and bf16 rerun on the int8 tree; their cycles compared test by test with th
  32 fp32    1    5            90/90  90/90 identical
  32 fp32    0    6            90/90  90/90 identical
  32 bf16    1    5            90/90  90/90 identical
- 32 bf16    0    6            90/90  18/18 identical; 72 passed, no cycle reference
+ 32 bf16    0    6            90/90  90/90 identical
+
+   Reference runs compared (bf16 branch, per point):
+   N=8  bf16 ck=0: g3m_N8_bf16_ck0
+   N=8  bf16 ck=1: g3m_N8_bf16_ck1 g3n_N8b_bf16_ck1
+   N=8  fp32 ck=0: g3m_N8_fp32_ck0 g3x_N8_fp32_ck0
+   N=8  fp32 ck=1: g3m_N8_fp32_ck1 g3x_N8_fp32_ck1
+   N=16 bf16 ck=0: g3_N16_bf16_ck0
+   N=16 bf16 ck=1: g3_N16_bf16_ck1 g3x_N16_bf16_ck1
+   N=16 fp32 ck=0: g3_N16_fp32_ck0 g3x_N16_fp32_ck0
+   N=16 fp32 ck=1: g3_N16_fp32_ck1 g3x_N16_fp32_ck1
+   N=32 bf16 ck=0: g3y_N32_bf16_ck0_T32 r15_N32_bf16_ck0_T16 r15_N32_bf16_ck0_T2_matmul r15_N32_bf16_ck0_T4 r15_N32_bf16_ck0_T8 r15_N32b_bf16_ck0_T2_conv
+   N=32 bf16 ck=1: g3_N32_bf16_ck1
+   N=32 fp32 ck=0: g3z_N32_fp32_ck0_T16 g3z_N32_fp32_ck0_T2 g3z_N32_fp32_ck0_T32 g3z_N32_fp32_ck0_T4 g3z_N32_fp32_ck0_T8
+   N=32 fp32 ck=1: g3_N32_fp32_ck1 g3x_N32_fp32_ck1
 
 2. int8 against fp32 on this tree. Expected: latency and streamed total = fp32 - D, serial total = fp32 - sets x D;
    D = 7 (multiplier 8 -> 1) + 4 (PE adder 5 -> 1) + 5 x L32 - L8, L = clog2(RP x U + 1) reduce levels (derived, not measured)
@@ -111,26 +125,34 @@ fp32 and bf16 rerun on the int8 tree; their cycles compared test by test with th
    g3i_ri_fp32_ck1                exit    0  wall   12:31.10  peak    1.1 GB
    g3i_ri_int8_ck0                exit    0  wall   15:08.67  peak    1.5 GB
    g3i_ri_int8_ck1                exit    0  wall    2:32.61  peak    0.5 GB
+   r15_N32_bf16_ck0_T16           exit    0  wall    9:55.82  peak    2.5 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T2_conv       exit    1  wall    0:01.29  peak    0.0 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T2_matmul     exit    0  wall    1:28:56  peak   22.3 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T4            exit    0  wall    1:01:08  peak    9.9 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T8            exit    0  wall   24:36.41  peak    5.1 GB  (bf16-tree reference)
+   r15_N32b_bf16_ck0_T2_conv      exit    0  wall    1:08:31  peak   22.3 GB  (bf16-tree reference)
 
 VERDICT: PASS
 
 6. Findings
    - Section 2: none. Every int8 test at every (N, ck, T) equals fp32 - D in latency and streamed total and fp32 - sets x D
      in serial total. At N=16 the int8 mm_random latencies are Task 14 Step 8's prediction: ck1 35/53/113/329, ck0 24/43/106/329.
-   - fp32 / bf16 DIFFER: none. Reference conflicts: none.
-   - bf16 N=32 collapse-k 0: 72 tests (T = 2, 4, 8, 16) passed with no cycle reference. The bf16 branch's g3_N32_bf16_ck0 was
-     cancelled at its time limit with no per-test logs, and only g3y_N32_bf16_ck0_T32 (18 tests) finished; those 18 are identical.
+   - fp32 / bf16 DIFFER: none. Reference conflicts: none. Tests with no cycle reference: none (ALLOW_NO_REF is empty).
+   - bf16 N=32 collapse-k 0: the bf16 branch's g3_N32_bf16_ck0 was cancelled at its time limit with no per-test logs, so T = 2, 4,
+     8, 16 were rerun on the bf16 tree (r15_*); all 72 tests pass and the int8 tree's cycles are identical to them (90/90 with T=32).
+   - r15_N32_bf16_ck0_T2_conv exited 1 before any simulation: the bf16 tree's git-ignored SystolicMesh/testbenches/stimulus held a
+     stale fp32 set (matrixA_3.mem, 2026-09-23) that a conv-only bf16 run does not overwrite, and check_widths refused it. Rerun as
+     r15_N32b_bf16_ck0_T2_conv with the snapshot's stimulus directory moved aside first ($J/cmds/fresh_stim.sh): 9/9 pass.
    - For the N = 64 sweep's memory plan (measured peaks, N=32 collapse-k 0): T=2 int8 8.8 GB, bf16 22.3 GB, fp32 46.7 GB;
      T=4 int8 3.7 GB, bf16 9.9 GB, fp32 22.0 GB.
 
 7. Not covered at G3
    - Covered, for the record: the ACC_W bias input, the bias queue and the int32 wrap, by every int8 set's bias file
      (Task 14; set 1 of every test within 4,096 of INT32_MAX, so its positive sums wrap).
-   - The fp32 / bf16 points outside the subset (N=64 collapse-k 0, T < 16), by ruling.
    - partial_i multi-pass sums and the weight cache in int8: TB_SystolicMesh ties them off. TB_PE_int8 covers two-pass
      sets at PE level; the mesh paths are covered at G4.
+   - wide_read_data_o, the ACC_W-wide read port: TB_SystolicMesh ties it off (wide_read_enable_i 0, output unconnected); covered at
+     G4 through sienna_top, which reads it.
    - Lint: Task 13's m13_lint (int8 both collapse modes clean; unsupported formats and wrong ACC_W rejected).
-   - Compared to nothing (passed, no cycle reference): bf16 N=32 collapse-k 0 T = 2, 4, 8, 16, 72 tests; the bf16 branch's run of
-     that point was cancelled at its time limit.
    - N = 64, every format, both collapse modes, every T: deferred to the final N = 64 sweep (Soham 2026-09-29). No other point
      is not run.

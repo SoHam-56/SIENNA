@@ -338,6 +338,49 @@ def write_sv_package(path: str, items: list) -> None:
         f.write("\nendpackage\n")
 
 
+def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
+                  use_bias: bool, drop_seed: int) -> list:
+    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
+    N = cfg.get("n", 16)
+    sram_depth = N * N
+    return [
+        ("N", N, "int"),
+        ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
+        ("NUM_LANES", cfg.get("lanes", 32), "int"),
+        ("HOST_WORDS", cfg.get("host_words", N), "int"),
+        ("EXP_W", FORMATS[fmt][0], "int"),
+        ("MAN_W", FORMATS[fmt][1], "int"),
+        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
+        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
+        ("IS_INT", int(fmt == "int8"), "int"),
+        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
+        ("SRAM_DEPTH", sram_depth, "int"),
+        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
+        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
+        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
+        ("IN_ROWS", N, "int"),
+        ("IN_COLS", N, "int"),
+        ("POOL_H", cfg.get("pool_h", 2), "int"),
+        ("POOL_W", cfg.get("pool_w", 2), "int"),
+        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
+        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
+        ("PADDING", cfg.get("padding", 1), "int"),
+        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
+        ("LFSR_WIDTH", 32, "int"),
+        ("CONTROL_WIDTH", 3, "int"),
+        ("NUM_SETS", num_sets, "int"),
+        ("SETS_IN_FLIGHT", credits, "int"),
+        ("HAS_BIAS", int(use_bias), "int"),
+        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
+        ("ACCUM_PASSES", passes, "int"),
+        ("MIXED_LEN", len(mixed), "int"),
+        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
+        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
+        ("DROPOUT_SEED", drop_seed, "int"),
+        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
+    ]
+
+
 def float_to_hex_str(f: float) -> str:
     """Helper to cleanly convert python float to IEEE-754 hex string"""
     return struct.pack(">f", f).hex()
@@ -535,42 +578,8 @@ def generate_vectors(cfg: dict) -> None:
     dump_golden_trace(test_name, C, C_act, C_pooled)
 
     # Dump SV Config Package
-    sram_depth = N * N
-    items = [
-        ("N", N, "int"),
-        ("TILE_SIZE", tile_size, "int"),
-        ("NUM_LANES", cfg.get("lanes", 32), "int"),
-        ("HOST_WORDS", cfg.get("host_words", N), "int"),
-        ("EXP_W", FORMATS[fmt][0], "int"),
-        ("MAN_W", FORMATS[fmt][1], "int"),
-        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
-        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
-        ("SRAM_DEPTH", sram_depth, "int"),
-        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
-        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
-        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
-        ("IN_ROWS", N, "int"),
-        ("IN_COLS", N, "int"),
-        ("POOL_H", cfg.get("pool_h", 2), "int"),
-        ("POOL_W", cfg.get("pool_w", 2), "int"),
-        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
-        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
-        ("PADDING", cfg.get("padding", 1), "int"),
-        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
-        ("LFSR_WIDTH", 32, "int"),
-        ("CONTROL_WIDTH", 3, "int"),
-        ("NUM_SETS", num_sets, "int"),
-        ("SETS_IN_FLIGHT", credits, "int"),
-        ("HAS_BIAS", int(use_bias), "int"),
-        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
-        ("ACCUM_PASSES", passes, "int"),
-        ("MIXED_LEN", len(mixed), "int"),
-        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
-        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
-        ("DROPOUT_SEED", drop_seed, "int"),
-        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
-    ]
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"), items)
+    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                     _config_items(cfg, fmt, act_type, num_sets, credits, passes, mixed, use_bias, drop_seed))
     if exact:
         _check_mem_widths(fmt, num_sets)
 

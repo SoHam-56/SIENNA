@@ -18,11 +18,13 @@ module dropout #(
     input wire [DATA_WIDTH-1:0] data_in,
     input wire                  reseed_i,  // load seed_i into the LFSR; only between sets
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
+    input wire [DATA_WIDTH-1:0] zero_point_i,  // int8 training: a dropped beat becomes this (D-5); other formats ignore it
 
     output logic [DATA_WIDTH-1:0] data_out,
     output logic                  valid_out
 );
 
+  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: no multiplier, the 1/keep factor lives in the next layer's scale
   localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
   localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
   localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
@@ -48,7 +50,7 @@ module dropout #(
   // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
 `ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial begin
-    if (DROPOUT_P_PERCENT != 50 && CONST_SCALE == DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W)))
+    if (!IS_INT && DROPOUT_P_PERCENT != 50 && CONST_SCALE == DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W)))
       $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
   end
 `endif
@@ -74,6 +76,10 @@ module dropout #(
       // INFERENCE: Combinational bypass, starve the multiplier
       data_out  = data_in;
       valid_out = in_valid;
+    end else if (IS_INT) begin
+      // int8 training: in the same cycle, a kept beat unchanged, a dropped beat the zero point (D-5).
+      data_out  = (lfsr_next >= DROPOUT_THRESHOLD) ? data_in : zero_point_i;
+      valid_out = in_valid;
     end else begin
       mult_valid_in = in_valid;
       valid_out     = mult_done;
@@ -87,16 +93,19 @@ module dropout #(
       kq_wr <= '0;
       kq_rd <= '0;
     end else begin
-      if (training_mode && in_valid) begin
+      if (!IS_INT && training_mode && in_valid) begin
         keep_q[kq_wr] <= (lfsr_next >= DROPOUT_THRESHOLD);  // the word this beat advances to
         kq_wr <= kq_wr + 1'b1;
       end
-      if (training_mode && mult_done) kq_rd <= kq_rd + 1'b1;
+      if (!IS_INT && training_mode && mult_done) kq_rd <= kq_rd + 1'b1;
     end
   end
 
   if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
     $fatal(1, "dropout: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
+  end else if (IS_INT) begin : G_INT
+    assign mult_out  = '0;
+    assign mult_done = 1'b0;
   end else if (sienna_fmt_pkg::is_fp32(EXP_W, MAN_W)) begin : G_FP32
     fp32Multiplier MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .A(data_in), .B(CONST_SCALE),
                         .result_o(mult_out), .done_o(mult_done), .overflow_o(), .underflow_o(), .invalid_o());

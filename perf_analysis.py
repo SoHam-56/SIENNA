@@ -93,9 +93,19 @@ def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
                 act_gaps=gap(g_up), pool=pool, lanes=lanes, reduce_to_written=[w - r for r, w in zip(reduce, written)])
 
 
-DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table
+DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
 MUL_LAT, ADD_LAT = 8, 5  # valid in to done out: fp32Multiplier and fp32Adder; main() sets the build's format's values
-UNIT_LAT = {"fp32": (8, 5), "bf16": (3, 5)}  # sienna_fmt_pkg::mul_lat, add_lat
+UNIT_LAT = {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg::mul_lat, add_lat
+MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
+REQ_LAT = {"fp32": 0, "bf16": 0, "int8": 3}  # tfliteRequant at the lane feed (sienna_fmt_pkg::req_lat()), int8 only
+FMT = "fp32"  # the build's format; main() sets it
+
+
+def degree(act: str) -> int:
+    """The polynomial degree of act's coefficient set in the build's format: Task 10's SETS_INT8 in int8."""
+    if FMT == "int8":
+        return reg.gpnae_model.SETS_INT8[reg.activation_to_code(act)][1]
+    return DEGREE[act]
 
 
 def pkg() -> dict:
@@ -114,7 +124,7 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     N, T, lanes = P["N"], P["TILE_SIZE"], P["NUM_LANES"]
     per_lane = P["SRAM_DEPTH"] // lanes
     K = N if collapse else T  # depth each array multiplies
-    U = min(K, 6)  # partial sums per PE pixel
+    U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (6 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
     LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
     words = len(open(os.path.join(reg.TB_DIR, "matrix_west_0.mem")).read().split())
@@ -133,9 +143,9 @@ def model(cfg: dict, collapse: bool = True) -> dict:
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
     m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
     if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
-        m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done
+        m["act"] = per_lane + 4 + REQ_LAT[FMT]  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, the requantize stage in int8, then done
     elif act in DEGREE:
-        m["act_rounds"] = (DEGREE[act] + 1) * max(per_lane, MUL_LAT + ADD_LAT + 1)  # barrel MAC round: max(n, 14)
+        m["act_rounds"] = (degree(act) + 1) * max(per_lane, MAC_LAT[FMT] + 1)  # barrel MAC round: max(n, Horner loop + 1)
     return m
 
 
@@ -151,13 +161,19 @@ def med(xs: list) -> int:
     return int(statistics.median(xs)) if xs else 0
 
 
-SUMMARY_COLS = ["config", "latency", "cycles/set", "FLOP/cyc", "GFLOPS*", "PE use", "limit", "its cycles",
-                "host model", "mesh model", "mesh lat model", "mesh lat", "sim"]
+def summary_cols() -> list:
+    """The summary table's columns; int8 counts integer operations and TOPS where the floats count FLOP and GFLOPS."""
+    op, rate = ("OP/cyc", "TOPS*") if FMT == "int8" else ("FLOP/cyc", "GFLOPS*")
+    return ["config", "latency", "cycles/set", op, rate, "PE use", "limit", "its cycles",
+            "host model", "mesh model", "mesh lat model", "mesh lat", "sim"]
 
 
 def one_config(name: str, args) -> tuple:
     """(detail lines, summary row) for one regression config."""
     flop = 2 * args.n ** 3
+    op = "OP" if FMT == "int8" else "FLOP"
+    rate = lambda s: flop / s * args.clock_mhz / (1e6 if FMT == "int8" else 1000)  # TOPS in int8, GFLOPS otherwise
+    rate_s = lambda s: f"{rate(s):.3f} TOPS" if FMT == "int8" else f"{rate(s):.1f} GFLOPS"
     cfg = next(t for t in reg.PIPELINE_TESTS if t["name"] == name)
     if args.reparse:  # the saved trace; only the stimulus is regenerated, for the model's geometry
         reg.generate_vectors({**GEOM, **cfg, "num_sets": args.sets})
@@ -199,10 +215,10 @@ def one_config(name: str, args) -> tuple:
           + (f"activation {mdl['act']} (measured {stage['activation']})" if "act" in mdl else
              f"activation: {mdl.get('act_rounds', '-')} cycles of polynomial rounds in the measured {stage['activation']}")
           + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}",
-          f"  Matmul rate  : {flop} FLOP per set -> {flop / steady:.1f} FLOP/cycle, {flop / steady * args.clock_mhz / 1000:.1f}"
-          f" GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
+          f"  Matmul rate  : {flop} {op} per set -> {flop / steady:.1f} {op}/cycle, {rate_s(steady)}"
+          f" at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
           f" {args.n ** 2} MAC/cycle" if steady else "", ""]
-    row = [name, a["first_latency"], f"{steady:.1f}", f"{flop / steady:.1f}", f"{flop / steady * args.clock_mhz / 1000:.1f}",
+    row = [name, a["first_latency"], f"{steady:.1f}", f"{flop / steady:.1f}", f"{rate(steady):.3f}" if FMT == "int8" else f"{rate(steady):.1f}",
            f"{100 * flop / 2 / steady / args.n ** 2:.0f}%", lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"],
            first["mesh"], "pass"]
     return L, row
@@ -219,13 +235,14 @@ def header(args) -> list:
 
 def footer(args, summary: list) -> list:
     L = ["=" * 100, " SUMMARY", "=" * 100]
-    L += fmt_table(summary, SUMMARY_COLS)
+    L += fmt_table(summary, summary_cols())
     L += [" latency = host start of the first output's first set to its completion pulse, on an idle pipeline; cycles/set",
           " counts each depth pass of an accumulate config as a set. host/mesh model: cycles per set the",
           " design needs (host N+3 is TB_sienna_top's handshake; the mesh alone needs max(T+2, K, T^2)).",
           " mesh lat model: launch to result written, 3T+K+T^2+LAT+16; mesh lat: the same, measured on set 0."]
-    L += [f" * GFLOPS at an ASSUMED {args.clock_mhz:.0f} MHz clock, not a timing result; they count the set's"
-          f" {2 * args.n ** 3}-FLOP matmul only.",
+    unit = "TOPS (2 x MACs per second)" if FMT == "int8" else "GFLOPS"
+    L += [f" * {unit} at an ASSUMED {args.clock_mhz:.0f} MHz clock, not a timing result; they count the set's"
+          f" {2 * args.n ** 3}-{'OP' if FMT == 'int8' else 'FLOP'} matmul only.",
           " PE use = multiply-accumulates per cycle over the mesh's N^2. limit = the stage with the largest cost per set."]
     return L
 
@@ -246,8 +263,11 @@ def main() -> None:
     ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(UNIT_LAT), help="number format of the build")
     args = ap.parse_args()
-    global MUL_LAT, ADD_LAT
+    global MUL_LAT, ADD_LAT, FMT
     MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
+    FMT = args.fmt_name
+    fmts = {t["name"]: t.get("formats", tuple(UNIT_LAT)) for t in reg.PIPELINE_TESTS}
+    args.configs = [c for c in args.configs if args.fmt_name in fmts[c]]  # int8-only tests run only in int8
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
     os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
     if args.merge:

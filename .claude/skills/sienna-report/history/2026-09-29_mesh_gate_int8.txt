@@ -1,0 +1,158 @@
+SystolicMesh gate G3, int8 build: TB_SystolicMesh regression, bit-exact against mesh_model (matmul_int in int8),
+N = 8 (matmul group only: the conv generators cannot build a 3x3 kernel at N=8), 16, 32, every tile size, collapse-k 1 and 0.
+N = 64 is deferred to the final N = 64 sweep (Soham 2026-09-29).
+fp32 and bf16 rerun on the int8 tree; their cycles compared test by test with the bf16 branch's G3 runs.
+
+1. Tests passed (over the point's tile and group runs) and fp32 / bf16 cycles against the bf16 branch
+  N format ck runs           passed  cycles vs bf16 branch
+  8 int8    1    1            27/27  -
+  8 int8    0    1            27/27  -
+  8 fp32    1    1            27/27  27/27 identical
+  8 fp32    0    1            27/27  27/27 identical
+  8 bf16    1    1            27/27  27/27 identical
+  8 bf16    0    1            27/27  27/27 identical
+ 16 int8    1    1            72/72  -
+ 16 int8    0    1            72/72  -
+ 16 fp32    1    1            72/72  72/72 identical
+ 16 fp32    0    1            72/72  72/72 identical
+ 16 bf16    1    1            72/72  72/72 identical
+ 16 bf16    0    1            72/72  72/72 identical
+ 32 int8    1    5            90/90  -
+ 32 int8    0    6            90/90  -
+ 32 fp32    1    5            90/90  90/90 identical
+ 32 fp32    0    6            90/90  90/90 identical
+ 32 bf16    1    5            90/90  90/90 identical
+ 32 bf16    0    6            90/90  90/90 identical
+
+   Reference runs compared (bf16 branch, per point):
+   N=8  bf16 ck=0: g3m_N8_bf16_ck0
+   N=8  bf16 ck=1: g3m_N8_bf16_ck1 g3n_N8b_bf16_ck1
+   N=8  fp32 ck=0: g3m_N8_fp32_ck0 g3x_N8_fp32_ck0
+   N=8  fp32 ck=1: g3m_N8_fp32_ck1 g3x_N8_fp32_ck1
+   N=16 bf16 ck=0: g3_N16_bf16_ck0
+   N=16 bf16 ck=1: g3_N16_bf16_ck1 g3x_N16_bf16_ck1
+   N=16 fp32 ck=0: g3_N16_fp32_ck0 g3x_N16_fp32_ck0
+   N=16 fp32 ck=1: g3_N16_fp32_ck1 g3x_N16_fp32_ck1
+   N=32 bf16 ck=0: g3y_N32_bf16_ck0_T32 r15_N32_bf16_ck0_T16 r15_N32_bf16_ck0_T2_matmul r15_N32_bf16_ck0_T4 r15_N32_bf16_ck0_T8 r15_N32b_bf16_ck0_T2_conv
+   N=32 bf16 ck=1: g3_N32_bf16_ck1
+   N=32 fp32 ck=0: g3z_N32_fp32_ck0_T16 g3z_N32_fp32_ck0_T2 g3z_N32_fp32_ck0_T32 g3z_N32_fp32_ck0_T4 g3z_N32_fp32_ck0_T8
+   N=32 fp32 ck=1: g3_N32_fp32_ck1 g3x_N32_fp32_ck1
+
+2. int8 against fp32 on this tree. Expected: latency and streamed total = fp32 - D, serial total = fp32 - sets x D;
+   D = 7 (multiplier 8 -> 1) + 4 (PE adder 5 -> 1) + 5 x L32 - L8, L = clog2(RP x U + 1) reduce levels (derived, not measured)
+  N ck   T   D fp32 lat int8 lat  serial fp32/int8  stream fp32/int8  tests as expected
+  8  1   2  24       51       27           804/684           393/369  9/9
+  8  1   4  24       69       45           894/774           411/387  9/9
+  8  1   8  24      129      105         1194/1074           471/447  9/9
+  8  0   2  27       50       23           799/664           392/365  9/9
+  8  0   4  28       70       42           899/759           412/384  9/9
+  8  0   8  24      129      105         1194/1074           471/447  9/9
+ 16  1   2  24       59       35         1844/1724         1369/1345  18/18
+ 16  1   4  24       77       53         1934/1814         1387/1363  18/18
+ 16  1   8  24      137      113         2234/2114         1447/1423  18/18
+ 16  1  16  24      353      329         3314/3194         1663/1639  18/18
+ 16  0   2  31       55       24         1824/1669         1365/1334  18/18
+ 16  0   4  32       75       43         1924/1764         1385/1353  18/18
+ 16  0   8  28      134      106         2219/2079         1444/1416  18/18
+ 16  0  16  24      353      329         3314/3194         1663/1639  18/18
+ 32  1   2  24       75       51         5844/5724         5241/5217  18/18
+ 32  1   4  24       93       69         5934/5814         5259/5235  18/18
+ 32  1   8  24      153      129         6234/6114         5319/5295  18/18
+ 32  1  16  24      369      345         7314/7194         5535/5511  18/18
+ 32  1  32  24     1185     1161       11394/11274         6351/6327  18/18
+ 32  0   2  35       60       25         5769/5594         5226/5191  18/18
+ 32  0   4  36       80       44         5869/5689         5246/5210  18/18
+ 32  0   8  32      139      107         6164/6004         5305/5273  18/18
+ 32  0  16  28      358      330         7259/7119         5524/5496  18/18
+ 32  0  32  24     1185     1161       11394/11274         6351/6327  18/18
+
+3. Random power-up (-DNO_ZERO_INIT, --x-initial unique, +verilator+rand+reset+2), N=16: cycles against the zero-init run
+   g3i_ri_int8_ck1    72/72 pass, exit 0, cycles 72/72 identical to the zero-init run
+   g3i_ri_fp32_ck1    72/72 pass, exit 0, cycles 72/72 identical to the zero-init run
+   g3i_ri_bf16_ck1    72/72 pass, exit 0, cycles 72/72 identical to the zero-init run
+   g3i_ri_int8_ck0    72/72 pass, exit 0, cycles 72/72 identical to the zero-init run
+
+4. Points not run, or run in part (N, format, collapse-k, T): tests with results / expected, and why
+   N=64 every format, both collapse modes, every T: deferred to the final N = 64 sweep (Soham 2026-09-29); the bf16 branch could not build bf16 ck=0 T=2, fp32 ck=0 T=2, fp32 ck=0 T=4 in 256 GB
+
+5. Runs: exit, wall time, peak memory
+   g3i_N16_bf16_ck0               exit    0  wall   18:45.85  peak    2.8 GB
+   g3i_N16_bf16_ck1               exit    0  wall    3:18.74  peak    0.5 GB
+   g3i_N16_fp32_ck0               exit    0  wall   25:45.03  peak    5.9 GB
+   g3i_N16_fp32_ck1               exit    0  wall    5:07.88  peak    0.9 GB
+   g3i_N16_int8_ck0               exit    0  wall   12:50.29  peak    1.5 GB
+   g3i_N16_int8_ck1               exit    0  wall    3:07.46  peak    0.4 GB
+   g3i_N32_bf16_ck0_T16           exit    0  wall   10:25.00  peak    2.5 GB
+   g3i_N32_bf16_ck0_T2_conv       exit    0  wall    1:13:30  peak   22.3 GB
+   g3i_N32_bf16_ck0_T2_matmul     exit    0  wall    1:21:10  peak   22.3 GB
+   g3i_N32_bf16_ck0_T32           exit    0  wall    6:51.36  peak    1.3 GB
+   g3i_N32_bf16_ck0_T4            exit    0  wall   56:18.17  peak    9.9 GB
+   g3i_N32_bf16_ck0_T8            exit    0  wall   21:57.27  peak    5.2 GB
+   g3i_N32_bf16_ck1_T16           exit    0  wall    5:04.98  peak    1.3 GB
+   g3i_N32_bf16_ck1_T2            exit    0  wall    8:07.30  peak    2.1 GB
+   g3i_N32_bf16_ck1_T32           exit    0  wall    7:12.11  peak    1.3 GB
+   g3i_N32_bf16_ck1_T4            exit    0  wall    5:13.97  peak    1.5 GB
+   g3i_N32_bf16_ck1_T8            exit    0  wall    5:10.41  peak    1.3 GB
+   g3i_N32_fp32_ck0_T16           exit    0  wall   24:22.15  peak    5.6 GB
+   g3i_N32_fp32_ck0_T2_conv       exit    0  wall    2:10:18  peak   46.7 GB
+   g3i_N32_fp32_ck0_T2_matmul     exit    0  wall    2:30:29  peak   46.7 GB
+   g3i_N32_fp32_ck0_T32           exit    0  wall   11:55.69  peak    2.8 GB
+   g3i_N32_fp32_ck0_T4            exit    0  wall    1:54:13  peak   22.0 GB
+   g3i_N32_fp32_ck0_T8            exit    0  wall   48:23.70  peak   11.3 GB
+   g3i_N32_fp32_ck1_T16           exit    0  wall   10:04.87  peak    2.8 GB
+   g3i_N32_fp32_ck1_T2            exit    0  wall   12:49.47  peak    3.7 GB
+   g3i_N32_fp32_ck1_T32           exit    0  wall   12:17.62  peak    2.8 GB
+   g3i_N32_fp32_ck1_T4            exit    0  wall    9:54.04  peak    3.0 GB
+   g3i_N32_fp32_ck1_T8            exit    0  wall    9:26.76  peak    2.9 GB
+   g3i_N32_int8_ck0_T16           exit    0  wall    5:35.26  peak    0.9 GB
+   g3i_N32_int8_ck0_T2_conv       exit    0  wall   32:16.54  peak    8.8 GB
+   g3i_N32_int8_ck0_T2_matmul     exit    0  wall   37:23.64  peak    8.8 GB
+   g3i_N32_int8_ck0_T32           exit    0  wall    4:19.81  peak    0.5 GB
+   g3i_N32_int8_ck0_T4            exit    0  wall   25:26.32  peak    3.7 GB
+   g3i_N32_int8_ck0_T8            exit    0  wall   10:43.53  peak    1.8 GB
+   g3i_N32_int8_ck1_T16           exit    0  wall    3:22.49  peak    0.4 GB
+   g3i_N32_int8_ck1_T2            exit    0  wall    5:01.75  peak    0.8 GB
+   g3i_N32_int8_ck1_T32           exit    0  wall    4:19.46  peak    0.4 GB
+   g3i_N32_int8_ck1_T4            exit    0  wall    2:44.83  peak    0.5 GB
+   g3i_N32_int8_ck1_T8            exit    0  wall    2:44.89  peak    0.5 GB
+   g3i_N8_bf16_ck0                exit    0  wall    1:01.67  peak    0.4 GB
+   g3i_N8_bf16_ck1                exit    0  wall    0:43.79  peak    0.4 GB
+   g3i_N8_fp32_ck0                exit    0  wall    1:26.23  peak    0.8 GB
+   g3i_N8_fp32_ck1                exit    0  wall    0:52.52  peak    0.4 GB
+   g3i_N8_int8_ck0                exit    0  wall    0:51.88  peak    0.4 GB
+   g3i_N8_int8_ck1                exit    0  wall    0:49.79  peak    0.4 GB
+   g3i_ri_bf16_ck1                exit    0  wall    6:07.31  peak    0.7 GB
+   g3i_ri_fp32_ck1                exit    0  wall   12:31.10  peak    1.1 GB
+   g3i_ri_int8_ck0                exit    0  wall   15:08.67  peak    1.5 GB
+   g3i_ri_int8_ck1                exit    0  wall    2:32.61  peak    0.5 GB
+   r15_N32_bf16_ck0_T16           exit    0  wall    9:55.82  peak    2.5 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T2_conv       exit    1  wall    0:01.29  peak    0.0 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T2_matmul     exit    0  wall    1:28:56  peak   22.3 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T4            exit    0  wall    1:01:08  peak    9.9 GB  (bf16-tree reference)
+   r15_N32_bf16_ck0_T8            exit    0  wall   24:36.41  peak    5.1 GB  (bf16-tree reference)
+   r15_N32b_bf16_ck0_T2_conv      exit    0  wall    1:08:31  peak   22.3 GB  (bf16-tree reference)
+
+VERDICT: PASS
+
+6. Findings
+   - Section 2: none. Every int8 test at every (N, ck, T) equals fp32 - D in latency and streamed total and fp32 - sets x D
+     in serial total. At N=16 the int8 mm_random latencies are Task 14 Step 8's prediction: ck1 35/53/113/329, ck0 24/43/106/329.
+   - fp32 / bf16 DIFFER: none. Reference conflicts: none. Tests with no cycle reference: none (ALLOW_NO_REF is empty).
+   - bf16 N=32 collapse-k 0: the bf16 branch's g3_N32_bf16_ck0 was cancelled at its time limit with no per-test logs, so T = 2, 4,
+     8, 16 were rerun on the bf16 tree (r15_*); all 72 tests pass and the int8 tree's cycles are identical to them (90/90 with T=32).
+   - r15_N32_bf16_ck0_T2_conv exited 1 before any simulation: the bf16 tree's git-ignored SystolicMesh/testbenches/stimulus held a
+     stale fp32 set (matrixA_3.mem, 2026-09-23) that a conv-only bf16 run does not overwrite, and check_widths refused it. Rerun as
+     r15_N32b_bf16_ck0_T2_conv with the snapshot's stimulus directory moved aside first ($J/cmds/fresh_stim.sh): 9/9 pass.
+   - For the N = 64 sweep's memory plan (measured peaks, N=32 collapse-k 0): T=2 int8 8.8 GB, bf16 22.3 GB, fp32 46.7 GB;
+     T=4 int8 3.7 GB, bf16 9.9 GB, fp32 22.0 GB.
+
+7. Not covered at G3
+   - Covered, for the record: the ACC_W bias input, the bias queue and the int32 wrap, by every int8 set's bias file
+     (Task 14; set 1 of every test within 4,096 of INT32_MAX, so its positive sums wrap).
+   - partial_i multi-pass sums and the weight cache in int8: TB_SystolicMesh ties them off. TB_PE_int8 covers two-pass
+     sets at PE level; the mesh paths are covered at G4.
+   - wide_read_data_o, the ACC_W-wide read port: TB_SystolicMesh ties it off (wide_read_enable_i 0, output unconnected); covered at
+     G4 through sienna_top, which reads it.
+   - Lint: Task 13's m13_lint (int8 both collapse modes clean; unsupported formats and wrong ACC_W rejected).
+   - N = 64, every format, both collapse modes, every T: deferred to the final N = 64 sweep (Soham 2026-09-29). No other point
+     is not run.

@@ -22,7 +22,7 @@ runs on the login node (pure Python, no simulation). Charts are inline SVG from 
 | 1 | How SIENNA got here: architecture changes, ready/valid to credits, GPNAE changes, day one against today | `report/journey.json` (curated from `journey.md`); day one measured from `sienna_jobs/dayone_tree` (SIENNA 0eeac7e + build fix e988875), runs `dayone_*` |
 | 2 | Regressions: what each level tests; latency and throughput against N and tile size | g4 sweep runs `g4p_N*_T*_{fp32,bf16}` via `sienna_jobs/g4_table.py` |
 | 3 | Real models (MLPerf Tiny) for each N and tile size | runs `ms_N*_T*_{fp32,bf16}` (`cmds/model_sweep.sh`, `model_runner.py --tile-size`) |
-| 4 | Number formats: fp32, bf16, int8 (int8 pending: add its columns when the int8 build is verified) | g4 runs, `history/2026-09-28_gpnae_gate.txt`, GEMM runs `s22_gemm_*` |
+| 4 | Number formats: fp32, bf16, int8 | g4 runs, int8 perf runs `g8p_N*_T*_int8`, GEMM runs `s22_gemm_*` and `g8_gemm_int8`, `history/2026-09-28_gpnae_gate.txt` and the int8 G2 summary (`testbenches/int8/gpnae_int8_accuracy.json` in the int8 tree, read by build_report.py) |
 
 ## Rules
 
@@ -36,4 +36,4 @@ runs on the login node (pure Python, no simulation). Charts are inline SVG from 
 
 Verbatim copies of the old generated reports, file names prefixed with the date they were written.
 They are the only record of the intermediate steps (2026-09-21 latency and throughput analyses, back-to-back
-findings, architecture changes, credit sweep, GPNAE review, synthesis readiness, the bf16 gate reports).
+findings, architecture changes, credit sweep, GPNAE review, synthesis readiness, the bf16 and int8 gate reports).

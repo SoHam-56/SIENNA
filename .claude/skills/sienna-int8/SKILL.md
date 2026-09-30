@@ -5,8 +5,25 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 
 # SIENNA: the int8 build (sub-project 2a)
 
-**Status: spec approved 2026-09-29. NOT implemented.**
-Update this line as pieces land.
+**Status: 2a implemented and verified 2026-09-30 on the `int8` branch of all four repos, at N = 8-32; N = 64 is
+deferred to one final sweep after check-in (Soham 2026-09-29); 2b not started.**
+Gate reports, verbatim in the `sienna-report` skill's `history/`:
+- G4 SIENNA: `2026-09-30_sienna_int8_g4.txt` (farm runs `g8*`; GATE G4: PASS; regression 35/35 exact at N = 16 and 32
+  in both mesh modes and at random power-up, TFLite int8 layers equal to the interpreter at N16 T4 and N32 T8, fp32 /
+  bf16 identical in results, cycles and output words; N = 64 deferred to the final sweep)
+- G3 SystolicMesh: `2026-09-29_mesh_gate_int8.txt` (Task 15; VERDICT: PASS at N = 8-32, every tile size, both collapse
+  modes, random power-up; fp32 / bf16 cycles identical; N = 64 deferred to the final sweep)
+- G2 GPNAE: `2026-09-29_gpnae_gate_int8.txt` (Task 12; VERDICT: PASS for correctness, the lane bit-exact everywhere;
+  accuracy against GPNAE's tolerance over the full Q4.11 range: SELU 0/262144 (over the Q4.11 range only) and tanh
+  0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5; SELU lane inputs at or above 16 saturate
+  to 16 * lambda (about 16.8), as the gate's not-gated SELU case s_in = 0.21875 shows: 49 of 256 outside, worst 102 LSB.
+  Open accuracy items: sigmoid below x = -3.5, and SELU at or above 16; the int8 regression's `matmul_large_selu`
+  reaches lane inputs of 19-68 at N = 8-64, default seed (113 of 4352 at or above 16 at N = 16), exact because its golden
+  saturates too)
+- G1 ArithmeticLibrary: `2026-09-29_aril_gate_int8.txt` (Task 8; VERDICT: PASS, all units bit-exact; fxMac sweeps
+  2.58e10 results, 0 errors)
+- G0 oracle: `2026-09-29_g0_oracle_int8.txt` (Task 2; G0: PASS, ROUNDING: DOUBLE pinned; 24,832,000 outputs,
+  0 mismatches against BUILTIN_REF with DOUBLE rounding, SINGLE differs in 11,332; TensorFlow 2.18.1)
 
 **REQUIRED BACKGROUND:** the `sienna-uniform-format` skill (one number format per build; this is its sub-project 2)
 and the `sienna-rtl` skill.
@@ -71,6 +88,50 @@ int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 m
 
 An `int8` branch off `bf16` in all four repos, in a separate checkout at `/proj/work/spramanik/SIENNA_int8`, so fp32
 and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE`). Push innermost first, as always.
+
+## As built (departures from the design above)
+
+- Requantize parameters of an accumulate group come from its activated pass, the last, like `activation_function_i`;
+  the bias comes with the first pass (the mesh's rule). Partial passes may carry anything: the regression gives them decoys.
+- The requantize stage is `src/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 3 cycles
+  at the lane feed; `sienna_top` holds each set's parameters by set id and copies the per-channel words at `g_accept`.
+  It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `regression._check_rounding()` checks that the
+  package, `ipu.REQ_ROUNDING` and `rounding.txt` agree.
+- `sienna_layer` in int8 always takes a bias beat per column block; its int32 bias, multipliers and shifts come on
+  `w_bias_i`, `w_req_mult_i`, `w_req_shift_i` beside it. A residual pass adds raw int8 codes (no rescale: 2b); in
+  simulation an int8 layer configured with `cfg_residual_i` fails the assertion `a_int_no_residual` (final fix).
+- Dropout in training drops to the output zero point of the set's activation (D-5 as corrected: `req_zp_i` after ReLU
+  or linear, 0 after tanh, -128 after sigmoid, `gp_zout_i` after SELU).
+- Test stimulus is quantized per accumulate group as TFLite PTQ would (zero points by `rint`, not the converter's nudging);
+  SELU's output scale is calibrated from each set's data.
+- Task 2: DOUBLE is what TensorFlow 2.18.1's reference kernels (`BUILTIN_REF`) do; the default optimized resolver
+  matches SINGLE instead, so the pin is tied to that TensorFlow build.
+- Task 10: the int8 degrees are `SETS_INT8 = {1: (0, 2), 2: (9, 3), 3: (16, 3)}` (SELU 2, sigmoid 3, tanh 3), from the
+  fit on the dense sweep; Task 12's refit over the full Q4.11 range left the table byte-identical.
+- Task 10: `gpnae_model`'s SELU rounding reads `REQ_ROUNDING` from GPNAE's own `sienna_fmt_pkg.sv`, not SIENNA's
+  `rounding.txt`, so the GPNAE checkout stands alone.
+- Task 11: `gpnae_poly_int8`'s G_RUN leaves on barrel_mac's `done_o` for a one-element group (the float lane's G_RUN,
+  copied, hung); the published float lane's same latent hang is reported to Soham, not changed.
+- Task 12: `TB_gpnae_poly` drives writes 1 ns after each clock edge in int8 mode (the zero-delay drive tripped the FIFO's
+  full assertion at 32 writes per batch); float modes unchanged.
+- Task 16: PINMISSING is fatal in this flow, so `sienna_top`'s ten new inputs were tied off (`'0`) in its four
+  instantiations until Task 19 connected them.
+- Task 20: the regression's `zp_random` key draws distinct per-set zero points and clamps (`req_random` draws only
+  multipliers and shifts); int8 has 35 tests, the plan's 33 plus `int8_mixed_act_train` and `int8_pad_negative_tanh`.
+- Task 21: the TFLite path uses only the model's own words: the multipliers and shifts from the G0 npz and the model's
+  int32 bias tensor (with the -z_in * sum(w) fold), never the regression's `requant_params` or `fold_bias`.
+- Task 22: the performance model counts 3 requantize cycles in int8 (exact against measured); it undercounts GPNAE lane
+  time by 50-76 cycles per set in every format, which predates the int8 work and was not retuned.
+- N = 64 (Soham 2026-09-29): skipped while testing; G3 and G4 ran N = 8-32, and every N = 64 run (int8 and the fp32 /
+  bf16 references, both collapse modes) is one final sweep after check-in.
+- Final fix: int8 ReLU relies on the host clamp. `sienna_top` (its `!IS_INT &&` ReLU bypass) and `gpnae_poly_int8` both
+  pass ReLU through unchanged, so the requantize clamp must be `[max(req_min, req_zp), req_max]`. The TFLite flow and
+  `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
+- Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
+  skip them when bisecting.
+- Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches 16; the regression's
+  SELU tests report their saturated inputs and check them bit-exact against the saturating golden. The one check is
+  `regression.selu_saturates(mx, shx, z_in, q)`, the lane's own rescale of code q reaching 2^15, positive side only.
 
 ## Out of scope (2a)
 

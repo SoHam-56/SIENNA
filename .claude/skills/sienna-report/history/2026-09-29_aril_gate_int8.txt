@@ -1,0 +1,120 @@
+GATE G1: ArithmeticLibrary (AriL), int8 units
+==============================================
+AriL int8 c80b8cd (pushed). Gate run: sienna_jobs/runs/i8_g1 (one snapshot, every check below). Farm, Verilator 5.035.
+
+VERDICT: PASS. Every check passed; nothing was skipped.
+
+1. FORMAT PACKAGE (sienna_fmt_pkg, Task 3)
+   TB_sienna_fmt_pkg: 0 errors (runs/i8_g1/results/int8/Common_pkg.log). Checks is_int, supported at (0,7)/(0,15)/(0,3),
+   acc_w at all three supported formats, mul_lat/add_lat at (0,7), fx_lat (2), req_lat (3), REQ_ROUNDING ("DOUBLE"),
+   and five localparam constant-expression uses (ACC8, MUL8, INT8, FX8, RQ8).
+
+1b. D-7 GUARD: fpMultiplier AND fpAdder REJECT EXP_W = 0
+   int8_fpguard.sh (runs/i8_g1/results/int8/fpguard.txt): "REJECTED fpMultiplier", "REJECTED fpAdder" (stdout.log:21-22).
+   Guard diff against d97e270 (git diff d97e270 -- Multipliers/FP/src/fpMultiplier.sv, Adders/FP/src/fpAdder.sv):
+   each file +5/-0, a `G_BAD_FORMAT` generate block emitting $fatal(1, "<unit>: EXP_W=%0d is an integer format, not a
+   float one", EXP_W) for EXP_W < 2, plus the blank line before it.
+
+2. intMultiplier (Multipliers/Int)
+   W=8 against the C reference: 65,536 products, 0 errors, latency 1 (Multipliers_Int_check.log / _verilator.log).
+   check_ipu mul: 65,536 results against ipu.py, 0 mismatches, 65,536 distinct operand combinations of 65,536
+   (exhaustive int8 x int8).
+   W=16 (GPNAE's width): 1,000,121 products against the C reference, 0 errors, latency 1 (_check16.log / _verilator16.log).
+   check_ipu mul16: 1,000,121 results against ipu.py, 0 mismatches.
+   Vivado vectors: vectors_int8.mem, 10,000 checked, 0 errors (Multipliers_Int_vivado_tb.log).
+   Random power-up, seeds 2 and 7 (-DNO_ZERO_INIT --x-initial unique --x-assign unique): 65,536 products each,
+   0 errors, RESULT: PASSED (Multipliers_Int_verilator_randinit2.log, _randinit7.log).
+   Lint: 0 warnings, no LATCH/MULTIDRIVEN/UNOPTFLAT/error (Multipliers_Int_lint.log).
+
+3. intAdder (Adders/Int)
+   W=32 against the C reference: 1,000,298 sums, 0 errors, latency 1 (Adders_Int_check.log / _verilator.log).
+   1,000,298 = 6 known wrap corners (MAX+1, MIN-1, MIN+MIN, MAX+MAX, -1+1, MIN+MAX) + 196 corner pairs (14x14) +
+   96 carry/borrow/power-of-two pairs (3x32) + 1,000,000 random pairs. No mismatch on the known wrap vectors: the
+   model wraps modulo 2^32 rather than saturating or widening, as intended.
+   check_ipu add: 1,000,298 results against ipu.py, 0 mismatches.
+   Vivado vectors: vectors_int32.mem, 10,000 checked, 0 errors (Adders_Int_vivado_tb.log).
+   Random power-up, seeds 2 and 7: 1,000,298 sums each, 0 errors, RESULT: PASSED
+   (Adders_Int_verilator_randinit2.log, _randinit7.log).
+   Lint: 0 warnings, no LATCH/MULTIDRIVEN/UNOPTFLAT/error (Adders_Int_lint.log).
+
+4. fxMac (Multipliers/Fx)
+   Default-stimulus run (W=16, FRAC=11) against the C reference: 217,540 results, 0 errors, latency 2
+   (Multipliers_Fx_check.log / _verilator.log). Covers 10 hand-worked known triples (incl. the two floor-vs-truncate
+   and pre-add-saturation cases), 2,527 corner triples (19x19x7), ~15,000 boundary triples targeting
+   MAX-1/MAX/MAX+1/MIN-1/MIN/MIN+1 after the add, and 200,000 uniform random triples.
+   check_ipu fx: 217,540 results against ipu.py, 0 mismatches.
+   Vivado vectors: vectors_q4_11.mem, 10,000 checked, 0 errors (Multipliers_Fx_vivado_tb.log).
+   Random power-up, seeds 2 and 7: 217,537 / 217,539 results (fewer idle-cycle draws differ run to run by design),
+   0 errors, RESULT: PASSED (Multipliers_Fx_verilator_randinit2.log, _randinit7.log).
+   Lint: 0 warnings, no LATCH/MULTIDRIVEN/UNOPTFLAT/error (Multipliers_Fx_lint.log).
+
+   fxMac commit the sweeps proved: bd3f3a1 (current HEAD's Multipliers/Fx/src/fxMac.sv, confirmed by
+   `git log --oneline -1 -- Multipliers/Fx/src/fxMac.sv`). The six exhaustive sweeps (24 farm slices, Task 6 Step 7):
+
+   | Sweep (MODE, FIXED)      | Slices | Results/slice | Errors | Digest mismatches | Elapsed (per slice)   |
+   |--------------------------|-------:|---------------:|-------:|-------------------:|-----------------------|
+   | AX, C=0 (0000)           | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:11.39 to 7:23.41    |
+   | AX, C=-1 (ffff)          | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:17.00 to 7:22.01    |
+   | AX, C=32767 (7fff)       | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:10.67 to 7:25.38    |
+   | AX, C=-32768 (8000)      | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:10.26 to 7:22.80    |
+   | XC, A=1.0 (0800)         | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:17.93 to 7:20.38    |
+   | XC, A=2.0 (1000)         | 4      | 1,073,741,824  | 0      | 0 of 16,384 outer   | 7:08.80 to 7:19.26    |
+   Totals: 6 sweeps x 4,294,967,296 triples = 25,769,803,776 (2.58e10) results against the C reference, 0 errors;
+   24 x 16,384 = 393,216 outer-value digests recomputed and matched by ipu.py, 0 mismatches (runs/i6_*, Task 6 Step 7,
+   not rerun for this gate per the brief's instructions).
+   Sweep-snapshot check (this task, Step 3): every one of the 24 sweep tar snapshots
+   ($J/snaps/i6_[AX][XC]_*_[0-3].tar) holds the same Multipliers/Fx/src/fxMac.sv byte-for-byte as the gated RTL
+   (bd3f3a1); the check loop printed nothing.
+   Not covered exhaustively (per Task 6's brief): products outside int16 against middle values of C for |A| other
+   than 2.0; sampled only by the default stimulus's random/boundary triples above.
+
+5. tfliteRequant (Requant, Task 7)
+   Vector generator (both roundings): 1,035,718 vectors each = 33,718 corners + 2,000 rounding discriminators +
+   1,000,000 random; 70,447 differ between roundings, clamp-bound share 57.2% (DOUBLE) / 57.4% (SINGLE).
+   DOUBLE: 1,035,718 vectors, 0 errors, latency 3, RESULT: PASSED.
+   SINGLE: 1,035,718 vectors, 0 errors, latency 3, RESULT: PASSED. (Requant_both.log)
+   Vivado vectors: 45,718 checked per rounding, 0 errors, RESULT: PASSED (Requant_vivado_tb.log).
+   Random power-up, seeds 2 and 7 (both roundings each): 1,035,718 vectors, 0 errors, RESULT: PASSED
+   (Requant_both_randinit2.log, _randinit7.log).
+   Lint: 6 warnings (3 distinct: UNUSEDSIGNAL on tfliteRequant.sv's 64-bit intermediate r[63:32] after the int32
+   truncation, UNUSEDSIGNAL on sienna_fmt_pkg man_w, UNUSEDPARAM on sienna_fmt_pkg REQ_ROUNDING; each counted twice,
+   once per rounding elaboration), no LATCH/MULTIDRIVEN/UNOPTFLAT/error (Requant_lint.log). Matches Task 7 Step 5.
+   lint_bad: elaboration with ROUNDING=NEAREST fails with "%Error-USERFATAL: ...tfliteRequant.sv:24:5: tfliteRequant:
+   unsupported ROUNDING NEAREST, use SINGLE or DOUBLE" and prints REJECTED (Requant_lint_bad.log via stdout.log:505-524);
+   no NOT-REJECTED. c80b8cd's silent Makefile recipes mean the job wrapper (int8_aril.sh) sees only the printed
+   verdict, so the target now exits 0 as it should (Task 7 had flagged the pre-c80b8cd false rc=1 from the recipe's
+   own echoed text; that is fixed by this commit).
+
+6. fp32 / bf16 UNITS UNCHANGED
+   RTL diff against d97e270 (git diff --stat / --numstat, Multipliers/FP, FP32, FPWiden, Karatsuba, Radix4Booth,
+   Adders/FP, FP32, and the listed Common/testbenches, models and Makefile paths): exactly three files touched --
+   Adders/FP/src/fpAdder.sv +5/-0, Multipliers/FP/src/fpMultiplier.sv +5/-0 (Task 3's D-7 guards), and
+   Common/Makefile +5/-2 (Task 1's header comment and the `ipu` target/.PHONY entry). Nothing else changed; the `pkg`
+   and `dump32` recipes are byte-identical to d97e270 (git diff d97e270 -- Common/Makefile shows only the above).
+   Package diff against d97e270 (git diff d97e270 -- Common/src/sienna_fmt_pkg.sv): only Task 3's int8 additions
+   (is_int, acc_w, the int8 mul_lat/add_lat branches, fx_lat, req_lat, REQ_ROUNDING); the fp32 and bf16 branches of
+   supported/mul_lat/add_lat are textually unchanged, confirmed behaviourally by Common_pkg.log's unchanged summary
+   line "TB_sienna_fmt_pkg: 0 errors" (matches g1b).
+   int8_g1_compare.sh i8_g1: "compared 15 logs with runs/g1b: 2 differ" -- Adders_FP_lint.log and
+   Multipliers_FP_lint.log, both accounted for and expected: in each, the package's line-17/22 exp_w UNUSEDSIGNAL
+   warnings are gone (now read by is_int inside mul_lat/add_lat) and a new line-48 REQ_ROUNDING UNUSEDPARAM warning
+   appears (unused by fpMultiplier/fpAdder); fpAdder.sv's own s4_m/norm_man UNUSEDSIGNAL warnings shift line numbers
+   only, from the 5-line guard insertion above them. No other content differs. The other 13 compared logs, including
+   Common_pkg.log and both randinit logs (Adders_FP_randinit.log, Multipliers_FP_randinit.log -- Verilator's default
+   seed, so even the random power-up runs match byte-for-byte against g1b), are unchanged.
+   fp32 unit TB SUCCESS counts: fp32Multiplier 2,003/2,003 (Multipliers_FP32_verilator.log, "SUCCESS: All 2003
+   vectors passed!"), fp32Adder 2,007/2,007 ("SUCCESS: All 2007 vectors passed!"), matching g1b exactly.
+   fpMulWiden: RESULT: PASSED (bf16 and fp16), matching g1b.
+   Full float suite (cmd_aril_gate.sh, unchanged): 16 RESULT: PASSED, matching g1b's 16, no GATE-FAIL.
+
+7. FINDINGS IN ipu.py OR THE PUBLISHED UNITS (reported, not changed)
+   None. No mismatches, no rounding discrepancies, no D-1-style findings surfaced in this gate's runs.
+
+NOT RUN AT THIS LEVEL: VCS; Vivado itself (the Vivado testbenches ran in Verilator); synthesis of the new units;
+the other AriL copy, GPNAE/ArithmeticLibrary, which stays at d97e270 until Level 2 moves its pointer.
+
+SUMMARY COUNTS (stdout.log)
+   int8 units:      30 RESULT: PASSED  (pkg 1; Multipliers/Int 9; Adders/Int 6; Multipliers/Fx 6; Requant 8)
+   fp32 / bf16 units: 16 RESULT: PASSED (unchanged from g1b)
+   lint: Multipliers/Int 0, Adders/Int 0, Multipliers/Fx 0, Requant 6 warnings; no LATCH/MULTIDRIVEN/UNOPTFLAT/error
+         anywhere.

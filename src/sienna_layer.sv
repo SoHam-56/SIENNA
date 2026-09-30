@@ -390,6 +390,10 @@ module sienna_layer #(
     else $error("sienna_layer: a set's last row came when the pipeline could not take its start");
   a_one_north: assert property (@(posedge clk_i) disable iff (!rstn_i) !(p_wc_we && p_north_we))
     else $error("sienna_layer: a cache fill and a set's B row on the north bus in one cycle");
+  if (IS_INT) begin : G_INT_NO_RESIDUAL  // int8 residual adds raw codes: its rescale is 2b
+    a_int_no_residual: assert property (@(posedge clk_i) disable iff (!rstn_i) !(cfg_load_i && !active && cfg_residual_i))
+      else $error("sienna_layer: int8 residual is not supported until 2b");
+  end
 `endif
 
 endmodule

@@ -9,7 +9,7 @@ module Maxpool_2D #(
     parameter     STRIDE_ROWS = 2,
     parameter     STRIDE_COLS = 2,
     parameter     PADDING     = 1,
-    parameter bit IS_FP32     = 1,   // float sign-magnitude compare, any width given EXP_W and MAN_W (the name predates bf16)
+    parameter bit IS_FP32     = 1,   // float sign-magnitude compare given EXP_W > 0; EXP_W = 0 (int8) always compares signed integers
     parameter int EXP_W       = 8,
     parameter int MAN_W       = 23
 ) (
@@ -42,9 +42,9 @@ module Maxpool_2D #(
 
   state_t state, next_state;
 
-  localparam bit FLOAT = IS_FP32 && (DATA_WIDTH == 1 + EXP_W + MAN_W);
-  localparam logic [DATA_WIDTH-1:0] FLOOR = FLOAT ? {1'b1, {EXP_W{1'b1}}, {MAN_W{1'b0}}}  // -infinity in the format
-                                                  : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};  // most negative integer
+  localparam bit FLOAT = IS_FP32 && (EXP_W > 0) && (DATA_WIDTH == 1 + EXP_W + MAN_W);  // EXP_W = 0 is int8
+  localparam logic [DATA_WIDTH-1:0] FLOOR = FLOAT ? DATA_WIDTH'({DATA_WIDTH{1'b1}} << MAN_W)  // -infinity: sign and exponent all ones
+                                                  : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};  // most negative integer, -128 in int8
 
   logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
   logic [$clog2(IN_SIZE+1)-1:0] input_count;

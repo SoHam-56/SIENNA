@@ -5,7 +5,8 @@ description: Use when changing SIENNA's number format - building it in bf16 (or 
 
 # SIENNA: one number format per build
 
-**Status: uniform bf16 implemented and verified 2026-09-28; int8 not started.** On the `bf16`
+**Status: uniform bf16 implemented and verified 2026-09-28; int8 (sub-project 2a) implemented and verified 2026-09-30
+at N = 8-32 (N = 64 in the final sweep), see the sienna-int8 skill.** bf16 is on the `bf16`
 branch of all four repos; it replaced the earlier mixed bf16. Plan and task record:
 `implementation-plan.md`. Gate reports (verbatim, in the `sienna-report` skill's `history/`):
 - G1 ArithmeticLibrary: `2026-09-28_aril_gate.txt`

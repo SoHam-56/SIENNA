@@ -1,6 +1,6 @@
 `timescale 1ns / 100ps
 
-// requant_lanes against ipu.requant (rq_lanes.mem): per-channel words, lane k's channel (k*PER_LANE + b) % N, 3-cycle latency.
+// requant_lanes against ipu.requant (rq_lanes.mem): per-channel words, lane k's channel (k*PER_LANE + b) % N, req_lat() latency.
 module TB_requant_lanes;
   localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;

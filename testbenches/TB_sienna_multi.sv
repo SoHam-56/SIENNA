@@ -108,7 +108,7 @@ module TB_sienna_multi #(
   endfunction
 
   longint cyc = 0;
-  always @(posedge clk_i) cyc++;
+  always_ff @(posedge clk_i) cyc <= cyc + 1;  // nonblocking, as TB_sienna_layer: a blocking ++ raced its readers under --threads
 
   // Per copy: the sets it was given, in order, and what it has produced for the current one.
   // Keyed by copy: Verilator dropped updates to a one-element fixed array of queues.

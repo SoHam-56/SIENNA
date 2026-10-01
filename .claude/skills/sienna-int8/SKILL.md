@@ -18,9 +18,10 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
   0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5. Rerun 2026-10-01 after SELU fix A (farm
   run `gb_c3_g2b`, not in `history/`): positive SELU is exact to lambda * x < 512 (x < 487.29) and saturates beyond;
   the not-gated SELU case s_in = 0.21875 is 0 of 256 outside, worst 1 LSB (was 49 of 256, 102 LSB), and 64 positive
-  SELU sets per seed, x = 16 to past the limit, are bit-exact. Open accuracy items: sigmoid below x = -3.5, and SELU
+  SELU sets per seed, x = 0 to past the limit, are bit-exact. Open accuracy items: sigmoid below x = -3.5, and SELU
   past x = 487.29 (the host guard rejects it); the int8 regression's `matmul_large_selu` (lane inputs 19-68 at
-  N = 8-64, default seed) now has 0 saturated inputs and passes against the unsaturated golden)
+  N = 8-64, default seed) now has 0 saturated inputs (measured at N = 16 and 32; at N = 8 and 64 it follows from
+  68 < 487.29) and passes against the unsaturated golden)
 - G1 ArithmeticLibrary: `2026-09-29_aril_gate_int8.txt` (Task 8; VERDICT: PASS, all units bit-exact; fxMac sweeps
   2.58e10 results, 0 errors)
 - G0 oracle: `2026-09-29_g0_oracle_int8.txt` (Task 2; G0: PASS, ROUNDING: DOUBLE pinned; 24,832,000 outputs,
@@ -54,7 +55,7 @@ int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 m
 | Requantize placement | at the GPNAE lane feed: one pipelined unit per lane (~3 stages, 32 x 32 multiplier) on the wide read; result memory stays int32 | unit count independent of T (32 lanes at N <= 32, 128 at N = 64); at the reducers it would be (N/T)^2 units (1,024 at N=64 T=2) |
 | Requantize parameters | per set, like the bias: `M_c`, `shift_c` for the set's N output channels; layer-wide `z_out`, `act_min`, `act_max` in the set's configuration | sets of one layer share them; channels are the set's columns |
 | Activation engine | GPNAE, fixed point (Soham's choice over a 256-entry LUT): the same Horner polynomial and barrel_mac / gpnae_poly structure, with 16-bit integer multiply and add units | one activation engine for every format |
-| GPNAE number format | input int8 q -> `x = round(((q - z_in) * M_x) >> sh_x)`, int16 Q4.11 (range +/-16, saturating); 16 x 16 -> 32-bit products shifted back to Q4.11; 32-bit add | 8-bit intermediates cannot hold a polynomial's terms; 16 bits is 8x finer than any int8 output |
+| GPNAE number format | input int8 q -> `x = round(((q - z_in) * M_x) >> sh_x)`, int16 Q4.11 (range +/-16, saturating); 16 x 16 -> 32-bit products shifted back to Q4.11; 32-bit add (as built, SELU's positive branch departs: see SELU fix A under As built) | 8-bit intermediates cannot hold a polynomial's terms; 16 bits is 8x finer than any int8 output |
 | GPNAE coefficients | re-encoded to 16-bit fixed point by `fit_poly_coeffs.py` into a new `poly_coeffs_int8.mem` (degree as the fit needs, as bf16 needed); fp32 / bf16 tables never change | published work; same kind of change as bf16's refit |
 | Beyond the fitted range | the float lane's own ranges (tanh abs(x) <= 4, sigmoid abs(x) <= 3.5, SELU x >= -4); beyond them the lane outputs the saturated int8 value (tanh +/-127/128, sigmoid 0 / 255/256, SELU -lambda*alpha); `gpnae_tail` not instantiated in int8 builds | Soham 2026-09-29: same design as the other formats; the saturation error is judged by the tolerance (sigmoid ~2.8%, SELU ~1.9% at the thresholds, estimates) |
 | GPNAE output | tanh: y * 128, zero point 0; sigmoid: y * 256, zero point -128 (TFLite's fixed output quantization); SELU: negative branch from the polynomial, positive branch lambda * x exact, per-layer `(M_out, sh_out, z_out)`; ReLU and linear pass through (already clamped) | TFLite's conventions where it has the op; SELU is not a TFLite op |
@@ -122,7 +123,8 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   multipliers and shifts); int8 has 35 tests, the plan's 33 plus `int8_mixed_act_train` and `int8_pad_negative_tanh`.
 - Task 21: the TFLite path uses only the model's own words: the multipliers and shifts from the G0 npz and the model's
   int32 bias tensor (with the -z_in * sum(w) fold), never the regression's `requant_params` or `fold_bias`.
-- Task 22: the performance model counts 3 requantize cycles in int8 (exact against measured); it undercounts GPNAE lane
+- Task 22: the performance model counts 3 requantize cycles in int8 (exact against measured; 5a removed them from the
+  ReLU / linear activation stage, see the drain-overlap line); it undercounts GPNAE lane
   time by 50-76 cycles per set in every format, which predates the int8 work and was not retuned.
 - N = 64 (Soham 2026-09-29): skipped while testing; G3 and G4 ran N = 8-32, and every N = 64 run (int8 and the fp32 /
   bf16 references, both collapse modes) is one final sweep after check-in.
@@ -130,7 +132,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   pass ReLU through unchanged, so the requantize clamp must be `[max(req_min, req_zp), req_max]`. The TFLite flow and
   `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
 - Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
-  skip them when bisecting.
+  skip them when bisecting, and GPNAE 71e9b75 and c35d24b too (SELU fix A split the same way, RTL first).
 - Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches x = 487.29, where
   lambda * x leaves int32 in 2^-22; the regression's SELU tests print "SELU saturation: k of n lane inputs at
   x >= 487.29" and check any such input bit-exact against the saturating golden. The one check is
@@ -139,9 +141,18 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 - SELU fix A (Soham 2026-09-30): the SELU post stage works in 2^-22: x * P and -lambda*alpha * 1.0 as they are, and
   lambda * x on the unsaturated 24-bit rescale (POSTM is `intMultiplier` W = 24), floored by 2^3 and saturated to
   int32; `(gp_mout, gp_shout)` = QuantizeMultiplier(2^-22 / s_out), not 2^-25 as D-4 says. The regression calibrates
-  SELU's output scale on lane inputs clipped to [-16, 487.29], not [-16, 16]. Lane latency unchanged.
+  SELU's output scale on lane inputs clipped to [-16, 487.29], not [-16, 16]. Lane latency unchanged. The one
+  dense-sweep output it changed (x = 5791, s_in = 1/32: 75 -> 76, exact 75.498) comes from DOUBLE rounding on the
+  coarser 2^-22 grid, in both branches, not from the floor: the new output is 0.502 LSB from exact, against 0.498.
 - D-8 in `gpnae_poly_int8` (2026-10-01): FSM state, counters and valid bits are reset; its data registers (buffers,
   unit operands, element tags, `final_result_o`) load in a reset-free `always_ff`.
+- Requantize drain overlap (5a, 2026-10-01): the requantize pipeline carries per-beat parameters, and the next set's
+  activation fill overlaps the drain. `tfliteRequant` takes mult, shift, zp, min and max at stage 1; `sienna_top`
+  pipelines each beat's destination (ReLU / linear flag, activation bank, element index) beside it for `req_lat()`
+  cycles. An int8 ReLU or linear set leaves the activation stage once its last wide read is in; its bank is marked
+  full, once, when that beat leaves (a partial set waits out a drain). N = 32 ReLU 39 -> 36 cycles per set, as fp32;
+  GPNAE sets unchanged (the lanes, not the drain, hold the stage). `TB_sienna_top` fails if a drain held a waiting
+  result and never overlapped. D-8 in `sienna_layer`: `mult_buf` / `shift_buf` load without reset.
 
 ## Out of scope (2a)
 

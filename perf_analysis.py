@@ -2,12 +2,15 @@
 """Cycle, latency and throughput analysis of the streamed SIENNA pipeline from TB_sienna_top's PERF trace."""
 import argparse
 import json
+import math
 import os
 import re
 import statistics
 import subprocess
 import sys
 import time
+
+import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -143,9 +146,97 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
     if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done; int8 leaves while the requantize drains
-    elif act in DEGREE:
-        m["act_rounds"] = (degree(act) + 1) * max(per_lane, MAC_LAT[FMT] + 1)  # barrel MAC round: max(n, Horner loop + 1)
+    elif act in DEGREE and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+        m["act"] = lane_stage(act, P, collapse)
     return m
+
+
+GROUP_K, TAIL_CTX = 16, 4  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults
+FX_LAT, REQ_LAT = 2, 3  # sienna_fmt_pkg::fx_lat, req_lat
+DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
+
+
+def lane_inputs(k: int, P: dict, collapse: bool) -> list:
+    """Set k's activation inputs from the bit-exact mesh model, row-major as the wide read hands them to the lanes."""
+    rd = lambda f: np.array([int(w, 16) for w in open(os.path.join(reg.TB_DIR, f)).read().split()], np.int64)
+    n, f = P["N"], reg.fpu.FORMATS[FMT]
+    A, B = (rd(f"matrix_{s}_{k}.mem").reshape(n, n) for s in ("west", "north"))
+    C = reg.mesh_model.matmul(f, [(A, B)], n, P["TILE_SIZE"], int(collapse), rd(f"bias_{k}.mem") if P["HAS_BIAS"] else None)
+    return reg.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16 rounds every sum: tails shift
+
+
+def in_tail(x: float, act: str) -> bool:
+    """gpnae_poly's sig_in_tail: past the fitted range, gpnae_tail computes the element."""
+    return x < -4.0 if act == "selu" else abs(x) > (3.5 if act == "sigmoid" else 4.0)
+
+
+def tail_ops(x: float, act: str) -> int:
+    """gpnae_tail's cycles for one element alone, from its first state to T_DONE: each step is request, issue, unit, state update."""
+    cm, ca = MUL_LAT + 2, ADD_LAT + 2
+    a = x if act == "selu" else -abs(x) if act == "sigmoid" else -2 * abs(x)  # e^a, a <= 0
+    if act == "tanh" and abs(x) >= 64.0:
+        a = -math.inf  # x's exponent at BIAS + 6: the underflow path
+    out = ca if act == "tanh" or (act == "sigmoid" and x >= 0) else 0  # 1 - 2s, 1 - s, or s as it is
+    if abs(a) > 104.0:  # e^a underflows: straight to the closing steps
+        return cm if act == "selu" else ca + cm + ca + cm + out
+    mant, m = math.frexp(abs(a))  # |a| = mant * 2^m, mant in [0.5, 1): the Taylor z = a / 2^m and m doublings back
+    z = -mant if m > 0 else a
+    m = max(m, 0)
+    ops = 10 * (cm + ca) + cm  # Taylor e^z - 1 from 1/11!: ten multiply-add rounds, then d = z * acc
+    if act == "selu":
+        return ops + m * (ca + cm) + cm  # m rounds of d = d * (d + 2), then lambda * alpha * d
+    ops += ca  # E = 1 + d
+    for j in range(m):  # E squared m times, cut short once E drops below 2^-63
+        if z * 2 ** j < -63 * math.log(2):
+            ops += 1
+            break
+        ops += cm
+    return ops + ca + cm + ca + cm + out  # u = 1 - E, v = E u, w = 1 - v, s = E w, then the output step
+
+
+def lane_cycles(xs: list, act: str, s: int) -> int:
+    """Cycle of a lane's last done_o, its first G_CAP at s: groups of GROUP_K run capture, load, MAC, post and emit in turn."""
+    int8, tanh, ncoef, loop = FMT == "int8", act == "tanh", degree(act) + 1, MAC_LAT[FMT]
+    for g in range(0, len(xs), GROUP_K):
+        grp = xs[g:g + GROUP_K]
+        n = len(grp)
+        # G_CAP n + 3, then G_LOAD n and G_LDRAIN to barrel_mac's RUN: the float lane loads while capturing unless tanh squares.
+        if int8:
+            run = s + 2 * n + MUL_LAT + 7 + (FX_LAT + 1 if tanh else 0)
+        else:
+            run = s + (2 * n + MUL_LAT + 7 if tanh else n + 5)
+        post = run + ncoef * max(n, loop + 1) + loop + 3 + n  # RUN rounds of max(n, loop + 1), DRAIN loop + 2, EMIT n: G_POST
+        if int8:  # result flag MUL_LAT (+ REQ_LAT for SELU) after the issue; sigmoid in place; tanh's saturated inputs read as unsaturated
+            lat = [MUL_LAT + REQ_LAT if act == "selu" else MUL_LAT if tanh else -1] * n
+        else:
+            lat = [(-1 if x >= 0 else DN_LAT[FMT]) if act == "sigmoid" else MUL_LAT for x in grp]
+        ready = [post + i + 2 + lat[i] for i in range(n)]
+        if not int8:  # tail elements start as captured, one per cycle, on TAIL_CTX contexts; unit contention is not modelled
+            free, last = [-1] * TAIL_CTX, -1
+            for i, x in enumerate(grp):
+                if in_tail(x, act):
+                    c = free.index(min(free))
+                    t0 = max(s + 4 + i, last + 1, free[c])
+                    ops = tail_ops(x, act)
+                    free[c], last, ready[i] = t0 + 2 + ops, t0, t0 + 3 + ops
+        e = post + n - 1  # G_EMIT from post + n: one element per cycle once its result is in
+        for r in ready:
+            e = max(e + 1, r)
+        s = e + 2  # G_NEXT, then the next group's G_CAP
+    return e + 1
+
+
+def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
+    """Activation stage cycles of a lane set (median over the streamed sets): FEED to the cycle after every lane is collected."""
+    per_lane, lanes = P["SRAM_DEPTH"] // P["NUM_LANES"], P["NUM_LANES"]
+    start = per_lane + 3 + (REQ_LAT if FMT == "int8" else 0)  # last_i: FEED, LATCH, the wide reads, the fill count, the requantize
+    if FMT == "int8":  # no tail path: every set costs the same
+        return lane_cycles([0.0] * per_lane, act, start + 1) + 2
+    out = []
+    for k in range(P["NUM_SETS"]):
+        xs = lane_inputs(k, P, collapse)
+        out.append(max(lane_cycles(xs[L * per_lane:(L + 1) * per_lane], act, start + 1) for L in range(lanes)) + 2)
+    return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
 def fmt_table(rows: list, cols: list) -> list:
@@ -211,8 +302,7 @@ def one_config(name: str, args) -> tuple:
           f"  Design model : host {mdl['host']} (measured {stage['host']}), mesh interval {mdl['mesh']} (measured min "
           f"{stage['mesh']}, host-bound), mesh latency {mdl['mesh_lat']} (measured {first['mesh']} on the first output"
           + (f", over its {P} depth passes" if P > 1 else "") + "), "
-          + (f"activation {mdl['act']} (measured {stage['activation']})" if "act" in mdl else
-             f"activation: {mdl.get('act_rounds', '-')} cycles of polynomial rounds in the measured {stage['activation']}")
+          + f"activation {mdl.get('act', '-')} (measured {stage['activation']})"
           + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}",
           f"  Matmul rate  : {flop} {op} per set -> {flop / steady:.1f} {op}/cycle, {rate_s(steady)}"
           f" at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"

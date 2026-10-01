@@ -383,16 +383,16 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
     if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
         rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
     x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
-    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, 16.0).astype(np.float32), "selu"))
-    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -25 / s_selu)  # the lane's SELU value, in units of 2^-25, to its int8 code (D-4)
+    x_hi = gpnae_model.SELU_POS_SAT / 2048.0  # the lane's SELU: Q4.11 below 0, lambda * x exact up to here (int32 in 2^-22)
+    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, x_hi).astype(np.float32), "selu"))
+    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -22 / s_selu)  # the lane's SELU value, in units of 2^-22, to its int8 code (D-4)
     rq.update(mout=int(mout), shout=int(shout), zout=z_selu, s_selu=s_selu)
     return rq
 
 
 def selu_saturates(mx: int, shx: int, z_in: int, q) -> np.ndarray:
-    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in) to 16 or more, where Q4.11 saturates SELU's positive branch."""
-    p = (np.asarray(q, np.int64) - int(z_in)) * int(mx)
-    return (p if shx == 0 else (p + (1 << (shx - 1))) >> shx) >= 1 << (4 + gpnae_model.Q)
+    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in), unsaturated, to x >= 487.29, where lambda * x leaves int32 in 2^-22."""
+    return gpnae_model.selu_pos_saturates(gpnae_model.rescale_wide(np.asarray(q, np.int64), int(z_in), int(mx), int(shx)))
 
 
 def int8_lane():
@@ -534,7 +534,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
     starts = list(range(0, num_sets, passes))
     acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
     zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
-    sat = [0, 0]  # activated SELU sets: lane inputs at or above 16, and all their lane inputs
+    sat = [0, 0]  # activated SELU sets: lane inputs where lambda * x saturates, and all their lane inputs
     for g, g0 in enumerate(starts):
         ks = list(range(g0, min(g0 + passes, num_sets)))
         act_g = acts_g[g]
@@ -564,7 +564,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
             if k == 0:
                 first = (parts[0][0], parts[0][1], hw_bias, rq_k)
     if sat[1]:
-        print(f"      SELU saturation: {sat[0]} of {sat[1]} lane inputs >= 16 (bit-exact against the saturating golden)")
+        print(f"      SELU saturation: {sat[0]} of {sat[1]} lane inputs at x >= {gpnae_model.SELU_POS_SAT / 2048:.2f}, where lambda * x "
+              f"saturates at int32 (bit-exact against the saturating golden)")
     # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
     a0, b0, hb0, rq0 = first
     C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)

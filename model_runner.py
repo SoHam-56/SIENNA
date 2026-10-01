@@ -435,7 +435,7 @@ class LayerSim:
             raise ValueError(f"{tag}: an int8 job needs its requantize parameters (job['req'])")
         rq = job.get("req")
         if int8 and job["act"] == "selu" and regression.selu_saturates(rq["mx"], rq["shx"], rq["zp"], rq["amax"]):  # the clamp's top code
-            raise ValueError(f"{tag}: SELU layer input range reaches 16: the int8 lane saturates it to 16 * lambda")
+            raise ValueError(f"{tag}: SELU layer input range reaches x = 487.29: the int8 lane saturates lambda * x at int32 (512)")
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")

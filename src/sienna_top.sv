@@ -136,6 +136,11 @@ module sienna_top #(
   p_state_t p_state;
 
   logic mesh_input_ready, host_accept, g_accept, g_done, p_accept, p_release, pool_done;
+  // g_done: the stage may take the next set; bank_done: bank bank_sel holds a whole set (later than g_done for an int8 ReLU or linear set).
+  logic bank_done, bank_sel, byp_all_in, rq_drain;
+  logic lane_v;  // a beat for the fill counters and the lanes
+  logic byp_wr, byp_bank;  // int8: a ReLU or linear beat to write, and its bank
+  logic [FCNT_W-1:0] byp_idx;  // its element within each lane's block
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
@@ -406,9 +411,11 @@ module sienna_top #(
   // =========================================================================
   always_ff @(posedge clk_i) begin
     // Beat b of the wide read holds element k*PER_LANE + b in word k, the element lane k would have taken.
-    if (g_state != G_IDLE && act_bypass && fill_v)
+    if (!IS_INT && g_state != G_IDLE && act_bypass && fill_v)
       for (int k = 0; k < NUM_LANES; k++)
-        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (!IS_INT && act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+    if (IS_INT && byp_wr)  // int8: a beat lands where its own tag says, so it may leave the requantize pipeline after its set left the stage
+      for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + k * PER_LANE + int'(byp_idx)] <= fill_d[k];
     if (g_state == G_ROUND && !act_bypass) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
@@ -537,9 +544,9 @@ module sienna_top #(
   // Not while the previous result's read or release is in flight: its bank flag may still read full.
   assign g_accept = (g_state == G_IDLE) && !set_accum[g_next_id] && systolic_collection_complete && !act_full[act_wr] &&
                     !systolic_read_enable && !systolic_release;
-  assign g_done = (g_state == G_ROUND) && (act_bypass ? (fill_count[0] == PER_LANE[FCNT_W-1:0]) : all_collected);
+  assign g_done = (g_state == G_ROUND) && (act_bypass ? byp_all_in : all_collected);
   logic g_null_done;  // a partial set, summed in the PEs, passes with no result and no activation bank
-  assign g_null_done = (g_state == G_IDLE) && (mesh_sets != 0) && set_accum[g_next_id];
+  assign g_null_done = (g_state == G_IDLE) && (mesh_sets != 0) && set_accum[g_next_id] && !rq_drain;
   // Pooling completes sets in id order: a partial in one cycle, never right after another completion, so pulses stay one cycle.
   logic complete_q, p_null;
   assign p_null = (p_state == P_IDLE) && (gp_sets != 0) && set_accum[p_next_id] && !complete_q;
@@ -593,15 +600,13 @@ module sienna_top #(
         P_WAIT:     if (streaming_complete) p_state <= P_IDLE;
         default:    p_state <= P_IDLE;
       endcase
-      if (g_done) begin
-        act_full[act_wr] <= 1'b1;
-        act_wr <= ~act_wr;
-      end
+      if (bank_done) act_full[bank_sel] <= 1'b1;
+      if (g_done) act_wr <= ~act_wr;
       if (p_release) begin
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
-      gp_sets <= gp_sets + CRW'(g_done || g_null_done) - CRW'(pipeline_complete_o);
+      gp_sets <= gp_sets + CRW'(bank_done || g_null_done) - CRW'(pipeline_complete_o);
       credits   <= credits - CRW'(host_accept) + CRW'(pipeline_complete_o);
       mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept || g_null_done);
       if (g_accept) g_set_id <= g_next_id;
@@ -717,9 +722,56 @@ module sienna_top #(
         .valid_o (fill_v),
         .result_o(fill_d)
     );
+    // Each beat's destination rides beside tfliteRequant, which takes its own mult, shift, zp, min and max at stage 1.
+    localparam int RQL = sienna_fmt_pkg::req_lat();
+    logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
+    logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
+    logic [RQL-1:0] tg_byp, tg_bank;
+    logic [FCNT_W-1:0] tg_idx[RQL];
+    always_ff @(posedge clk_i or negedge rstn_i) begin
+      if (!rstn_i) begin
+        rq_in <= '0;
+        tg_v  <= '0;
+      end else begin
+        if (g_state == G_IDLE) rq_in <= '0;
+        else if (wide_rd_valid) rq_in <= rq_in + 1'b1;
+        tg_v <= {tg_v[RQL-2:0], wide_rd_valid};
+      end
+    end
+    always_ff @(posedge clk_i) begin  // no reset: read only beside tg_v / fill_v
+      tg_byp  <= {tg_byp[RQL-2:0], act_bypass};
+      tg_bank <= {tg_bank[RQL-2:0], act_wr};
+      tg_idx[0] <= rq_in;
+      for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
+    end
+    assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last read is in: the stage may leave while it drains
+    assign rq_drain   = |tg_v;
+    assign lane_v     = fill_v && !tg_byp[RQL-1];
+    assign byp_wr     = fill_v && tg_byp[RQL-1];
+    assign byp_bank   = tg_bank[RQL-1];
+    assign byp_idx    = tg_idx[RQL-1];
+    // The bank is full when a ReLU or linear set's last beat leaves the pipeline, or when the lanes return a set.
+    assign bank_done  = (byp_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1)) || (g_done && !act_bypass);
+    assign bank_sel   = byp_wr ? tg_bank[RQL-1] : act_wr;
+`ifndef SYNTHESIS
+    a_rq_tag_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) fill_v == tg_v[RQL-1])
+      else $error("sienna_top: the requantize sideband is out of step with requant_lanes");
+    a_rq_bank_once: assert property (@(posedge clk_i) disable iff (!rstn_i) !(byp_wr && g_done && !act_bypass))
+      else $error("sienna_top: a drained ReLU or linear set and a lane set completed banks in the same cycle");
+    a_rq_bank_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) bank_done |-> !act_full[bank_sel])
+      else $error("sienna_top: a set completed into a full activation bank");
+`endif
   end else begin : G_NO_REQ
-    assign fill_v = wide_rd_valid;
-    assign fill_d = wide_rd_data;
+    assign fill_v     = wide_rd_valid;
+    assign fill_d     = wide_rd_data;
+    assign lane_v     = fill_v;
+    assign byp_wr     = 1'b0;
+    assign byp_bank   = 1'b0;
+    assign byp_idx    = '0;
+    assign byp_all_in = (fill_count[0] == PER_LANE[FCNT_W-1:0]);
+    assign rq_drain   = 1'b0;
+    assign bank_done  = g_done;
+    assign bank_sel   = act_wr;
   end
 
   always_comb begin
@@ -743,7 +795,7 @@ module sienna_top #(
         lane_collected_n[i] = 1'b0;
       end
     end else begin
-      if (fill_v) begin
+      if (lane_v) begin
         filled_total_n = filled_total + NUM_LANES[TOT_W-1:0];
         for (int i = 0; i < NUM_LANES; i++) begin
           gpnae_signal_n[i] = fill_d[i];

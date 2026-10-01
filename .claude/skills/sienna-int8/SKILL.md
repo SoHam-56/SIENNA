@@ -123,9 +123,10 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   multipliers and shifts); int8 has 35 tests, the plan's 33 plus `int8_mixed_act_train` and `int8_pad_negative_tanh`.
 - Task 21: the TFLite path uses only the model's own words: the multipliers and shifts from the G0 npz and the model's
   int32 bias tensor (with the -z_in * sum(w) fold), never the regression's `requant_params` or `fold_bias`.
-- Task 22: the performance model counts 3 requantize cycles in int8 (exact against measured; 5a removed them from the
-  ReLU / linear activation stage, see the drain-overlap line); it undercounts GPNAE lane
-  time by 50-76 cycles per set in every format, which predates the int8 work and was not retuned.
+- Task 22: the performance model counted 3 requantize cycles in an int8 ReLU / linear activation stage; since 9dbced4
+  (5a) it does not (`per_lane + 4` in every format, still 1 above measured), because that set leaves the stage while
+  its beats drain. Its GPNAE lane model counted only the Horner rounds, 50-76 cycles per set short in every format;
+  5b replaced it (see the activation-model line).
 - N = 64 (Soham 2026-09-29): skipped while testing; G3 and G4 ran N = 8-32, and every N = 64 run (int8 and the fp32 /
   bf16 references, both collapse modes) is one final sweep after check-in.
 - Final fix: int8 ReLU relies on the host clamp. `sienna_top` (its `!IS_INT &&` ReLU bypass) and `gpnae_poly_int8` both
@@ -153,6 +154,18 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   full, once, when that beat leaves (a partial set waits out a drain). N = 32 ReLU 39 -> 36 cycles per set, as fp32;
   GPNAE sets unchanged (the lanes, not the drain, hold the stage). `TB_sienna_top` fails if a drain held a waiting
   result and never overlapped. D-8 in `sienna_layer`: `mult_buf` / `shift_buf` load without reset.
+- Drain-overlap hardening (2026-10-01): int8 has 37 tests. `int8_mixed_bypass_lane_nopool` (relu, tanh, linear, selu,
+  no pooling, `zp_random` and `req_random`) drains a ReLU or linear set into a GPNAE set's fill, and
+  `int8_accum2_mixed_bypass_nopool` puts a partial set behind each draining one; both are bit-exact at N = 16 and 32.
+  `TB_sienna_top` fails a pass in which a draining ReLU or linear set still holds the stage while the next set could
+  start (old RTL: 3 cycles per set) or a partial set passes during a drain, and prints the overlap-into-lane-set and
+  partial-set-held counts. `sienna_top`'s `a_rq_one_set` (int8, simulation only): a set's first beat never enters the
+  requantize pipeline while a beat is in it; it holds for `req_lat()` up to 4 and fires at 5.
+- Activation model (5b, 2026-10-01): `perf_analysis.lane_stage` walks the lane FSMs per group of 16 (capture, load,
+  barrel_mac's rounds, drain and emit, the post stage, emit, G_NEXT) and, in fp32 and bf16, gpnae_tail's op chain per
+  tail element on its 4 contexts, on the bit-exact mesh model's inputs. Against the g8p and ov_5a runs (N = 8-64, every
+  T and format) it is exact or 1-7 cycles (at most 0.4%) low; gpnae_tail's shared-unit grants and one result per cycle
+  are left out, so it is a lower bound per set.
 
 ## Out of scope (2a)
 

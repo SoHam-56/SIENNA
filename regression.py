@@ -1070,6 +1070,14 @@ PIPELINE_TESTS = [
     # int8 only: all-negative A drives whole columns to tanh's -128, so edge windows hold only -128 beside the -128 pad.
     {"name": "int8_pad_negative_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "a_range": (-1.0, -0.5),
      "scale": 2.5, "formats": ("int8",)},
+    # int8 only: each ReLU or linear set drains its requantize beats into a GPNAE set's fill; every set has its own zp, clamps, multipliers.
+    {"name": "int8_mixed_bypass_lane_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu",
+     "pool_h": 1, "pool_w": 1, "padding": 0, "mixed_acts": ["relu", "tanh", "linear", "selu"], "req_random": True,
+     "zp_random": True, "num_sets": 16, "formats": ("int8",)},
+    # int8 only: the same with a partial set right behind each draining ReLU or linear set, which must wait out the drain.
+    {"name": "int8_accum2_mixed_bypass_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "accum_passes": 2,
+     "pool_h": 1, "pool_w": 1, "padding": 0, "mixed_acts": ["relu", "relu", "tanh", "tanh", "linear", "linear", "selu", "selu"],
+     "req_random": True, "zp_random": True, "num_sets": 16, "formats": ("int8",)},
 ]
 
 

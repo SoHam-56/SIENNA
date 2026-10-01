@@ -337,8 +337,6 @@ module sienna_layer #(
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
             for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= IS_INT ? w_bias_i[c] : ACC_W'(w_data_i[c]);
-            mult_buf[wl_blk[0]] <= w_req_mult_i;
-            shift_buf[wl_blk[0]] <= w_req_shift_i;
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;
@@ -382,6 +380,13 @@ module sienna_layer #(
       end
     end
   end
+
+  // D-8: the requantize words carry no reset, so rstn_i is no hold enable on them; readers wait for bias_in, set by the same beat.
+  always_ff @(posedge clk_i)
+    if (wl_take_bias) begin
+      mult_buf[wl_blk[0]]  <= w_req_mult_i;
+      shift_buf[wl_blk[0]] <= w_req_shift_i;
+    end
 
   assign busy_o = active;
 

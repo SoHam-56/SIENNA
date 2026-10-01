@@ -670,8 +670,8 @@ module TB_sienna_top;
             ov_rq++;
             if (rq_byp[0] != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
           end
-          // A ReLU or linear set's reads are all in and the next result is ready with a free bank: only the drain holds it.
-          else if (rq_byp[0] != 0 && !dut.wide_rd_valid && !dut.systolic_read_enable && !dut.systolic_release &&
+          // A ReLU or linear set's reads are all in, the next result is ready with a free bank, yet not accepted: the drain holds it.
+          else if (rq_byp[0] != 0 && !dut.g_accept && !dut.wide_rd_valid && !dut.systolic_read_enable && !dut.systolic_release &&
                    dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
                    !dut.act_full[rq_bank[0] == 0])
             rq_wait++;

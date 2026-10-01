@@ -760,6 +760,8 @@ module sienna_top #(
       else $error("sienna_top: a drained ReLU or linear set and a lane set completed banks in the same cycle");
     a_rq_bank_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) bank_done |-> !act_full[bank_sel])
       else $error("sienna_top: a set completed into a full activation bank");
+    a_rq_one_set: assert property (@(posedge clk_i) disable iff (!rstn_i) (wide_rd_valid && rq_in == '0) |-> !rq_drain)
+      else $error("sienna_top: a set's first beat entered the requantize pipeline while an earlier beat was still in it");
 `endif
   end else begin : G_NO_REQ
     assign fill_v     = wide_rd_valid;

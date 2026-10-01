@@ -424,11 +424,16 @@ module TB_sienna_top;
                    real'($bitstoshortreal(dut.fifo2_wr_data[lane])), dut.fifo2_wr_data[lane]);
         end
       end
-      // Console Print: Data exiting Dropout to final Output
+      // Console Print: Data exiting Dropout to final Output, dec in the build's format (int8: the signed code)
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.dropout_valid_out[lane]) begin
-          $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%.4f  hex=%08x", $time, lane,
-                   real'($bitstoshortreal(dut.dropout_data_out[lane])), dut.dropout_data_out[lane]);
+          if (EXP_W == 0)
+            $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%0d  hex=%08x", $time, lane,
+                     $signed(dut.dropout_data_out[lane][7:0]), dut.dropout_data_out[lane]);
+          else
+            $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%.4f  hex=%08x", $time, lane,
+                     f32((EXP_W == 8 && MAN_W == 7) ? {16'(dut.dropout_data_out[lane]), 16'h0} : 32'(dut.dropout_data_out[lane])),
+                     dut.dropout_data_out[lane]);
         end
       end
     end

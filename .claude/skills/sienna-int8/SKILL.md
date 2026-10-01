@@ -8,6 +8,9 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 **Status: 2a implemented and verified 2026-09-30 on the `int8` branch of all four repos, at N = 8-32; N = 64 is
 deferred to one final sweep after check-in (Soham 2026-09-29); 2b not started.**
 Gate reports, verbatim in the `sienna-report` skill's `history/`:
+- 2026-10-01 rerun after the requantize split and the Taylor capture fix (farm runs `sp_*`, not in `history/`): G1
+  `sp_g1` PASS, G2 `sp_g2` bit-exact, SIENNA int8 37/37 at N = 16 and 32 (both mesh modes, random power-up at N = 16),
+  output words identical to the `hb_*` runs; see the two As-built lines below
 - G4 SIENNA: `2026-09-30_sienna_int8_g4.txt` (farm runs `g8*`; GATE G4: PASS; regression 35/35 exact at N = 16 and 32
   in both mesh modes and at random power-up, TFLite int8 layers equal to the interpreter at N16 T4 and N32 T8, fp32 /
   bf16 identical in results, cycles and output words; N = 64 deferred to the final sweep)
@@ -95,8 +98,8 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 
 - Requantize parameters of an accumulate group come from its activated pass, the last, like `activation_function_i`;
   the bias comes with the first pass (the mesh's rule). Partial passes may carry anything: the regression gives them decoys.
-- The requantize stage is `src/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 3 cycles
-  at the lane feed; `sienna_top` holds each set's parameters by set id and copies the per-channel words at `g_accept`.
+- The requantize stage is `src/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 4 cycles
+  (`req_lat()`; 3 before the split below) at the lane feed; `sienna_top` holds each set's parameters by set id and copies the per-channel words at `g_accept`.
   It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `regression._check_rounding()` checks that the
   package, `ipu.REQ_ROUNDING` and `rounding.txt` agree.
 - `sienna_layer` in int8 always takes a bias beat per column block; its int32 bias, multipliers and shifts come on
@@ -151,21 +154,45 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   activation fill overlaps the drain. `tfliteRequant` takes mult, shift, zp, min and max at stage 1; `sienna_top`
   pipelines each beat's destination (ReLU / linear flag, activation bank, element index) beside it for `req_lat()`
   cycles. An int8 ReLU or linear set leaves the activation stage once its last wide read is in; its bank is marked
-  full, once, when that beat leaves (a partial set waits out a drain). N = 32 ReLU 39 -> 36 cycles per set, as fp32;
+  full, once, when that beat leaves (a partial set waits out a drain). N = 32 ReLU 39 -> 36 cycles per set, as fp32 (36.5 since the split);
   GPNAE sets unchanged (the lanes, not the drain, hold the stage). `TB_sienna_top` fails if a drain held a waiting
   result and never overlapped. D-8 in `sienna_layer`: `mult_buf` / `shift_buf` load without reset.
 - Drain-overlap hardening (2026-10-01): int8 has 37 tests. `int8_mixed_bypass_lane_nopool` (relu, tanh, linear, selu,
   no pooling, `zp_random` and `req_random`) drains a ReLU or linear set into a GPNAE set's fill, and
   `int8_accum2_mixed_bypass_nopool` puts a partial set behind each draining one; both are bit-exact at N = 16 and 32.
   `TB_sienna_top` fails a pass in which a draining ReLU or linear set still holds the stage while the next set could
-  start (old RTL: 3 cycles per set) or a partial set passes during a drain, and prints the overlap-into-lane-set and
-  partial-set-held counts. `sienna_top`'s `a_rq_one_set` (int8, simulation only): a set's first beat never enters the
-  requantize pipeline while a beat is in it; it holds for `req_lat()` up to 4 and fires at 5.
+  start (1b4bf1a's RTL at `req_lat()` 3: 3 cycles per set) or a partial set passes during a drain, and prints the
+  overlap-into-lane-set and partial-set-held counts. `sienna_top`'s `a_rq_one_set` (int8, simulation only: a set's first
+  beat never enters the requantize pipeline while a beat is in it) is stricter than the real bank-reuse hazard: each beat
+  carries its own sideband, so two sets' beats could share the pipeline safely. It holds at `req_lat()` = 4 by
+  construction with 0 margin, from the fixed 5-cycle chain (last read t, `g_done` t+1, G_IDLE t+2, G_FEED t+3, read
+  enable t+4, `wide_valid` t+5); its firing at 5 marks where the invariant stops, not where the design breaks.
 - Activation model (5b, 2026-10-01): `perf_analysis.lane_stage` walks the lane FSMs per group of 16 (capture, load,
   barrel_mac's rounds, drain and emit, the post stage, emit, G_NEXT) and, in fp32 and bf16, gpnae_tail's op chain per
   tail element on its 4 contexts, on the bit-exact mesh model's inputs. Against the g8p and ov_5a runs (N = 8-64, every
   T and format) it is exact or 1-7 cycles (at most 0.4%) low; gpnae_tail's shared-unit grants and one result per cycle
-  are left out, so it is a lower bound per set.
+  are left out, so it is a lower bound per set. Since the split it reads mul_lat, add_lat, fx_lat and req_lat from
+  `sienna_fmt_pkg` and K and TAIL_CONTEXTS from `gpnae_poly` (it fails if they change form or sienna_top overrides
+  them); at `req_lat()` 4 it equals measured on every int8 lane config at N = 8, 16 and 32.
+- Requantize split (Soham 2026-10-01): `tfliteRequant` is 4 stages and `req_lat()` 4 (AriL cb46ced). A Yosys / ABC
+  generic-gate depth study (`testbenches/results/int8/logic_depth.log`) found stage 3, four carry chains in series (the
+  RoundingDivideByPOT compare, its +1, the + zp add, two clamps), at 69 gates in DOUBLE and 75 in SINGLE, against 25 and
+  24 for the fp32 multiplier and adder; stage 3 now ends at q, the rounded shift (zp, act_min, act_max carried beside it),
+  and stage 4 adds zp and clamps. Stage by stage (the probes) the stages are 8, 46, 34-35 and 40-41, so the worst is
+  stage 2 at about 46 (1.8x fp32); mapped as a whole unit every variant reads 52-54 (stage 4, identical logic, is 44 in
+  DOUBLE and 53 in SINGLE: ABC noise of about 20%), from 69-75. All consumers take `req_lat()`. Results unchanged bit
+  for bit (G1, G2, G4 words identical); cycles +1 per single set, +1 to 17 per streamed pass, G2 STREAM +22. Cost:
+  a bank is marked full one cycle later, so at N = 32 the int8 ReLU / linear stage alternates 36 and 37 cycles while it
+  waits for pooling to free a bank, 36.5 per set (+1.4%, int8 ReLU / linear at N = 32 only; N = 16 stays 19); a third
+  activation bank would remove it, Soham's option. With it, `TB_sienna_top`'s drain-overlap absence check counts only
+  cycles that do not accept the next set (`!g_accept`): the last beat can now leave in the accept cycle, which held
+  nothing; 1b4bf1a's RTL still fails the check.
+- Taylor lane capture fix (Soham 2026-10-01, GPNAE a3d580c): `gpnae`'s G_CAP read the FIFO head as soon as `empty_o`
+  fell, but a word written into an empty FIFO reaches `data_o` 3 edges later, so a held `last_i`, `last_i` on or one
+  cycle after the write, and G_NEXT or G_WAIT -> G_CAP after a refill of a drained FIFO captured a stale word. It now
+  waits until `empty_o` was low at the last two edges; every capture that was correct keeps its cycle (fpref
+  identical). `TB_gpnae`'s TIMING lines drive all five timings (old RTL fails them, new passes). A write into a partly
+  drained FIFO still reorders words (InputFIFO is a slot pool), in both lanes.
 
 ## Out of scope (2a)
 

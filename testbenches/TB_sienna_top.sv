@@ -652,6 +652,9 @@ module TB_sienna_top;
   // int8: set id, activation bank and bypass flag of each beat inside the requantize pipeline, oldest first.
   int rq_id[$], rq_bank[$], rq_byp[$];
   int ov_rq = 0, rq_wait = 0;
+  int ov_lane = 0, rq_hold = 0, rq_null_wait = 0, rq_null_pass = 0, rd_in = 0;  // rd_in: wide reads of the stage's set so far
+  wire next_ready = dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
+                    !dut.systolic_read_enable && !dut.systolic_release;  // g_accept's terms but the stage state and the bank
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0) begin
@@ -659,16 +662,29 @@ module TB_sienna_top;
         rq_id.delete();
         rq_bank.delete();
         rq_byp.delete();
+        rd_in = 0;
       end else begin
         if (stream_on && rq_id.size() != 0) begin
           // Overlap: set k's beats still in the requantize pipeline while the activation stage holds set k+1.
-          if (int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) ov_rq++;
+          if (int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) begin
+            ov_rq++;
+            if (rq_byp[0] != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
+          end
           // A ReLU or linear set's reads are all in and the next result is ready with a free bank: only the drain holds it.
           else if (rq_byp[0] != 0 && !dut.wide_rd_valid && !dut.systolic_read_enable && !dut.systolic_release &&
                    dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
                    !dut.act_full[rq_bank[0] == 0])
             rq_wait++;
+          // The draining ReLU or linear set still holds the stage, not leaving this cycle, though the next set could start.
+          if (int'(dut.g_state) != 0 && rq_id[0] == int'(dut.g_set_id) && rq_byp[0] != 0 && dut.act_bypass &&
+              rd_in == SRAM_DEPTH / NUM_LANES && !dut.g_done && next_ready && !dut.act_full[!dut.act_wr])
+            rq_hold++;
+          // A partial set that could pass the stage but for the drain, and one that passed during it.
+          if (int'(dut.g_state) == 0 && dut.mesh_sets != 0 && dut.set_accum[dut.g_next_id]) rq_null_wait++;
+          if (dut.g_null_done) rq_null_pass++;
         end
+        if (int'(dut.g_state) == 0) rd_in = 0;
+        else if (dut.wide_rd_valid) rd_in++;
         if (dut.fill_v) begin
           void'(rq_id.pop_front());
           void'(rq_bank.pop_front());
@@ -737,6 +753,10 @@ module TB_sienna_top;
     bp_act = 0;
     ov_rq = 0;
     rq_wait = 0;
+    ov_lane = 0;
+    rq_hold = 0;
+    rq_null_wait = 0;
+    rq_null_pass = 0;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
@@ -848,12 +868,25 @@ module TB_sienna_top;
       $display("  [Stream] activation/pooling overlap not reachable: no mesh result was ready while pooling ran");
     if (EXP_W == 0) begin
       $display("  [Stream] requantize pipeline held set k while set k+1 was in the activation stage: %0d cycles", ov_rq);
+      $display("  [Stream] of those, a ReLU or linear set draining while a GPNAE lane set held the stage: %0d cycles", ov_lane);
       if (rq_wait > 0 && ov_rq == 0) begin
         failed++;
         $display("  [FAIL] Overlap: a mesh result waited %0d cycles on a ReLU or linear set's requantize drain, yet no drain overlapped the next set",
                  rq_wait);
       end else if (rq_wait == 0)
         $display("  [Stream] requantize drain overlap not reachable: no mesh result waited on a ReLU or linear set's drain");
+      $display("  [Stream] stage held by a ReLU or linear set with every read in, the next result ready and a bank free: %0d cycles",
+               rq_hold);
+      if (rq_hold > 0) begin
+        failed++;
+        $display("  [FAIL] Overlap: a ReLU or linear set held the activation stage for %0d cycles of its requantize drain", rq_hold);
+      end
+      $display("  [Stream] partial set held back by the requantize drain: %0d cycles", rq_null_wait);
+      if (rq_null_pass > 0) begin
+        failed++;
+        $display("  [FAIL] A partial set passed the activation stage in %0d cycles while the requantize pipeline held beats",
+                 rq_null_pass);
+      end
     end
     if (max_in_flight > SETS_IN_FLIGHT) begin
       failed++;

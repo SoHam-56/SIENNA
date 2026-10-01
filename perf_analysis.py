@@ -97,7 +97,6 @@ DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in
 MUL_LAT, ADD_LAT = 8, 5  # valid in to done out: fp32Multiplier and fp32Adder; main() sets the build's format's values
 UNIT_LAT = {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg::mul_lat, add_lat
 MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
-REQ_LAT = {"fp32": 0, "bf16": 0, "int8": 3}  # tfliteRequant at the lane feed (sienna_fmt_pkg::req_lat()), int8 only
 FMT = "fp32"  # the build's format; main() sets it
 
 
@@ -143,7 +142,7 @@ def model(cfg: dict, collapse: bool = True) -> dict:
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
     m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
     if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
-        m["act"] = per_lane + 4 + REQ_LAT[FMT]  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, the requantize stage in int8, then done
+        m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done; int8 leaves while the requantize drains
     elif act in DEGREE:
         m["act_rounds"] = (degree(act) + 1) * max(per_lane, MAC_LAT[FMT] + 1)  # barrel MAC round: max(n, Horner loop + 1)
     return m

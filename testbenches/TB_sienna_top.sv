@@ -649,6 +649,40 @@ module TB_sienna_top;
     end
   end
 
+  // int8: set id, activation bank and bypass flag of each beat inside the requantize pipeline, oldest first.
+  int rq_id[$], rq_bank[$], rq_byp[$];
+  int ov_rq = 0, rq_wait = 0;
+  initial forever begin
+    @(negedge clk_i);
+    if (EXP_W == 0) begin
+      if (!rstn_i) begin
+        rq_id.delete();
+        rq_bank.delete();
+        rq_byp.delete();
+      end else begin
+        if (stream_on && rq_id.size() != 0) begin
+          // Overlap: set k's beats still in the requantize pipeline while the activation stage holds set k+1.
+          if (int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) ov_rq++;
+          // A ReLU or linear set's reads are all in and the next result is ready with a free bank: only the drain holds it.
+          else if (rq_byp[0] != 0 && !dut.wide_rd_valid && !dut.systolic_read_enable && !dut.systolic_release &&
+                   dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
+                   !dut.act_full[rq_bank[0] == 0])
+            rq_wait++;
+        end
+        if (dut.fill_v) begin
+          void'(rq_id.pop_front());
+          void'(rq_bank.pop_front());
+          void'(rq_byp.pop_front());
+        end
+        if (dut.wide_rd_valid) begin
+          rq_id.push_back(int'(dut.g_set_id));
+          rq_bank.push_back(int'(dut.act_wr));
+          rq_byp.push_back(int'(dut.act_bypass));
+        end
+      end
+    end
+  end
+
   task automatic verify_slice(input int k, input logic [DATA_WIDTH-1:0] exp_q[$]);
     automatic logic [DATA_WIDTH-1:0] bnd_q[$];
     automatic int lo = (k == 0) ? 0 : stream_bounds[k-1];
@@ -701,6 +735,8 @@ module TB_sienna_top;
     max_in_flight = 0;
     bp_mesh = 0;
     bp_act = 0;
+    ov_rq = 0;
+    rq_wait = 0;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
@@ -810,6 +846,15 @@ module TB_sienna_top;
                pool_with_result);
     end else if (ov_g_p == 0)
       $display("  [Stream] activation/pooling overlap not reachable: no mesh result was ready while pooling ran");
+    if (EXP_W == 0) begin
+      $display("  [Stream] requantize pipeline held set k while set k+1 was in the activation stage: %0d cycles", ov_rq);
+      if (rq_wait > 0 && ov_rq == 0) begin
+        failed++;
+        $display("  [FAIL] Overlap: a mesh result waited %0d cycles on a ReLU or linear set's requantize drain, yet no drain overlapped the next set",
+                 rq_wait);
+      end else if (rq_wait == 0)
+        $display("  [Stream] requantize drain overlap not reachable: no mesh result waited on a ReLU or linear set's drain");
+    end
     if (max_in_flight > SETS_IN_FLIGHT) begin
       failed++;
       $display("  [FAIL] %0d sets in flight, the credit limit is %0d", max_in_flight, SETS_IN_FLIGHT);

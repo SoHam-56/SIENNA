@@ -15,11 +15,12 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
   modes, random power-up; fp32 / bf16 cycles identical; N = 64 deferred to the final sweep)
 - G2 GPNAE: `2026-09-29_gpnae_gate_int8.txt` (Task 12; VERDICT: PASS for correctness, the lane bit-exact everywhere;
   accuracy against GPNAE's tolerance over the full Q4.11 range: SELU 0/262144 (over the Q4.11 range only) and tanh
-  0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5; SELU lane inputs at or above 16 saturate
-  to 16 * lambda (about 16.8), as the gate's not-gated SELU case s_in = 0.21875 shows: 49 of 256 outside, worst 102 LSB.
-  Open accuracy items: sigmoid below x = -3.5, and SELU at or above 16; the int8 regression's `matmul_large_selu`
-  reaches lane inputs of 19-68 at N = 8-64, default seed (113 of 4352 at or above 16 at N = 16), exact because its golden
-  saturates too)
+  0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5. Rerun 2026-10-01 after SELU fix A (farm
+  run `gb_c3_g2b`, not in `history/`): positive SELU is exact to lambda * x < 512 (x < 487.29) and saturates beyond;
+  the not-gated SELU case s_in = 0.21875 is 0 of 256 outside, worst 1 LSB (was 49 of 256, 102 LSB), and 64 positive
+  SELU sets per seed, x = 16 to past the limit, are bit-exact. Open accuracy items: sigmoid below x = -3.5, and SELU
+  past x = 487.29 (the host guard rejects it); the int8 regression's `matmul_large_selu` (lane inputs 19-68 at
+  N = 8-64, default seed) now has 0 saturated inputs and passes against the unsaturated golden)
 - G1 ArithmeticLibrary: `2026-09-29_aril_gate_int8.txt` (Task 8; VERDICT: PASS, all units bit-exact; fxMac sweeps
   2.58e10 results, 0 errors)
 - G0 oracle: `2026-09-29_g0_oracle_int8.txt` (Task 2; G0: PASS, ROUNDING: DOUBLE pinned; 24,832,000 outputs,
@@ -111,7 +112,8 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 - Task 10: `gpnae_model`'s SELU rounding reads `REQ_ROUNDING` from GPNAE's own `sienna_fmt_pkg.sv`, not SIENNA's
   `rounding.txt`, so the GPNAE checkout stands alone.
 - Task 11: `gpnae_poly_int8`'s G_RUN leaves on barrel_mac's `done_o` for a one-element group (the float lane's G_RUN,
-  copied, hung); the published float lane's same latent hang is reported to Soham, not changed.
+  copied, hung); the published float lanes' same latent hang is fixed the same way since (Soham 2026-09-30):
+  `gpnae_poly` in GPNAE 892eb7c, the Taylor lane `gpnae` in e6014b9, each with SINGLE lines in its TB.
 - Task 12: `TB_gpnae_poly` drives writes 1 ns after each clock edge in int8 mode (the zero-delay drive tripped the FIFO's
   full assertion at 32 writes per batch); float modes unchanged.
 - Task 16: PINMISSING is fatal in this flow, so `sienna_top`'s ten new inputs were tied off (`'0`) in its four
@@ -129,9 +131,17 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
 - Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
   skip them when bisecting.
-- Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches 16; the regression's
-  SELU tests report their saturated inputs and check them bit-exact against the saturating golden. The one check is
-  `regression.selu_saturates(mx, shx, z_in, q)`, the lane's own rescale of code q reaching 2^15, positive side only.
+- Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches x = 487.29, where
+  lambda * x leaves int32 in 2^-22; the regression's SELU tests print "SELU saturation: k of n lane inputs at
+  x >= 487.29" and check any such input bit-exact against the saturating golden. The one check is
+  `regression.selu_saturates(mx, shx, z_in, q)`, the lane's own unsaturated rescale of code q reaching
+  `gpnae_model.SELU_POS_SAT` (997960 in 2^-11), positive side only.
+- SELU fix A (Soham 2026-09-30): the SELU post stage works in 2^-22: x * P and -lambda*alpha * 1.0 as they are, and
+  lambda * x on the unsaturated 24-bit rescale (POSTM is `intMultiplier` W = 24), floored by 2^3 and saturated to
+  int32; `(gp_mout, gp_shout)` = QuantizeMultiplier(2^-22 / s_out), not 2^-25 as D-4 says. The regression calibrates
+  SELU's output scale on lane inputs clipped to [-16, 487.29], not [-16, 16]. Lane latency unchanged.
+- D-8 in `gpnae_poly_int8` (2026-10-01): FSM state, counters and valid bits are reset; its data registers (buffers,
+  unit operands, element tags, `final_result_o`) load in a reset-free `always_ff`.
 
 ## Out of scope (2a)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """perf_analysis on saved PERF traces (N=16, T=4, bf16, 24 streamed sets) and its activation-stage model of the GPNAE lanes."""
+import contextlib
 import os
 import statistics
 import sys
@@ -30,36 +31,48 @@ def test_single_pass_unchanged():
     assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
 
 
+@contextlib.contextmanager
 def fmt(f):
+    """perf_analysis's build format for the block, restored afterwards so no test depends on the order they run in."""
+    old = pa.FMT, pa.MUL_LAT, pa.ADD_LAT
     pa.FMT, (pa.MUL_LAT, pa.ADD_LAT) = f, pa.UNIT_LAT[f]
+    try:
+        yield
+    finally:
+        pa.FMT, pa.MUL_LAT, pa.ADD_LAT = old
+
+
+def test_rtl_lat():
+    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's mul_lat, add_lat, as parsed
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 16, 4)  # fx_lat, req_lat, gpnae_poly's K, TAIL_CONTEXTS
 
 
 def test_lane_stage_int8():
-    fmt("int8")  # no tail path, so the stage is data-free; each value derived from gpnae_poly_int8 and barrel_mac, and measured
-    stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
-    assert stage("selu", 16) == 95 and stage("tanh", 16) == 106  # g8p_N16_*_int8
-    assert stage("selu", 32) == 326 and stage("tanh", 32) == 364  # g8p_N32_*_int8
-    assert stage("selu", 8) == 51 and stage("tanh", 8) == 55  # g8p_N8_*_int8
+    with fmt("int8"):  # no tail path, so the stage is data-free; each value derived from gpnae_poly_int8 and barrel_mac, and measured
+        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
+        assert stage("selu", 16) == 96 and stage("tanh", 16) == 107  # sp_p16t2
+        assert stage("selu", 32) == 327 and stage("tanh", 32) == 365  # sp_p32t2, sp_p32t4
+        assert stage("selu", 8) == 53 and stage("tanh", 8) == 56  # sp_p8t2
 
 
 def test_lane_group_float():
-    fmt("fp32")  # one group, no tail element: last_i at per_lane + 3, so the first G_CAP at per_lane + 4
-    assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 195 and pa.lane_cycles([0.0] * 2, "tanh", 6) + 2 == 183
-    fmt("bf16")
-    assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 143 and pa.lane_cycles([0.0] * 32, "tanh", 36) + 2 == 529
+    with fmt("fp32"):  # one group, no tail element: last_i at per_lane + 3, so the first G_CAP at per_lane + 4
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 195 and pa.lane_cycles([0.0] * 2, "tanh", 6) + 2 == 183
+    with fmt("bf16"):
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 143 and pa.lane_cycles([0.0] * 32, "tanh", 36) + 2 == 529
 
 
 def test_tail_ops_fp32():
-    fmt("fp32")  # multiply 8 + 2, add 5 + 2 cycles per gpnae_tail step, by hand
-    assert pa.tail_ops(5.0, "tanh") == 10 * 17 + 10 + 7 + 4 * 10 + 7 + 10 + 7 + 10 + 7  # a = -10: four squarings
-    assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # a = -5: three doublings
-    assert pa.tail_ops(60.0, "tanh") == 7 + 10 + 7 + 10 + 7  # |a| = 120 > 104: e^a underflows
-    assert pa.tail_ops(-4.5, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10  # x < 0 keeps s, no output step
-    assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
+    with fmt("fp32"):  # multiply 8 + 2, add 5 + 2 cycles per gpnae_tail step, by hand
+        assert pa.tail_ops(5.0, "tanh") == 10 * 17 + 10 + 7 + 4 * 10 + 7 + 10 + 7 + 10 + 7  # a = -10: four squarings
+        assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # a = -5: three doublings
+        assert pa.tail_ops(60.0, "tanh") == 7 + 10 + 7 + 10 + 7  # |a| = 120 > 104: e^a underflows
+        assert pa.tail_ops(-4.5, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10  # x < 0 keeps s, no output step
+        assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
 
 
 if __name__ == "__main__":
-    for t in (test_accumulate_outputs_every_third_set, test_single_pass_unchanged, test_lane_stage_int8, test_lane_group_float,
-              test_tail_ops_fp32):
+    for t in (test_accumulate_outputs_every_third_set, test_single_pass_unchanged, test_rtl_lat, test_lane_stage_int8,
+              test_lane_group_float, test_tail_ops_fp32):
         t()
         print(f"PASS {t.__name__}")

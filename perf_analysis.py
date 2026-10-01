@@ -97,8 +97,29 @@ def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
 
 
 DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
-MUL_LAT, ADD_LAT = 8, 5  # valid in to done out: fp32Multiplier and fp32Adder; main() sets the build's format's values
-UNIT_LAT = {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg::mul_lat, add_lat
+FMT_KNOBS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # (EXP_W, MAN_W) of each build
+FMT_PKG = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
+
+
+def rtl_lat() -> tuple:
+    """sienna_fmt_pkg's unit latencies, parsed from the RTL: ({fmt: (mul_lat, add_lat)}, fx_lat, req_lat)."""
+    raw = open(FMT_PKG).read()
+
+    def body(fn: str, form: str) -> tuple:
+        m = re.search(rf"function automatic int {fn}\([^)]*\);(.*?)endfunction", raw, re.S)
+        b = re.fullmatch(form, re.sub(r"//[^\n]*", "", m.group(1)).strip()) if m else None
+        if not b:
+            raise RuntimeError(f"perf_analysis: {FMT_PKG}: {fn}() is not in the form the model reads; update rtl_lat()")
+        return tuple(int(x) for x in b.groups())
+
+    mi, mw, mhi, mlo = body("mul_lat", r"if \(is_int\(exp_w\)\) return (\d+);\s*return \(man_w \+ 1 > (\d+)\) \? (\d+) : (\d+);")
+    ai, af = body("add_lat", r"return is_int\(exp_w\) \? (\d+) : (\d+);")
+    unit = {f: ((mi if e == 0 else mhi if m + 1 > mw else mlo), (ai if e == 0 else af)) for f, (e, m) in FMT_KNOBS.items()}
+    return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0]
+
+
+UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()  # mul_lat and add_lat per format, fxMac, tfliteRequant
+MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]  # valid in to done out; main() sets the build's format's values
 MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
 FMT = "fp32"  # the build's format; main() sets it
 
@@ -151,8 +172,17 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     return m
 
 
-GROUP_K, TAIL_CTX = 16, 4  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults
-FX_LAT, REQ_LAT = 2, 3  # sienna_fmt_pkg::fx_lat, req_lat
+def lane_params() -> tuple:
+    """gpnae_poly's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_top overrides either."""
+    poly = open(os.path.join(ROOT, "GPNAE", "src", "gpnae_poly.sv")).read()
+    inst = re.search(r"gpnae_poly #\((.*?)\) gpnae_inst", open(os.path.join(ROOT, "src", "sienna_top.sv")).read(), re.S)
+    k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
+    if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
+        raise RuntimeError("perf_analysis: gpnae_poly's K / TAIL_CONTEXTS defaults not found, or sienna_top overrides them")
+    return int(k.group(1)), int(t.group(1))
+
+
+GROUP_K, TAIL_CTX = lane_params()  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults
 DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
 
 

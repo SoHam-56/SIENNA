@@ -1249,7 +1249,7 @@ if __name__ == "__main__":
     p.add_argument("--conv-type", default="basic")
     p.add_argument("--activation", default="selu")
     p.add_argument(
-        "--test", type=str, default=None, help="Run a specific test by name substring"
+        "--test", type=str, default=None, help="regression: tests whose name contains this; pkg: one exact test name"
     )
     args, unknown = p.parse_known_args()
     COLLAPSE_K = args.collapse_k

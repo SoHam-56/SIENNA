@@ -1130,6 +1130,32 @@ def _parse_log(raw: str) -> dict:
     }
 
 
+PKG_DEFAULT_TEST = "matmul_relu_nopool"  # in every format, so make pkg works with any FMT
+
+
+def _pkg_fields(path: str) -> dict:
+    """{name: int} of the package's int localparams, to check what was written."""
+    return {m.group(1): int(m.group(2)) for m in re.finditer(r"localparam int (\w+) = (-?\d+);", open(path).read())}
+
+
+def write_pkg(N: int, T: int, test: str, lanes: int = 32, host_words: int = None, fmt_name: str = "fp32") -> None:
+    """test_config_pkg.sv and one test's stimulus for one build; exits non-zero on a test the format does not run."""
+    t = next((x for x in PIPELINE_TESTS if x["name"] == test), None)
+    if t is None:
+        near = [x["name"] for x in PIPELINE_TESTS if test in x["name"]]
+        sys.exit(f"[ERROR] pkg: no pipeline test named '{test}'" + (f"; tests containing it: {', '.join(near)}" if near else ""))
+    if fmt_name not in t.get("formats", tuple(FORMATS)):
+        sys.exit(f"[ERROR] pkg: test '{test}' runs only in {', '.join(t['formats'])}, not {fmt_name}")
+    generate_vectors({"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, "fmt_name": fmt_name, **t})
+    path = os.path.join(TB_DIR, "test_config_pkg.sv")
+    got = _pkg_fields(path)
+    want = {"EXP_W": FORMATS[fmt_name][0], "MAN_W": FORMATS[fmt_name][1], "IS_INT": int(fmt_name == "int8"), "N": N, "TILE_SIZE": T}
+    bad = {k: got.get(k) for k in want if got.get(k) != want[k]}
+    if bad:
+        sys.exit(f"[ERROR] pkg: {path} has {bad}, expected {want}")
+    print(f"PACKAGE OK: {fmt_name} {test} N={N} TILE={T} LANES={lanes} COLLAPSE_K={COLLAPSE_K} -> {path}")
+
+
 def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, host_words: int = None,
                    fmt_name: str = "fp32"):
     _check_dropout_generator()
@@ -1207,8 +1233,8 @@ if __name__ == "__main__":
     p.add_argument(
         "--action",
         default="regression",
-        choices=["regression", "gen", "analyze"],
-        help="Action to perform",
+        choices=["regression", "gen", "pkg", "analyze"],
+        help="Action to perform; pkg writes test_config_pkg.sv and one --test's stimulus (default %s)" % PKG_DEFAULT_TEST,
     )
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)
@@ -1242,5 +1268,7 @@ if __name__ == "__main__":
                 "name": "manual_gen",
             }
         )
+    elif args.action == "pkg":
+        write_pkg(args.matrix_size, args.tile_size, args.test or PKG_DEFAULT_TEST, args.lanes, args.host_words, args.fmt_name)
     elif args.action == "analyze":
         dump_hardware_trace("manual_run", args.matrix_size, print_to_console=True)

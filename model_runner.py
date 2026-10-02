@@ -284,7 +284,8 @@ class Sim:
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
         regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N, **t})
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0"],
+        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
+                            "FMT=fp32", "GEN_PKG=0"],  # the package generate_vectors just wrote, which is fp32
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
@@ -422,7 +423,8 @@ class LayerSim:
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
         regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N,
                                      "fmt_name": self.fmt_name, **t})
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0"],
+        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0",
+                            f"FMT={self.fmt_name}", "GEN_PKG=0"],  # the package generate_vectors just wrote
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])

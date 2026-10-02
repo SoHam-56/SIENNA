@@ -1,0 +1,394 @@
+====================================================================================================
+ GATE G4: SIENNA int8 (sub-project 2a), measured in Verilator RTL simulation on the farm (g8* runs)
+====================================================================================================
+ Tree /proj/work/spramanik/SIENNA_int8 at 4e3d15a; runs directory /proj/work/spramanik/sienna_jobs/runs
+ Catalog (from 4e3d15a's code and the job scripts): regression 35 int8 / 29 fp32 / 29 bf16 tests; perf 4 + 3 configs per point; GEMM 67 shapes (+3 layer cases); 5 TFLite models; 4 MLPerf Tiny float models
+ N = 64 perf points are the final N = 64 sweep, run once after check-in on /proj/work/spramanik/SIENNA_int8 at SIENNA adda9e9 / SystolicMesh 7187688 (Soham 2026-09-29); the catalog above is still read at 4e3d15a.
+
+1. Regressions in int8 (bit-exact golden: every element must match)
+  g8r16_int8       N=16 T=4, collapse-k 1       exit 0   35/35 passed (catalog 35), 35/35 test logs PASSED, 35/35 exact on every element
+  g8r16ck0_int8    N=16 T=4, collapse-k 0       exit 0   35/35 passed (catalog 35), 35/35 test logs PASSED, 35/35 exact on every element
+  g8r32_int8       N=32 T=4, collapse-k 1       exit 0   35/35 passed (catalog 35), 35/35 test logs PASSED, 35/35 exact on every element
+  g8r32ck0_int8    N=32 T=4, collapse-k 0       exit 0   35/35 passed (catalog 35), 35/35 test logs PASSED, 35/35 exact on every element
+  g8ri_int8        N=16 T=4, random power-up    exit 0   35/35 passed (catalog 35), 35/35 test logs PASSED, 35/35 exact on every element
+  g8r16ck0_int8 against g8r16_int8: single-set cycles differ in 35 of 35 tests (the depth-sliced mesh is built)
+  g8r32ck0_int8 against g8r32_int8: single-set cycles differ in 35 of 35 tests (the depth-sliced mesh is built)
+  g8ri_int8 against the zero-init g8r16_int8 (result, cycles, output words): identical: 35 reference tests, 35 new, 35 identical; 0 act= and 177506 hex= words compared
+
+2. fp32 and bf16 on the int8 tree against Task 0's references, the bf16 branch's code (result, cycles and output words, test by test)
+  g8r16_fp32       vs i0_sienna_fp32   identical: 29 reference tests, 29 new, 29 identical; 2164 act= and 135006 hex= words compared; 29/29 passed (catalog 29), 29/29 test logs PASSED
+  g8r16_bf16       vs i0_sienna_bf16   identical: 29 reference tests, 29 new, 29 identical; 0 act= and 135006 hex= words compared; 29/29 passed (catalog 29), 29/29 test logs PASSED
+  g8r32_fp32       vs i0_reg32_fp32    identical: 29 reference tests, 29 new, 29 identical; 8225 act= and 504254 hex= words compared; 29/29 passed (catalog 29), 29/29 test logs PASSED
+  g8r32_bf16       vs i0_reg32_bf16    identical: 29 reference tests, 29 new, 29 identical; 0 act= and 504254 hex= words compared; 29/29 passed (catalog 29), 29/29 test logs PASSED
+  g8ri_fp32        random power-up: 29/29 passed (catalog 29), 29/29 test logs PASSED; against the zero-init g8r16_fp32: identical: 29 reference tests, 29 new, 29 identical; 2164 act= and 135006 hex= words compared
+  g8ri_bf16        random power-up: 29/29 passed (catalog 29), 29/29 test logs PASSED; against the zero-init g8r16_bf16: identical: 29 reference tests, 29 new, 29 identical; 0 act= and 135006 hex= words compared
+
+3. Single-layer TFLite int8 models through the RTL against the interpreter (reference kernels)
+  g8_tfl_N16_T4    exit 0   TFLITE_INT8: 5 models, 0 failing (catalog 5)
+    MODEL conv3x3_8x8x16_linear: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-128, 127): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 2304 sets, 37002 cycles
+    MODEL conv3x3_8x8x16_relu6: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-128, 127): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 2304 sets, 37002 cycles
+    MODEL conv3x3_8x8x16_relu6_wide: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-100, 70): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 2304 sets, 37002 cycles
+    MODEL fc64x16_linear: FULLY_CONNECTED out (64, 16) z_in -48 per-channel unpadded clamp (-128, 127): RTL 0/1024 differ from the interpreter, host lowering 0/1024; 16 sets, 364 cycles
+    MODEL fc64x16_relu: FULLY_CONNECTED out (64, 16) z_in -48 per-channel unpadded clamp (-128, 127): RTL 0/1024 differ from the interpreter, host lowering 0/1024; 16 sets, 364 cycles
+  g8_tfl_N32_T8    exit 0   TFLITE_INT8: 5 models, 0 failing (catalog 5)
+    MODEL conv3x3_8x8x16_linear: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-128, 127): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 640 sets, 20754 cycles
+    MODEL conv3x3_8x8x16_relu6: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-128, 127): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 640 sets, 20754 cycles
+    MODEL conv3x3_8x8x16_relu6_wide: CONV_2D out (64, 8, 8, 16) z_in -48 per-channel SAME-padded clamp (-100, 70): RTL 0/65536 differ from the interpreter, host lowering 0/65536; 640 sets, 20754 cycles
+    MODEL fc64x16_linear: FULLY_CONNECTED out (64, 16) z_in -48 per-channel unpadded clamp (-128, 127): RTL 0/1024 differ from the interpreter, host lowering 0/1024; 4 sets, 366 cycles
+    MODEL fc64x16_relu: FULLY_CONNECTED out (64, 16) z_in -48 per-channel unpadded clamp (-128, 127): RTL 0/1024 differ from the interpreter, host lowering 0/1024; 4 sets, 366 cycles
+
+4. int8 N / T sweep (measured cycles; TOPS = 2 x MACs per second at an ASSUMED 950 MHz clock)
+    N   T  config                              latency  cyc/set   TOPS  limit       mesh lat  model
+    8   2  matmul_relu_nopool                       41     11.0   0.09  host              26     26
+    8   2  matmul_cached_relu_nopool                41     11.0   0.09  host              26     26
+    8   2  matmul_accum3_bias_linear_nopool         63     11.0   0.09  host              48     26
+    8   2  matmul_random_tanh                       92     56.0   0.02  activation        26     26
+    8   2  matmul_random_selu                       88     52.0   0.02  activation        26     26
+    8   2  matmul_large_selu                        88     52.0   0.02  activation        26     26
+    8   2  matmul_large_tanh                        92     56.0   0.02  activation        26     26
+    8   4  matmul_relu_nopool                       59     16.0   0.06  host              44     44
+    8   4  matmul_cached_relu_nopool                59     16.0   0.06  host              44     44
+    8   4  matmul_accum3_bias_linear_nopool         81     11.0   0.09  host              66     44
+    8   4  matmul_random_tanh                      110     56.0   0.02  activation        44     44
+    8   4  matmul_random_selu                      106     52.0   0.02  activation        44     44
+    8   4  matmul_large_selu                       106     52.0   0.02  activation        44     44
+    8   4  matmul_large_tanh                       110     56.0   0.02  activation        44     44
+    8   8  matmul_relu_nopool                      119     64.0   0.02  host             104    104
+    8   8  matmul_cached_relu_nopool               119     64.0   0.02  host             104    104
+    8   8  matmul_accum3_bias_linear_nopool        145     21.3   0.05  host             130    104
+    8   8  matmul_random_tanh                      170     64.0   0.02  activation       104    104
+    8   8  matmul_random_selu                      166     64.0   0.02  activation       104    104
+    8   8  matmul_large_selu                       166     64.0   0.02  activation       104    104
+    8   8  matmul_large_tanh                       170     64.0   0.02  activation       104    104
+   16   2  matmul_relu_nopool                       61     19.0   0.41  host              34     34
+   16   2  matmul_cached_relu_nopool                61     19.0   0.41  host              34     34
+   16   2  matmul_accum3_bias_linear_nopool         99     19.0   0.41  host              72     34
+   16   2  matmul_random_tanh                      163    107.0   0.07  activation        34     34
+   16   2  matmul_random_selu                      152     96.0   0.08  activation        34     34
+   16   2  matmul_large_selu                       152     96.0   0.08  activation        34     34
+   16   2  matmul_large_tanh                       163    107.0   0.07  activation        34     34
+   16   4  matmul_relu_nopool                       79     19.0   0.41  host              52     52
+   16   4  matmul_cached_relu_nopool                79     19.0   0.41  host              52     52
+   16   4  matmul_accum3_bias_linear_nopool        117     19.0   0.41  host              90     52
+   16   4  matmul_random_tanh                      181    107.0   0.07  activation        52     52
+   16   4  matmul_random_selu                      170     96.0   0.08  activation        52     52
+   16   4  matmul_large_selu                       170     96.0   0.08  activation        52     52
+   16   4  matmul_large_tanh                       181    107.0   0.07  activation        52     52
+   16   8  matmul_relu_nopool                      139     64.0   0.12  host             112    112
+   16   8  matmul_cached_relu_nopool               139     64.0   0.12  host             112    112
+   16   8  matmul_accum3_bias_linear_nopool        177     21.3   0.37  host             150    112
+   16   8  matmul_random_tanh                      241    107.0   0.07  activation       112    112
+   16   8  matmul_random_selu                      230     96.0   0.08  activation       112    112
+   16   8  matmul_large_selu                       230     96.0   0.08  activation       112    112
+   16   8  matmul_large_tanh                       241    107.0   0.07  activation       112    112
+   16  16  matmul_relu_nopool                      355    256.0   0.03  host             328    328
+   16  16  matmul_cached_relu_nopool               355    256.0   0.03  host             328    328
+   16  16  matmul_accum3_bias_linear_nopool        405     85.3   0.09  host             378    328
+   16  16  matmul_random_tanh                      457    256.0   0.03  activation       328    328
+   16  16  matmul_random_selu                      446    256.0   0.03  activation       328    328
+   16  16  matmul_large_selu                       446    256.0   0.03  activation       328    328
+   16  16  matmul_large_tanh                       457    256.0   0.03  activation       328    328
+   32   2  matmul_relu_nopool                      125     39.0   1.60  activation        50     50
+   32   2  matmul_cached_relu_nopool               125     39.0   1.60  activation        50     50
+   32   2  matmul_accum3_bias_linear_nopool        195     35.0   1.78  host             120     50
+   32   2  matmul_random_tanh                      479    365.0   0.17  activation        50     50
+   32   2  matmul_random_selu                      441    327.0   0.19  activation        50     50
+   32   2  matmul_large_selu                       441    327.0   0.19  activation        50     50
+   32   2  matmul_large_tanh                       479    365.0   0.17  activation        50     50
+   32   4  matmul_relu_nopool                      143     39.0   1.60  activation        68     68
+   32   4  matmul_cached_relu_nopool               143     39.0   1.60  activation        68     68
+   32   4  matmul_accum3_bias_linear_nopool        213     35.0   1.78  host             138     68
+   32   4  matmul_random_tanh                      497    365.0   0.17  activation        68     68
+   32   4  matmul_random_selu                      459    327.0   0.19  activation        68     68
+   32   4  matmul_large_selu                       459    327.0   0.19  activation        68     68
+   32   4  matmul_large_tanh                       497    365.0   0.17  activation        68     68
+   32   8  matmul_relu_nopool                      203     64.0   0.97  activation       128    128
+   32   8  matmul_cached_relu_nopool               203     64.0   0.97  activation       128    128
+   32   8  matmul_accum3_bias_linear_nopool        273     35.0   1.78  host             198    128
+   32   8  matmul_random_tanh                      557    365.0   0.17  activation       128    128
+   32   8  matmul_random_selu                      519    327.0   0.19  activation       128    128
+   32   8  matmul_large_selu                       519    327.0   0.19  activation       128    128
+   32   8  matmul_large_tanh                       557    365.0   0.17  activation       128    128
+   32  16  matmul_relu_nopool                      419    256.0   0.24  activation       344    344
+   32  16  matmul_cached_relu_nopool               419    256.0   0.24  activation       344    344
+   32  16  matmul_accum3_bias_linear_nopool        489     85.3   0.73  host             414    344
+   32  16  matmul_random_tanh                      773    365.0   0.17  activation       344    344
+   32  16  matmul_random_selu                      735    327.0   0.19  activation       344    344
+   32  16  matmul_large_selu                       735    327.0   0.19  activation       344    344
+   32  16  matmul_large_tanh                       773    365.0   0.17  activation       344    344
+   32  32  matmul_relu_nopool                     1235   1024.0   0.06  activation      1160   1160
+   32  32  matmul_cached_relu_nopool              1235   1024.0   0.06  activation      1160   1160
+   32  32  matmul_accum3_bias_linear_nopool       1333    341.3   0.18  host            1258   1160
+   32  32  matmul_random_tanh                     1589   1024.0   0.06  activation      1160   1160
+   32  32  matmul_random_selu                     1551   1024.0   0.06  activation      1160   1160
+   32  32  matmul_large_selu                      1551   1024.0   0.06  activation      1160   1160
+   32  32  matmul_large_tanh                      1589   1024.0   0.06  activation      1160   1160
+   64   2  matmul_relu_nopool                      157     67.0   7.43  host              82     82
+   64   2  matmul_cached_relu_nopool               157     67.0   7.43  host              82     82
+   64   2  matmul_accum3_bias_linear_nopool        291     67.0   7.43  host             216     82
+   64   2  matmul_random_tanh                      505    365.0   1.36  activation        82     82
+   64   2  matmul_random_selu                      467    327.0   1.52  activation        82     82
+   64   2  matmul_large_selu                       467    327.0   1.52  activation        82     82
+   64   2  matmul_large_tanh                       505    365.0   1.36  activation        82     82
+   64   4  matmul_relu_nopool                      175     67.0   7.43  host             100    100
+   64   4  matmul_cached_relu_nopool               175     67.0   7.43  host             100    100
+   64   4  matmul_accum3_bias_linear_nopool        309     67.0   7.43  host             234    100
+   64   4  matmul_random_tanh                      523    365.0   1.36  activation       100    100
+   64   4  matmul_random_selu                      485    327.0   1.52  activation       100    100
+   64   4  matmul_large_selu                       485    327.0   1.52  activation       100    100
+   64   4  matmul_large_tanh                       523    365.0   1.36  activation       100    100
+   64   8  matmul_relu_nopool                      235     67.0   7.43  host             160    160
+   64   8  matmul_cached_relu_nopool               235     67.0   7.43  host             160    160
+   64   8  matmul_accum3_bias_linear_nopool        369     67.0   7.43  host             294    160
+   64   8  matmul_random_tanh                      583    365.0   1.36  activation       160    160
+   64   8  matmul_random_selu                      545    327.0   1.52  activation       160    160
+   64   8  matmul_large_selu                       545    327.0   1.52  activation       160    160
+   64   8  matmul_large_tanh                       583    365.0   1.36  activation       160    160
+   64  16  matmul_relu_nopool                      451    256.0   1.95  host             376    376
+   64  16  matmul_cached_relu_nopool               451    256.0   1.95  host             376    376
+   64  16  matmul_accum3_bias_linear_nopool        585     85.3   5.84  host             510    376
+   64  16  matmul_random_tanh                      799    365.0   1.36  activation       376    376
+   64  16  matmul_random_selu                      761    327.0   1.52  activation       376    376
+   64  16  matmul_large_selu                       761    327.0   1.52  activation       376    376
+   64  16  matmul_large_tanh                       799    365.0   1.36  activation       376    376
+   64  32  matmul_relu_nopool                     1267   1024.0   0.49  host            1192   1192
+   64  32  matmul_cached_relu_nopool              1267   1024.0   0.49  host            1192   1192
+   64  32  matmul_accum3_bias_linear_nopool       1401    341.3   1.46  host            1326   1192
+   64  32  matmul_random_tanh                     1615   1024.0   0.49  activation      1192   1192
+   64  32  matmul_random_selu                     1577   1024.0   0.49  activation      1192   1192
+   64  32  matmul_large_selu                      1577   1024.0   0.49  activation      1192   1192
+   64  32  matmul_large_tanh                      1615   1024.0   0.49  activation      1192   1192
+   64  64  matmul_relu_nopool                     4435   4096.0   0.12  host            4360   4360
+   64  64  matmul_cached_relu_nopool              4435   4096.0   0.12  host            4360   4360
+   64  64  matmul_accum3_bias_linear_nopool       4629   1365.3   0.36  host            4554   4360
+   64  64  matmul_random_tanh                     4783   4096.0   0.12  activation      4360   4360
+   64  64  matmul_random_selu                     4745   4096.0   0.12  activation      4360   4360
+   64  64  matmul_large_selu                      4745   4096.0   0.12  activation      4360   4360
+   64  64  matmul_large_tanh                      4783   4096.0   0.12  activation      4360   4360
+  Accumulate rows are per output set over its 3 depth passes (perf_analysis after f1cc285).
+
+5. fp32 and bf16 sweep points against the bf16 gate's g4p runs (latency, cycles per set and result per config;
+   every config's raw PERF trace line for line). A reference written before f1cc285 (2026-09-28 11:13) carries the old
+   accumulate row, so matmul_accum3_bias_linear_nopool is compared by its raw PERF trace there, as Task 22 did.
+  N=8  T=2  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '8.8') new (84, '11.0')
+  N=8  T=2  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '8.8') new (79, '11.0')
+  N=8  T=4  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '8.8') new (102, '11.0')
+  N=8  T=4  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '8.8') new (97, '11.0')
+  N=8  T=8  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '16.5') new (166, '21.3')
+  N=8  T=8  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '16.5') new (161, '21.3')
+  N=16 T=2  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '14.8') new (120, '19.0')
+  N=16 T=2  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '14.8') new (115, '19.0')
+  N=16 T=4  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '14.8') new (138, '19.0')
+  N=16 T=4  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '14.8') new (133, '19.0')
+  N=16 T=8  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '16.5') new (198, '21.3')
+  N=16 T=8  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '16.5') new (193, '21.3')
+  N=16 T=16 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (426, '85.3')
+  N=16 T=16 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (421, '85.3')
+  N=32 T=2  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (216, '35.0')
+  N=32 T=2  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (211, '35.0')
+  N=32 T=4  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (234, '35.0')
+  N=32 T=4  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (229, '35.0')
+  N=32 T=8  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (294, '35.0')
+  N=32 T=8  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '26.8') new (289, '35.0')
+  N=32 T=16 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (510, '85.3')
+  N=32 T=16 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (505, '85.3')
+  N=32 T=32 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '256.5') new (1354, '341.3')
+  N=32 T=32 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '256.5') new (1349, '341.3')
+  N=64 T=2  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (312, '67.0')
+  N=64 T=2  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (307, '67.0')
+  N=64 T=4  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (330, '67.0')
+  N=64 T=4  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (325, '67.0')
+  N=64 T=8  fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (390, '67.0')
+  N=64 T=8  bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '50.8') new (385, '67.0')
+  N=64 T=16 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (606, '85.3')
+  N=64 T=16 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '64.5') new (601, '85.3')
+  N=64 T=32 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '256.5') new (1422, '341.3')
+  N=64 T=32 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '256.5') new (1417, '341.3')
+  N=64 T=64 fp32: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '1024.5') new (4650, '1365.3')
+  N=64 T=64 bf16: identical, 7 configs (6 by row, matmul_accum3_bias_linear_nopool by its raw trace; 7 raw PERF traces identical); accum3 row reference (2, '1024.5') new (4645, '1365.3')
+  36 of 36 points identical
+  References written before f1cc285 (stale accumulate row, 36): g4p_N8_T2_fp32 g4p_N8_T2_bf16 g4p_N8_T4_fp32 g4p_N8_T4_bf16 g4p_N8_T8_fp32 g4p_N8_T8_bf16 g4p_N16_T2_fp32 g4p_N16_T2_bf16 g4p_N16_T4_fp32 g4p_N16_T4_bf16 g4p_N16_T8_fp32 g4p_N16_T8_bf16 g4p_N16_T16_fp32 g4p_N16_T16_bf16 g4p_N32_T2_fp32 g4p_N32_T2_bf16 g4p_N32_T4_fp32 g4p_N32_T4_bf16 g4p_N32_T8_fp32 g4p_N32_T8_bf16 g4p_N32_T16_fp32 g4p_N32_T16_bf16 g4p_N32_T32_fp32 g4p_N32_T32_bf16 g4p_N64_T2_fp32 g4p_N64_T2_bf16 g4p_N64_T4_fp32 g4p_N64_T4_bf16 g4p_N64_T8_fp32 g4p_N64_T8_bf16 g4p_N64_T16_fp32 g4p_N64_T16_bf16 g4p_N64_T32_fp32 g4p_N64_T32_bf16 g4p_N64_T64_fp32 g4p_N64_T64_bf16
+
+6. GEMM on the layer engine (N=16)
+  g8_gemm_int8     exit 0   GEMM int8: 70 cases, 0 with outputs that differ from the bit-exact model (catalog 70)
+    grid_1024x16x256       sets   1024 cycles    16482 MAC/cycle  254.5 mism 0 q err 8.5e-03
+    grid_1024x64x256       sets   4096 cycles    65644 MAC/cycle  255.6 mism 0 q err 8.7e-03
+    grid_1024x256x256      sets  16384 cycles   262312 MAC/cycle  255.8 mism 0 q err 7.7e-03
+    grid_1024x1024x256     sets  65536 cycles  1048984 MAC/cycle  255.9 mism 0 q err 8.9e-03
+    layer_tanh_bias        sets     36 cycles     1447 MAC/cycle   84.9 mism 0 q err 6.4e-02
+    layer_sigmoid_bias     sets     36 cycles     1411 MAC/cycle   87.1 mism 0 q err 2.9e-02
+    layer_selu_bias        sets     36 cycles     1315 MAC/cycle   93.4 mism 0 q err 9.7e-03
+  g8_gemm_fp32     vs s22_gemm_fp32: identical: 67 shapes in both, 67 identical, 0 new only; layer_* lines 3/3
+  g8_gemm_bf16     vs s22_gemm2_bf16: identical: 67 shapes in both, 67 identical, 0 new only; layer_* lines 3/3; 3/3 layer cases bit-exact
+
+7. MLPerf Tiny float models, fp32 and bf16 (every JSON field but wall_s, and the report with times masked, against the bf16 tree)
+  g8_ms_N16_T4_fp32 vs ms_N16_T4_fp32: identical; 4 models, 13 inferences, report 229/229 lines; cycles per inference {'ad01': [17765, 17765, 17765, 51540], 'kws': [30222, 30222, 30222], 'resnet8': [52004, 52004, 52004], 'vww': [98684, 98684, 98684]}
+  g8_ms_N16_T4_bf16 vs ms_N16_T4_bf16: identical; 4 models, 13 inferences, report 229/229 lines; cycles per inference {'ad01': [17715, 17715, 17715, 51490], 'kws': [30167, 30167, 30167], 'resnet8': [51959, 51959, 51959], 'vww': [98539, 98539, 98539]}
+
+8. sienna_multi, two copies, N=16 (RESULT and the steady rate only: per-set cycles race under --threads, pre-existing)
+  i0_multi_fp32    PASSED  MULTI COPIES=2 N=16 lanes=32 host_words=16 collapse_k=1: steady 128.0 cycles per set, 64.0 FLOP/cycle
+  g8_multi_fp32    PASSED  MULTI COPIES=2 N=16 lanes=32 host_words=16 collapse_k=1: steady 128.0 cycles per set, 64.0 FLOP/cycle
+  g8_multi_int8    PASSED  MULTI COPIES=2 N=16 lanes=32 host_words=16 collapse_k=1: steady 53.5 cycles per set, 153.1 FLOP/cycle
+  fp32 steady rate: reference 128.0, new 128.0 cycles per set
+
+9. Lint (sienna_layer and sienna_top, -Wall -Werror-USERFATAL): exit=0, 0 errors, no LATCH / MULTIDRIVEN / UNOPTFLAT
+   in int8, bf16 and fp32; (0, 15) and (5, 10) rejected by sienna_top's own format check on a %Error line
+  sienna_layer (0, 7): exit=0, 172 warnings, 0 errors
+  sienna_top (0, 7): exit=0, 163 warnings, 0 errors
+  CLEAN (0 7) sienna_layer: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  CLEAN (0 7) sienna_top: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  sienna_layer (8, 7): exit=0, 194 warnings, 0 errors
+  sienna_top (8, 7): exit=0, 185 warnings, 0 errors
+  CLEAN (8 7) sienna_layer: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  CLEAN (8 7) sienna_top: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  sienna_layer (8, 23): exit=0, 208 warnings, 0 errors
+  sienna_top (8, 23): exit=0, 199 warnings, 0 errors
+  CLEAN (8 23) sienna_layer: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  CLEAN (8 23) sienna_top: exit=0, 0 errors, 0 LATCH / MULTIDRIVEN / UNOPTFLAT
+  sienna_layer (0, 15): exit=1, 131 warnings, 7 errors
+  sienna_top (0, 15): exit=1, 125 warnings, 7 errors
+  REJECTED (0 15) sienna_layer: exit=1, sienna_top.sv:86:5: sienna_top: unsupported format EXP_W=0 MAN_W=15
+  REJECTED (0 15) sienna_top: exit=1, sienna_top.sv:86:5: sienna_top: unsupported format EXP_W=0 MAN_W=15
+  sienna_layer (5, 10): exit=1, 129 warnings, 8 errors
+  sienna_top (5, 10): exit=1, 123 warnings, 8 errors
+  REJECTED (5 10) sienna_layer: exit=1, sienna_top.sv:86:5: sienna_top: unsupported format EXP_W=5 MAN_W=10
+  REJECTED (5 10) sienna_top: exit=1, sienna_top.sv:86:5: sienna_top: unsupported format EXP_W=5 MAN_W=10
+  LINT VERDICT: PASS (6 clean, 4 rejected)
+
+10. Requantize stage size: an estimate from the RTL's sizing, not synthesis
+  N=8    32 lanes: 32 tfliteRequant units (one 32 x 32 multiplier each), 6,928 flops of per-set parameters; for scale, the mesh has 64 multipliers (int8 x int8 here, 24 x 24 significands in fp32, 8 x 8 in bf16)
+  N=16   32 lanes: 32 tfliteRequant units (one 32 x 32 multiplier each), 12,368 flops of per-set parameters; for scale, the mesh has 256 multipliers (int8 x int8 here, 24 x 24 significands in fp32, 8 x 8 in bf16)
+  N=32   32 lanes: 32 tfliteRequant units (one 32 x 32 multiplier each), 23,248 flops of per-set parameters; for scale, the mesh has 1024 multipliers (int8 x int8 here, 24 x 24 significands in fp32, 8 x 8 in bf16)
+  N=64  128 lanes: 128 tfliteRequant units (one 32 x 32 multiplier each), 45,008 flops of per-set parameters; for scale, the mesh has 4096 multipliers (int8 x int8 here, 24 x 24 significands in fp32, 8 x 8 in bf16)
+  Per-set parameter storage in sienna_top is NUM_IDS x (40 N + 93) bits plus a 40 N-bit copy at g_accept (an estimate,
+  not synthesis). A FIFO of SETS_IN_FLIGHT entries would save one entry; sharing the storage with set_act would not shrink
+  it. For information only: area is a synthesis matter, no decision now (Soham, 2026-09-29); the spec's Risk 2 fallback
+  (time-share the requantizers across lanes) is not implemented.
+
+11. Not run: N = 64 outside the perf sweep (regressions, TFLite, GEMM, models, multi stay at N <= 32); synthesis, timing
+    and area (every TOPS figure assumes 950 MHz); the four MLPerf Tiny int8 models (sub-project 2b); agreement of the int8
+    lane with TFLite's int8 tanh / logistic is G2's report.
+
+12. Runs: exit, wall time, peak memory, node, provenance (N = 64 sweep runs: snapshot tar is the int8 tree at its pushed heads)
+  g8_gemm_bf16                     exit    0  wall   32:07.03  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-5  provenance: not checked (tar removed)
+  g8_gemm_fp32                     exit    0  wall   10:11.74  peak   3.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-1  provenance: not checked (tar removed)
+  g8_gemm_int8                     exit    0  wall    6:03.39  peak   3.5 GB  od-m7a-4xl-dy-od-64-gb-16-cores-3  provenance: not checked (tar removed)
+  g8_lint                          exit    0  wall    1:13.43  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8_ms_N16_T4_bf16                exit    0  wall    1:55.09  peak   0.6 GB  od-m7a-4xl-dy-od-64-gb-16-cores-6  provenance: not checked (tar removed)
+  g8_ms_N16_T4_fp32                exit    0  wall    2:38.25  peak   1.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-4  provenance: not checked (tar removed)
+  g8_multi_fp32                    exit    0  wall    1:31.87  peak   2.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8_multi_int8                    exit    0  wall    0:32.19  peak   0.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8_tfl_N16_T4                    exit    0  wall    0:21.77  peak   0.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8_tfl_N32_T8                    exit    0  wall    0:37.96  peak   0.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N16_T16_bf16                 exit    0  wall    3:51.29  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N16_T16_fp32                 exit    0  wall    5:59.18  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7  provenance: not checked (tar removed)
+  g8p_N16_T16_int8                 exit    0  wall    2:30.37  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N16_T2_bf16                  exit    0  wall    5:19.35  peak   1.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N16_T2_fp32                  exit    0  wall    7:30.39  peak   1.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N16_T2_int8                  exit    0  wall    3:20.62  peak   1.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8p_N16_T4_bf16                  exit    0  wall    4:09.55  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8p_N16_T4_fp32                  exit    0  wall    6:07.32  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1  provenance: not checked (tar removed)
+  g8p_N16_T4_int8                  exit    0  wall    2:34.04  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8p_N16_T8_bf16                  exit    0  wall    3:59.02  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-8  provenance: not checked (tar removed)
+  g8p_N16_T8_fp32                  exit    0  wall    5:49.17  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8p_N16_T8_int8                  exit    0  wall    2:26.66  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7  provenance: not checked (tar removed)
+  g8p_N32_T16_bf16                 exit    0  wall   10:45.71  peak   3.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-5  provenance: not checked (tar removed)
+  g8p_N32_T16_fp32                 exit    0  wall   18:45.73  peak   3.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7  provenance: not checked (tar removed)
+  g8p_N32_T16_int8                 exit    0  wall    5:13.17  peak   3.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-3  provenance: not checked (tar removed)
+  g8p_N32_T2_bf16                  exit    0  wall   17:28.50  peak   4.1 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N32_T2_fp32                  exit    0  wall   25:57.80  peak   4.1 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1  provenance: not checked (tar removed)
+  g8p_N32_T2_int8                  exit    0  wall    8:18.04  peak   4.1 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8p_N32_T32_bf16                 exit    0  wall   13:06.19  peak   3.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N32_T32_fp32                 exit    0  wall   22:11.25  peak   3.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N32_T32_int8                 exit    0  wall    7:43.50  peak   3.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-3  provenance: not checked (tar removed)
+  g8p_N32_T4_bf16                  exit    0  wall   11:31.38  peak   3.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N32_T4_fp32                  exit    0  wall   19:50.20  peak   3.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8p_N32_T4_int8                  exit    0  wall    5:34.13  peak   3.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-8  provenance: not checked (tar removed)
+  g8p_N32_T8_bf16                  exit    0  wall   10:45.02  peak   3.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8p_N32_T8_fp32                  exit    0  wall   18:28.96  peak   3.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-8  provenance: not checked (tar removed)
+  g8p_N32_T8_int8                  exit    0  wall    4:51.84  peak   3.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7  provenance: not checked (tar removed)
+  g8p_N64_T16_bf16                 exit    0  wall   52:07.38  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-9  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T16_fp32                 exit    0  wall    1:31:17  peak  12.9 GB  od-m7a-4xl-dy-od-64-gb-16-cores-2  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T16_int8                 exit    0  wall   21:27.19  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-8  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T2_bf16                  exit    0  wall    1:41:27  peak  16.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-4  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T2_fp32                  exit    0  wall    2:22:26  peak  16.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-5  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T2_int8                  exit    0  wall   45:16.05  peak  16.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-1  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T32_bf16                 exit    0  wall    1:00:33  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-6  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T32_fp32                 exit    0  wall    1:51:11  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-3  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T32_int8                 exit    0  wall   29:18.64  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-8  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T4_bf16                  exit    0  wall   55:58.86  peak  13.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-3  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T4_fp32                  exit    0  wall    1:43:00  peak  13.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-1  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T4_int8                  exit    0  wall   24:26.50  peak  13.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-3  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T64_bf16                 exit    0  wall    1:59:47  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-8  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T64_fp32                 exit    0  wall    3:35:04  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-4  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T64_int8                 exit    0  wall    1:05:18  peak  12.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-7  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T8_bf16                  exit    0  wall   50:33.66  peak  13.1 GB  od-m7a-4xl-dy-od-64-gb-16-cores-6  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T8_fp32                  exit    0  wall    1:28:35  peak  13.1 GB  od-m7a-4xl-dy-od-64-gb-16-cores-10  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N64_T8_int8                  exit    0  wall   20:39.04  peak  13.1 GB  od-m7a-4xl-dy-od-64-gb-16-cores-2  provenance: ok, recorded 2026-09-30 22:39 before the tar was removed (int8 tree; 3 files match SIENNA adda9e9, SystolicMesh 7187688)
+  g8p_N8_T2_bf16                   exit    0  wall    2:47.03  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8p_N8_T2_fp32                   exit    0  wall    3:57.90  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8p_N8_T2_int8                   exit    0  wall    1:52.02  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N8_T4_bf16                   exit    0  wall    2:41.08  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N8_T4_fp32                   exit    0  wall    3:44.55  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g8p_N8_T4_int8                   exit    0  wall    1:49.51  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8p_N8_T8_bf16                   exit    0  wall    2:34.38  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8p_N8_T8_fp32                   exit    0  wall    3:45.03  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1  provenance: not checked (tar removed)
+  g8p_N8_T8_int8                   exit    0  wall    1:53.93  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8r16_bf16                       exit    0  wall   13:15.25  peak   0.6 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9  provenance: not checked (tar removed)
+  g8r16_fp32                       exit    0  wall   21:49.48  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7  provenance: not checked (tar removed)
+  g8r16_int8                       exit    0  wall    8:52.27  peak   0.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4  provenance: not checked (tar removed)
+  g8r16ck0_int8                    exit    0  wall   37:08.26  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-5  provenance: not checked (tar removed)
+  g8r32_bf16                       exit    0  wall   33:53.55  peak   1.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-3  provenance: not checked (tar removed)
+  g8r32_fp32                       exit    0  wall    1:06:14  peak   3.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-2  provenance: not checked (tar removed)
+  g8r32_int8                       exit    0  wall   15:35.41  peak   0.6 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1  provenance: not checked (tar removed)
+  g8r32ck0_int8                    exit    0  wall    1:54:26  peak   3.8 GB  od-m7a-4xl-dy-od-64-gb-16-cores-2  provenance: not checked (tar removed)
+  g8ri_bf16                        exit    0  wall   12:58.47  peak   0.6 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10  provenance: not checked (tar removed)
+  g8ri_fp32                        exit    0  wall   22:21.89  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-8  provenance: not checked (tar removed)
+  g8ri_int8                        exit    0  wall    8:56.73  peak   0.3 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6  provenance: not checked (tar removed)
+  g4p_N16_T16_bf16       reference exit    0  wall    3:50.71  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6
+  g4p_N16_T16_fp32       reference exit    0  wall    5:52.34  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4
+  g4p_N16_T2_bf16        reference exit    0  wall    5:13.68  peak   1.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-8
+  g4p_N16_T2_fp32        reference exit    0  wall    7:35.76  peak   1.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-7
+  g4p_N16_T4_bf16        reference exit    0  wall    4:09.33  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-10
+  g4p_N16_T4_fp32        reference exit    0  wall    6:11.54  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-9
+  g4p_N16_T8_bf16        reference exit    0  wall    3:51.33  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1
+  g4p_N16_T8_fp32        reference exit    0  wall    5:55.81  peak   1.2 GB  od-c7a-4xl-dy-od-32-gb-16-cores-2
+  g4p_N32_T16_bf16       reference exit    0  wall   15:08.11  peak   3.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-7
+  g4p_N32_T16_fp32       reference exit    0  wall   21:07.80  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-6
+  g4p_N32_T2_bf16        reference exit    0  wall   25:40.52  peak   4.1 GB  od-m7a-4xl-dy-od-64-gb-16-cores-8
+  g4p_N32_T2_fp32        reference exit    0  wall   32:16.44  peak   4.1 GB  od-m7a-4xl-dy-od-64-gb-16-cores-1
+  g4p_N32_T32_bf16       reference exit    0  wall   16:55.05  peak   3.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-5
+  g4p_N32_T32_fp32       reference exit    0  wall   24:09.64  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-7
+  g4p_N32_T4_bf16        reference exit    0  wall   17:06.75  peak   3.5 GB  od-m7a-4xl-dy-od-64-gb-16-cores-9
+  g4p_N32_T4_fp32        reference exit    0  wall   23:55.42  peak   3.5 GB  od-m7a-4xl-dy-od-64-gb-16-cores-3
+  g4p_N32_T8_bf16        reference exit    0  wall   15:46.15  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-5
+  g4p_N32_T8_fp32        reference exit    0  wall   22:08.85  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-10
+  g4p_N64_T16_bf16       reference exit    0  wall    1:56:03  peak  12.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-19
+  g4p_N64_T16_fp32       reference exit    0  wall    2:13:42  peak  12.9 GB  od-r7a-4xl-dy-od-128-gb-16-cores-17
+  g4p_N64_T2_bf16        reference exit    0  wall    4:04:31  peak  16.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-6
+  g4p_N64_T2_fp32        reference exit    0  wall    4:00:44  peak  16.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-3
+  g4p_N64_T32_bf16       reference exit    0  wall    1:59:45  peak  12.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-21
+  g4p_N64_T32_fp32       reference exit    0  wall    2:29:34  peak  12.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-20
+  g4p_N64_T4_bf16        reference exit    0  wall    2:20:33  peak  13.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-14
+  g4p_N64_T4_fp32        reference exit    0  wall    2:34:23  peak  13.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-7
+  g4p_N64_T64_bf16       reference exit    0  wall    2:31:31  peak  12.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-11
+  g4p_N64_T64_fp32       reference exit    0  wall    3:28:06  peak  12.8 GB  od-r7a-4xl-dy-od-128-gb-16-cores-22
+  g4p_N64_T8_bf16        reference exit    0  wall    1:58:50  peak  13.1 GB  od-r7a-4xl-dy-od-128-gb-16-cores-16
+  g4p_N64_T8_fp32        reference exit    0  wall    2:14:41  peak  13.1 GB  od-r7a-4xl-dy-od-128-gb-16-cores-15
+  g4p_N8_T2_bf16         reference exit    0  wall    2:47.53  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-2
+  g4p_N8_T2_fp32         reference exit    0  wall    3:54.53  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1
+  g4p_N8_T4_bf16         reference exit    0  wall    2:33.79  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-4
+  g4p_N8_T4_fp32         reference exit    0  wall    3:40.53  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-3
+  g4p_N8_T8_bf16         reference exit    0  wall    2:33.65  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-6
+  g4p_N8_T8_fp32         reference exit    0  wall    3:42.23  peak   0.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-5
+  i0_multi_fp32          reference exit    0  wall    1:39.01  peak   2.4 GB  od-c7a-4xl-dy-od-32-gb-16-cores-3
+  i0_reg32_bf16          reference exit    0  wall   34:20.21  peak   1.7 GB  od-c7a-4xl-dy-od-32-gb-16-cores-2
+  i0_reg32_fp32          reference exit    0  wall    1:06:37  peak   3.5 GB  od-c7a-4xl-dy-od-32-gb-16-cores-1
+  i0_sienna_bf16         reference exit    0  wall   12:59.24  peak   0.6 GB  od-m7a-4xl-dy-od-64-gb-16-cores-2
+  i0_sienna_fp32         reference exit    0  wall   24:06.00  peak   1.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-1
+  ms_N16_T4_bf16         reference exit    0  wall    1:56.27  peak   0.6 GB  od-m7a-4xl-dy-od-64-gb-16-cores-9
+  ms_N16_T4_fp32         reference exit    0  wall    2:28.61  peak   1.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-10
+  s22_gemm2_bf16         reference exit    0  wall   31:49.68  peak   3.3 GB  od-m7a-4xl-dy-od-64-gb-16-cores-8
+  s22_gemm_fp32          reference exit    0  wall    9:35.58  peak   3.2 GB  od-m7a-4xl-dy-od-64-gb-16-cores-6
+
+GATE G4: PASS

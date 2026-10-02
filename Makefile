@@ -525,6 +525,7 @@ model:
 
 # gemm_sweep.py has no --tile-size: it builds sienna_layer at T=4.
 gemm:
+	@[ "$(TILE)" = 4 ] || echo "WARNING: gemm_sweep.py has no tile option and builds T=4; TILE=$(TILE) is ignored"
 	$(PYTHON) gemm_sweep.py \
 		--n $(N) \
 		--lanes $(LANES) \

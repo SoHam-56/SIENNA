@@ -1266,6 +1266,7 @@ if __name__ == "__main__":
                 "conv_type": args.conv_type,
                 "activation": args.activation,
                 "name": "manual_gen",
+                "fmt_name": args.fmt_name,
             }
         )
     elif args.action == "pkg":

@@ -347,17 +347,22 @@ pkg:
 		--collapse-k $(COLLAPSE_K) \
 		--test $(PKG_TEST)
 
-# Fails the build unless the package's EXP_W, MAN_W and IS_INT (when present) are FMT's.
+# Fails the build unless the package's EXP_W, MAN_W, IS_INT (when present), N, TILE_SIZE and NUM_LANES are FMT's, N, TILE and LANES.
 pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 	@set -- $(FMT_FIELDS_$(FMT)); \
 	field() { awk -v k="$$1" '$$1 == "localparam" && $$3 == k { sub(/;.*/, "", $$5); print $$5 }' $(PKG_FILE) 2>/dev/null; }; \
-	e=$$(field EXP_W); m=$$(field MAN_W); i=$$(field IS_INT); \
+	e=$$(field EXP_W); m=$$(field MAN_W); i=$$(field IS_INT); n=$$(field N); t=$$(field TILE_SIZE); l=$$(field NUM_LANES); \
 	if [ "$$e" != "$$1" ] || [ "$$m" != "$$2" ] || { [ -n "$$i" ] && [ "$$i" != "$$3" ]; }; then \
 		echo "ERROR: $(PKG_FILE) has EXP_W=$${e:-missing} MAN_W=$${m:-missing} IS_INT=$${i:-absent}, but FMT=$(FMT) needs EXP_W=$$1 MAN_W=$$2 IS_INT=$$3."; \
 		echo "       The package is stale or for another format: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
 		exit 1; \
 	fi; \
-	echo "-- test_config_pkg.sv matches FMT=$(FMT): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent}"
+	if [ "$$n" != "$(N)" ] || [ "$$t" != "$(TILE)" ] || [ "$$l" != "$(LANES)" ]; then \
+		echo "ERROR: $(PKG_FILE) has N=$${n:-missing} TILE_SIZE=$${t:-missing} NUM_LANES=$${l:-missing}, but the build asks for N=$(N) TILE=$(TILE) LANES=$(LANES)."; \
+		echo "       The package was written for another geometry: run make pkg with these N, TILE, LANES, or pass the package's."; \
+		exit 1; \
+	fi; \
+	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top

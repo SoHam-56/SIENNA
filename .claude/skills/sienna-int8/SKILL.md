@@ -183,8 +183,11 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   DOUBLE and 53 in SINGLE: ABC noise of about 20%), from 69-75. All consumers take `req_lat()`. Results unchanged bit
   for bit (G1, G2, G4 words identical); cycles +1 per single set, +1 to 17 per streamed pass, G2 STREAM +22. Cost:
   a bank is marked full one cycle later, so at N = 32 the int8 ReLU / linear stage alternates 36 and 37 cycles while it
-  waits for pooling to free a bank, 36.5 per set (+1.4%, int8 ReLU / linear at N = 32 only; N = 16 stays 19); a third
-  activation bank would remove it, Soham's option. With it, `TB_sienna_top`'s drain-overlap absence check counts only
+  waits for pooling to free a bank, 36.5 per set (+1.4% at N = 32; N = 16 stays 19); a third activation bank would
+  remove it, Soham's option. The split also costs every int8 GPNAE lane set (tanh, SELU) one cycle per set wherever
+  activation is the bottleneck (lane stage 53 -> 54 at N = 8): G4 (4e3d15a) to final (ff5ecb1), tanh 56 -> 57 at
+  N = 8, 107 -> 108 at N = 16, 365 -> 366 at N = 32 and 64; SELU 52 -> 54 at N = 8 (+3.8%), 96 -> 97, 327 -> 328
+  (perf runs g8p_* against fnp_* / fn64p_*); mesh- and host-bound points and fp32 / bf16 are unchanged. With it, `TB_sienna_top`'s drain-overlap absence check counts only
   cycles that do not accept the next set (`!g_accept`): the last beat can now leave in the accept cycle, which held
   nothing; 1b4bf1a's RTL still fails the check.
 - Taylor lane capture fix (Soham 2026-10-01, GPNAE a3d580c): `gpnae`'s G_CAP read the FIFO head as soon as `empty_o`

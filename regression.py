@@ -1081,10 +1081,11 @@ PIPELINE_TESTS = [
 ]
 
 
-def _run_make_live(log_path: str, fmt_name: str = "fp32") -> tuple:
+def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 4, lanes: int = 32) -> tuple:
     t0 = time.time()
     process = subprocess.Popen(
-        ["make", "verilator", f"FMT={fmt_name}", "GEN_PKG=0"],  # GEN_PKG=0: build the package this test just wrote
+        ["make", "verilator", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}",
+         "GEN_PKG=0"],  # GEN_PKG=0: build the package this test just wrote, in its format and geometry
         cwd=ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1187,7 +1188,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
 
         # 2. Run Verilator (Streams live status)
         log_path = os.path.join(RESULTS_DIR, f"{t['name']}.log")
-        raw_log, wall = _run_make_live(log_path, fmt_name)
+        raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes)
 
         # 3. Parse Log
         r = {

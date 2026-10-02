@@ -640,7 +640,8 @@ module TB_sienna_top;
     if (stream_on) begin
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
-      if (maxpool_busy_tb && dut.systolic_collection_complete) pool_with_result++;
+      // Not the cycle the stage accepts the result: it never waited.
+      if (maxpool_busy_tb && dut.systolic_collection_complete && !dut.g_accept) pool_with_result++;
       if (mesh_blocked) bp_mesh++;  // a finished set waits because no result bank is free
       if (int'(dut.g_state) == 0 && dut.systolic_collection_complete && dut.act_full[dut.act_wr])
         bp_act++;  // a mesh result waits because both activation banks are full

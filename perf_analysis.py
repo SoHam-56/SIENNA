@@ -27,7 +27,8 @@ def run(name: str, num_sets: int, build_dir: str) -> str:
     cfg = next(t for t in reg.PIPELINE_TESTS if t["name"] == name)
     reg.generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
     cmd = ["make", "verilator", "TRACE=0", "EXTRA_FLAGS=-DPERF", f"VERILATOR_DIR={build_dir}",
-           f"FMT={GEOM.get('fmt_name', 'fp32')}", "GEN_PKG=0"]  # the package generate_vectors just wrote
+           f"FMT={GEOM.get('fmt_name', 'fp32')}", f"N={GEOM['n']}", f"TILE={GEOM['tile_size']}", f"LANES={GEOM['lanes']}",
+           "GEN_PKG=0"]  # the package generate_vectors just wrote
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     raw_dir = os.path.join(os.path.dirname(REPORT), "raw")
     os.makedirs(raw_dir, exist_ok=True)

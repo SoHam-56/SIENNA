@@ -5,6 +5,27 @@ SHELL := /bin/bash
 # =========================================================================
 N    ?= 16
 TILE ?= 4
+# Number format of every build, regression, test and model run: fp32, bf16 or int8.
+FMT  ?= fp32
+LANES      ?= 32
+COLLAPSE_K ?= 1
+# GEN_PKG=0 builds the test_config_pkg.sv already on disk (scripts that write their own); the format guard still runs.
+GEN_PKG ?= 1
+# Interpreter for the Python flows; tflite and model need the tflite package, e.g. PYTHON=<venv>/bin/python.
+PYTHON ?= python3
+# model_runner.py has no default model directory, so make model needs one.
+MODEL_DIR ?=
+QUICK ?= 0
+
+FORMATS = fp32 bf16 int8
+ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
+$(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
+endif
+
+# EXP_W MAN_W IS_INT of each FMT, as regression.py's FORMATS writes them into test_config_pkg.sv.
+FMT_FIELDS_fp32 = 8 23 0
+FMT_FIELDS_bf16 = 8 7 0
+FMT_FIELDS_int8 = 0 7 1
 
 # Project Structure
 PRJ_DIR     = $(shell pwd)
@@ -24,6 +45,8 @@ WAVE      = surfer
 
 TEST ?=
 ACTIVATION ?= tanh
+# make pkg (and every build through it) writes this test; it runs in every format.
+PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 
 TOP_FILES = \
 	sienna_top.sv \
@@ -96,6 +119,7 @@ DESIGN_FILES = \
 # Testbench
 # TB_PKG_FILES compiles before TESTBENCH: a package must be declared before it is imported.
 TB_PKG_FILES = test_config_pkg.sv
+PKG_FILE     = $(TB_DIR)/test_config_pkg.sv
 TESTBENCH  = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 
@@ -223,6 +247,15 @@ default: help
 help:
 	@echo "=== SIENNA Hardware Simulation Makefile ==="
 	@echo ""
+	@echo "Precision (one variable for every build and run):"
+	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
+	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K for the golden and sm-verilator (default 1; TB_sienna_top builds 1)"
+	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); regression: name filter"
+	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
+	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"
+	@echo "  verilator, lint, debug and perf run make pkg first, then check its EXP_W/MAN_W/IS_INT against FMT"
+	@echo ""
 	@echo "Simulation Targets:"
 	@echo "  make verilator           - Simulate using Verilator (no waveform)"
 	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
@@ -232,18 +265,26 @@ help:
 	@echo "  make vcs       TRACE=fst - VCS has no native FST dump; still writes VCD"
 	@echo ""
 	@echo "Individual Module Targets:"
-	@echo "  make sm-verilator      - Simulate Systolic Mesh only"
-	@echo "  make gpnae-verilator   - Simulate GPNAE only"
+	@echo "  make sm-verilator      - Systolic Mesh only: its regression in FMT at N, TILE, COLLAPSE_K"
+	@echo "  make gpnae-verilator   - GPNAE only: its regression in FMT on gpnae_poly, the lane sienna_top uses"
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
 	@echo "  make debug             - Build with GDB back-trace"
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
+	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE except gemm):"
+	@echo "  make regression FMT=int8          - Full pipeline regression (TEST=<substring> narrows it)"
+	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
+	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (gemm_sweep.py; T=4)"
+	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (perf_analysis.py)"
+	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit; needs FMT=int8"
+	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
+	@echo ""
 	@echo "Utility Targets:"
 	@echo "  make wave              - View waveforms (requires prior TRACE=vcd|fst run)"
-	@echo "  make gen-matmul        - Generate matmul stimulus (N=16 default)"
-	@echo "  make gen-conv          - Generate conv stimulus   (N=16 default)"
+	@echo "  make gen-matmul        - Generate matmul stimulus in FMT (N=16 default); build it with GEN_PKG=0"
+	@echo "  make gen-conv          - Generate conv stimulus in FMT   (N=16 default); build it with GEN_PKG=0"
 	@echo "  make clean             - Remove all simulation artifacts"
 	@echo "  make clean-all         - Clean all including subprojects"
 	@echo ""
@@ -253,6 +294,7 @@ help:
 	@echo "  TRACE=vcd           → can be very large for complex designs."
 	@echo ""
 	@echo "Current Configuration:"
+	@echo "  FMT        : $(FMT)  (N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K) TEST=$(PKG_TEST))"
 	@echo "  TOP_MODULE : $(TOP_MODULE)"
 	@echo "  TESTBENCH  : $(TESTBENCH)"
 	@echo "  TRACE      : $(TRACE)"
@@ -269,27 +311,59 @@ help:
 # ─────────────────────────────────────────────────────────────────────────────
 
 gen-matmul:
-	@echo "=== Generating matmul stimulus (N=$(N), tile=$(TILE)) ==="
-	python3 regression.py \
+	@echo "=== Generating matmul stimulus (FMT=$(FMT), N=$(N), tile=$(TILE)) ==="
+	$(PYTHON) regression.py \
 		--action gen \
 		--mode matmul \
+		--format $(FMT) \
 		--n $(N) \
-		--tile-size $(TILE)
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--collapse-k $(COLLAPSE_K)
 
 gen-conv:
-	@echo "=== Generating conv stimulus (N=$(N), tile=$(TILE)) ==="
-	python3 regression.py \
+	@echo "=== Generating conv stimulus (FMT=$(FMT), N=$(N), tile=$(TILE)) ==="
+	$(PYTHON) regression.py \
 		--action gen \
 		--mode conv \
 		--conv-type basic \
+		--format $(FMT) \
 		--n $(N) \
-		--tile-size $(TILE)
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--collapse-k $(COLLAPSE_K)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test package: written for FMT, then checked before every build
+# ─────────────────────────────────────────────────────────────────────────────
+pkg:
+	@echo "=== Writing test_config_pkg.sv: FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K) TEST=$(PKG_TEST) ==="
+	$(PYTHON) regression.py \
+		--action pkg \
+		--format $(FMT) \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--collapse-k $(COLLAPSE_K) \
+		--test $(PKG_TEST)
+
+# Fails the build unless the package's EXP_W, MAN_W and IS_INT (when present) are FMT's.
+pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
+	@set -- $(FMT_FIELDS_$(FMT)); \
+	field() { awk -v k="$$1" '$$1 == "localparam" && $$3 == k { sub(/;.*/, "", $$5); print $$5 }' $(PKG_FILE) 2>/dev/null; }; \
+	e=$$(field EXP_W); m=$$(field MAN_W); i=$$(field IS_INT); \
+	if [ "$$e" != "$$1" ] || [ "$$m" != "$$2" ] || { [ -n "$$i" ] && [ "$$i" != "$$3" ]; }; then \
+		echo "ERROR: $(PKG_FILE) has EXP_W=$${e:-missing} MAN_W=$${m:-missing} IS_INT=$${i:-absent}, but FMT=$(FMT) needs EXP_W=$$1 MAN_W=$$2 IS_INT=$$3."; \
+		echo "       The package is stale or for another format: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
+		exit 1; \
+	fi; \
+	echo "-- test_config_pkg.sv matches FMT=$(FMT): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
 # ─────────────────────────────────────────────────────────────────────────────
-verilator:
-	@echo "=== Verilator simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
+verilator: pkg-check
+	@echo "=== Verilator simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --binary \
 		$(VERILATOR_FLAGS) \
@@ -310,13 +384,16 @@ endif
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-module targets
 # ─────────────────────────────────────────────────────────────────────────────
+# The mesh TB takes its format only from SystolicMesh's regression, which patches EXP_W/MAN_W/COLLAPSE_K into it.
 sm-verilator:
-	@echo "=== Building Systolic Mesh only ==="
-	$(MAKE) -C SystolicMesh verilator
+	@echo "=== Systolic Mesh only: FMT=$(FMT) N=$(N) TILE=$(TILE) COLLAPSE_K=$(COLLAPSE_K) ==="
+	$(MAKE) -C SystolicMesh regression MATRIX_SIZE=$(N) \
+		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)"
 
+# GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
 gpnae-verilator:
-	@echo "=== Building GPNAE only ==="
-	$(MAKE) -C GPNAE verilator
+	@echo "=== GPNAE only: FMT=$(FMT), gpnae_poly lane ==="
+	cd GPNAE && $(PYTHON) regression.py --lane poly --format $(FMT)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS
@@ -358,8 +435,8 @@ wave:
 # ─────────────────────────────────────────────────────────────────────────────
 # Lint / debug / perf
 # ─────────────────────────────────────────────────────────────────────────────
-lint:
-	@echo "=== Linting $(TOP_MODULE) ==="
+lint: pkg-check
+	@echo "=== Linting $(TOP_MODULE)  FMT=$(FMT) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --lint-only \
 		$(VERILATOR_FLAGS) \
@@ -410,11 +487,48 @@ check-files:
 	fi
 
 regression:
-	@echo "=== Running Sienna Pipeline Regression ==="
-	python3 regression.py \
+	@echo "=== Running Sienna Pipeline Regression: FMT=$(FMT) ==="
+	$(PYTHON) regression.py \
 		--matrix-size $(N) \
 		--tile-size $(TILE) \
+		--format $(FMT) \
+		--lanes $(LANES) \
+		--collapse-k $(COLLAPSE_K) \
 		$(if $(TEST),--test $(TEST))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Format-aware runs (each script writes its own package and builds with GEN_PKG=0)
+# ─────────────────────────────────────────────────────────────────────────────
+model:
+	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models>; model_runner.py has no default"; exit 1; }
+	$(PYTHON) model_runner.py \
+		--model-dir $(MODEL_DIR) \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--format $(FMT)
+
+# gemm_sweep.py has no --tile-size: it builds sienna_layer at T=4.
+gemm:
+	$(PYTHON) gemm_sweep.py \
+		--n $(N) \
+		--lanes $(LANES) \
+		--format $(FMT) \
+		$(if $(filter 1,$(QUICK)),--quick)
+
+perf-analysis:
+	$(PYTHON) perf_analysis.py \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--format $(FMT)
+
+tflite:
+	@[ "$(FMT)" = int8 ] || { echo "ERROR: make tflite runs the int8 TFLite models only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
+	$(PYTHON) tflite_int8_run.py \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
@@ -434,4 +548,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv regression
+        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite

@@ -129,7 +129,7 @@ DESIGN_FILES = \
 # Testbench
 # TB_PKG_FILES compiles before TESTBENCH: a package must be declared before it is imported.
 TB_PKG_FILES = test_config_pkg.sv
-PKG_FILE     = $(TB_DIR)/test_config_pkg.sv
+PKG_FILE     = $(TB_DIR)/$(TB_PKG_FILES)
 TESTBENCH  = TB_sienna_top.sv
 TOP_MODULE = TB_sienna_top
 

@@ -413,7 +413,7 @@ gpnae-verilator:
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS
 # ─────────────────────────────────────────────────────────────────────────────
-vcs:
+vcs: pkg-check
 	@echo "=== VCS simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
 ifeq ($(TRACE),fst)
 	@echo "-- WARNING: VCS's \$$dumpvars only produces VCD; this run will write"

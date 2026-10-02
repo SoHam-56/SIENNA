@@ -18,6 +18,7 @@ MODEL_DIR ?=
 QUICK ?= 0
 
 FORMATS = fp32 bf16 int8
+# Exactly one word, and one of FORMATS: anything left after filter-out, or a word count but 1, stops make.
 ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
 $(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
 endif

@@ -112,7 +112,7 @@ make check-files                # verify every file in DESIGN_FILES exists
 ```bash
 make pkg FMT=bf16 TEST=matmul_random_tanh       # test_config_pkg.sv + that test's stimulus (default matmul_relu_nopool)
 make verilator FMT=int8                         # make pkg, then the package guard, then build and run
-make lint FMT=bf16                              # also through pkg and the guard; so are debug and perf
+make lint FMT=bf16                              # also through pkg and the guard; so are debug, perf and vcs
 make regression FMT=int8 N=16 TILE=4            # 37 tests in int8, 29 in fp32 and bf16
 make gemm FMT=int8 QUICK=1 PYTHON=<venv>/bin/python
 make model FMT=bf16 MODEL_DIR=<dir>             # model_runner.py has no default model dir; it refuses int8
@@ -122,9 +122,9 @@ make sm-verilator FMT=int8                      # SystolicMesh's regression at N
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses
 ```
 
-- **`make verilator` regenerates the package and stimulus.** After `make gen-matmul` / `gen-conv`, or anything else that wrote its own, build with `GEN_PKG=0`. `regression.py`, `model_runner.py` and `perf_analysis.py` pass `GEN_PKG=0 FMT=<their format>` to the make they run.
-- **The guard (`pkg-check`)** stops the build before Verilator unless the package's `EXP_W`, `MAN_W` and `IS_INT` are FMT's. A pre-format package (no `EXP_W`) fails it in every FMT.
-- `COLLAPSE_K` reaches `regression.py`'s golden and the mesh regression only; `TB_sienna_top` builds `sienna_top`'s default, 1.
+- **`make verilator` rewrites the package and stimulus.** After `make gen-matmul` / `gen-conv`, or anything else that wrote its own, build with `GEN_PKG=0` and that package's `FMT`, `N`, `TILE`, `LANES`. `regression.py`, `model_runner.py` and `perf_analysis.py` pass all of them to the make they run.
+- **The guard (`pkg-check`)** stops the build before Verilator unless the package's `EXP_W`, `MAN_W`, `IS_INT`, `N`, `TILE_SIZE` and `NUM_LANES` are those of `FMT`, `N`, `TILE`, `LANES`. A pre-format package (no `EXP_W`) fails it in every FMT. `test_makefile_fmt.py` covers it without a build.
+- `COLLAPSE_K` must be 0 or 1, and 0 is refused for every target but `sm-verilator` and `help`: `TB_sienna_top` has no parameters, so it always builds `sienna_top`'s default, 1. A collapse-k 0 SIENNA build is `sienna_jobs/cmds/sienna_ck0.sh`.
 - The tracked `testbenches/test_config_pkg.sv` is the fp32 default (`make pkg FMT=fp32 N=16 TILE=4`). Every build overwrites it, so don't commit it from a run.
 - `PYTHON` (default `python3`) runs the scripts; `tflite` and `model` need the `tflite` package, which the farm has in `sienna_jobs/venv`.
 - `gpnae-verilator` rewrites GPNAE's tracked `testbenches/gpnae_test_config.svh` for FMT, as GPNAE's regression always does.

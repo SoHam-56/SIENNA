@@ -359,6 +359,7 @@ pkg:
 
 # Fails the build unless the package's EXP_W, MAN_W, IS_INT (when present), N, TILE_SIZE and NUM_LANES are FMT's, N, TILE and LANES.
 pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
+	@[ -r $(PKG_FILE) ] || { echo "ERROR: $(PKG_FILE) is missing or unreadable: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; exit 1; }
 	@set -- $(FMT_FIELDS_$(FMT)); \
 	field() { awk -v k="$$1" '$$1 == "localparam" && $$3 == k { sub(/;.*/, "", $$5); print $$5 }' $(PKG_FILE) 2>/dev/null; }; \
 	e=$$(field EXP_W); m=$$(field MAN_W); i=$$(field IS_INT); n=$$(field N); t=$$(field TILE_SIZE); l=$$(field NUM_LANES); \

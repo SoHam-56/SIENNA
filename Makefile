@@ -22,6 +22,16 @@ ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
 $(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
 endif
 
+# COLLAPSE_K is 0 or 1, and 0 only for sm-verilator: TB_sienna_top has no parameters, so -G cannot reach sienna_top's.
+ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
+$(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
+endif
+ifeq ($(COLLAPSE_K),0)
+ifneq ($(filter-out sm-verilator help default,$(or $(MAKECMDGOALS),default)),)
+$(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a collapse-k 0 SIENNA build uses $$J/cmds/sienna_ck0.sh)
+endif
+endif
+
 # EXP_W MAN_W IS_INT of each FMT, as regression.py's FORMATS writes them into test_config_pkg.sv.
 FMT_FIELDS_fp32 = 8 23 0
 FMT_FIELDS_bf16 = 8 7 0
@@ -250,7 +260,7 @@ help:
 	@echo "Precision (one variable for every build and run):"
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K for the golden and sm-verilator (default 1; TB_sienna_top builds 1)"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1); 0 only for sm-verilator, as TB_sienna_top builds 1"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); regression: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"

@@ -73,6 +73,13 @@ parameter would be about 98 kbit at N = 64, which is why the table.
 (POOL_H * POOL_W > 1) and pack_shift_i != 0; COLLAPSE_K = 0 and pack_shift_i != 0; a map entry is >= P; accumulate is
 set with pack_shift_i != 0 (no multi-pass packing).
 
+**A packing build needs NUM_LANES = N or a multiple of it.** The Makefile's default `LANES = 32` packs at N = 8, 16 and
+32, but an N = 64 build needs `LANES=64` or `128`. In simulation a packed start on any other lane count fires
+`a_pack_lanes`; silicon has no assertions, so the set would read past the result bank and come back silently wrong. The
+host must not issue it: `model_runner.pack_precheck` (LayerSim, before the layer file is written) refuses with ValueError
+a lane count N does not divide, collapse-k 0 (`regression.COLLAPSE_K`), a residual input, a shift outside
+1 .. log2(N) - 1, a map that is not N/2 entries in 0 .. 7, and a table that is not 8 entries.
+
 ## Mesh: the out-of-block skip
 
 - pack_shift travels with its set through the mesh beside `fresh` and `more` (sets of different b run back to back).
@@ -169,6 +176,9 @@ Deviations from the plan, each with its reason (the plan ledger has the full rul
     fired in the first gate run).
 12. **`make pack`** runs `pack_regression.py`, whose `--act` (one activation in every entry) and `--rows` (several
     row-tile counts) give the same-activation cycle sweep.
+13. **The host refuses what the RTL only asserts** (final review): `pack_precheck` in `model_runner` raises ValueError
+    for NUM_LANES not N or a multiple (an N = 64 build needs `LANES=64` or `128`), collapse-k 0, a residual, a shift out
+    of range, and a map or table of the wrong size, so a packed layer never reaches a build that would compute it wrong.
 
 **Gate (all on the farm, N <= 32):** 93 of 94 runs pass, and the one failure (`pkg_ck0_16_int8`, packed tests on
 collapse-k 0) is deviation 11, rerun clean. Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in

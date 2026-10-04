@@ -2,6 +2,7 @@
 """model_runner.pack_jobs / unpack, without a simulator: layout, refusals, and every job recovered from Y = A @ B + bias."""
 import os
 import sys
+import tempfile
 
 import numpy as np
 
@@ -111,6 +112,62 @@ def test_selu_saturation_refused():
     except ValueError:
         return
     raise AssertionError("pack_jobs accepted a saturating SELU entry")
+
+
+def _packed(N, rng_seed=9):
+    rng = np.random.RandomState(rng_seed)
+    job, _ = mr.pack_jobs(_models(rng, [(3, 3, [2]), (2, 4, [3])], ["tanh", "relu"]), N, int8=False)
+    return job
+
+
+def _refused(job, N, lanes, why):
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            mr.LayerSim(N, lanes, d).run_job(job, "t")  # every refusal is raised before the simulator would run
+        except ValueError as e:
+            assert not os.listdir(d), f"{why}: a layer file was written before the refusal"
+            return str(e)
+    raise AssertionError(f"LayerSim accepted {why}")
+
+
+def test_precheck_accepts_legal():
+    for N, lanes in ((16, 32), (32, 32), (64, 64), (64, 128), (8, 8)):
+        job = _packed(N)
+        cfg, _, _, (M, C, rt, _) = mr.format_layer(job, N)
+        mr.pack_precheck(job["pack"], cfg, (M, C, rt), N, lanes)
+
+
+def test_precheck_lanes():
+    assert "NUM_LANES" in _refused(_packed(64), 64, 32, "N = 64 at the default 32 lanes")
+    assert "NUM_LANES" in _refused(_packed(16), 16, 24, "24 lanes at N = 16")
+
+
+def test_precheck_collapse_k0():
+    old = mr.regression.COLLAPSE_K
+    mr.regression.COLLAPSE_K = 0
+    try:
+        assert "collapse-k 0" in _refused(_packed(16), 16, 32, "a packed layer on the collapse-k 0 mesh")
+    finally:
+        mr.regression.COLLAPSE_K = old
+
+
+def test_precheck_residual():
+    job = _packed(16)
+    A = job["terms"][0][0]
+    job["terms"].append((np.ones_like(A), np.eye(16, dtype=np.float32)))  # an identity term is format_layer's residual
+    assert "residual" in _refused(job, 16, 32, "a packed layer with a residual")
+
+
+def test_precheck_table():
+    for edit, why in ((lambda pk: pk.update(map=pk["map"][:-1]), "a map shorter than N/2"),
+                      (lambda pk: pk.update(map=pk["map"] + [0]), "a map longer than N/2"),
+                      (lambda pk: pk["map"].__setitem__(1, 8), "a map entry past the table"),
+                      (lambda pk: pk.update(ents=pk["ents"][:7]), "7 table entries"),
+                      (lambda pk: pk.update(shift=0), "pack shift 0"),
+                      (lambda pk: pk.update(shift=4), "pack shift log2(N)")):
+        job = _packed(16)
+        edit(job["pack"])
+        _refused(job, 16, 32, why)
 
 
 if __name__ == "__main__":

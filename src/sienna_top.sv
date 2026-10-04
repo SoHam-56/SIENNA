@@ -1084,14 +1084,25 @@ module sienna_top #(
   assign dropout_busy_o = any_dropout_active;
 
 `ifndef SYNTHESIS
+  // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
+  logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
+  logic acc_credit_q, acc_mready_q;  // a credit was free and the mesh had a staging bank, at the accept
+  logic [2:0] acc_shift_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum, acc_credit_q, acc_mready_q} <= '0;
+    else begin
+      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, accumulate_i, pack_shift_i, last_accum};
+      {acc_credit_q, acc_mready_q} <= {credits != 0, mesh_input_ready};
+      if (host_accept) last_accum <= accumulate_i;
+    end
   // Stage handshake invariants; live only with --assert.
   a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) credits <= SETS_IN_FLIGHT)
     else $error("sienna_top: more credits than SETS_IN_FLIGHT");
-  a_credit_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) host_accept |-> credits != 0)
+  a_credit_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> acc_credit_q)
     else $error("sienna_top: a start was accepted without a credit");
   a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> credits < SETS_IN_FLIGHT)
     else $error("sienna_top: a set finished with every credit already free");
-  a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) systolic_start |-> mesh_input_ready)
+  a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> acc_mready_q)  // systolic_start is host_accept
     else $error("sienna_top: a start was forwarded to a mesh with no free staging bank");
   a_g_from_mesh: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> mesh_sets != 0)
     else $error("sienna_top: the activation stage took a result the host never started");
@@ -1109,15 +1120,6 @@ module sienna_top #(
   a_complete_dispatched: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> disp_done)
     else $error("sienna_top: pooling completed a set it never dispatched");
   localparam bit PACK_OK = (NUM_LANES % N == 0) && (COLLAPSE_K != 0) && POOL_BYPASS;
-  // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
-  logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
-  logic [2:0] acc_shift_q;
-  always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum} <= '0;
-    else begin
-      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, accumulate_i, pack_shift_i, last_accum};
-      if (host_accept) last_accum <= accumulate_i;
-    end
   a_pack_lanes: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> PACK_OK)
     else $error("sienna_top: a packed set needs N (%0d) to divide NUM_LANES (%0d), collapse-k 1 and a 1x1 pool", N, NUM_LANES);
   a_pack_range: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> int'(acc_shift_q) < LGN)

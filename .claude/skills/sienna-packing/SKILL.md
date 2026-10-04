@@ -111,11 +111,11 @@ a lane count N does not divide, collapse-k 0 (`regression.COLLAPSE_K`), a residu
 
 ## Software
 
-- `model_runner`: `pack_jobs(jobs, N)` picks the smallest power-of-two b >= max(K_c, C_c, 2) over the jobs it packs,
+- `model_runner`: `pack_jobs(models, N, int8)` picks the smallest power-of-two b >= max(K_c, C_c, 2) over the jobs it packs,
   puts each model in a column block (jobs of one model share the block, inputs stacked down its rows), assigns table
   entries (at most P distinct activation / int8 output settings per set), builds A and the block-diagonal B, bias,
   per-column multiplier and shift, and the map; `unpack` cuts each job's rows and columns back out. Jobs with
-  K or C > N/2 are not packed. int8 input quantization stays per model: each block's A codes use that model's scale,
+  K or C > N/2 are refused (ValueError). int8 input quantization stays per model: each block's A codes use that model's scale,
   and its zero point is already folded into its columns' bias.
 - Golden: a packed job's golden is the job computed alone (`int8_layer_exact`, `exact_layer` with the build's T);
   with the skip they are identical by construction, so no packed golden is needed beyond the existing ones.
@@ -180,8 +180,10 @@ Deviations from the plan, each with its reason (the plan ledger has the full rul
     for NUM_LANES not N or a multiple (an N = 64 build needs `LANES=64` or `128`), collapse-k 0, a residual, a shift out
     of range, and a map or table of the wrong size, so a packed layer never reaches a build that would compute it wrong.
 
-**Gate (all on the farm, N <= 32):** 93 of 94 runs pass, and the one failure (`pkg_ck0_16_int8`, packed tests on
-collapse-k 0) is deviation 11, rerun clean. Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in
+**Gate (all on the farm, N <= 32):** Task 9 launched 94 gate runs, 93 configurations plus `pkg_ck0b_16_int8`, the rerun
+of the one failure (`pkg_ck0_16_int8`, packed tests on collapse-k 0, deviation 11); 93 pass. Not counted there: the 8
+`pkg_perf_*` measurement runs and the 11 audit runs (`pkg_vacprobe`, `pkg_neg_*`). Task 10 added 12 `pk10_*` runs
+(`packing_gate.log` section 7 lists the three lints on one line). Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in
 fp32, bf16 and int8: READY, every row of `mg_mesh16_*`, `mg_mesh32_*_T4`, `g3i_N32_*`, `g3i_N8_*` identical in result
 and cycles. `TB_PE_pack`, `TB_PE_int8`, `TB_SystolicArray`, `TB_requant_lanes`: passed. SIENNA regression N = 16 T = 4
 identical to `mg_reg_fp32/bf16/int8` (29/29/37 tests, plus 3/3/4 packed); N = 32 int8 identical to `mg_r32_int8`;
@@ -191,8 +193,9 @@ fp32/bf16 pass (no earlier reference). `make pack` at every N/T and format: 0 mi
 lint clean both tops in three formats with the four rejections. No assertion fired in any run.
 
 **Throughput (measured, `pack_regression.py --act`, N = 16 and 32, T = 4, bf16 and int8, linear and tanh, 2, 8, 32 row
-tiles):** a packed set costs exactly what one of its jobs costs alone, so packing N/b jobs is exactly N/b times
-faster at every row count. Fits are exact (residual 0): cycles = fixed + R x per-set, identical packed and alone, e.g.
+tiles):** the baseline is each job alone as its own unpacked layer on the same build, padded to full N x N sets
+(K = C = b rounded up to one N tile). A packed set costs exactly what one of its jobs costs alone, so packing N/b jobs
+is exactly N/b times faster at every row count. Fits are exact (residual 0): cycles = fixed + R x per-set, identical packed and alone, e.g.
 N = 32 bf16 tanh 190 + 530 R, bf16 linear 190 + 36 R, int8 tanh 171 + 366 R, int8 linear 173 + 36.5 R;
 N = 16 bf16 tanh 118 + 157 R, int8 linear 98 + 16 R. The mixed-activation table of the default run shows less
 (N = 32 bf16 b = 2: 9.2x for 16) only because a packed set costs its slowest entry.
@@ -211,3 +214,21 @@ lane: about 0.9 MGE at N = 16 (47% of flop-storage area) and 1.9 MGE at N = 32 (
 floats, unless synthesis decomposed the index set id first. Assumptions: a mux2 bit = 2 GE, a flop bit = 5 GE, an
 n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis. The copy changed no result or cycle
 (regression, `make pack` and TFLite pack runs identical to Task 9's, `pk10_*` in `packing_gate.log` section 7).
+
+**Known gaps:**
+
+- `sienna_layer`'s `a_pack_shape` has never been seen to fire: `pack_precheck` refuses its cases first, so only a
+  hand-written layer file reaches it.
+- `sienna_layer`'s assertions that mix its inputs (`cfg_load_i`, `a_valid_i`, `w_valid_i`) with state, `a_pack_shape`
+  among them, are aligned only because `TB_sienna_layer` drives 1 ns after the edge; an edge-driving host would be
+  checked one edge late (not converted to registered terms, Task 9 audit).
+- The packed TFLite models have full-range clamps only (TFLite folds their ReLU into the zero point); a non-trivial
+  per-entry clamp is covered by `TB_requant_lanes` and `int8_packed_zp_random_nopool`, not end to end.
+- Per-entry int8 SELU saturation is refused in `pack_jobs` only; the RTL has no per-entry check, and LayerSim checks
+  entry 0 (the set's activation).
+- Untested: an unpacked set with `pack_map_i[0] != 0`; a weight-cached packed B reused with a different shift; packed
+  sets interleaved with unpacked accumulate pairs; the outputs of empty blocks (partial packing) are not compared.
+- `PACK_ENTRIES` is a parameter of `sienna_top` and `sienna_layer`, but 8 is hard-coded in `TB_sienna_layer`,
+  `model_runner.PACK_ENTRIES` and `regression.py`.
+- Without a pre-packing reference (pass/fail only): SIENNA regression N = 16 T = 2, 8, 16 and N = 32 fp32 / bf16;
+  N = 8 is compared only to Task 5's packing tree.

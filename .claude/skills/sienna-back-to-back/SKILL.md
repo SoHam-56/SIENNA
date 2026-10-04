@@ -33,7 +33,7 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 | `accumulate_i` | sampled with the start: 1 makes the set a partial sum (added into `acc_mem`, no output, still completes in order); the next set with it low is added to the sum and activated |
-| `pack_shift_i` | sampled with the start: a packed set of blocks b = N >> pack_shift_i wide (sienna-packing); 0 is unpacked and behaves exactly as before. Refused with accumulate, pooling, collapse-k 0, N not dividing the lanes, or b < 2 |
+| `pack_shift_i` | sampled with the start: a packed set of blocks b = N >> pack_shift_i wide (sienna-packing); 0 is unpacked and behaves exactly as before. Refused with accumulate or when it continues a partial sum, pooling, collapse-k 0, N not dividing the lanes, or b < 2 |
 | `pack_map_i` | sampled with the start: the table entry (0..7) of each column block; entry 0 is the per-set ports below |
 | `pack_act_i`, int8 `pack_zp_i` `pack_min_i` `pack_max_i` `pack_mx_i` `pack_shx_i` `pack_mout_i` `pack_shout_i` `pack_zout_i` | sampled with the start: table entries 1..7 (activation; requantize zero point and clamp; GPNAE words), held per set id like `activation_function_i` |
 

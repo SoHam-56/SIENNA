@@ -444,15 +444,27 @@ class LayerSim:
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
         with open(lf, "w") as f:
-            f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)}\n")
+            pk = job.get("pack")
+            if pk and (C != N or cfg["kb"] != N or rt * N != M):
+                raise ValueError(f"{tag}: a packed layer is a whole number of row tiles, N columns and N deep")
+            f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pk))}\n")
             if int8:
                 q = job["req"]
                 f.write(f"Q {q['zp']} {q['amin']} {q['amax']} {q['mx']} {q['shx']} {q['mout']} {q['shout']} {q['zout']}\n")
+            if pk:
+                f.write("P " + " ".join(str(int(v)) for v in [pk["shift"]] + list(pk["map"])) + "\n")
+                for act, rq_e in pk["ents"][1:]:
+                    q = rq_e or {}
+                    f.write(f"E {ACT_CODES[act]} " + " ".join(str(int(q.get(x, 0))) for x in
+                                                            ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) + "\n")
             f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
             f.write("\n")
             if int8:
                 f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in layer_epilogue(job, N).ravel()))
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
+        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
+            sys.stdout.write((r.stdout + r.stderr)[-3000:])
+            raise RuntimeError(f"{tag}: an assertion fired in the layer simulation")
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
         e = re.search(r"epilogues=(\d+)/(\d+)", r.stdout)
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):

@@ -113,7 +113,7 @@ make check-files                # verify every file in DESIGN_FILES exists
 make pkg FMT=bf16 TEST=matmul_random_tanh       # test_config_pkg.sv + that test's stimulus (default matmul_relu_nopool)
 make verilator FMT=int8                         # make pkg, then the package guard, then build and run
 make lint FMT=bf16                              # also through pkg and the guard; so are debug, perf and vcs
-make regression FMT=int8 N=16 TILE=4            # 37 tests in int8, 29 in fp32 and bf16
+make regression FMT=int8 N=16 TILE=4            # 41 tests in int8, 32 in fp32 and bf16 (each with its packed tests)
 make gemm FMT=int8 QUICK=1 PYTHON=<venv>/bin/python
 make model FMT=bf16 MODEL_DIR=<dir>             # model_runner.py has no default model dir; it refuses int8
 make perf-analysis FMT=bf16                     # perf_analysis.py; make perf is still the profiling build

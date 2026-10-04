@@ -20,13 +20,21 @@ def layer(N, sh, R, rng, fmt, zero_rows=False):
     """A packed layer of R row tiles: block c's job is A[:, block] @ W_c + bias, through ACTS[(c + 1) % 8]."""
     b = N >> sh
     A = rng.uniform(-1, 1, (R * N, N))
-    if zero_rows:
-        A[0::4, :], A[1::4, :] = -0.0, 0.0
     B = np.zeros((N, N))
     for c in range(N // b):
         B[c * b:(c + 1) * b, c * b:(c + 1) * b] = rng.uniform(-1, 1, (b, b))
     bias = rng.uniform(-0.5, 0.5, N)
     mp = [((c + 1) % 8 if c < N // b else 0) for c in range(N // 2)]
+    if zero_rows:  # exact zero sums, no bias beat: rows 0, 1 are -0 / +0 inputs, rows 2 mod 4 cancel x * w against -x * w, block 0's first column has zero weights
+        A[0::4, :], A[1::4, :] = -0.0, 0.0
+        A[2::4, :] = 0.0
+        for c in range(N // b):
+            B[c * b + 1, c * b:(c + 1) * b] = B[c * b, c * b:(c + 1) * b]
+            A[2::4, c * b] = rng.uniform(-1, 1, A[2::4, c * b].shape)
+            A[2::4, c * b + 1] = -A[2::4, c * b]
+        B[0:b, 0] = 0.0
+        bias = np.zeros(N)
+        mp = [(0, 1, 5, 7)[c % 4] if c < N // b else 0 for c in range(N // 2)]  # linear and tanh entries only
     return A, B, bias, mp, b
 
 
@@ -66,7 +74,7 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             gold = reg.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])
         else:
             alone = {"terms": [(A[:, cols], B[cols, cols])], "bias": bias[cols], "act": ACTS[e], "shape": (R * N, b)}
-            gold = gs.exact_layer(A[:, cols], B[cols, cols], bias[cols], ACTS[e], N, a.fmt) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
+            gold = gs.exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, ACTS[e], N, a.fmt) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
         Ya, _, cyc = sim.run_job(alone, f"al_s{sh}_{c}")
         cyc_a += cyc
         bits = (lambda y: y) if a.fmt == "int8" else (lambda y: reg.fmt_bits(y, a.fmt))

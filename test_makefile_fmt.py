@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The Makefile's FMT flow without building: the pkg-check guard on fixture packages, the parse-time FMT and COLLAPSE_K checks, regression.py --action pkg's refusals, and FMT_FIELDS_* against regression.FORMATS."""
+"""The Makefile's FMT flow without building: the pkg-check guard on fixture packages, the parse-time FMT and COLLAPSE_K checks, make pack's recipe, regression.py --action pkg's refusals, and FMT_FIELDS_* against regression.FORMATS."""
 import os
 import re
 import subprocess
@@ -76,7 +76,7 @@ def test_guard_missing_file():
 def test_parse_time_rejections():
     r = make_n("regression", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
-    for t in ("regression", "verilator", "lint", "pkg"):
+    for t in ("regression", "verilator", "lint", "pkg", "pack"):
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode != 0 and "sienna_ck0.sh" in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
@@ -84,6 +84,13 @@ def test_parse_time_rejections():
     for t in ("help", "sm-verilator"):  # the only targets collapse-k 0 is meaningful for, or harmless in
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode == 0, (t, r.stderr)
+
+
+def test_pack_target():
+    r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
+    assert r.returncode == 0 and r.stdout.split() == "py pack_regression.py --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    r = make_n("pack", "FMT=fp16")
+    assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
 
 
 def test_pkg_action_refusals():

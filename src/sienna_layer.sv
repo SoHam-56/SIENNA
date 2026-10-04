@@ -30,7 +30,8 @@ module sienna_layer #(
     parameter int STRIDE_COLS       = 1,
     parameter int PADDING           = 0,
     parameter int DROPOUT_P_PERCENT = 50,
-    parameter int DIM_W             = 16  // width of the configured sizes
+    parameter int DIM_W             = 16,  // width of the configured sizes
+    parameter int PACK_ENTRIES      = 8
 ) (
     input logic clk_i,
     input logic rstn_i,
@@ -54,6 +55,18 @@ module sienna_layer #(
     input logic [31:0]              cfg_gp_mout_i,
     input logic [7:0]               cfg_gp_shout_i,
     input logic [7:0]               cfg_gp_zout_i,
+    // Packing, taken with cfg_load_i: every set of the layer is packed this way (sienna-packing)
+    input logic [2:0]                          cfg_pack_shift_i,
+    input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] cfg_pack_map_i,
+    input logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] cfg_pack_act_i,
+    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_zp_i,
+    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_min_i,
+    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_max_i,
+    input logic [PACK_ENTRIES-1:1][15:0]       cfg_pack_mx_i,
+    input logic [PACK_ENTRIES-1:1][4:0]        cfg_pack_shx_i,
+    input logic [PACK_ENTRIES-1:1][31:0]       cfg_pack_mout_i,
+    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_shout_i,
+    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_zout_i,
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
@@ -91,6 +104,13 @@ module sienna_layer #(
   logic [15:0] gp_mx_q;
   logic [4:0] gp_shx_q;
   logic [31:0] gp_mout_q;
+  logic [2:0] pk_shift_q;  // packing configuration, as the cfg_pack_* ports
+  logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pk_map_q;
+  logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
+  logic [PACK_ENTRIES-1:1][7:0] pk_zp_q, pk_min_q, pk_max_q, pk_shout_q, pk_zout_q;
+  logic [PACK_ENTRIES-1:1][15:0] pk_mx_q;
+  logic [PACK_ENTRIES-1:1][4:0] pk_shx_q;
+  logic [PACK_ENTRIES-1:1][31:0] pk_mout_q;
   logic [31:0] total_sets;
   logic active;
 
@@ -144,7 +164,8 @@ module sienna_layer #(
       .STRIDE_COLS      (STRIDE_COLS),
       .PADDING          (PADDING),
       .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
-      .LFSR_WIDTH       (LFSR_WIDTH)
+      .LFSR_WIDTH       (LFSR_WIDTH),
+      .PACK_ENTRIES     (PACK_ENTRIES)
   ) pipe (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
@@ -163,17 +184,17 @@ module sienna_layer #(
       .gp_mout_i                  (gp_mout_q),
       .gp_shout_i                 (gp_shout_q),
       .gp_zout_i                  (gp_zout_q),
-      .pack_shift_i               ('0),  // packing: tied off until Task 6 wires the layer configuration
-      .pack_map_i                 ('0),
-      .pack_act_i                 ('0),
-      .pack_zp_i                  ('0),
-      .pack_min_i                 ('0),
-      .pack_max_i                 ('0),
-      .pack_mx_i                  ('0),
-      .pack_shx_i                 ('0),
-      .pack_mout_i                ('0),
-      .pack_shout_i               ('0),
-      .pack_zout_i                ('0),
+      .pack_shift_i               (pk_shift_q),
+      .pack_map_i                 (pk_map_q),
+      .pack_act_i                 (pk_act_q),
+      .pack_zp_i                  (pk_zp_q),
+      .pack_min_i                 (pk_min_q),
+      .pack_max_i                 (pk_max_q),
+      .pack_mx_i                  (pk_mx_q),
+      .pack_shx_i                 (pk_shx_q),
+      .pack_mout_i                (pk_mout_q),
+      .pack_shout_i               (pk_shout_q),
+      .pack_zout_i                (pk_zout_q),
       .weight_cached_i            (p_cached),
       .weight_tile_i              (p_tile),
       .wc_write_enable_i          (p_wc_we),
@@ -286,6 +307,17 @@ module sienna_layer #(
       gp_mout_q <= '0;
       gp_shout_q <= '0;
       gp_zout_q <= '0;
+      pk_shift_q <= '0;
+      pk_map_q <= '0;
+      pk_act_q <= '0;
+      pk_zp_q <= '0;
+      pk_min_q <= '0;
+      pk_max_q <= '0;
+      pk_mx_q <= '0;
+      pk_shx_q <= '0;
+      pk_mout_q <= '0;
+      pk_shout_q <= '0;
+      pk_zout_q <= '0;
       total_sets <= '0;
       wl_blk <= '0;
       wl_bias_done <= 1'b0;
@@ -325,6 +357,17 @@ module sienna_layer #(
         gp_mout_q <= cfg_gp_mout_i;
         gp_shout_q <= cfg_gp_shout_i;
         gp_zout_q <= cfg_gp_zout_i;
+        pk_shift_q <= cfg_pack_shift_i;
+        pk_map_q <= cfg_pack_map_i;
+        pk_act_q <= cfg_pack_act_i;
+        pk_zp_q <= cfg_pack_zp_i;
+        pk_min_q <= cfg_pack_min_i;
+        pk_max_q <= cfg_pack_max_i;
+        pk_mx_q <= cfg_pack_mx_i;
+        pk_shx_q <= cfg_pack_shx_i;
+        pk_mout_q <= cfg_pack_mout_i;
+        pk_shout_q <= cfg_pack_shout_i;
+        pk_zout_q <= cfg_pack_zout_i;
         total_sets <= 32'(r) * 32'(c) * 32'(d + DIM_W'(cfg_residual_i));
         wl_blk <= '0;
         wl_bias_done <= 1'b0;
@@ -402,6 +445,9 @@ module sienna_layer #(
   assign busy_o = active;
 
 `ifndef SYNTHESIS
+  a_pack_shape: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                 (cfg_load_i && !active && cfg_pack_shift_i != '0) |-> (cfg_n_i == DIM_W'(N) && cfg_kb_i == DIM_W'(N) && !cfg_residual_i))
+    else $error("sienna_layer: a packed layer is N columns and N deep, without a residual");
   a_start_taken: assert property (@(posedge clk_i) disable iff (!rstn_i) p_start |-> p_ready)
     else $error("sienna_layer: a set's last row came when the pipeline could not take its start");
   a_one_north: assert property (@(posedge clk_i) disable iff (!rstn_i) !(p_wc_we && p_north_we))

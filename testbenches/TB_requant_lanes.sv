@@ -1,13 +1,14 @@
 `timescale 1ns / 100ps
 
-// requant_lanes against ipu.requant (rq_lanes.mem): per-channel words, lane k's channel (k*PER_LANE + b) % N, req_lat() latency.
+// requant_lanes against ipu.requant (rq_lanes.mem): per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency.
 module TB_requant_lanes;
   localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;
   logic [NUM_LANES-1:0][31:0] acc_i = '0;
   logic [N-1:0][31:0] mult_i = '0;
   logic [N-1:0][7:0] shift_i = '0;
-  logic [7:0] zp_i = '0, min_i = '0, max_i = '0;
+  logic packed_i = 0;
+  logic [NUM_LANES-1:0][7:0] zp_i = '0, min_i = '0, max_i = '0;
   logic [NUM_LANES-1:0][7:0] result_o;
   always #5 clk_i = ~clk_i;
 
@@ -51,7 +52,7 @@ module TB_requant_lanes;
     sets = int'(v[0]);
     p = 1;
     for (int s = 0; s < sets; s++) begin
-      p += 3 + 2 * N;
+      p += 1 + 3 * NUM_LANES + 2 * N;
       for (int b = 0; b < PER_LANE; b++) begin
         logic [NUM_LANES-1:0][7:0] row;
         for (int k = 0; k < NUM_LANES; k++) row[k] = v[p+NUM_LANES+k][7:0];
@@ -66,14 +67,17 @@ module TB_requant_lanes;
     for (int s = 0; s < sets; s++) begin
       @(negedge clk_i);
       clear_i = 1;
-      zp_i  = v[p][7:0];
-      min_i = v[p+1][7:0];
-      max_i = v[p+2][7:0];
-      for (int c = 0; c < N; c++) begin
-        mult_i[c]  = v[p+3+c];
-        shift_i[c] = v[p+3+N+c][7:0];
+      packed_i = v[p][0];
+      for (int k = 0; k < NUM_LANES; k++) begin
+        zp_i[k]  = v[p+1+k][7:0];
+        min_i[k] = v[p+1+NUM_LANES+k][7:0];
+        max_i[k] = v[p+1+2*NUM_LANES+k][7:0];
       end
-      p += 3 + 2 * N;
+      for (int c = 0; c < N; c++) begin
+        mult_i[c]  = v[p+1+3*NUM_LANES+c];
+        shift_i[c] = v[p+1+3*NUM_LANES+N+c][7:0];
+      end
+      p += 1 + 3 * NUM_LANES + 2 * N;
       @(negedge clk_i);
       clear_i = 0;
       for (int b = 0; b < PER_LANE; b++) begin

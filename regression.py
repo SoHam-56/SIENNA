@@ -13,6 +13,7 @@ import argparse
 import math
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -305,14 +306,18 @@ def _golden_bits(passes, bias, cfg: dict, act: str, drop_seed: int, fmt: str) ->
     rom = gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
     A = gpnae_model.Lane(f, rom).run(C, activation_to_code(act))
     P = _maxpool_bits(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1), f)
+    return C, A, P, _dropout_bits(P, cfg, drop_seed, f)
+
+
+def _dropout_bits(P, cfg: dict, drop_seed: int, f) -> np.ndarray:
+    """Dropout of a set's pooled bits as the lanes apply it: scaled by 1/(1-p) where kept, a zero with the input's sign where dropped."""
     if not cfg.get("training", False):
-        return C, A, P, P.copy()
+        return P.copy()
     flat = P.flatten()
     keep = dropout_keep(flat.size, cfg.get("dropout_p", 0.5), drop_seed, cfg.get("lanes", 32))
     scale = fpu.from_fp32(int(np.float32(1.0 / (1.0 - cfg.get("dropout_p", 0.5))).view(np.uint32)), f.m)
     prod = fpu.mul(f, flat, np.full_like(flat, scale))[0]
-    F = np.where(keep, prod, flat & (1 << (f.w - 1)))  # a dropped beat is a zero with the input's sign
-    return C, A, P, F.reshape(P.shape)
+    return np.where(keep, prod, flat & (1 << (f.w - 1))).reshape(P.shape)
 
 
 # ===== int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden =====
@@ -648,6 +653,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("ACCUM_PASSES", passes, "int"),
         ("MIXED_LEN", len(mixed), "int"),
         ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
+        ("PACKED", int(bool(cfg.get("packed", False))), "int"),
         ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
         ("DROPOUT_SEED", drop_seed, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
@@ -726,7 +732,138 @@ def fp32_error_bound(S: np.ndarray, products: int, cfg: dict, act_type: str, C: 
     return B.astype(np.float32)
 
 
+PACK_ENTRIES = 8  # sienna_top's PACK_ENTRIES; entry 0 is the per-set ports
+
+
+def pack_shift_of(N: int, k: int) -> int:
+    """Set k's pack shift in the packed tests: packed, unpacked, b = 2 (fewer columns than the PE's slots), b = N / 4."""
+    lg = N.bit_length() - 1
+    return [1, 0, lg - 1, min(2, lg - 1)][k % 4]
+
+
+def pack_map_of(N: int, sh: int, k: int) -> list:
+    """Entry of each of the N/2 block slots: the set's 2^sh blocks rotate through the entries; an unpacked set uses entry 0."""
+    return [((c + k) % PACK_ENTRIES if sh and c < (1 << sh) else 0) for c in range(N // 2)]
+
+
+def _write_pack(path: str, sh: int, mp: list, ents: list) -> None:
+    """pack_<k>.mem: the shift, N/2 map words, then entries 1..7 as act, zp, min, max, mx, shx, mout, shout, zout."""
+    words = [sh] + list(mp)
+    for act, rq in ents[1:]:
+        q = rq or {}
+        words += [activation_to_code(act)] + [int(q.get(x, 0)) for x in ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")]
+    _write_w32(path, np.array(words, np.int64))
+
+
+def _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop):
+    """One packed float set's files; the golden is each column's block through its entry's activation, then dropout."""
+    N, fmt = cfg.get("n", 16), cfg.get("fmt_name", "fp32")
+    A, B = op_round(A, fmt), op_round(B, fmt)
+    b = op_round(bias, fmt) if bias is not None else np.zeros(N, np.float32)
+    write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), A, fmt)
+    write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), B, fmt)
+    if fmt == "fp32":
+        write_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), b)
+        C = (_ref_matmul(A, B) + b).astype(np.float32)
+        S = np.abs(A).astype(np.float64) @ np.abs(B).astype(np.float64) + np.abs(b)
+        Ca, Bnd = np.zeros_like(C), np.zeros_like(C)
+        for e in sorted(set(col_ent.tolist())):
+            cols = col_ent == e
+            Ca[:, cols] = apply_activation(C, acts[e])[:, cols]
+            Bnd[:, cols] = fp32_error_bound(S, N, cfg, acts[e], C)[:, cols]
+        F = apply_dropout(Ca, cfg.get("dropout_p", 0.5), cfg.get("training", False), drop, cfg.get("lanes", 32))
+        write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), F)
+        write_mem(os.path.join(TB_DIR, f"bound_output_{k}.mem"), Bnd)
+        return
+    f = fpu.FORMATS[fmt]
+    write_op_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), b, fmt)
+    Ab, Bb = fmt_bits(A, fmt), fmt_bits(B, fmt)
+    bb = fmt_bits(b, fmt) if bias is not None else None
+    C = mesh_model.matmul_packed(f, Ab, Bb, N, sh, bb) if sh else mesh_model.matmul(f, [(Ab, Bb)], N, cfg.get("tile_size", 4), 1, bb)
+    lane = gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+    Aout = np.zeros_like(C)
+    for e in sorted(set(col_ent.tolist())):
+        cols = col_ent == e
+        Aout[:, cols] = lane.run(C, activation_to_code(acts[e]))[:, cols]
+    F = _dropout_bits(Aout, cfg, drop, f)
+    write_bits(os.path.join(TB_DIR, f"expected_output_{k}.mem"), F, fmt)
+    write_bits(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F), fmt)
+
+
+def _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs):
+    """One packed int8 set: one input scale for the set, weights per column; each entry's requantize and lane parameters
+    come from the accumulators of the columns that use it; dropout drops each column to its entry's zero point (D-5)."""
+    N = cfg.get("n", 16)
+    A_q, s_a, z_a = quant_act(A)
+    B_q, s_w = quant_weights(B)
+    hw_bias = fold_bias(bias, s_a, s_w, z_a, B_q)
+    acc = wrap32(imatmul(A_q, B_q) + hw_bias[None, :])
+    mult, shift = np.zeros(N, np.int64), np.zeros(N, np.int64)
+    ents = [(acts[e], None) for e in range(PACK_ENTRIES)]
+    Y, dzp = np.zeros_like(acc), np.zeros(N, np.int64)
+    for e in sorted(set(col_ent.tolist())):
+        cols = col_ent == e
+        rq = requant_params(acc[:, cols], s_a, s_w[cols], acts[e], req_rng, zqs[e])
+        mult[cols], shift[cols] = rq["mult"], rq["shift"]
+        ents[e] = (acts[e], rq)
+        Y[:, cols] = activate_int8(requantize(acc[:, cols], rq), acts[e], rq)
+        dzp[cols] = drop_zp(acts[e], rq)
+    if cfg.get("training", False):
+        keep = dropout_keep(N * N, cfg.get("dropout_p", 0.5), drop, cfg.get("lanes", 32)).reshape(N, N)
+        Y = np.where(keep, Y, dzp[None, :])
+    head = ents[0][1] or requant_params(acc, s_a, s_w, acts[0], req_rng, zqs[0])  # entry 0 rides on the per-set ports
+    write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), A_q, "int8")
+    write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), B_q, "int8")
+    _write_w32(os.path.join(TB_DIR, f"bias_{k}.mem"), hw_bias)
+    _write_w32(os.path.join(TB_DIR, f"requant_{k}.mem"), _requant_words(dict(head, mult=mult, shift=shift)))
+    _write_s8(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Y)
+    _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(Y))
+    return ents
+
+
+def _generate_vectors_packed(cfg: dict) -> None:
+    """Packed sets (sienna-packing): block-diagonal B, a pack shift per set, an activation (int8: and output parameters) per
+    column block from an 8-entry table; the golden is each block's job alone, assembled. Needs a 1x1 pool."""
+    os.makedirs(TB_DIR, exist_ok=True)
+    N, fmt, act_type, acts = cfg.get("n", 16), cfg.get("fmt_name", "fp32"), cfg["act"], cfg["pack_acts"]
+    assert len(acts) == PACK_ENTRIES and acts[0] == act_type, (cfg["name"], "pack_acts[0] must be the test's act")
+    assert (cfg.get("pool_h"), cfg.get("pool_w"), cfg.get("padding")) == (1, 1, 0), (cfg["name"], "packed sets need a 1x1 pool")
+    if fmt == "int8":
+        _check_rounding()
+    seed = cfg.get("seed", 42) + int(os.environ.get("SIENNA_SEED", "0"))
+    credits = cfg.get("credits", SETS_IN_FLIGHT)
+    num_sets = cfg.get("num_sets", credits + 2)
+    drop_seed = 0x2ACE0000 + seed
+    use_bias = bool(cfg.get("bias", False))
+    req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
+    zqs = _zp_draws(np.random.RandomState(seed + 8000), PACK_ENTRIES, acts) if cfg.get("zp_random") else [None] * PACK_ENTRIES
+    for k in range(num_sets):
+        sh, rng = pack_shift_of(N, k), np.random.RandomState(seed + 1000 + k)
+        mp = pack_map_of(N, sh, k)
+        col_ent = np.array([mp[j // (N >> sh)] if sh else mp[0] for j in range(N)])
+        b = N >> sh
+        mask = np.kron(np.eye(N // b), np.ones((b, b))).astype(bool) if sh else np.ones((N, N), bool)
+        A = rng.uniform(-1.0, 1.0, (N, N))
+        B = np.where(mask, rng.uniform(-1.0, 1.0, (N, N)), 0.0)
+        bias = rng.uniform(-1.0, 1.0, N) if use_bias else None
+        drop = set_dropout_seed(drop_seed, k)
+        if fmt == "int8":
+            ents = _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs)
+        else:
+            _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop)
+            ents = [(a, None) for a in acts]
+        _write_pack(os.path.join(TB_DIR, f"pack_{k}.mem"), sh, mp, ents)
+    for name in ("matrix_west", "matrix_north", "expected_output", "bound_output"):  # the single-set pass runs set 0
+        shutil.copy(os.path.join(TB_DIR, f"{name}_0.mem"), os.path.join(TB_DIR, f"{name}.mem"))
+    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),  # int8 always sends bias_<k>: it carries the folded input zero point
+                     _config_items(cfg, fmt, act_type, num_sets, credits, 1, [], use_bias or fmt == "int8", drop_seed))
+    if fmt != "fp32":
+        _check_mem_widths(fmt, num_sets)
+
+
 def generate_vectors(cfg: dict) -> None:
+    if cfg.get("packed"):
+        return _generate_vectors_packed(cfg)
     if cfg.get("fmt_name", "fp32") == "int8":
         return _generate_vectors_int8(cfg)
     os.makedirs(TB_DIR, exist_ok=True)
@@ -1078,6 +1215,17 @@ PIPELINE_TESTS = [
     {"name": "int8_accum2_mixed_bypass_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "accum_passes": 2,
      "pool_h": 1, "pool_w": 1, "padding": 0, "mixed_acts": ["relu", "relu", "tanh", "tanh", "linear", "linear", "selu", "selu"],
      "req_random": True, "zp_random": True, "num_sets": 16, "formats": ("int8",)},
+    # sienna-packing: shifts 1, 0, b = 2, b = N / 4 per set, an 8-entry table of activations rotating over the blocks
+    {"name": "packed_mixed_act_nopool", "mode": "matmul", "matrix_type": "random", "act": "tanh", "pool_h": 1, "pool_w": 1,
+     "padding": 0, "packed": True, "pack_acts": ["tanh", "relu", "selu", "linear", "sigmoid", "tanh", "relu", "selu"]},
+    {"name": "packed_bias_cached_train_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "pool_h": 1,
+     "pool_w": 1, "padding": 0, "packed": True, "bias": True, "cached": True, "training": True,
+     "pack_acts": ["relu", "linear", "tanh", "sigmoid", "relu", "selu", "linear", "tanh"]},
+    {"name": "packed_all_bypass_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "pool_h": 1, "pool_w": 1,
+     "padding": 0, "packed": True, "pack_acts": ["relu", "linear"] * 4},  # every lane ReLU or linear: the bypass path, per lane
+    {"name": "int8_packed_zp_random_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "pool_h": 1,
+     "pool_w": 1, "padding": 0, "packed": True, "req_random": True, "zp_random": True, "formats": ("int8",),
+     "pack_acts": ["linear", "relu", "tanh", "selu", "sigmoid", "linear", "relu", "tanh"]},
 ]
 
 

@@ -33,6 +33,9 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `pipeline_complete_o` | **one-cycle pulse** when a set's last output leaves dropout (was a held level) |
 | `done_set_id_o` | 2-bit id of that set: accepted starts, counted mod 4 |
 | `accumulate_i` | sampled with the start: 1 makes the set a partial sum (added into `acc_mem`, no output, still completes in order); the next set with it low is added to the sum and activated |
+| `pack_shift_i` | sampled with the start: a packed set of blocks b = N >> pack_shift_i wide (sienna-packing); 0 is unpacked and behaves exactly as before. Refused with accumulate, pooling, collapse-k 0, N not dividing the lanes, or b < 2 |
+| `pack_map_i` | sampled with the start: the table entry (0..7) of each column block; entry 0 is the per-set ports below |
+| `pack_act_i`, int8 `pack_zp_i` `pack_min_i` `pack_max_i` `pack_mx_i` `pack_shx_i` `pack_mout_i` `pack_shout_i` `pack_zout_i` | sampled with the start: table entries 1..7 (activation; requantize zero point and clamp; GPNAE words), held per set id like `activation_function_i` |
 
 Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
 defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), synchronous `SystolicArray` mesh tiles. GFLOPS count the
@@ -118,6 +121,8 @@ selected. It is the default since 2026-09-24 (sienna_top, sienna_multi and the m
 | `start_matrix_mult_i` | pulse: the set just written is complete. Queued, not launched; ignored while `input_ready_o` is low |
 | `collection_complete_o` | the oldest unreleased result is readable. A bank-full level, cleared by release |
 | `result_release_i` | pulse after the consumer's last read. `sienna_top` sends it when its read stream ends |
+| `pack_shift_i` | sampled with the start: the set's pack shift, held per staging and operand bank and passed east with A; each PE skips products outside its column block |
+| `wide_read_packed_i` | the wide read takes the oldest result column-wise (word k is column k % N), so a lane holds one column block |
 
 The mesh launches a set when a staging bank is full and a result bank is free. A
 queued start costs one cycle: 204 cycles per set at N=16, T=4, instead of 203.

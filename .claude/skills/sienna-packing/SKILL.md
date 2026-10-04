@@ -5,8 +5,9 @@ description: Use when designing, building or verifying SIENNA's multi-job packin
 
 # SIENNA: multi-job packing
 
-**Status: spec, approved in conversation 2026-10-04; not implemented.** Branch `packing` (SIENNA; SystolicMesh gets
-one when its RTL changes). Tag `pre_packing_v1` (all four repos, 2026-10-04) is the design before this work.
+**Status: implemented and verified 2026-10-04 on the packing branch (SIENNA 935221f, SystolicMesh cae6e87) at N = 8-32; N = 64 after check-in.**
+Spec approved 2026-10-04; "As built" at the end lists every deviation. Tag `pre_packing_v1` (all four repos,
+2026-10-04) is the design before this work.
 
 ## The problem
 
@@ -134,3 +135,65 @@ set with pack_shift_i != 0 (no multi-pass packing).
 - Partial packing: fewer models than N/b blocks; empty blocks must produce zeros and cost nothing extra.
 - Weight-cached packed B reused across sets with a different pack_shift.
 - Float signed zero (D-6) on exact cancellations: allowed to differ only between +0 and -0, never in value.
+
+## As built (2026-10-04)
+
+Verified tree: SIENNA `packing` 935221f, SystolicMesh `packing` cae6e87 (not pushed); the gate ran on efe2b68, and
+935221f, which only skips the packed tests on collapse-k 0, was rerun for that run. Gate record:
+`sienna_report/packing_gate.log`; run results in `sienna_jobs/runs/pkg_*`.
+
+Deviations from the plan, each with its reason (the plan ledger has the full rulings):
+
+1. **PE column origin is `COL0 = COLLAPSE_K ? j * T : 0`** (Task 3), not unconditional: under collapse-k 0 a PE's depth is
+   T, and the PE's `COL < K` check fired. Collapse-k 0 never packs, so local column c is right there.
+2. **The Verilator build deletes stale `packShift*.mem`** before copying stimulus (Task 3): the copy never deletes, and a
+   packed test's file packed the next unpacked conv set.
+3. **N = 8 runs skip conv** (mesh: `--group matmul`; SIENNA: no conv, and two `_train` tests whose generator rejects
+   N = 8), as the pre-packing baselines did: the conv kernel depth 9 does not fit N = 8.
+4. **The packed wide read is a second address formula into MeshOutputSram's existing read muxes** (Task 3, against
+   `2026-09-27_synthesis_readiness.txt` item 3b); a future per-tile banking must route that pattern through its crossbar.
+5. **`TB_requant_lanes` packs sets 1, 2 and 5** (Task 4), so an unpacked set starts at an odd multiple of the period and
+   a `clear_i` mutant dies.
+6. **Refusals and start-time checks are assertions on registered accept terms** (Task 5 and its fix round; Task 9 for
+   two more). A testbench that drives an input at the clock edge is seen by the flops at that edge but by a concurrent
+   assertion one edge later, against state the edge already changed; `host_accept` checks never fired. `sienna_top`
+   keeps `acc_*` copies, the mesh `sa_*`, `wcw_q`/`rd_q`. The refusal of a packed set that continues a partial sum was
+   added (the accumulate flag of the previous accept).
+7. **`set_act` became `set_ents[id][0]`**; the int8 packed generator needed `HAS_BIAS` (Task 5).
+8. **Regressions fail on any assertion firing** (Task 6 LayerSim, Task 9 both `regression.py` parsers): with
+   `+verilator+error+limit` a firing changes neither the exit code nor the testbench's counts.
+9. **`pack_jobs` does not reorder jobs** (Task 7): grouping is the caller's. A set costs its slowest activation, so a
+   set mixing ReLU/linear with a polynomial activation loses the bypass path for its fast blocks.
+10. **The TFLite packed run is N = 32 only** (Task 8): its groups need b <= N/2 = 16.
+11. **SIENNA's collapse-k 0 regression skips the packed tests** (Task 9): that mesh refuses them (`a_pack_collapsed`
+    fired in the first gate run).
+12. **`make pack`** runs `pack_regression.py`, whose `--act` (one activation in every entry) and `--rows` (several
+    row-tile counts) give the same-activation cycle sweep.
+
+**Gate (all on the farm, N <= 32):** 93 of 94 runs pass, and the one failure (`pkg_ck0_16_int8`, packed tests on
+collapse-k 0) is deviation 11, rerun clean. Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in
+fp32, bf16 and int8: READY, every row of `mg_mesh16_*`, `mg_mesh32_*_T4`, `g3i_N32_*`, `g3i_N8_*` identical in result
+and cycles. `TB_PE_pack`, `TB_PE_int8`, `TB_SystolicArray`, `TB_requant_lanes`: passed. SIENNA regression N = 16 T = 4
+identical to `mg_reg_fp32/bf16/int8` (29/29/37 tests, plus 3/3/4 packed); N = 32 int8 identical to `mg_r32_int8`;
+collapse-k 0 identical to `mg_ck0_16_int8`; N = 8 identical to Task 5's runs; N = 16 T = 2, 8, 16 and N = 32
+fp32/bf16 pass (no earlier reference). `make pack` at every N/T and format: 0 mismatches, lines identical to Task 7's
+`pk_lr2_*`. `tflite_pack_run.py` (N = 32, T = 2-16), `make tflite`, `make gemm QUICK=1` identical to their references;
+lint clean both tops in three formats with the four rejections. No assertion fired in any run.
+
+**Throughput (measured, `pack_regression.py --act`, N = 16 and 32, T = 4, bf16 and int8, linear and tanh, 2, 8, 32 row
+tiles):** a packed set costs exactly what one of its jobs costs alone, so packing N/b jobs is exactly N/b times
+faster at every row count. Fits are exact (residual 0): cycles = fixed + R x per-set, identical packed and alone, e.g.
+N = 32 bf16 tanh 190 + 530 R, bf16 linear 190 + 36 R, int8 tanh 171 + 366 R, int8 linear 173 + 36.5 R;
+N = 16 bf16 tanh 118 + 157 R, int8 linear 98 + 16 R. The mixed-activation table of the default run shows less
+(N = 32 bf16 b = 2: 9.2x for 16) only because a packed set costs its slowest entry.
+
+**Energy proxy (not a power figure):** a packed set issues b/N of today's multiplies and adds: each PE counts only its
+block's b products per pass (`a_pack_count`; `TB_PE_pack` counts the multiplier's valid strobes, fp32 / bf16 / int8).
+
+**Area (estimate from the RTL's sizing, `sienna_jobs/pk_area_estimate.py`; no synthesis):** packing adds 1.2-2.9% of
+storage bits (N = 16 / 32, all formats; most in the PE's pack pipeline). The lane-order muxes (packed wide-read address,
+write-back index, block lookup) cost 0.1-0.3% of flop-storage area as address selects, up to 5-11% if synthesis must
+double every word's sources. The int8 per-lane parameter muxes as written index {set id, entry}, 128:1 per field per
+lane: about 0.9 MGE at N = 16 (47% of flop-storage area) and 1.9 MGE at N = 32 (30%). Copying the set's 8 entries at
+`g_accept` / `p_accept` (as `g_mult` already is) makes them 8:1 per lane after one shared 16:1: about 84 / 135 kGE.
+Recommended before synthesis; not changed here.

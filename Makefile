@@ -291,6 +291,7 @@ help:
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (gemm_sweep.py; T=4)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (perf_analysis.py)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit; needs FMT=int8"
+	@echo "  make pack FMT=int8                - packed layers vs each job alone (pack_regression.py)"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
 	@echo "Utility Targets:"
@@ -549,6 +550,10 @@ tflite:
 		--tile-size $(TILE) \
 		--lanes $(LANES)
 
+# Packed layers against each job alone on sienna_layer (pack_regression.py), in FMT at N, TILE and LANES.
+pack:
+	$(PYTHON) pack_regression.py --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,4 +572,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite
+        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite pack

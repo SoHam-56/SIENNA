@@ -412,6 +412,66 @@ def layer_epilogue(job, N):
     return np.stack([np.stack([v[c * N:(c + 1) * N] for v in (bb, mm, ss)]) for c in range(ct)])
 
 
+PACK_ENTRIES = 8  # sienna_top's parameter table
+
+
+def pack_jobs(models: list, N: int, int8: bool) -> tuple:
+    """Packs small models into one layer: column block c per model, a table entry per distinct activation and int8 output setting; returns (LayerSim job, recipe for unpack).
+    A set's cycles follow its slowest activation, so mixing ReLU or linear with polynomial activations costs the bypass jobs their fast path."""
+    if not models:
+        raise ValueError("nothing to pack")
+    K = max(m["W"].shape[0] for m in models)
+    C = max(m["W"].shape[1] for m in models)
+    b = 2
+    while b < max(K, C):
+        b *= 2
+    if b > N // 2:
+        raise ValueError(f"a job of depth {K} and width {C} needs blocks of {b}; packing needs at most N/2 = {N // 2}")
+    if len(models) > N // b:
+        raise ValueError(f"{len(models)} models need {len(models)} blocks of {b}; N = {N} holds {N // b}")
+    sh = (N // b).bit_length() - 1
+    rows = max(sum(x.shape[0] for x in m["inputs"]) for m in models)
+    M = -(-rows // N) * N
+    A, B = np.zeros((M, N), np.float32), np.zeros((N, N), np.float32)
+    bias = np.zeros(N, np.int64 if int8 else np.float32)
+    mult, shift = np.zeros(N, np.int64), np.zeros(N, np.int64)
+    keys, ents, mp, recipe = [], [], [0] * (N // 2), []
+    for c, m in enumerate(models):
+        k, cc = m["W"].shape
+        X = np.vstack(m["inputs"]).astype(np.float32)
+        A[:X.shape[0], c * b:c * b + k] = X
+        B[c * b:c * b + k, c * b:c * b + cc] = m["W"]
+        if m["bias"] is not None:
+            bias[c * b:c * b + cc] = m["bias"]
+        q = m.get("req")
+        if int8:
+            mult[c * b:c * b + cc], shift[c * b:c * b + cc] = q["mult"], q["shift"]
+            if m["act"] == "selu" and np.any(regression.selu_saturates(q["mx"], q["shx"], q["zp"], np.arange(q["amin"], q["amax"] + 1))):
+                raise ValueError(f"model {c}: its SELU input range reaches x = 487.29, where the int8 lane saturates")
+        key = (m["act"],) + (tuple(int(q[x]) for x in ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) if int8 else ())
+        if key not in keys:
+            keys.append(key)
+            ents.append((m["act"], {x: v for x, v in q.items() if x not in ("mult", "shift")} if int8 else None))
+        mp[c] = keys.index(key)
+        r0, spans = 0, []
+        for x in m["inputs"]:
+            spans.append((r0, x.shape[0]))
+            r0 += x.shape[0]
+        recipe.append((c * b, cc, spans))
+    if len(ents) > PACK_ENTRIES:
+        raise ValueError(f"{len(ents)} distinct activation / output settings; a packed set holds {PACK_ENTRIES}")
+    ents += [("linear", None)] * (PACK_ENTRIES - len(ents))
+    job = {"terms": [(A, B)], "bias": bias, "act": ents[0][0], "shape": (M, N), "pack": {"shift": sh, "map": mp, "ents": ents}}
+    if int8:
+        job["req"] = dict(ents[0][1], mult=mult, shift=shift)
+    return job, recipe
+
+
+def unpack(Y: np.ndarray, recipe: list) -> list:
+    """Each model's outputs, one array per input, from a packed layer's result."""
+    return [[Y[r0:r0 + m, c0:c0 + cc] for r0, m in spans] for c0, cc, spans in recipe]
+
+
 class LayerSim:
     """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
 

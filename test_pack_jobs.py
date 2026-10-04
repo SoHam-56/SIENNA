@@ -24,6 +24,9 @@ def test_round_trip_float():
     for m, outs in zip(models, mr.unpack(Y, recipe)):
         for x, y in zip(m["inputs"], outs):
             assert np.allclose(y, x @ m["W"] + m["bias"]), "a job's rows and columns came back wrong"
+    pk = job["pack"]
+    assert pk["map"][:3] == [0, 1, 2] and set(pk["map"][3:]) == {0}, "each model's block must point at its own entry"
+    assert [e[0] for e in pk["ents"][:3]] == ["tanh", "relu", "linear"] and len(pk["ents"]) == 8
 
 
 def test_partial_packing_and_entries():
@@ -46,6 +49,54 @@ def test_refusals():
         except ValueError:
             continue
         raise AssertionError(f"pack_jobs accepted {why}")
+
+
+def test_refuses_wide_output():
+    rng = np.random.RandomState(6)
+    try:
+        mr.pack_jobs(_models(rng, [(2, 9, [1])], ["linear"]), 16, int8=False)
+    except ValueError:
+        return
+    raise AssertionError("pack_jobs accepted C > N/2")
+
+
+def _int8_model(rng, i, act="linear"):
+    req = dict(mult=np.array([1000 + 10 * i, 2000 + 10 * i]), shift=np.array([i, i + 1]), zp=i, amin=-128, amax=127, mx=0, shx=0,
+               mout=0, shout=0, zout=0)
+    return {"W": rng.randint(-5, 5, (2, 2)).astype(float), "bias": rng.randint(-9, 9, 2), "act": act, "req": req,
+            "inputs": [rng.randint(-5, 5, (3, 2)).astype(float)]}
+
+
+def test_int8_layout_and_entry_limit():
+    rng = np.random.RandomState(7)
+    models = [_int8_model(rng, i) for i in range(9)]  # K = C = 2 at N = 32: b = 2, 16 blocks, 9 distinct zero points
+    try:
+        mr.pack_jobs(models, 32, int8=True)
+    except ValueError as e:
+        assert "distinct" in str(e), f"refused for the wrong reason: {e}"
+    else:
+        raise AssertionError("pack_jobs accepted 9 settings in a set that holds 8")
+    job, recipe = mr.pack_jobs(models[:8], 32, int8=True)
+    pk, q = job["pack"], job["req"]
+    assert pk["shift"] == 4 and pk["map"] == list(range(8)) + [0] * 8 and len(pk["ents"]) == 8
+    assert q["zp"] == 0 and all(q[x] == models[0]["req"][x] for x in ("amin", "amax", "mx", "shx", "mout", "shout", "zout"))
+    assert [e[1]["zp"] for e in pk["ents"]] == list(range(8)) and "mult" not in pk["ents"][3][1], "entries carry the output words only"
+    assert job["bias"].dtype == np.int64 and q["mult"].shape == (32,) and q["shift"].shape == (32,)
+    for c, m in enumerate(models[:8]):
+        assert list(q["mult"][2 * c:2 * c + 2]) == list(m["req"]["mult"]) and list(q["shift"][2 * c:2 * c + 2]) == list(m["req"]["shift"])
+        assert list(job["bias"][2 * c:2 * c + 2]) == list(m["bias"]), f"model {c}'s bias is not at its columns"
+    assert not np.any(q["mult"][16:]) and not np.any(q["shift"][16:]) and not np.any(job["bias"][16:]), "padding columns must be zero"
+    Y = job["terms"][0][0] @ job["terms"][0][1] + job["bias"][None, :]
+    for m, outs in zip(models[:8], mr.unpack(Y, recipe)):
+        assert np.array_equal(outs[0], m["inputs"][0] @ m["W"] + m["bias"])
+
+
+def test_int8_shared_entry():
+    rng = np.random.RandomState(8)
+    a, b, c = _int8_model(rng, 0), _int8_model(rng, 0), _int8_model(rng, 0, "relu")
+    b["req"] = dict(b["req"], mult=np.array([5, 6]))  # a column's own multiplier is not part of the entry
+    job, _ = mr.pack_jobs([a, b, c], 16, int8=True)
+    assert job["pack"]["map"][:3] == [0, 0, 1] and [e[0] for e in job["pack"]["ents"][:2]] == ["linear", "relu"]
 
 
 def test_selu_saturation_refused():

@@ -28,6 +28,7 @@ module sienna_top #(
     parameter int    STRIDE_ROWS       = 2,
     parameter int    STRIDE_COLS       = 2,
     parameter int    PADDING           = 1,
+    parameter int    PACK_ENTRIES      = 8,  // distinct activation / int8 output settings one packed set may mix; entry 0 is the per-set ports
     parameter int    DROPOUT_P_PERCENT = 50,
     parameter int    LFSR_WIDTH        = 32,
     parameter string INPUT_A_FILE      = "matrixA.mem",
@@ -51,6 +52,17 @@ module sienna_top #(
     input logic [31:0]              gp_mout_i,    // int8 GPNAE: SELU's output requantize
     input logic [7:0]               gp_shout_i,
     input logic [7:0]               gp_zout_i,
+    input logic [2:0]                       pack_shift_i,  // with the start: a packed set of N >> pack_shift_i columns per job; 0 unpacked
+    input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pack_map_i,  // entry of each column block; an unpacked set uses block 0's
+    input logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pack_act_i,  // entries 1..: activation; entry 0 is activation_function_i
+    input logic [PACK_ENTRIES-1:1][7:0]     pack_zp_i,     // int8 entries 1..: as req_zp_i, req_min_i, req_max_i
+    input logic [PACK_ENTRIES-1:1][7:0]     pack_min_i,
+    input logic [PACK_ENTRIES-1:1][7:0]     pack_max_i,
+    input logic [PACK_ENTRIES-1:1][15:0]    pack_mx_i,     // int8 entries 1..: as gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i
+    input logic [PACK_ENTRIES-1:1][4:0]     pack_shx_i,
+    input logic [PACK_ENTRIES-1:1][31:0]    pack_mout_i,
+    input logic [PACK_ENTRIES-1:1][7:0]     pack_shout_i,
+    input logic [PACK_ENTRIES-1:1][7:0]     pack_zout_i,
     input logic                     weight_cached_i,  // with the start: B is cache tile weight_tile_i, only A is written
     input logic [WCTW-1:0]          weight_tile_i,
     input logic                     wc_write_enable_i,  // weight cache write of north_write_data_i at word wc_write_addr_i
@@ -123,6 +135,22 @@ module sienna_top #(
 
   localparam int NUM_IDS = 1 << ID_W;  // more ids than sets in flight, so ids in flight never repeat
   localparam int CRW = $clog2(SETS_IN_FLIGHT + 1);
+  localparam int PEW = $clog2(PACK_ENTRIES);
+  localparam int LGN = $clog2(N);
+`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
+  initial if (PACK_ENTRIES < 2 || (PACK_ENTRIES & (PACK_ENTRIES - 1)) != 0) $error("sienna_top: PACK_ENTRIES (%0d) must be a power of two >= 2", PACK_ENTRIES);
+`endif
+  // A packed set's lanes each take one column: N must divide the lanes; the mesh packs only collapsed; pooling must be the identity.
+  function automatic logic [PEW-1:0] ent_of(input logic [N/2-1:0][PEW-1:0] map, input logic [2:0] sh, input int col);
+    return (sh == '0) ? map[0] : map[col >> (LGN - int'(sh))];
+  endfunction
+  function automatic logic is_byp_code(input logic [CONTROL_WIDTH-1:0] c);
+    return (c == CONTROL_WIDTH'(3'b100)) || (c == CONTROL_WIDTH'(3'b101));
+  endfunction
+  // Lane k's element i of the set the activation stage holds: a run along a row, or for a packed set down column k % N.
+  function automatic int elem(input int k, input int i, input logic pk);
+    return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
+  endfunction
 `ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
 `endif
@@ -140,6 +168,7 @@ module sienna_top #(
   logic bank_done, bank_sel, byp_all_in, rq_drain;
   logic lane_v;  // a beat for the fill counters and the lanes
   logic byp_wr, byp_bank;  // int8: a ReLU or linear beat to write, and its bank
+  logic byp_pack;  // int8: the draining beat's set was packed
   logic [FCNT_W-1:0] byp_idx;  // its element within each lane's block
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
@@ -151,16 +180,23 @@ module sienna_top #(
   logic                  set_train[NUM_IDS];
   logic [LFSR_WIDTH-1:0] set_seed [NUM_IDS];
   logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
-  logic [CONTROL_WIDTH-1:0] set_act[NUM_IDS];  // activation each set asked for, so layers in flight keep their own
-  logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with set_act
+  logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with each set's activation
+  logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = activation_function_i)
+  logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
+  logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
+  logic g_pack;  // the activation stage's set is packed
+  logic [PEW-1:0] lane_ent[NUM_LANES];  // the entry each lane uses for that set
+  logic [PEW-1:0] p_lane_ent[NUM_LANES];  // and each pooling lane for the pooled set
+  logic [CONTROL_WIDTH-1:0] lane_act[NUM_LANES];
+  logic act_bypass;  // every lane's code is ReLU or linear; declared here because the lane-control block above its old place reads it
   logic [CRW-1:0] gp_sets;  // sets past the activation stage and not yet complete; pooling takes them in id order
   // int8: the requantize and GPNAE parameters of the set the activation stage holds (g_*); p_zp: dropout's drop value for the pooled set.
   logic [N-1:0][31:0] g_mult;
   logic [N-1:0][7:0]  g_shift;
-  logic [7:0]         g_zp, g_min, g_max, g_shout, g_zout, p_zp;
-  logic [15:0]        g_mx;
-  logic [4:0]         g_shx;
-  logic [31:0]        g_mout;
+  logic [NUM_LANES-1:0][7:0]  g_zp, g_min, g_max, g_shout, g_zout, p_zp;  // per lane: its column block's entry
+  logic [NUM_LANES-1:0][15:0] g_mx;
+  logic [NUM_LANES-1:0][4:0]  g_shx;
+  logic [NUM_LANES-1:0][31:0] g_mout;
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -266,6 +302,7 @@ module sienna_top #(
       .partial_i             (accumulate_i),
       .bias_valid_i          (bias_valid_i),
       .bias_i                (bias_i),
+      .pack_shift_i          (pack_shift_i),  // sampled with systolic_start, which is host_accept
       .weight_cached_i       (weight_cached_i),
       .weight_tile_i         (weight_tile_i),
       .wc_write_enable_i     (wc_write_enable_i),
@@ -286,6 +323,7 @@ module sienna_top #(
       .read_valid_o          (),
       .wide_read_enable_i    (systolic_read_enable),
       .wide_read_index_i     (32'(systolic_read_addr)),
+      .wide_read_packed_i    (g_pack),
       .wide_read_data_o      (wide_rd_data),
       .wide_read_valid_o     (wide_rd_valid),
       .collection_complete_o (systolic_collection_complete),
@@ -312,12 +350,12 @@ module sienna_top #(
           .last_i        (gpnae_start[g]),
           .terms_i       (gpnae_terms[g]),
           .control_word_i(gpnae_ctrl[g]),
-          .gp_mx_i       (g_mx),
-          .gp_shx_i      (g_shx),
-          .gp_zin_i      (g_zp),     // int8: the lane's input is the requantize output, whose zero point is req_zp_i
-          .gp_mout_i     (g_mout),
-          .gp_shout_i    (g_shout),
-          .gp_zout_i     (g_zout),
+          .gp_mx_i       (g_mx[g]),
+          .gp_shx_i      (g_shx[g]),
+          .gp_zin_i      (g_zp[g]),  // int8: the lane's input is the requantize output, whose zero point is its entry's
+          .gp_mout_i     (g_mout[g]),
+          .gp_shout_i    (g_shout[g]),
+          .gp_zout_i     (g_zout[g]),
           .full_o        (gpnae_full[g]),
           .empty_o       (gpnae_empty_o[g]),
           .idle_o        (gpnae_idle[g]),
@@ -384,7 +422,7 @@ module sienna_top #(
           .data_in      (dropout_data_in[g]),
           .reseed_i     (p_accept),
           .seed_i       (lane_seed),
-          .zero_point_i (p_zp),
+          .zero_point_i (p_zp[g]),
           .data_out     (dropout_data_out[g]),
           .valid_out    (dropout_valid_out[g])
       );
@@ -396,31 +434,35 @@ module sienna_top #(
       dropout_in_valid[i] = POOL_BYPASS ? byp_valid[i] : maxpool_out_valid[i];
       dropout_data_in[i] = POOL_BYPASS ? byp_data[i] : maxpool_out_data[i];
       gpnae_terms[i] = set_terms[g_set_id][GPNAE_ADDR_LINES-1:0];
-      gpnae_ctrl[i] = set_act[g_set_id];  // the set the activation stage holds
+      gpnae_ctrl[i] = (IS_INT && lane_act[i] == CONTROL_WIDTH'(3'b100) && !act_bypass) ? CONTROL_WIDTH'(3'b101) : lane_act[i];  // int8 ReLU is the clamp's
     end
   end
 
-  // ReLU and linear need no polynomial: the activation stage writes each beat straight into its bank and the lanes stay idle.
-  logic act_bypass;
-  assign act_bypass = (set_act[g_set_id] == CONTROL_WIDTH'(3'b100)) || (set_act[g_set_id] == CONTROL_WIDTH'(3'b101));
-  logic act_is_relu;
-  assign act_is_relu = (set_act[g_set_id] == CONTROL_WIDTH'(3'b100));
+  // ReLU and linear need no polynomial: when every lane's code is one of them, each beat goes straight into its bank and the lanes stay idle.
+  always_comb begin
+    act_bypass = 1'b1;
+    for (int k = 0; k < NUM_LANES; k++) begin
+      lane_act[k] = set_ents[g_set_id][lane_ent[k]];
+      act_bypass &= is_byp_code(lane_act[k]);
+    end
+  end
 
   // =========================================================================
   // GPNAE TO CENTRAL BUFFER WRITE LOGIC
   // =========================================================================
   always_ff @(posedge clk_i) begin
-    // Beat b of the wide read holds element k*PER_LANE + b in word k, the element lane k would have taken.
+    // Beat b of the wide read holds element elem(k, b) in word k, the element lane k would have taken.
     if (!IS_INT && g_state != G_IDLE && act_bypass && fill_v)
       for (int k = 0; k < NUM_LANES; k++)
-        gpnae_out_mem[act_wr_base + k * PER_LANE + fill_count[k]] <= (act_is_relu && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+        gpnae_out_mem[act_wr_base + elem(k, int'(fill_count[k]), g_pack)] <=
+            (lane_act[k] == CONTROL_WIDTH'(3'b100) && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
     if (IS_INT && byp_wr)  // int8: a beat lands where its own tag says, so it may leave the requantize pipeline after its set left the stage
-      for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + k * PER_LANE + int'(byp_idx)] <= fill_d[k];
+      for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + elem(k, int'(byp_idx), byp_pack)] <= fill_d[k];
     if (g_state == G_ROUND && !act_bypass) begin
       for (int i = 0; i < NUM_LANES; i++) begin
         if (load_finalized[i] && gpnae_done[i] && (done_count[i] < fill_count[i])) begin
           // RESTORED: This is the mathematically perfect chunked indexing!
-          gpnae_out_mem[act_wr_base + i * PER_LANE + done_count[i]] <= gpnae_result[i];
+          gpnae_out_mem[act_wr_base + elem(i, int'(done_count[i]), g_pack)] <= gpnae_result[i];
         end
       end
     end
@@ -570,19 +612,29 @@ module sienna_top #(
       p_next_id <= '0;
       p_set_id  <= '0;
       host_next_id <= '0;
+      g_pack    <= 1'b0;
       for (int k = 0; k < NUM_IDS; k++) begin
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
         set_accum[k] <= 1'b0;
-        set_act[k]   <= '0;
         set_terms[k] <= '0;
+        set_pack[k]  <= '0;
+        set_map[k]   <= '0;
+        set_ents[k]  <= '0;
+      end
+      for (int k = 0; k < NUM_LANES; k++) begin
+        lane_ent[k]   <= '0;
+        p_lane_ent[k] <= '0;
       end
     end else begin
       complete_q <= pipeline_complete_o;
       if (host_accept) begin
         set_accum[host_next_id] <= accumulate_i;
-        set_act[host_next_id]   <= activation_function_i;
         set_terms[host_next_id] <= num_terms_i;
+        set_pack[host_next_id] <= pack_shift_i;
+        set_map[host_next_id]  <= pack_map_i;
+        set_ents[host_next_id][0] <= activation_function_i;
+        for (int e = 1; e < PACK_ENTRIES; e++) set_ents[host_next_id][e] <= pack_act_i[e];
         set_train[host_next_id] <= training_mode_i;
         set_seed[host_next_id]  <= dropout_seed_i;
         host_next_id <= host_next_id + 1'b1;
@@ -610,6 +662,12 @@ module sienna_top #(
       credits   <= credits - CRW'(host_accept) + CRW'(pipeline_complete_o);
       mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept || g_null_done);
       if (g_accept) g_set_id <= g_next_id;
+      if (g_accept) begin
+        g_pack <= (set_pack[g_next_id] != '0);
+        for (int k = 0; k < NUM_LANES; k++) lane_ent[k] <= ent_of(set_map[g_next_id], set_pack[g_next_id], k % N);
+      end
+      if (p_accept)
+        for (int k = 0; k < NUM_LANES; k++) p_lane_ent[k] <= ent_of(set_map[p_next_id], set_pack[p_next_id], k % N);
       if (g_accept || g_null_done) g_next_id <= g_next_id + 1'b1;
       if (p_accept || p_null) begin
         p_set_id  <= p_next_id;
@@ -622,44 +680,56 @@ module sienna_top #(
   if (IS_INT) begin : G_REQ_SETS
     logic [N-1:0][31:0] s_mult [NUM_IDS];
     logic [N-1:0][7:0]  s_shift[NUM_IDS];
-    logic [7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_shout[NUM_IDS], s_zout[NUM_IDS];
-    logic [15:0] s_mx[NUM_IDS];
-    logic [4:0]  s_shx[NUM_IDS];
-    logic [31:0] s_mout[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_shout[NUM_IDS], s_zout[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][31:0] s_mout[NUM_IDS];
     always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
       if (host_accept) begin
         s_mult[host_next_id]  <= req_mult_i;
         s_shift[host_next_id] <= req_shift_i;
-        s_zp[host_next_id]    <= req_zp_i;
-        s_min[host_next_id]   <= req_min_i;
-        s_max[host_next_id]   <= req_max_i;
-        s_mx[host_next_id]    <= gp_mx_i;
-        s_shx[host_next_id]   <= gp_shx_i;
-        s_mout[host_next_id]  <= gp_mout_i;
-        s_shout[host_next_id] <= gp_shout_i;
-        s_zout[host_next_id]  <= gp_zout_i;
+        s_zp[host_next_id][0]    <= req_zp_i;
+        s_min[host_next_id][0]   <= req_min_i;
+        s_max[host_next_id][0]   <= req_max_i;
+        s_mx[host_next_id][0]    <= gp_mx_i;
+        s_shx[host_next_id][0]   <= gp_shx_i;
+        s_mout[host_next_id][0]  <= gp_mout_i;
+        s_shout[host_next_id][0] <= gp_shout_i;
+        s_zout[host_next_id][0]  <= gp_zout_i;
+        for (int e = 1; e < PACK_ENTRIES; e++) begin
+          s_zp[host_next_id][e]    <= pack_zp_i[e];
+          s_min[host_next_id][e]   <= pack_min_i[e];
+          s_max[host_next_id][e]   <= pack_max_i[e];
+          s_mx[host_next_id][e]    <= pack_mx_i[e];
+          s_shx[host_next_id][e]   <= pack_shx_i[e];
+          s_mout[host_next_id][e]  <= pack_mout_i[e];
+          s_shout[host_next_id][e] <= pack_shout_i[e];
+          s_zout[host_next_id][e]  <= pack_zout_i[e];
+        end
       end
       if (g_accept) begin
         g_mult  <= s_mult[g_next_id];
         g_shift <= s_shift[g_next_id];
       end
     end
-    assign g_zp    = s_zp[g_set_id];
-    assign g_min   = s_min[g_set_id];
-    assign g_max   = s_max[g_set_id];
-    assign g_mx    = s_mx[g_set_id];
-    assign g_shx   = s_shx[g_set_id];
-    assign g_mout  = s_mout[g_set_id];
-    assign g_shout = s_shout[g_set_id];
-    assign g_zout  = s_zout[g_set_id];
-    // D-5: a dropped value is the output zero point of the pooled set's activation (tanh, and every code the lane runs as tanh: 0).
-    always_comb
-      case (set_act[p_set_id])
-        CONTROL_WIDTH'(3'b001): p_zp = s_zout[p_set_id];  // SELU: its requantized output's zero point
-        CONTROL_WIDTH'(3'b010): p_zp = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
-        CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp = s_zp[p_set_id];  // ReLU, linear: the requantize output's
-        default: p_zp = 8'h00;  // tanh: zero point 0
-      endcase
+    for (genvar k = 0; k < NUM_LANES; k++) begin : G_LANE_PAR
+      assign g_zp[k]    = s_zp[g_set_id][lane_ent[k]];
+      assign g_min[k]   = s_min[g_set_id][lane_ent[k]];
+      assign g_max[k]   = s_max[g_set_id][lane_ent[k]];
+      assign g_mx[k]    = s_mx[g_set_id][lane_ent[k]];
+      assign g_shx[k]   = s_shx[g_set_id][lane_ent[k]];
+      assign g_mout[k]  = s_mout[g_set_id][lane_ent[k]];
+      assign g_shout[k] = s_shout[g_set_id][lane_ent[k]];
+      assign g_zout[k]  = s_zout[g_set_id][lane_ent[k]];
+      // D-5: a dropped value is the output zero point of the pooled column's activation (tanh, and every code the lane runs as tanh: 0).
+      always_comb
+        case (set_ents[p_set_id][p_lane_ent[k]])
+          CONTROL_WIDTH'(3'b001): p_zp[k] = s_zout[p_set_id][p_lane_ent[k]];  // SELU: its requantized output's zero point
+          CONTROL_WIDTH'(3'b010): p_zp[k] = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
+          CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = s_zp[p_set_id][p_lane_ent[k]];  // ReLU, linear: the requantize output's
+          default: p_zp[k] = 8'h00;  // tanh: zero point 0
+        endcase
+    end
   end else begin : G_NO_REQ_SETS
     assign g_mult  = '0;
     assign g_shift = '0;
@@ -716,6 +786,7 @@ module sienna_top #(
         .acc_i   (wide_rd_data),
         .mult_i  (g_mult),
         .shift_i (g_shift),
+        .packed_i(g_pack),
         .zp_i    (g_zp),
         .min_i   (g_min),
         .max_i   (g_max),
@@ -727,6 +798,7 @@ module sienna_top #(
     logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
     logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
     logic [RQL-1:0] tg_byp, tg_bank;
+    logic [RQL-1:0] tg_pack;
     logic [FCNT_W-1:0] tg_idx[RQL];
     always_ff @(posedge clk_i or negedge rstn_i) begin
       if (!rstn_i) begin
@@ -741,6 +813,7 @@ module sienna_top #(
     always_ff @(posedge clk_i) begin  // no reset: read only beside tg_v / fill_v
       tg_byp  <= {tg_byp[RQL-2:0], act_bypass};
       tg_bank <= {tg_bank[RQL-2:0], act_wr};
+      tg_pack <= {tg_pack[RQL-2:0], g_pack};
       tg_idx[0] <= rq_in;
       for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
     end
@@ -749,6 +822,7 @@ module sienna_top #(
     assign lane_v     = fill_v && !tg_byp[RQL-1];
     assign byp_wr     = fill_v && tg_byp[RQL-1];
     assign byp_bank   = tg_bank[RQL-1];
+    assign byp_pack   = tg_pack[RQL-1];
     assign byp_idx    = tg_idx[RQL-1];
     // The bank is full when a ReLU or linear set's last beat leaves the pipeline, or when the lanes return a set.
     assign bank_done  = (byp_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1)) || (g_done && !act_bypass);
@@ -769,6 +843,7 @@ module sienna_top #(
     assign lane_v     = fill_v;
     assign byp_wr     = 1'b0;
     assign byp_bank   = 1'b0;
+    assign byp_pack   = 1'b0;
     assign byp_idx    = '0;
     assign byp_all_in = (fill_count[0] == PER_LANE[FCNT_W-1:0]);
     assign rq_drain   = 1'b0;
@@ -1033,6 +1108,19 @@ module sienna_top #(
     else $error("sienna_top: pipeline_complete_o held for more than one cycle");
   a_complete_dispatched: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> disp_done)
     else $error("sienna_top: pooling completed a set it never dispatched");
+  localparam bit PACK_OK = (NUM_LANES % N == 0) && (COLLAPSE_K != 0) && POOL_BYPASS;
+  // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
+  logic acc_q, acc_accum_q;
+  logic [2:0] acc_shift_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q} <= '0;
+    else {acc_q, acc_accum_q, acc_shift_q} <= {host_accept, accumulate_i, pack_shift_i};
+  a_pack_lanes: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> PACK_OK)
+    else $error("sienna_top: a packed set needs N (%0d) to divide NUM_LANES (%0d), collapse-k 1 and a 1x1 pool", N, NUM_LANES);
+  a_pack_range: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> int'(acc_shift_q) < LGN)
+    else $error("sienna_top: pack shift %0d leaves blocks narrower than 2 of N=%0d", acc_shift_q, N);
+  a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q)
+    else $error("sienna_top: a packed set cannot be a partial sum");
 `ifdef ASSERT_SELFTEST
   a_selftest: assert property (@(posedge clk_i) disable iff (!rstn_i) 1'b0)
     else $error("sienna_top: assertion self-test fired, so assertions are live");

@@ -299,6 +299,9 @@ class Sim:
         r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
+        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
+            sys.stdout.write((r.stdout + r.stderr)[-3000:])
+            raise RuntimeError(f"{tag}: an assertion fired in the model simulation")
         m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
         if not m or int(m.group(6)) != 0:
             sys.stdout.write(r.stdout[-3000:])

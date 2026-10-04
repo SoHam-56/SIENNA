@@ -74,7 +74,7 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             gold = reg.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])
         else:
             alone = {"terms": [(A[:, cols], B[cols, cols])], "bias": bias[cols], "act": ACTS[e], "shape": (R * N, b)}
-            gold = gs.exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, ACTS[e], N, a.fmt) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
+            gold = gs.exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, ACTS[e], N, a.fmt, a.tile) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
         Ya, _, cyc = sim.run_job(alone, f"al_s{sh}_{c}")
         cyc_a += cyc
         bits = (lambda y: y) if a.fmt == "int8" else (lambda y: reg.fmt_bits(y, a.fmt))
@@ -84,6 +84,37 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
     line = (f"{a.fmt} N={N} T={a.tile} b={b:<3} rows={R * N:<4} {'zero rows ' if zero_rows else ''}packed: {sets_p} sets "
             f"{cyc_p} cycles | {N // b} jobs alone: {cyc_a} cycles | speedup {cyc_a / cyc_p:5.2f}x | mismatches {bad} | "
             f"wall {time.time() - t0:.0f}s")
+    print(line, flush=True)
+    log.write(line + "\n")
+    return bad
+
+
+def run_models(a, sim, log):
+    """Review Focus 2: heterogeneous small jobs through pack_jobs, fewer models than blocks; each against itself alone."""
+    rng = np.random.RandomState(77)
+    N = a.n
+    shapes = [(3, 2, [5, 9]), (2, 2, [N]), (2, 1, [3])]  # blocks of 4: N = 8 holds two models, 16 and 32 leave blocks empty
+    acts = ["tanh", "relu", "linear"]
+    models = [{"W": rng.uniform(-1, 1, (K, C)), "bias": rng.uniform(-0.5, 0.5, C), "act": act, "req": None,
+               "inputs": [rng.uniform(-1, 1, (m, K)) for m in ms]} for (K, C, ms), act in zip(shapes, acts)][:N // 4]
+    if a.fmt != "fp32":
+        for m in models:
+            m["W"], m["bias"] = reg.op_round(m["W"], a.fmt), reg.op_round(m["bias"], a.fmt)
+            m["inputs"] = [reg.op_round(x, a.fmt) for x in m["inputs"]]
+    if a.fmt == "int8":
+        log.write("int8 pack_jobs case: covered by tflite_pack_run.py (Task 8)\n")
+        return 0
+    job, recipe = mr.pack_jobs(models, N, int8=False)
+    Y, _, _ = sim.run_job(job, "pj")
+    bad = 0
+    for i, (m, outs) in enumerate(zip(models, mr.unpack(Y, recipe))):
+        X = np.vstack(m["inputs"]).astype(np.float32)
+        alone = {"terms": [(X, m["W"].astype(np.float32))], "bias": m["bias"].astype(np.float32), "act": m["act"],
+                 "shape": (X.shape[0], m["W"].shape[1])}
+        Ya, _, _ = sim.run_job(alone, f"pj_al{i}")
+        got = np.vstack(outs)
+        bad += int(np.sum(reg.fmt_bits(got, a.fmt) != reg.fmt_bits(Ya, a.fmt)))
+    line = f"{a.fmt} N={N} T={a.tile} pack_jobs: {len(models)} models in {N // (N >> job['pack']['shift'])} blocks, mismatches {bad}"
     print(line, flush=True)
     log.write(line + "\n")
     return bad
@@ -107,6 +138,7 @@ def main():
         bad += run_case(a, sim, a.n, sh, a.rows, 900 + sh, log)
     if a.fmt != "int8":
         bad += run_case(a, sim, a.n, 2, a.rows, 990, log, zero_rows=True)  # Review Focus 3: signed zeros
+    bad += run_models(a, sim, log)
     tail = f"PACK REGRESSION {'PASS' if bad == 0 else 'FAIL'}: {bad} mismatching outputs"
     print(tail, flush=True)
     log.write(tail + "\n")

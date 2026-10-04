@@ -27,9 +27,9 @@ TRANSFORMER = [
 ]
 
 
-def exact_layer(A, B, bias, act, N, fmt):
+def exact_layer(A, B, bias, act, N, fmt, T=4):
     """Bit-exact output of sienna_layer for one product in a narrow format: per output tile, the depth blocks as passes in
-    order (format_layer's order), the bias with the first, then the lane; returns the output's bit patterns."""
+    order (format_layer's order), the bias with the first, then the lane; T is the build's tile size."""
     import regression as reg
     from mesh_model import fpu
     import mesh_model
@@ -53,7 +53,7 @@ def exact_layer(A, B, bias, act, N, fmt):
             passes = [(reg.fmt_bits(Ap[r * N:(r + 1) * N, t * N:(t + 1) * N], fmt), reg.fmt_bits(Bp[t * N:(t + 1) * N, c * N:(c + 1) * N], fmt))
                       for t in range(dt)]
             b = reg.fmt_bits(bp[c * N:(c + 1) * N], fmt) if bias is not None else None
-            Ct = mesh_model.matmul(f, passes, N, 4, 1, b)
+            Ct = mesh_model.matmul(f, passes, N, T, 1, b)
             Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = lane.run(Ct, reg.activation_to_code(act))
     return Y[:M, :C]
 

@@ -1313,6 +1313,8 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = [t for t in PIPELINE_TESTS if fmt_name in t.get("formats", tuple(FORMATS))]  # int8-only tests skip the floats
+    if COLLAPSE_K == 0:  # the collapse-k 0 mesh refuses packed sets (a_pack_collapsed), as the mesh regression skips them
+        tests_to_run = [t for t in tests_to_run if not t.get("packed")]
 
     if target_test:
         tests_to_run = [t for t in tests_to_run if target_test in t["name"]]

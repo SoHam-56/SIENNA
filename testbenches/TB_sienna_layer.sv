@@ -4,7 +4,8 @@ import test_config_pkg::*;
 
 // Runs one layer on sienna_layer: writes the configuration, streams the two inputs from +layer=<file>
 // whenever the hardware is ready, and writes every result to +out=<file>. Nothing else crosses the boundary.
-// Layer file: "L m kb n residual bias act train seed a_rows w_rows", then a_rows and w_rows rows of N hex words.
+// Layer file: "L m kb n residual bias act train seed a_rows w_rows packed", then a_rows and w_rows rows of N hex words.
+// packed: a "P sh m0 .. m(N/2-1)" line and seven "E act zp min max mx shx mout shout zout" lines after L (and Q).
 // int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
 module TB_sienna_layer;
 
@@ -27,6 +28,13 @@ module TB_sienna_layer;
   logic [N-1:0][ACC_W-1:0] w_bias_i = '0;  // int8: beside each block's bias beat
   logic [N-1:0][31:0] w_req_mult_i = '0;
   logic [N-1:0][7:0] w_req_shift_i = '0;
+  logic [2:0] cfg_pack_shift_i = '0;  // packing: the P and E lines
+  logic [N/2-1:0][2:0] cfg_pack_map_i = '0;
+  logic [7:1][CONTROL_WIDTH-1:0] cfg_pack_act_i = '0;
+  logic [7:1][7:0] cfg_pack_zp_i = '0, cfg_pack_min_i = '0, cfg_pack_max_i = '0, cfg_pack_shout_i = '0, cfg_pack_zout_i = '0;
+  logic [7:1][15:0] cfg_pack_mx_i = '0;
+  logic [7:1][4:0] cfg_pack_shx_i = '0;
+  logic [7:1][31:0] cfg_pack_mout_i = '0;
   logic [31:0] ep[$];  // int8 epilogues, 3N words per column block
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [NUM_LANES-1:0] result_valid_o;
@@ -97,7 +105,7 @@ module TB_sienna_layer;
   initial begin
     string layer_f, out_f, kind;
     integer fin, fout, rc;
-    int m, kb, n, res, bias, act, train, seed, na, nw, ai, wi, idle;
+    int m, kb, n, res, bias, act, train, seed, na, nw, pk, ai, wi, idle;
     int qzp, qmin, qmax, qmx, qshx, qmout, qshout, qzout, ne, ei;
     logic [DATA_WIDTH-1:0] v;
     logic [31:0] w32;
@@ -114,8 +122,8 @@ module TB_sienna_layer;
       $display("[FATAL] cannot open %s", layer_f);
       $finish;
     end
-    rc = $fscanf(fin, "%s %d %d %d %d %d %d %d %d %d %d", kind, m, kb, n, res, bias, act, train, seed, na, nw);
-    if (rc != 11 || kind != "L") begin
+    rc = $fscanf(fin, "%s %d %d %d %d %d %d %d %d %d %d %d", kind, m, kb, n, res, bias, act, train, seed, na, nw, pk);
+    if (rc != 12 || kind != "L") begin
       $display("[FATAL] %s is not a layer file", layer_f);
       $finish;
     end
@@ -125,6 +133,35 @@ module TB_sienna_layer;
       if (rc != 9 || kind != "Q") begin
         $display("[FATAL] %s: an int8 layer file needs its Q line", layer_f);
         $finish;
+      end
+    end
+    if (pk) begin
+      int sh, mv, ev[9];
+      rc = $fscanf(fin, "%s %d", kind, sh);
+      if (rc != 2 || kind != "P") begin
+        $display("[FATAL] %s: a packed layer needs its P line", layer_f);
+        $finish;
+      end
+      cfg_pack_shift_i = 3'(sh);
+      for (int c = 0; c < N / 2; c++) begin
+        rc = $fscanf(fin, "%d", mv);
+        cfg_pack_map_i[c] = 3'(mv);
+      end
+      for (int e = 1; e < 8; e++) begin
+        rc = $fscanf(fin, "%s %d %d %d %d %d %d %d %d %d", kind, ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8]);
+        if (rc != 10 || kind != "E") begin
+          $display("[FATAL] %s: entry %0d needs its E line", layer_f, e);
+          $finish;
+        end
+        cfg_pack_act_i[e] = CONTROL_WIDTH'(ev[0]);
+        cfg_pack_zp_i[e] = 8'(ev[1]);
+        cfg_pack_min_i[e] = 8'(ev[2]);
+        cfg_pack_max_i[e] = 8'(ev[3]);
+        cfg_pack_mx_i[e] = 16'(ev[4]);
+        cfg_pack_shx_i[e] = 5'(ev[5]);
+        cfg_pack_mout_i[e] = 32'(ev[6]);
+        cfg_pack_shout_i[e] = 8'(ev[7]);
+        cfg_pack_zout_i[e] = 8'(ev[8]);
       end
     end
     for (int i = 0; i < (na + nw) * N; i++) begin

@@ -419,8 +419,7 @@ PACK_ENTRIES = 8  # sienna_top's parameter table
 
 
 def pack_jobs(models: list, N: int, int8: bool) -> tuple:
-    """Packs small models into one layer: column block c per model, a table entry per distinct activation and int8 output setting; returns (LayerSim job, recipe for unpack).
-    A set's cycles follow its slowest activation, so mixing ReLU or linear with polynomial activations costs the bypass jobs their fast path."""
+    """Packs models into one layer (block c per model, an entry per distinct act / int8 output) -> (job, recipe); a set runs at its slowest act."""
     if not models:
         raise ValueError("nothing to pack")
     K = max(m["W"].shape[0] for m in models)

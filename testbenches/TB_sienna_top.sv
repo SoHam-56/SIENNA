@@ -36,6 +36,14 @@ module TB_sienna_top;
   logic [15:0]        gp_mx_i;
   logic [4:0]         gp_shx_i;
   logic [31:0]        gp_mout_i;
+  localparam int PACK_ENTRIES = 8, PEW = 3;
+  logic [2:0] pack_shift_i;  // the set's pack shift and parameter table (pack_<k>.mem), with the start
+  logic [N/2-1:0][PEW-1:0] pack_map_i;
+  logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pack_act_i;
+  logic [PACK_ENTRIES-1:1][7:0] pack_zp_i, pack_min_i, pack_max_i, pack_shout_i, pack_zout_i;
+  logic [PACK_ENTRIES-1:1][15:0] pack_mx_i;
+  logic [PACK_ENTRIES-1:1][4:0] pack_shx_i;
+  logic [PACK_ENTRIES-1:1][31:0] pack_mout_i;
   localparam int WC_TILES = 128;
   logic                     weight_cached_i;  // this set takes B from cache tile weight_tile_i
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
@@ -120,6 +128,17 @@ module TB_sienna_top;
       .gp_mout_i                  (gp_mout_i),
       .gp_shout_i                 (gp_shout_i),
       .gp_zout_i                  (gp_zout_i),
+      .pack_shift_i               (pack_shift_i),
+      .pack_map_i                 (pack_map_i),
+      .pack_act_i                 (pack_act_i),
+      .pack_zp_i                  (pack_zp_i),
+      .pack_min_i                 (pack_min_i),
+      .pack_max_i                 (pack_max_i),
+      .pack_mx_i                  (pack_mx_i),
+      .pack_shx_i                 (pack_shx_i),
+      .pack_mout_i                (pack_mout_i),
+      .pack_shout_i               (pack_shout_i),
+      .pack_zout_i                (pack_zout_i),
       .weight_cached_i            (weight_cached_i),
       .weight_tile_i              (weight_tile_i),
       .wc_write_enable_i          (wc_write_enable_i),
@@ -280,6 +299,9 @@ module TB_sienna_top;
     gp_mout_i = '0;
     gp_shout_i = '0;
     gp_zout_i = '0;
+    pack_shift_i = '0;
+    pack_map_i = '0;
+    {pack_act_i, pack_zp_i, pack_min_i, pack_max_i, pack_shout_i, pack_zout_i, pack_mx_i, pack_shx_i, pack_mout_i} = '0;
     weight_cached_i = 1'b0;
     weight_tile_i = '0;
     wc_write_enable_i = 1'b0;
@@ -555,6 +577,30 @@ module TB_sienna_top;
     end
   endtask
 
+  // Set k's pack shift, block map and table entries 1..7 (pack_<k>.mem); unpacked tests drive zeros.
+  task automatic apply_pack(input int k);
+    logic [31:0] q[$];
+    pack_shift_i = '0;
+    pack_map_i = '0;
+    {pack_act_i, pack_zp_i, pack_min_i, pack_max_i, pack_shout_i, pack_zout_i, pack_mx_i, pack_shx_i, pack_mout_i} = '0;
+    if (PACKED == 0) return;
+    read_word_file($sformatf("pack_%0d.mem", k), q);
+    pack_shift_i = q[0][2:0];
+    for (int c = 0; c < N / 2; c++) pack_map_i[c] = q[1+c][PEW-1:0];
+    for (int e = 1; e < PACK_ENTRIES; e++) begin
+      automatic int o = 1 + N / 2 + 9 * (e - 1);
+      pack_act_i[e]   = q[o][CONTROL_WIDTH-1:0];
+      pack_zp_i[e]    = q[o+1][7:0];
+      pack_min_i[e]   = q[o+2][7:0];
+      pack_max_i[e]   = q[o+3][7:0];
+      pack_mx_i[e]    = q[o+4][15:0];
+      pack_shx_i[e]   = q[o+5][4:0];
+      pack_mout_i[e]  = q[o+6];
+      pack_shout_i[e] = q[o+7][7:0];
+      pack_zout_i[e]  = q[o+8][7:0];
+    end
+  endtask
+
   // With WEIGHT_CACHE, set k's B is written once into cache tile k and the set sends only A.
   task automatic write_cache();
     logic [DATA_WIDTH-1:0] q[$];
@@ -777,6 +823,7 @@ module TB_sienna_top;
               num_terms_i = terms_of(k);
               apply_bias(k);
               apply_requant(k);
+              apply_pack(k);
               apply_weight(k);
 `ifdef PERF
               while (!pipeline_ready_o && !overrun) @(posedge clk_i);
@@ -910,6 +957,7 @@ module TB_sienna_top;
           num_terms_i = terms_of(k);
           apply_bias(k);
           apply_requant(k);
+          apply_pack(k);
           apply_weight(k);
           while (!pipeline_ready_o) @(posedge clk_i);
           load_inputs();
@@ -1032,6 +1080,7 @@ module TB_sienna_top;
     num_terms_i           = terms_of(0);
     apply_bias(0);
     apply_requant(0);
+    apply_pack(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
@@ -1065,6 +1114,7 @@ module TB_sienna_top;
       num_terms_i = terms_of(1);
       apply_bias(1);
       apply_requant(1);
+      apply_pack(1);
       apply_weight(1);
       trace_states = 1;
       actual_results.delete();

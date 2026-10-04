@@ -190,10 +190,14 @@ N = 16 bf16 tanh 118 + 157 R, int8 linear 98 + 16 R. The mixed-activation table 
 **Energy proxy (not a power figure):** a packed set issues b/N of today's multiplies and adds: each PE counts only its
 block's b products per pass (`a_pack_count`; `TB_PE_pack` counts the multiplier's valid strobes, fp32 / bf16 / int8).
 
-**Area (estimate from the RTL's sizing, `sienna_jobs/pk_area_estimate.py`; no synthesis):** packing adds 1.2-2.9% of
+**Area (estimate from the RTL's sizing, `sienna_jobs/pk_area_estimate.py`; no synthesis):** packing adds 1.2-3.0% of
 storage bits (N = 16 / 32, all formats; most in the PE's pack pipeline). The lane-order muxes (packed wide-read address,
 write-back index, block lookup) cost 0.1-0.3% of flop-storage area as address selects, up to 5-11% if synthesis must
-double every word's sources. The int8 per-lane parameter muxes as written index {set id, entry}, 128:1 per field per
-lane: about 0.9 MGE at N = 16 (47% of flop-storage area) and 1.9 MGE at N = 32 (30%). Copying the set's 8 entries at
-`g_accept` / `p_accept` (as `g_mult` already is) makes them 8:1 per lane after one shared 16:1: about 84 / 135 kGE.
-Recommended before synthesis; not changed here.
+double every word's sources. Per-lane parameters (Task 10): the stages copy their set's 8 entries at `g_accept`
+(`g_ents`, and in int8 `ge_*`) and, in int8, on `p_accept`/`p_null` (`pe_*`: code, zp, zout for the drop value), as `g_mult`
+already was, so each lane selects 8:1 behind one shared 16:1 per stage: about 84 kGE at N = 16 and 135 kGE at N = 32
+in int8, 2 / 4 kGE in the floats (code only). Before Task 10 the lanes indexed {set id, entry}, 128:1 per field per
+lane: about 0.9 MGE at N = 16 (47% of flop-storage area) and 1.9 MGE at N = 32 (30%) in int8, 24 / 49 kGE in the
+floats, unless synthesis decomposed the index set id first. Assumptions: a mux2 bit = 2 GE, a flop bit = 5 GE, an
+n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis. The copy changed no result or cycle
+(regression, `make pack` and TFLite pack runs identical to Task 9's, `pk10_*` in `packing_gate.log` section 7).

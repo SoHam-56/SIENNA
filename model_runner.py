@@ -472,6 +472,25 @@ def unpack(Y: np.ndarray, recipe: list) -> list:
     return [[Y[r0:r0 + m, c0:c0 + cc] for r0, m in spans] for c0, cc, spans in recipe]
 
 
+def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
+    """Refuses a packed layer sienna_layer cannot run: in silicon (no assertions) it would compute it silently wrong."""
+    M, C, rt = shape
+    if C != N or cfg["kb"] != N or rt * N != M:
+        raise ValueError(f"{tag}: a packed layer is a whole number of row tiles, N columns and N deep")
+    if cfg["residual"]:
+        raise ValueError(f"{tag}: a packed layer takes no residual input")
+    if lanes % N:
+        raise ValueError(f"{tag}: packing needs NUM_LANES ({lanes}) to be N ({N}) or a multiple of it")
+    if regression.COLLAPSE_K == 0:
+        raise ValueError(f"{tag}: the collapse-k 0 mesh refuses packed sets")
+    if not 1 <= pk["shift"] < N.bit_length() - 1:
+        raise ValueError(f"{tag}: pack shift {pk['shift']} is outside 1 .. log2(N) - 1 = {N.bit_length() - 2}")
+    if len(pk["map"]) != N // 2 or not all(0 <= int(e) < PACK_ENTRIES for e in pk["map"]):
+        raise ValueError(f"{tag}: the block map needs N/2 = {N // 2} entries in 0 .. {PACK_ENTRIES - 1}")
+    if len(pk["ents"]) != PACK_ENTRIES:
+        raise ValueError(f"{tag}: a packed layer needs all {PACK_ENTRIES} table entries, not {len(pk['ents'])}")
+
+
 class LayerSim:
     """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -501,12 +520,12 @@ class LayerSim:
         if int8 and job["act"] == "selu" and regression.selu_saturates(rq["mx"], rq["shx"], rq["zp"], rq["amax"]):  # the clamp's top code
             raise ValueError(f"{tag}: SELU layer input range reaches x = 487.29: the int8 lane saturates lambda * x at int32 (512)")
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
+        pk = job.get("pack")
+        if pk:
+            pack_precheck(pk, cfg, (M, C, rt), N, self.lanes, tag)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
         with open(lf, "w") as f:
-            pk = job.get("pack")
-            if pk and (C != N or cfg["kb"] != N or rt * N != M):
-                raise ValueError(f"{tag}: a packed layer is a whole number of row tiles, N columns and N deep")
             f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pk))}\n")
             if int8:
                 q = job["req"]

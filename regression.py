@@ -1253,6 +1253,9 @@ def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 
 
 
 def _parse_log(raw: str) -> dict:
+    fired = re.search(r"^.*(?:Assertion failed|%Error).*$", raw, re.M)
+    if fired:  # a firing assertion leaves the exit code and the TB's counts untouched, so the log is the only witness
+        return {"status": "ASSERT", "total": 0, "exact": 0, "tol": 0, "failed": 1, "cyc": 0, "fired": fired.group(0).strip()}
     if "FATAL" in raw or "[FATAL] Timeout" in raw:
         return {
             "status": "TIMEOUT",
@@ -1359,7 +1362,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         )
 
         if r["status"] != "PASS":
-            print(f"  {_R}╚══  Sweep Aborted: {r['status']}.{_X}")
+            print(f"  {_R}╚══  Sweep Aborted: {r['status']}.{_X}" + (f"\n      {r['fired']}" if "fired" in r else ""))
             sys.exit(1)
 
     print(f"\n  ╚══  Sweep Complete")

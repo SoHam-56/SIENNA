@@ -1110,17 +1110,20 @@ module sienna_top #(
     else $error("sienna_top: pooling completed a set it never dispatched");
   localparam bit PACK_OK = (NUM_LANES % N == 0) && (COLLAPSE_K != 0) && POOL_BYPASS;
   // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
-  logic acc_q, acc_accum_q;
+  logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
   logic [2:0] acc_shift_q;
   always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q} <= '0;
-    else {acc_q, acc_accum_q, acc_shift_q} <= {host_accept, accumulate_i, pack_shift_i};
+    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum} <= '0;
+    else begin
+      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, accumulate_i, pack_shift_i, last_accum};
+      if (host_accept) last_accum <= accumulate_i;
+    end
   a_pack_lanes: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> PACK_OK)
     else $error("sienna_top: a packed set needs N (%0d) to divide NUM_LANES (%0d), collapse-k 1 and a 1x1 pool", N, NUM_LANES);
   a_pack_range: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> int'(acc_shift_q) < LGN)
     else $error("sienna_top: pack shift %0d leaves blocks narrower than 2 of N=%0d", acc_shift_q, N);
-  a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q)
-    else $error("sienna_top: a packed set cannot be a partial sum");
+  a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q && !acc_prev_accum_q)
+    else $error("sienna_top: a packed set cannot be a partial sum or continue one");
 `ifdef ASSERT_SELFTEST
   a_selftest: assert property (@(posedge clk_i) disable iff (!rstn_i) 1'b0)
     else $error("sienna_top: assertion self-test fired, so assertions are live");

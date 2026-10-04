@@ -184,6 +184,7 @@ module sienna_top #(
   logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = activation_function_i)
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
+  logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] g_ents;  // the activation stage's copy of its set's entry codes, taken at g_accept
   logic g_pack;  // the activation stage's set is packed
   logic [PEW-1:0] lane_ent[NUM_LANES];  // the entry each lane uses for that set
   logic [PEW-1:0] p_lane_ent[NUM_LANES];  // and each pooling lane for the pooled set
@@ -442,7 +443,7 @@ module sienna_top #(
   always_comb begin
     act_bypass = 1'b1;
     for (int k = 0; k < NUM_LANES; k++) begin
-      lane_act[k] = set_ents[g_set_id][lane_ent[k]];
+      lane_act[k] = g_ents[lane_ent[k]];
       act_bypass &= is_byp_code(lane_act[k]);
     end
   end
@@ -613,6 +614,7 @@ module sienna_top #(
       p_set_id  <= '0;
       host_next_id <= '0;
       g_pack    <= 1'b0;
+      g_ents    <= '0;
       for (int k = 0; k < NUM_IDS; k++) begin
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
@@ -664,6 +666,7 @@ module sienna_top #(
       if (g_accept) g_set_id <= g_next_id;
       if (g_accept) begin
         g_pack <= (set_pack[g_next_id] != '0);
+        g_ents <= set_ents[g_next_id];
         for (int k = 0; k < NUM_LANES; k++) lane_ent[k] <= ent_of(set_map[g_next_id], set_pack[g_next_id], k % N);
       end
       if (p_accept)
@@ -676,7 +679,7 @@ module sienna_top #(
     end
   end
 
-  // int8 (D-2): parameters per set id; at g_accept the stage copies its set's per-channel words, so a lane picks among N, not NUM_IDS * N.
+  // int8 (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
   if (IS_INT) begin : G_REQ_SETS
     logic [N-1:0][31:0] s_mult [NUM_IDS];
     logic [N-1:0][7:0]  s_shift[NUM_IDS];
@@ -684,6 +687,12 @@ module sienna_top #(
     logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][31:0] s_mout[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_shout, ge_zout;  // the activation stage's copy of its set's entries
+    logic [PACK_ENTRIES-1:0][15:0] ge_mx;
+    logic [PACK_ENTRIES-1:0][4:0]  ge_shx;
+    logic [PACK_ENTRIES-1:0][31:0] ge_mout;
+    logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] pe_act;  // the pooling stage's copy of its set's codes, zp and zout, for the drop value
+    logic [PACK_ENTRIES-1:0][7:0]  pe_zp, pe_zout;
     always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
       if (host_accept) begin
         s_mult[host_next_id]  <= req_mult_i;
@@ -708,25 +717,40 @@ module sienna_top #(
         end
       end
       if (g_accept) begin
-        g_mult  <= s_mult[g_next_id];
-        g_shift <= s_shift[g_next_id];
+        g_mult   <= s_mult[g_next_id];
+        g_shift  <= s_shift[g_next_id];
+        ge_zp    <= s_zp[g_next_id];
+        ge_min   <= s_min[g_next_id];
+        ge_max   <= s_max[g_next_id];
+        ge_mx    <= s_mx[g_next_id];
+        ge_shx   <= s_shx[g_next_id];
+        ge_mout  <= s_mout[g_next_id];
+        ge_shout <= s_shout[g_next_id];
+        ge_zout  <= s_zout[g_next_id];
+      end
+      if (p_accept || p_null) begin  // the edge p_set_id loads on
+        pe_zp   <= s_zp[p_next_id];
+        pe_zout <= s_zout[p_next_id];
       end
     end
+    always_ff @(posedge clk_i or negedge rstn_i)  // reset, as set_ents is, so p_zp reads tanh's 0 before the first pooled set
+      if (!rstn_i) pe_act <= '0;
+      else if (p_accept || p_null) pe_act <= set_ents[p_next_id];
     for (genvar k = 0; k < NUM_LANES; k++) begin : G_LANE_PAR
-      assign g_zp[k]    = s_zp[g_set_id][lane_ent[k]];
-      assign g_min[k]   = s_min[g_set_id][lane_ent[k]];
-      assign g_max[k]   = s_max[g_set_id][lane_ent[k]];
-      assign g_mx[k]    = s_mx[g_set_id][lane_ent[k]];
-      assign g_shx[k]   = s_shx[g_set_id][lane_ent[k]];
-      assign g_mout[k]  = s_mout[g_set_id][lane_ent[k]];
-      assign g_shout[k] = s_shout[g_set_id][lane_ent[k]];
-      assign g_zout[k]  = s_zout[g_set_id][lane_ent[k]];
+      assign g_zp[k]    = ge_zp[lane_ent[k]];
+      assign g_min[k]   = ge_min[lane_ent[k]];
+      assign g_max[k]   = ge_max[lane_ent[k]];
+      assign g_mx[k]    = ge_mx[lane_ent[k]];
+      assign g_shx[k]   = ge_shx[lane_ent[k]];
+      assign g_mout[k]  = ge_mout[lane_ent[k]];
+      assign g_shout[k] = ge_shout[lane_ent[k]];
+      assign g_zout[k]  = ge_zout[lane_ent[k]];
       // D-5: a dropped value is the output zero point of the pooled column's activation (tanh, and every code the lane runs as tanh: 0).
       always_comb
-        case (set_ents[p_set_id][p_lane_ent[k]])
-          CONTROL_WIDTH'(3'b001): p_zp[k] = s_zout[p_set_id][p_lane_ent[k]];  // SELU: its requantized output's zero point
+        case (pe_act[p_lane_ent[k]])
+          CONTROL_WIDTH'(3'b001): p_zp[k] = pe_zout[p_lane_ent[k]];  // SELU: its requantized output's zero point
           CONTROL_WIDTH'(3'b010): p_zp[k] = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
-          CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = s_zp[p_set_id][p_lane_ent[k]];  // ReLU, linear: the requantize output's
+          CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = pe_zp[p_lane_ent[k]];  // ReLU, linear: the requantize output's
           default: p_zp[k] = 8'h00;  // tanh: zero point 0
         endcase
     end

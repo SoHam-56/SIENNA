@@ -791,8 +791,7 @@ def _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop):
 
 
 def _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs):
-    """One packed int8 set: one input scale for the set, weights per column; each entry's requantize and lane parameters
-    come from the accumulators of the columns that use it; dropout drops each column to its entry's zero point (D-5)."""
+    """One packed int8 set: one input scale, per-column weights, each entry's parameters from its columns' sums, drop to its zp (D-5)."""
     N = cfg.get("n", 16)
     A_q, s_a, z_a = quant_act(A)
     B_q, s_w = quant_weights(B)
@@ -822,8 +821,7 @@ def _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs):
 
 
 def _generate_vectors_packed(cfg: dict) -> None:
-    """Packed sets (sienna-packing): block-diagonal B, a pack shift per set, an activation (int8: and output parameters) per
-    column block from an 8-entry table; the golden is each block's job alone, assembled. Needs a 1x1 pool."""
+    """Packed sets: block-diagonal B, a shift per set, an 8-entry act (int8: output) table by block; golden = each job alone; 1x1 pool."""
     os.makedirs(TB_DIR, exist_ok=True)
     N, fmt, act_type, acts = cfg.get("n", 16), cfg.get("fmt_name", "fp32"), cfg["act"], cfg["pack_acts"]
     assert len(acts) == PACK_ENTRIES and acts[0] == act_type, (cfg["name"], "pack_acts[0] must be the test's act")

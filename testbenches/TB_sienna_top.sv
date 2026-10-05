@@ -555,7 +555,7 @@ module TB_sienna_top;
     return (MIXED_LEN > 0) ? CONTROL_WIDTH'((MIXED_ACTS >> (4 * (k % MIXED_LEN))) & 15) : CONTROL_WIDTH'(ACTIVATION_CODE);
   endfunction
 
-  // Polynomial terms for set k's code, the same table as regression.py's ACTIVATION_TERMS.
+  // Polynomial terms for set k's code, the same table as model_runner.py's ACTIVATION_TERMS.
   function automatic logic [ADDR_LINES:0] terms_of(input int k);
     if (MIXED_LEN == 0) return NUM_TERMS[ADDR_LINES:0];
     case (act_of(k))
@@ -998,7 +998,7 @@ module TB_sienna_top;
     stream_all_sets(0, 0);
   endtask
 
-  // ── PERF trace: stage transitions per cycle, read by perf_analysis.py ──
+  // ── PERF trace: stage transitions per cycle, read by regression.py --action perf ──
 `ifdef PERF
   int perf_mesh_st = -1, perf_g_st = -1, perf_p_st = -1, perf_cred = -1, perf_mread = 0;
   int perf_lane_busy = 0, perf_round_cyc = 0;

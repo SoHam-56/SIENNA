@@ -13,8 +13,8 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | File | Lines | Status | What it is |
 |---|---|---|---|
 | `Makefile` | 406 | live | All build, lint, wave, regression and clean targets. `DESIGN_FILES` is the authoritative source list |
-| `regression.py` | 2,923 | live | Hardware sanity: golden model, stimulus generator, orchestrator and scoreboard, and every check behind `--action` (pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors, selftest, all = `make check`); see the `sienna-tooling` skill |
-| `model_runner.py` | 1,353 | live | Host software stack: numerics (format rounding, TFLite quantization, requantize, int8 golden), device build package, TFLite lowering, tiling, packing, the layer file, backends `RtlLayer` / `RtlSets` / `Emulator`, `--action model` and `--action tflite [--pack]` |
+| `regression.py` | 3,017 | live | Hardware sanity: golden model, stimulus generator, orchestrator and scoreboard, and every check behind `--action` (pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors, selftest, all = `make check`); see the `sienna-tooling` skill |
+| `model_runner.py` | 1,349 | live | Host software stack in eight sections (contents block at the top): numerics, frontend (TFLite lowering), middle end (tiling, packing), device protocol (`write_layer`, `read_outputs`, `write_sets`), device build package, backends `RtlLayer` / `RtlSets` / `Emulator`, runtime, CLI (`--action model`, `--action tflite [--pack]`) |
 | `run_real_model.py` | 116 | live, untracked | Runs a PyTorch checkpoint's weights through the pipeline |
 | `README.md` | 1 | — | Contains only the title |
 | `performance_analysis_report.log` | — | untracked | Latency and throughput analysis; mixes measured and modeled figures |

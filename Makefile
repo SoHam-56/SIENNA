@@ -279,7 +279,7 @@ help:
 	@echo "Individual Module Targets:"
 	@echo "  make sm-verilator      - Systolic Mesh only: its regression in FMT at N, TILE, COLLAPSE_K"
 	@echo "  make gpnae-verilator   - GPNAE only: its regression in FMT on gpnae_poly, the lane sienna_top uses"
-	@echo "  make gpnae-verilator GPNAE_MODEL=hw - the same, bit-exact against the lane model instead of accuracy"
+	@echo "  make gpnae-verilator GPNAE_MODEL=hw - the same, bit-exact against the lane model instead of accuracy (int8 ignores it)"
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
@@ -294,6 +294,7 @@ help:
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
 	@echo "  make check FMT=int8               - One verdict: self-tests, sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
+	@echo "                                      bf16: gpnae-verilator is bit-exact and gpnae-accuracy is reported, not gated"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
 	@echo "Utility Targets:"
@@ -412,7 +413,7 @@ sm-verilator:
 		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)"
 
 # GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
-# GPNAE_MODEL: exact (accuracy against the functions) or hw (bit-exact against gpnae_poly's model); int8 always runs both.
+# GPNAE_MODEL: exact (accuracy against the functions) or hw (bit-exact against gpnae_poly's model); int8 ignores it and runs both.
 GPNAE_MODEL ?= exact
 gpnae-verilator:
 	@echo "=== GPNAE only: FMT=$(FMT), gpnae_poly lane, model $(GPNAE_MODEL) ==="
@@ -558,7 +559,7 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
+# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), regression, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
 check:
 	$(PYTHON) regression.py --action all --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 

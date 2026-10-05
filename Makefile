@@ -285,13 +285,13 @@ help:
 	@echo "  make debug             - Build with GDB back-trace"
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
-	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE except gemm):"
+	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
 	@echo "  make regression FMT=int8          - Full pipeline regression (TEST=<substring> narrows it)"
 	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
-	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (gemm_sweep.py; T=4)"
-	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (perf_analysis.py)"
+	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (regression.py --action gemm)"
+	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
-	@echo "  make pack FMT=int8                - packed layers vs each job alone (pack_regression.py)"
+	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
 	@echo "Utility Targets:"
@@ -527,17 +527,17 @@ model:
 		--lanes $(LANES) \
 		--format $(FMT)
 
-# gemm_sweep.py has no --tile-size: it builds sienna_layer at T=4.
+# GEMM shape sweep on sienna_layer, built at N, TILE and LANES.
 gemm:
-	@[ "$(TILE)" = 4 ] || echo "WARNING: gemm_sweep.py has no tile option and builds T=4; TILE=$(TILE) is ignored"
-	$(PYTHON) gemm_sweep.py \
+	$(PYTHON) regression.py --action gemm \
 		--n $(N) \
+		--tile $(TILE) \
 		--lanes $(LANES) \
 		--format $(FMT) \
 		$(if $(filter 1,$(QUICK)),--quick)
 
 perf-analysis:
-	$(PYTHON) perf_analysis.py \
+	$(PYTHON) regression.py --action perf \
 		--n $(N) \
 		--tile-size $(TILE) \
 		--lanes $(LANES) \
@@ -550,9 +550,9 @@ tflite:
 		--tile-size $(TILE) \
 		--lanes $(LANES)
 
-# Packed layers against each job alone on sienna_layer (pack_regression.py), in FMT at N, TILE and LANES.
+# Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:
-	$(PYTHON) pack_regression.py --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
+	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean

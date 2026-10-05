@@ -88,7 +88,7 @@ def test_parse_time_rejections():
 
 def test_pack_target():
     r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
-    assert r.returncode == 0 and r.stdout.split() == "py pack_regression.py --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    assert r.returncode == 0 and r.stdout.split() == "py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
     r = make_n("pack", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
 

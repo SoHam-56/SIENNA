@@ -127,7 +127,7 @@ def main():
     sim = mr.LayerSim(a.n, a.lanes, a.work, "int8", a.tile_size)
     t0 = time.time()
     sim.build()
-    log(f"TB_sienna_layer built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
+    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
     bad, covered = 0, False
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]

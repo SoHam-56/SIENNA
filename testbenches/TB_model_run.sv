@@ -7,7 +7,7 @@ import test_config_pkg::*;
 // Layer file: "L m kb n residual bias act train seed a_rows w_rows packed", then a_rows and w_rows rows of N hex words.
 // packed: a "P sh m0 .. m(N/2-1)" line and seven "E act zp min max mx shx mout shout zout" lines after L (and Q).
 // int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
-module TB_sienna_layer;
+module TB_model_run;
 
   localparam int STALL_CYCLES = 50_000;  // this long with nothing moving is a hang
 

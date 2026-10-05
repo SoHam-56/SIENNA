@@ -104,7 +104,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 - Activation stream, per block, per row tile: the depth tiles of A, then the residual tile.
 - Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
 - The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache and waits for `wc_region_busy_o` before overwriting a half.
-- Testbench `TB_sienna_layer.sv`; `model_runner.py --engine layer` (default) and `gemm_sweep.py` format the streams with `format_layer()`, which only rearranges data.
+- Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default) and `gemm_sweep.py` format the streams with `format_layer()`, which only rearranges data.
 
 ---
 

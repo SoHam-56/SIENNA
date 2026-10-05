@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Runs tflite float models end to end on the SIENNA RTL: every multiply-accumulate on the pipeline, host only reshapes and softmax (--action model, the default; --action tflite runs the int8 TFLite layers)."""
+"""SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers)."""
+
+# Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
+#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact; TFLite's kernels
+#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_layer, job_of
+#   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
+#   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
+#   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
+#   6. Backends         RtlLayer (TB_model_run), RtlSets (TB_sienna_model), Emulator (numpy)
+#   7. Runtime          execute, macs_of
+#   8. CLI              model_main, tflite_main, tflite_pack_main, main
+
 import argparse
 import glob
 import json
@@ -23,16 +34,12 @@ sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common"
 import ipu  # noqa: E402
 from ipu import quantize_multiplier, round_half_away  # noqa: E402,F401  re-exported: TFLite's QuantizeMultiplier and TfLiteRound, one copy in AriL
 
-ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
-HW_BIAS = True  # the mesh adds the bias; False lowers it as a ones column and an extra depth row
 
-
-# ── Numerics ─────────────────────────────────────────────────────────────────
+# ── 1. Numerics: the reference arithmetic the host must reproduce ────────────
 
 # Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
 # No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
 ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
-
 # Number formats a build may use, as (exponent bits, mantissa bits); every word of the pipeline is in the build's format.
 FORMATS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # int8: EXP_W = 0, 8-bit two's-complement codes
 
@@ -308,82 +315,7 @@ def conv2d_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, ami
     return ipu.requant(acc, mult, shift, out_zp, amin, amax, rounding).astype(np.int8)
 
 
-# ── Device build ─────────────────────────────────────────────────────────────
-
-SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its banks, ACC_BANKS=RESULT_BANKS=4); the testbenches read it from the package
-
-COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for the bit-exact golden
-TB_DIR = os.path.join(ROOT, "testbenches")
-
-
-def write_sv_package(path: str, items: list) -> None:
-    with open(path, "w") as f:
-        f.write("// Auto-Generated Configuration Package\npackage test_config_pkg;\n\n")
-        for name, val, vtype in items:
-            kw = "shortreal" if vtype == "float" else "int"
-            f.write(f"  localparam {kw} {name} = {val};\n")
-        f.write("\nendpackage\n")
-
-
-def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
-                  use_bias: bool, drop_seed: int) -> list:
-    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
-    N = cfg.get("n", 16)
-    sram_depth = N * N
-    return [
-        ("N", N, "int"),
-        ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
-        ("NUM_LANES", cfg.get("lanes", 32), "int"),
-        ("HOST_WORDS", cfg.get("host_words", N), "int"),
-        ("EXP_W", FORMATS[fmt][0], "int"),
-        ("MAN_W", FORMATS[fmt][1], "int"),
-        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
-        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
-        ("IS_INT", int(fmt == "int8"), "int"),
-        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
-        ("SRAM_DEPTH", sram_depth, "int"),
-        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
-        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
-        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
-        ("IN_ROWS", N, "int"),
-        ("IN_COLS", N, "int"),
-        ("POOL_H", cfg.get("pool_h", 2), "int"),
-        ("POOL_W", cfg.get("pool_w", 2), "int"),
-        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
-        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
-        ("PADDING", cfg.get("padding", 1), "int"),
-        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
-        ("LFSR_WIDTH", 32, "int"),
-        ("CONTROL_WIDTH", 3, "int"),
-        ("NUM_SETS", num_sets, "int"),
-        ("SETS_IN_FLIGHT", credits, "int"),
-        ("HAS_BIAS", int(use_bias), "int"),
-        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
-        ("ACCUM_PASSES", passes, "int"),
-        ("MIXED_LEN", len(mixed), "int"),
-        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
-        ("PACKED", int(bool(cfg.get("packed", False))), "int"),
-        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
-        ("DROPOUT_SEED", drop_seed, "int"),
-        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
-    ]
-
-
-def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
-    """test_config_pkg.sv of the model simulators' build (RtlSets, RtlLayer): matmul_relu_nopool's configuration in fmt, no stimulus."""
-    os.makedirs(TB_DIR, exist_ok=True)
-    if fmt == "int8":
-        _check_rounding()
-    cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "pool_h": 1, "pool_w": 1, "padding": 0}
-    drop_seed = 0x2ACE0000 + 42 + int(os.environ.get("SIENNA_SEED", "0"))  # the generators' seed, so the package matches theirs
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
-                     _config_items(cfg, fmt, "relu", SETS_IN_FLIGHT + 2, SETS_IN_FLIGHT, 1, [], fmt == "int8", drop_seed))
-
-
-# =============================================================================
-# tflite reader
-# =============================================================================
-
+# ── 2. Frontend: each op becomes Y = sum_i X_i @ W_i + b, then an activation ─
 
 def load_tflite(path: str) -> dict:
     import tflite
@@ -449,11 +381,6 @@ def load_tflite(path: str) -> dict:
         ops.append(d)
     shapes = {i: tuple(g.Tensors(i).ShapeAsNumpy()) for i in range(g.TensorsLength()) if g.Tensors(i).ShapeLength()}
     return {"ops": ops, "consts": consts, "shapes": shapes, "input": g.Inputs(0), "output": g.Outputs(0)}
-
-
-# =============================================================================
-# Lowering: every compute op becomes Y = sum_i X_i @ W_i + b, then an activation
-# =============================================================================
 
 
 def _same_pad(n, k, s):
@@ -542,9 +469,96 @@ def job_reference(job):
     return y, (np.maximum(y, 0) if job["act"] == "relu" else y)
 
 
-# =============================================================================
-# Tiling into N x N sets
-# =============================================================================
+def load_layer(path: str) -> dict:
+    """The one CONV_2D or FULLY_CONNECTED operator of an int8 .tflite, with its tensors' codes and quantization."""
+    import tflite
+    from tflite.ActivationFunctionType import ActivationFunctionType as AF
+    from tflite.BuiltinOperator import BuiltinOperator as BO
+
+    names = {v: k for k, v in BO.__dict__.items() if not k.startswith("_")}
+    m = tflite.Model.GetRootAsModel(open(path, "rb").read(), 0)
+    g = m.Subgraphs(0)
+    code = lambda op: m.OperatorCodes(op.OpcodeIndex())
+    kinds = [names[max(code(g.Operators(i)).BuiltinCode(), code(g.Operators(i)).DeprecatedBuiltinCode())]
+             for i in range(g.OperatorsLength())]
+    if kinds not in (["CONV_2D"], ["FULLY_CONNECTED"]):
+        raise ValueError(f"{path}: operators {kinds}; expected one CONV_2D or FULLY_CONNECTED with int8 input and output")
+    op = g.Operators(0)
+
+    def tensor(i):
+        if i < 0:
+            return None
+        t = g.Tensors(i)
+        q = t.Quantization()
+        buf = m.Buffers(t.Buffer()).DataAsNumpy()
+        data = None
+        if not isinstance(buf, int) and buf is not None and len(buf):
+            data = np.frombuffer(buf.tobytes(), dtype={9: np.int8, 2: np.int32}[t.Type()]).reshape(tuple(t.ShapeAsNumpy()))
+        return dict(type=t.Type(), shape=tuple(t.ShapeAsNumpy()), data=data,
+                    scale=np.atleast_1d(q.ScaleAsNumpy()).astype(np.float32),
+                    zp=np.atleast_1d(q.ZeroPointAsNumpy()).astype(np.int64))
+
+    ins = [op.Inputs(j) for j in range(op.InputsLength())]
+    inp, flt = tensor(ins[0]), tensor(ins[1])
+    bias = tensor(ins[2]) if len(ins) > 2 else None
+    out = tensor(op.Outputs(0))
+    if inp["type"] != 9 or flt["type"] != 9 or out["type"] != 9:  # 9 is INT8
+        raise ValueError(f"{path}: input, filter and output must be int8")
+    if np.any(flt["zp"] != 0):
+        raise ValueError(f"{path}: TFLite's int8 filters are symmetric; a non-zero filter zero point is not supported")
+    opt = (tflite.Conv2DOptions if kinds[0] == "CONV_2D" else tflite.FullyConnectedOptions)()
+    t = op.BuiltinOptions()
+    opt.Init(t.Bytes, t.Pos)
+    d = dict(kind=kinds[0], input=inp, filter=flt, bias=bias, output=out)
+    if kinds[0] == "CONV_2D":
+        if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
+            raise ValueError(f"{path}: dilation is not supported")
+        d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
+    fa = opt.FusedActivationFunction()
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations activation_range defines
+    if fa not in acts:
+        raise ValueError(f"{path}: fused activation {fa} is not supported")
+    d["act_range"] = activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
+    return d
+
+
+def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
+    """(int8 job for RtlLayer, output shape) of one layer on the interpreter's input codes x; saved is the layer's G0 npz."""
+    inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
+    z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
+    w = flt["data"].astype(np.int64)
+    cout = w.shape[0]
+    if str(saved["rounding"]) != ROUNDING:
+        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {ROUNDING}")
+    mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
+    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
+    rm, rs = layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, ROUNDING)
+    if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
+        raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
+    if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):
+        raise ValueError(f"clamp {layer['act_range']} differs from the npz's ({int(saved['act_min'])}, {int(saved['act_max'])})")
+    if layer["kind"] == "CONV_2D":
+        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
+                          pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
+        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
+        W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
+        shape = (len(x), oh, ow, cout)
+    else:
+        W = w.T
+        X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
+        shape = (X.shape[0], cout)
+    bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
+    hw_bias = wrap32(bq - z_in * W.sum(axis=0))
+    amin, amax = layer["act_range"]
+    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
+    job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
+           "req": req}
+    return job, shape
+
+
+# ── 3. Middle end: jobs become N x N sets or a layer's streams; packing ───────
+
+HW_BIAS = True  # the mesh adds the bias; False lowers it as a ones column and an extra depth row
 
 
 def tile_job(job, N):
@@ -586,135 +600,7 @@ def tile_job(job, N):
     return groups, (P, C, rt, ct)
 
 
-def write_sets(path, groups, act):
-    code = ACT_CODE[act]
-    lines = []
-    n = 0
-    for _, passes, bias in groups:
-        for k, (A, B) in enumerate(passes):
-            partial = int(k < len(passes) - 1)
-            with_bias = int(bias is not None and k == 0)  # the first pass carries the group's bias
-            lines.append(f"{partial} {code} 0 {with_bias}")
-            parts = [A.ravel(), B.ravel()] + ([bias] if with_bias else [])
-            words = np.concatenate(parts).astype(np.float32).view(np.uint32)
-            lines.append("\n".join(f"{v:08x}" for v in words.tolist()))
-            n += 1
-    with open(path, "w") as f:
-        f.write(f"{n}\n" + "\n".join(lines) + "\n")
-    return n
-
-
-def read_outputs(path, fmt="fp32"):
-    """Output sets as float32; words are in the build's format, a narrow one widened exactly; int8 as signed integer codes."""
-    if fmt == "int8":  # two's-complement codes
-        sets, cur = [], None
-        for line in open(path):
-            if line.startswith("S "):
-                cur = []
-                sets.append(cur)
-            else:
-                cur.append(int(line, 16))
-        return [((np.array(s, np.int64) + 128) % 256) - 128 for s in sets]
-    sh = 23 - FORMATS[fmt][1]
-    sets = []
-    cur = None
-    for line in open(path):
-        if line.startswith("S "):
-            cur = []
-            sets.append(cur)
-        else:
-            cur.append(int(line, 16) << sh)
-    return [np.array(s, dtype=np.uint32).view(np.float32) for s in sets]
-
-
-# =============================================================================
-# Execution
-# =============================================================================
-
-
-class RtlSets:
-    """The TB_sienna_model binary, built once per configuration and run once per layer."""
-
-    def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
-        self.N, self.lanes, self.work, self.T = N, lanes, work, tile_size
-        self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
-        self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_model_sim")
-        self.cycles = 0
-        self.sets = 0
-
-    def build(self):
-        write_build_pkg(self.N, self.T, self.lanes, "fp32")
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
-                            "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
-                            "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
-                           cwd=ROOT, capture_output=True, text=True)
-        if r.returncode != 0 or not os.path.exists(self.bin):
-            sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_sienna_model build failed")
-
-    def run(self, groups, act, tag):
-        sets_f = os.path.join(self.work, f"{tag}.sets")
-        out_f = os.path.join(self.work, f"{tag}.out")
-        n = write_sets(sets_f, groups, act)
-        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
-                           cwd=os.path.dirname(self.bin),
-                           capture_output=True, text=True)
-        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
-            sys.stdout.write((r.stdout + r.stderr)[-3000:])
-            raise RuntimeError(f"{tag}: an assertion fired in the model simulation")
-        m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
-        if not m or int(m.group(6)) != 0:
-            sys.stdout.write(r.stdout[-3000:])
-            raise RuntimeError(f"{tag}: simulation failed")
-        outs = read_outputs(out_f)
-        os.remove(sets_f)
-        os.remove(out_f)
-        cyc = int(m.group(3))
-        self.cycles += cyc
-        self.sets += n
-        return outs, n, cyc
-
-
-class Emulator(RtlSets):
-    """Numpy stand-in for the RTL with the same set stream: checks tiling and reassembly, not the hardware."""
-
-    def build(self):
-        pass
-
-    def run(self, groups, act, tag):
-        outs, n = [], 0
-        for _, passes, bias in groups:
-            acc = None
-            for k, (A, B) in enumerate(passes):
-                p = A.astype(np.float32) @ B.astype(np.float32)
-                if bias is not None and k == 0:
-                    p = (p + bias[None, :]).astype(np.float32)
-                acc = p if acc is None else (acc + p).astype(np.float32)
-                n += 1
-                outs.append(np.zeros(0, np.float32))
-            outs[-1] = (np.maximum(acc, 0) if act == "relu" else acc).ravel()
-        self.sets += n
-        return outs, n, 0
-
-
-def run_job_hw(job, sim, tag):
-    N = sim.N
-    groups, (P, C, rt, ct) = tile_job(job, N)
-    outs, n, cyc = sim.run(groups, job["act"], tag)
-    Y = np.zeros((rt * N, ct * N), np.float32)
-    k = 0
-    for (r, c), passes, _ in groups:
-        k += len(passes) - 1  # partial sets complete with no output
-        o = outs[k]
-        k += 1
-        if o.size != N * N:
-            raise RuntimeError(f"{tag}: tile {r},{c} returned {o.size} words")
-        Y[r * N : (r + 1) * N, c * N : (c + 1) * N] = o.reshape(N, N)
-    return Y[:P, :C], n, cyc
-
-
 WC_TILES = 128  # sienna_layer's weight cache; a column block with more than half of it is streamed with its sets
-ACT_CODES = {"linear": 5, "relu": 4, "selu": 1, "sigmoid": 2, "tanh": 3}
 
 
 def format_layer(job, N):
@@ -853,6 +739,145 @@ def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
         raise ValueError(f"{tag}: a packed layer needs all {PACK_ENTRIES} table entries, not {len(pk['ents'])}")
 
 
+# ── 4. Device protocol: host to hardware; a silicon driver replaces 5-6 ──────
+
+ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
+ACT_CODES = {"linear": 5, "relu": 4, "selu": 1, "sigmoid": 2, "tanh": 3}
+
+
+def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None):
+    """TB_model_run's layer file: L (configuration), int8's Q (requantize), a packed layer's P (shift, block map) and E (entries 1-7), rows of N words, int8's epilogue words."""
+    with open(path, "w") as f:
+        f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pack))}\n")
+        if fmt == "int8":
+            f.write(f"Q {req['zp']} {req['amin']} {req['amax']} {req['mx']} {req['shx']} {req['mout']} {req['shout']} {req['zout']}\n")
+        if pack:
+            f.write("P " + " ".join(str(int(v)) for v in [pack["shift"]] + list(pack["map"])) + "\n")
+            for act, rq_e in pack["ents"][1:]:
+                q = rq_e or {}
+                f.write(f"E {ACT_CODES[act]} " + " ".join(str(int(q.get(x, 0))) for x in
+                                                        ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) + "\n")
+        f.write("\n".join(op_hex(np.concatenate([a.ravel(), w.ravel()]), fmt)))
+        f.write("\n")
+        if fmt == "int8":
+            f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in epilogue.ravel()))
+
+
+def read_outputs(path, fmt="fp32"):
+    """The result file (an "S" line per output set, then its words) as float32 sets; words are in the build's format, a narrow one widened exactly; int8 as signed integer codes."""
+    if fmt == "int8":  # two's-complement codes
+        sets, cur = [], None
+        for line in open(path):
+            if line.startswith("S "):
+                cur = []
+                sets.append(cur)
+            else:
+                cur.append(int(line, 16))
+        return [((np.array(s, np.int64) + 128) % 256) - 128 for s in sets]
+    sh = 23 - FORMATS[fmt][1]
+    sets = []
+    cur = None
+    for line in open(path):
+        if line.startswith("S "):
+            cur = []
+            sets.append(cur)
+        else:
+            cur.append(int(line, 16) << sh)
+    return [np.array(s, dtype=np.uint32).view(np.float32) for s in sets]
+
+
+def write_sets(path, groups, act):
+    """TB_sienna_model's set file: the set count, then per set "partial code 0 bias" and its A, B (and bias) words as fp32 hex; returns the count."""
+    code = ACT_CODE[act]
+    lines = []
+    n = 0
+    for _, passes, bias in groups:
+        for k, (A, B) in enumerate(passes):
+            partial = int(k < len(passes) - 1)
+            with_bias = int(bias is not None and k == 0)  # the first pass carries the group's bias
+            lines.append(f"{partial} {code} 0 {with_bias}")
+            parts = [A.ravel(), B.ravel()] + ([bias] if with_bias else [])
+            words = np.concatenate(parts).astype(np.float32).view(np.uint32)
+            lines.append("\n".join(f"{v:08x}" for v in words.tolist()))
+            n += 1
+    with open(path, "w") as f:
+        f.write(f"{n}\n" + "\n".join(lines) + "\n")
+    return n
+
+
+# ── 5. Device build: the package the simulators compile against ──────────────
+
+SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its banks, ACC_BANKS=RESULT_BANKS=4); the testbenches read it from the package
+COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for the bit-exact golden
+TB_DIR = os.path.join(ROOT, "testbenches")
+
+
+def write_sv_package(path: str, items: list) -> None:
+    with open(path, "w") as f:
+        f.write("// Auto-Generated Configuration Package\npackage test_config_pkg;\n\n")
+        for name, val, vtype in items:
+            kw = "shortreal" if vtype == "float" else "int"
+            f.write(f"  localparam {kw} {name} = {val};\n")
+        f.write("\nendpackage\n")
+
+
+def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
+                  use_bias: bool, drop_seed: int) -> list:
+    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
+    N = cfg.get("n", 16)
+    sram_depth = N * N
+    return [
+        ("N", N, "int"),
+        ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
+        ("NUM_LANES", cfg.get("lanes", 32), "int"),
+        ("HOST_WORDS", cfg.get("host_words", N), "int"),
+        ("EXP_W", FORMATS[fmt][0], "int"),
+        ("MAN_W", FORMATS[fmt][1], "int"),
+        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
+        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
+        ("IS_INT", int(fmt == "int8"), "int"),
+        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
+        ("SRAM_DEPTH", sram_depth, "int"),
+        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
+        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
+        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
+        ("IN_ROWS", N, "int"),
+        ("IN_COLS", N, "int"),
+        ("POOL_H", cfg.get("pool_h", 2), "int"),
+        ("POOL_W", cfg.get("pool_w", 2), "int"),
+        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
+        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
+        ("PADDING", cfg.get("padding", 1), "int"),
+        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
+        ("LFSR_WIDTH", 32, "int"),
+        ("CONTROL_WIDTH", 3, "int"),
+        ("NUM_SETS", num_sets, "int"),
+        ("SETS_IN_FLIGHT", credits, "int"),
+        ("HAS_BIAS", int(use_bias), "int"),
+        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
+        ("ACCUM_PASSES", passes, "int"),
+        ("MIXED_LEN", len(mixed), "int"),
+        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
+        ("PACKED", int(bool(cfg.get("packed", False))), "int"),
+        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
+        ("DROPOUT_SEED", drop_seed, "int"),
+        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
+    ]
+
+
+def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
+    """test_config_pkg.sv of the model simulators' build (RtlSets, RtlLayer): matmul_relu_nopool's configuration in fmt, no stimulus."""
+    os.makedirs(TB_DIR, exist_ok=True)
+    if fmt == "int8":
+        _check_rounding()
+    cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "pool_h": 1, "pool_w": 1, "padding": 0}
+    drop_seed = 0x2ACE0000 + 42 + int(os.environ.get("SIENNA_SEED", "0"))  # the generators' seed, so the package matches theirs
+    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                     _config_items(cfg, fmt, "relu", SETS_IN_FLIGHT + 2, SETS_IN_FLIGHT, 1, [], fmt == "int8", drop_seed))
+
+
+# ── 6. Backends: build(), run_job(job, tag) -> (outputs, sets, cycles) ───────
+
 class RtlLayer:
     """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -872,6 +897,7 @@ class RtlLayer:
             raise RuntimeError("TB_model_run build failed")
 
     def run_job(self, job, tag):
+        """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run, reads the results."""
         N = self.N
         int8 = self.fmt_name == "int8"
         if int8 and job.get("req") is None:
@@ -885,21 +911,7 @@ class RtlLayer:
             pack_precheck(pk, cfg, (M, C, rt), N, self.lanes, tag)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
-        with open(lf, "w") as f:
-            f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pk))}\n")
-            if int8:
-                q = job["req"]
-                f.write(f"Q {q['zp']} {q['amin']} {q['amax']} {q['mx']} {q['shx']} {q['mout']} {q['shout']} {q['zout']}\n")
-            if pk:
-                f.write("P " + " ".join(str(int(v)) for v in [pk["shift"]] + list(pk["map"])) + "\n")
-                for act, rq_e in pk["ents"][1:]:
-                    q = rq_e or {}
-                    f.write(f"E {ACT_CODES[act]} " + " ".join(str(int(q.get(x, 0))) for x in
-                                                            ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) + "\n")
-            f.write("\n".join(op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
-            f.write("\n")
-            if int8:
-                f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in layer_epilogue(job, N).ravel()))
+        write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None)
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
@@ -926,6 +938,89 @@ class RtlLayer:
         self.words += (len(a) + len(w)) * N
         return Y[:M, :C], n, cyc
 
+
+class RtlSets:
+    """The TB_sienna_model binary, built once per configuration and run once per layer."""
+
+    def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
+        self.N, self.lanes, self.work, self.T = N, lanes, work, tile_size
+        self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
+        self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_model_sim")
+        self.cycles = 0
+        self.sets = 0
+
+    def build(self):
+        write_build_pkg(self.N, self.T, self.lanes, "fp32")
+        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
+                            "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
+                            "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(self.bin):
+            sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
+            raise RuntimeError("TB_sienna_model build failed")
+
+    def run(self, groups, act, tag):
+        sets_f = os.path.join(self.work, f"{tag}.sets")
+        out_f = os.path.join(self.work, f"{tag}.out")
+        n = write_sets(sets_f, groups, act)
+        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
+                           cwd=os.path.dirname(self.bin),
+                           capture_output=True, text=True)
+        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
+            sys.stdout.write((r.stdout + r.stderr)[-3000:])
+            raise RuntimeError(f"{tag}: an assertion fired in the model simulation")
+        m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
+        if not m or int(m.group(6)) != 0:
+            sys.stdout.write(r.stdout[-3000:])
+            raise RuntimeError(f"{tag}: simulation failed")
+        outs = read_outputs(out_f)
+        os.remove(sets_f)
+        os.remove(out_f)
+        cyc = int(m.group(3))
+        self.cycles += cyc
+        self.sets += n
+        return outs, n, cyc
+
+    def run_job(self, job, tag):
+        """One job as N x N sets in tile order -> (outputs, sets, cycles); a tile's result is its last set's, partial sets return none."""
+        N = self.N
+        groups, (P, C, rt, ct) = tile_job(job, N)
+        outs, n, cyc = self.run(groups, job["act"], tag)
+        Y = np.zeros((rt * N, ct * N), np.float32)
+        k = 0
+        for (r, c), passes, _ in groups:
+            k += len(passes) - 1  # partial sets complete with no output
+            o = outs[k]
+            k += 1
+            if o.size != N * N:
+                raise RuntimeError(f"{tag}: tile {r},{c} returned {o.size} words")
+            Y[r * N : (r + 1) * N, c * N : (c + 1) * N] = o.reshape(N, N)
+        return Y[:P, :C], n, cyc
+
+
+class Emulator(RtlSets):
+    """Numpy stand-in for the RTL with the same set stream: checks tiling and reassembly, not the hardware."""
+
+    def build(self):
+        pass
+
+    def run(self, groups, act, tag):
+        outs, n = [], 0
+        for _, passes, bias in groups:
+            acc = None
+            for k, (A, B) in enumerate(passes):
+                p = A.astype(np.float32) @ B.astype(np.float32)
+                if bias is not None and k == 0:
+                    p = (p + bias[None, :]).astype(np.float32)
+                acc = p if acc is None else (acc + p).astype(np.float32)
+                n += 1
+                outs.append(np.zeros(0, np.float32))
+            outs[-1] = (np.maximum(acc, 0) if act == "relu" else acc).ravel()
+        self.sets += n
+        return outs, n, 0
+
+
+# ── 7. Runtime: a model graph through a backend ──────────────────────────────
 
 def macs_of(job):
     """Multiply-accumulates the model defines: structural zeros and identity (residual) passes not counted."""
@@ -980,10 +1075,8 @@ def execute(model, x, sim=None, log=None):
         if sim is None:
             y = ref.astype(np.float32)
             n = cyc = 0
-        elif isinstance(sim, RtlLayer):
-            y, n, cyc = sim.run_job(job, f"L{li:02d}")
         else:
-            y, n, cyc = run_job_hw(job, sim, f"L{li:02d}")
+            y, n, cyc = sim.run_job(job, f"L{li:02d}")
         scale = float(np.max(np.abs(ref))) or 1.0
         err = float(np.max(np.abs(y.astype(np.float64) - ref))) / scale
         err_fmt = float(np.max(np.abs(y.astype(np.float64) - ref_float))) / (float(np.max(np.abs(ref_float))) or 1.0)
@@ -995,10 +1088,7 @@ def execute(model, x, sim=None, log=None):
     return t[model["output"]], stats
 
 
-# =============================================================================
-# Models and inputs
-# =============================================================================
-
+# ── 8. CLI: --action model (default), --action tflite [--pack] ───────────────
 
 def cifar_test(data_dir):
     import pickle
@@ -1058,98 +1148,90 @@ MODELS = {
     "kws": "kws_ref_model_float32.tflite",
     "vww": "vww_96_float.tflite",
 }
-
-
-# ── TFLite runs ──────────────────────────────────────────────────────────────
-
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
+ACTIONS = ("model", "tflite")
 
 
-def load_layer(path: str) -> dict:
-    """The one CONV_2D or FULLY_CONNECTED operator of an int8 .tflite, with its tensors' codes and quantization."""
-    import tflite
-    from tflite.ActivationFunctionType import ActivationFunctionType as AF
-    from tflite.BuiltinOperator import BuiltinOperator as BO
+def model_main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
+    ap.add_argument("--models", default="resnet8,ad01,kws,vww")
+    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS),
+                    help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
+    ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
+    ap.add_argument("--no-sim", action="store_true", help="float reference only")
+    ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL, to check the lowering")
+    ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
+                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
+    ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
+    a = ap.parse_args(argv)
+    if a.fmt_name == "int8":
+        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
+    os.makedirs(a.work, exist_ok=True)
+    report = os.path.join(a.work, f"model_report_N{a.n}.log")
+    js = os.path.join(a.work, f"model_results_N{a.n}.json")
+    rep = open(report, "w")
 
-    names = {v: k for k, v in BO.__dict__.items() if not k.startswith("_")}
-    m = tflite.Model.GetRootAsModel(open(path, "rb").read(), 0)
-    g = m.Subgraphs(0)
-    code = lambda op: m.OperatorCodes(op.OpcodeIndex())
-    kinds = [names[max(code(g.Operators(i)).BuiltinCode(), code(g.Operators(i)).DeprecatedBuiltinCode())]
-             for i in range(g.OperatorsLength())]
-    if kinds not in (["CONV_2D"], ["FULLY_CONNECTED"]):
-        raise ValueError(f"{path}: operators {kinds}; expected one CONV_2D or FULLY_CONNECTED with int8 input and output")
-    op = g.Operators(0)
+    def log(s):
+        print(s, flush=True)
+        rep.write(s + "\n")
+        rep.flush()
 
-    def tensor(i):
-        if i < 0:
-            return None
-        t = g.Tensors(i)
-        q = t.Quantization()
-        buf = m.Buffers(t.Buffer()).DataAsNumpy()
-        data = None
-        if not isinstance(buf, int) and buf is not None and len(buf):
-            data = np.frombuffer(buf.tobytes(), dtype={9: np.int8, 2: np.int32}[t.Type()]).reshape(tuple(t.ShapeAsNumpy()))
-        return dict(type=t.Type(), shape=tuple(t.ShapeAsNumpy()), data=data,
-                    scale=np.atleast_1d(q.ScaleAsNumpy()).astype(np.float32),
-                    zp=np.atleast_1d(q.ZeroPointAsNumpy()).astype(np.int64))
-
-    ins = [op.Inputs(j) for j in range(op.InputsLength())]
-    inp, flt = tensor(ins[0]), tensor(ins[1])
-    bias = tensor(ins[2]) if len(ins) > 2 else None
-    out = tensor(op.Outputs(0))
-    if inp["type"] != 9 or flt["type"] != 9 or out["type"] != 9:  # 9 is INT8
-        raise ValueError(f"{path}: input, filter and output must be int8")
-    if np.any(flt["zp"] != 0):
-        raise ValueError(f"{path}: TFLite's int8 filters are symmetric; a non-zero filter zero point is not supported")
-    opt = (tflite.Conv2DOptions if kinds[0] == "CONV_2D" else tflite.FullyConnectedOptions)()
-    t = op.BuiltinOptions()
-    opt.Init(t.Bytes, t.Pos)
-    d = dict(kind=kinds[0], input=inp, filter=flt, bias=bias, output=out)
-    if kinds[0] == "CONV_2D":
-        if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
-            raise ValueError(f"{path}: dilation is not supported")
-        d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
-    fa = opt.FusedActivationFunction()
-    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations activation_range defines
-    if fa not in acts:
-        raise ValueError(f"{path}: fused activation {fa} is not supported")
-    d["act_range"] = activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
-    return d
-
-
-def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
-    """(int8 job for RtlLayer, output shape) of one layer on the interpreter's input codes x; saved is the layer's G0 npz."""
-    inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
-    z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
-    w = flt["data"].astype(np.int64)
-    cout = w.shape[0]
-    if str(saved["rounding"]) != ROUNDING:
-        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {ROUNDING}")
-    mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
-    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
-    rm, rs = layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, ROUNDING)
-    if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
-        raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
-    if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):
-        raise ValueError(f"clamp {layer['act_range']} differs from the npz's ({int(saved['act_min'])}, {int(saved['act_max'])})")
-    if layer["kind"] == "CONV_2D":
-        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
-                          pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
-        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
-        W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
-        shape = (len(x), oh, ow, cout)
-    else:
-        W = w.T
-        X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
-        shape = (X.shape[0], cout)
-    bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
-    hw_bias = wrap32(bq - z_in * W.sum(axis=0))
-    amin, amax = layer["act_range"]
-    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
-    job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
-           "req": req}
-    return job, shape
+    sim = None
+    if not a.no_sim:
+        if a.emulate:
+            sim = Emulator(a.n, a.lanes, a.work, a.host_gaps)
+        elif a.engine == "layer":
+            sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
+        else:
+            sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
+        t0 = time.time()
+        sim.build()
+        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
+    results = {}
+    for name in a.models.split(","):
+        model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
+        if name == "resnet8" and a.ref_accuracy:
+            x, y = cifar_test(os.path.join(a.model_dir, "data"))
+            hits = sum(int(np.argmax(execute(model, x[i : i + 1])[0]) == y[i]) for i in range(a.ref_accuracy))
+            log(f"{name}: float64 reference top-1 on the first {a.ref_accuracy} CIFAR-10 test images: {hits}/{a.ref_accuracy} = {100 * hits / a.ref_accuracy:.1f}%")
+            results.setdefault(name, {})["ref_top1"] = [hits, a.ref_accuracy]
+        inputs, source = model_inputs(name, a.model_dir, a.count, 7)
+        log(f"\n== {name} ({MODELS[name]}), inputs: {source}")
+        runs = []
+        for x, label, desc in inputs:
+            ref, _ = execute(model, x)
+            if sim is None:
+                runs.append({"input": desc, "label": label, "ref_top": int(np.argmax(ref))})
+                continue
+            c0, s0, w0, t0 = sim.cycles, sim.sets, getattr(sim, "words", 0), time.time()
+            log(f"  inference on {desc}")
+            hw, stats = execute(model, x, sim, log)
+            cyc, sets, hwords = sim.cycles - c0, sim.sets - s0, getattr(sim, "words", 0) - w0
+            macs = sum(s["macs"] for s in stats)
+            diff = float(np.max(np.abs(hw.astype(np.float64) - ref)))
+            r = {"input": desc, "label": label, "ref_top": int(np.argmax(ref)), "hw_top": int(np.argmax(hw)), "cycles": cyc,
+                 "host_words": hwords,
+                 "sets": sets, "macs": macs, "max_abs_out_diff": diff, "wall_s": time.time() - t0, "layers": stats,
+                 "ref_out": ref.ravel().tolist()[:16], "hw_out": hw.ravel().tolist()[:16]}
+            if name == "ad01":  # the anomaly score is the reconstruction error of each slice
+                r["score_ref"] = np.mean((x.astype(np.float64) - ref) ** 2, axis=1).tolist()
+                r["score_hw"] = np.mean((x.astype(np.float64) - hw) ** 2, axis=1).tolist()
+                log(f"  anomaly score (MSE) ref {np.mean(r['score_ref']):.6f} hw {np.mean(r['score_hw']):.6f}")
+            runs.append(r)
+            util = macs / (sets * a.n ** 3) if sets else 0
+            log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
+                f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
+        results.setdefault(name, {})["runs"] = runs
+        results[name]["source"] = source
+        json.dump(results, open(js, "w"), indent=1)
+    log(f"\nreport {report}\nresults {js}")
 
 
 def tflite_main(argv=None):
@@ -1248,92 +1330,6 @@ def tflite_pack_main(argv=None):
     print(tail)
     rep.write(tail + "\nRESULT: " + ("PASSED" if bad == 0 else "FAILED") + "\n")
     sys.exit(1 if bad else 0)
-
-
-def model_main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
-    ap.add_argument("--models", default="resnet8,ad01,kws,vww")
-    ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
-    ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS),
-                    help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
-    ap.add_argument("--lanes", type=int, default=32)
-    ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")
-    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
-    ap.add_argument("--ref-accuracy", type=int, default=0, help="CIFAR-10 test images for the float reference accuracy")
-    ap.add_argument("--no-sim", action="store_true", help="float reference only")
-    ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL, to check the lowering")
-    ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
-                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
-    ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
-    a = ap.parse_args(argv)
-    if a.fmt_name == "int8":
-        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
-    os.makedirs(a.work, exist_ok=True)
-    report = os.path.join(a.work, f"model_report_N{a.n}.log")
-    js = os.path.join(a.work, f"model_results_N{a.n}.json")
-    rep = open(report, "w")
-
-    def log(s):
-        print(s, flush=True)
-        rep.write(s + "\n")
-        rep.flush()
-
-    sim = None
-    if not a.no_sim:
-        if a.emulate:
-            sim = Emulator(a.n, a.lanes, a.work, a.host_gaps)
-        elif a.engine == "layer":
-            sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
-        else:
-            sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
-        t0 = time.time()
-        sim.build()
-        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
-    results = {}
-    for name in a.models.split(","):
-        model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
-        if name == "resnet8" and a.ref_accuracy:
-            x, y = cifar_test(os.path.join(a.model_dir, "data"))
-            hits = sum(int(np.argmax(execute(model, x[i : i + 1])[0]) == y[i]) for i in range(a.ref_accuracy))
-            log(f"{name}: float64 reference top-1 on the first {a.ref_accuracy} CIFAR-10 test images: {hits}/{a.ref_accuracy} = {100 * hits / a.ref_accuracy:.1f}%")
-            results.setdefault(name, {})["ref_top1"] = [hits, a.ref_accuracy]
-        inputs, source = model_inputs(name, a.model_dir, a.count, 7)
-        log(f"\n== {name} ({MODELS[name]}), inputs: {source}")
-        runs = []
-        for x, label, desc in inputs:
-            ref, _ = execute(model, x)
-            if sim is None:
-                runs.append({"input": desc, "label": label, "ref_top": int(np.argmax(ref))})
-                continue
-            c0, s0, w0, t0 = sim.cycles, sim.sets, getattr(sim, "words", 0), time.time()
-            log(f"  inference on {desc}")
-            hw, stats = execute(model, x, sim, log)
-            cyc, sets, hwords = sim.cycles - c0, sim.sets - s0, getattr(sim, "words", 0) - w0
-            macs = sum(s["macs"] for s in stats)
-            diff = float(np.max(np.abs(hw.astype(np.float64) - ref)))
-            r = {"input": desc, "label": label, "ref_top": int(np.argmax(ref)), "hw_top": int(np.argmax(hw)), "cycles": cyc,
-                 "host_words": hwords,
-                 "sets": sets, "macs": macs, "max_abs_out_diff": diff, "wall_s": time.time() - t0, "layers": stats,
-                 "ref_out": ref.ravel().tolist()[:16], "hw_out": hw.ravel().tolist()[:16]}
-            if name == "ad01":  # the anomaly score is the reconstruction error of each slice
-                r["score_ref"] = np.mean((x.astype(np.float64) - ref) ** 2, axis=1).tolist()
-                r["score_hw"] = np.mean((x.astype(np.float64) - hw) ** 2, axis=1).tolist()
-                log(f"  anomaly score (MSE) ref {np.mean(r['score_ref']):.6f} hw {np.mean(r['score_hw']):.6f}")
-            runs.append(r)
-            util = macs / (sets * a.n ** 3) if sets else 0
-            log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
-                f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
-        results.setdefault(name, {})["runs"] = runs
-        results[name]["source"] = source
-        json.dump(results, open(js, "w"), indent=1)
-    log(f"\nreport {report}\nresults {js}")
-
-
-
-ACTIONS = ("model", "tflite")
 
 
 def main():

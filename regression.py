@@ -1425,7 +1425,7 @@ def gemm_main(argv=None):
         B = mr.op_round(rng.uniform(-1, 1, (k, n)), a.fmt_name)
         job = {"terms": [(A, B)], "bias": None, "act": "linear", "shape": (m, n)}
         t0 = time.time()
-        y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.RtlLayer) else mr.run_job_hw(job, sim, name)
+        y, sets, cyc = sim.run_job(job, name)
         ref = A.astype(np.float64) @ B.astype(np.float64)
         err = float(np.max(np.abs(y - ref)) / (np.max(np.abs(ref)) or 1.0))
         mism = 0
@@ -2430,6 +2430,38 @@ def test_gpnae_target_model():
     assert r.returncode == 0 and "py regression.py --lane poly --format bf16 --model exact" in r.stdout, r.stdout + r.stderr
     r = make_n("gpnae-verilator", "FMT=bf16", "GPNAE_MODEL=hw", "PYTHON=py")
     assert r.returncode == 0 and "--model hw" in r.stdout, r.stdout + r.stderr
+
+
+@selftest
+def test_layer_file_format():
+    N, rng = 16, np.random.default_rng(5)
+    req = dict(zp=3, amin=-128, amax=127, mx=0, shx=0, mout=0, shout=0, zout=0)
+    models = [{"W": rng.integers(-5, 5, (6, 8)).astype(np.float32), "bias": rng.integers(-9, 9, 8), "act": a,
+               "req": dict(req, mult=np.full(8, 1 << 30), shift=np.full(8, -3)), "inputs": [rng.integers(-9, 9, (5, 6)).astype(np.float32)]}
+              for a in ("linear", "relu")]
+    job, _ = mr.pack_jobs(models, N, int8=True)
+    cfg, a, w, _ = mr.format_layer(job, N)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.layer")
+        mr.write_layer(path, cfg, a, w, "int8", job["req"], job["pack"], mr.layer_epilogue(job, N))
+        lines = open(path).read().splitlines()
+    head = [x for x in lines if x[:1] in ("L", "Q", "P", "E")]
+    assert [x[0] for x in head] == ["L", "Q", "P"] + ["E"] * (mr.PACK_ENTRIES - 1), head
+    assert len(head[0].split()) == 12 and head[0].split()[-1] == "1" and len(head[2].split()) == 2 + N // 2, head
+    words, blocks = (len(a) + len(w)) * N, -(-cfg["n"] // N)
+    assert len(lines) == len(head) + words + blocks * 3 * N, (len(lines), len(a), len(w))
+    assert all(len(x) == 2 for x in lines[len(head):len(head) + words])  # int8 words: two hex digits
+    assert all(len(x) == 8 for x in lines[len(head) + words:])  # the epilogue's int32 words
+
+
+@selftest
+def test_backends_share_run_job():
+    fjob = {"terms": [(np.eye(20, dtype=np.float32), np.arange(20 * 9, dtype=np.float32).reshape(20, 9) - 90)], "bias": np.ones(9, np.float32),
+            "act": "relu", "shape": (20, 9)}
+    for cls in (mr.RtlLayer, mr.RtlSets, mr.Emulator):
+        assert callable(getattr(cls, "build")) and callable(getattr(cls, "run_job")), cls
+    y, sets, cyc = mr.Emulator(16, 32, tempfile.gettempdir()).run_job(fjob, "t")
+    assert np.array_equal(y, mr.job_reference(fjob)[1].astype(np.float32)) and sets == 4 and cyc == 0, (sets, cyc)
 
 
 @selftest

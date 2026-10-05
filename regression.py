@@ -7,13 +7,17 @@ Contains:
   2. Live Status Streamer
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
+  5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors
 """
 
 import argparse
+import itertools
+import json
 import math
 import os
 import re
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -32,6 +36,7 @@ from model_runner import (  # noqa: E402
     FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _check_rounding, _config_items, activate_int8, activation_to_code,
     apply_activation, bits_float, drop_zp, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
+import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 
 # Ensure we can import the mesh helpers
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
@@ -41,6 +46,7 @@ from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -1125,13 +1131,1178 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         sys.exit(1)
 
 
+# ── pack (was pack_regression.py) ────────────────────────────────────────────
+
+ACTS = ["linear", "tanh", "relu", "selu", "sigmoid", "linear", "relu", "tanh"]
+
+
+def layer(N, sh, R, rng, fmt, zero_rows=False):
+    """A packed layer of R row tiles: block c's job is A[:, block] @ W_c + bias, through ACTS[(c + 1) % 8]."""
+    b = N >> sh
+    A = rng.uniform(-1, 1, (R * N, N))
+    B = np.zeros((N, N))
+    for c in range(N // b):
+        B[c * b:(c + 1) * b, c * b:(c + 1) * b] = rng.uniform(-1, 1, (b, b))
+    bias = rng.uniform(-0.5, 0.5, N)
+    mp = [((c + 1) % 8 if c < N // b else 0) for c in range(N // 2)]
+    if zero_rows:  # exact zero sums, no bias beat: rows 0, 1 are -0 / +0 inputs, rows 2 mod 4 cancel x * w against -x * w, block 0's first column has zero weights
+        A[0::4, :], A[1::4, :] = -0.0, 0.0
+        A[2::4, :] = 0.0
+        for c in range(N // b):
+            B[c * b + 1, c * b:(c + 1) * b] = B[c * b, c * b:(c + 1) * b]
+            A[2::4, c * b] = rng.uniform(-1, 1, A[2::4, c * b].shape)
+            A[2::4, c * b + 1] = -A[2::4, c * b]
+        B[0:b, 0] = 0.0
+        bias = np.zeros(N)
+        mp = [(0, 1, 5, 7)[c % 4] if c < N // b else 0 for c in range(N // 2)]  # linear and tanh entries only
+    return A, B, bias, mp, b
+
+
+def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
+    rng = np.random.RandomState(seed)
+    A, B, bias, mp, b = layer(N, sh, R, rng, a.fmt, zero_rows)
+    col_ent = [mp[j // b] for j in range(N)]
+    ents = [(a.acts[e], None) for e in range(8)]
+    if a.fmt == "int8":
+        A_q, s_a, z_a = mr.quant_act(A)
+        B_q, s_w = mr.quant_weights(B)
+        hw = mr.fold_bias(bias, s_a, s_w, z_a, B_q)
+        acc = mr.wrap32(mr.imatmul(A_q, B_q) + hw[None, :])
+        mult, shift = np.zeros(N, np.int64), np.zeros(N, np.int64)
+        for e in sorted(set(col_ent)):
+            cols = np.array(col_ent) == e
+            act = "linear" if a.acts[e] == "selu" else a.acts[e]  # SELU's int8 saturation is pack_jobs' to refuse (Task 7)
+            rq = mr.requant_params(acc[:, cols], s_a, s_w[cols], act)
+            mult[cols], shift[cols] = rq["mult"], rq["shift"]
+            ents[e] = (act, rq)
+        head = ents[0][1] or mr.requant_params(acc, s_a, s_w, "linear")
+        job = {"terms": [(A_q.astype(np.float32), B_q.astype(np.float32))], "bias": hw, "act": ents[0][0], "shape": (R * N, N),
+               "req": dict(head, mult=mult, shift=shift), "pack": {"shift": sh, "map": mp, "ents": ents}}
+    else:
+        A, B, bias = (mr.op_round(v, a.fmt) for v in (A, B, bias))
+        job = {"terms": [(A, B)], "bias": bias, "act": a.acts[0], "shape": (R * N, N), "pack": {"shift": sh, "map": mp, "ents": ents}}
+    t0 = time.time()
+    Yp, sets_p, cyc_p = sim.run_job(job, f"pk_s{sh}")
+    bad = cyc_a = 0
+    for c in range(N // b):
+        cols = slice(c * b, (c + 1) * b)
+        e = mp[c]
+        if a.fmt == "int8":
+            rq = dict(ents[e][1], mult=mult[cols], shift=shift[cols])
+            alone = {"terms": [(A_q[:, cols].astype(np.float32), B_q[cols, cols].astype(np.float32))], "bias": hw[cols],
+                     "act": ents[e][0], "shape": (R * N, b), "req": rq}
+            gold = mr.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])
+        else:
+            alone = {"terms": [(A[:, cols], B[cols, cols])], "bias": bias[cols], "act": a.acts[e], "shape": (R * N, b)}
+            gold = exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, a.acts[e], N, a.fmt, a.tile) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
+        Ya, _, cyc = sim.run_job(alone, f"al_s{sh}_{c}")
+        cyc_a += cyc
+        bits = (lambda y: y) if a.fmt == "int8" else (lambda y: mr.fmt_bits(y, a.fmt))
+        bad += int(np.sum(bits(Yp[:, cols]) != bits(Ya)))
+        if gold is not None:
+            bad += int(np.sum(bits(Yp[:, cols]) != gold))
+    line = (f"{a.fmt} N={N} T={a.tile} b={b:<3} rows={R * N:<4} {'zero rows ' if zero_rows else ''}packed: {sets_p} sets "
+            f"{cyc_p} cycles | {N // b} jobs alone: {cyc_a} cycles | speedup {cyc_a / cyc_p:5.2f}x | mismatches {bad} | "
+            f"wall {time.time() - t0:.0f}s")
+    print(line, flush=True)
+    log.write(line + "\n")
+    return bad
+
+
+def run_models(a, sim, log):
+    """Review Focus 2: heterogeneous small jobs through pack_jobs, fewer models than blocks; each against itself alone."""
+    rng = np.random.RandomState(77)
+    N = a.n
+    shapes = [(3, 2, [5, 9]), (2, 2, [N]), (2, 1, [3])]  # blocks of 4: N = 8 holds two models, 16 and 32 leave blocks empty
+    acts = ["tanh", "relu", "linear"]
+    models = [{"W": rng.uniform(-1, 1, (K, C)), "bias": rng.uniform(-0.5, 0.5, C), "act": act, "req": None,
+               "inputs": [rng.uniform(-1, 1, (m, K)) for m in ms]} for (K, C, ms), act in zip(shapes, acts)][:N // 4]
+    if a.fmt != "fp32":
+        for m in models:
+            m["W"], m["bias"] = mr.op_round(m["W"], a.fmt), mr.op_round(m["bias"], a.fmt)
+            m["inputs"] = [mr.op_round(x, a.fmt) for x in m["inputs"]]
+    if a.fmt == "int8":
+        log.write("int8 pack_jobs case: covered by model_runner.py --action tflite --pack (Task 8)\n")
+        return 0
+    job, recipe = mr.pack_jobs(models, N, int8=False)
+    Y, _, _ = sim.run_job(job, "pj")
+    bad = 0
+    for i, (m, outs) in enumerate(zip(models, mr.unpack(Y, recipe))):
+        X = np.vstack(m["inputs"]).astype(np.float32)
+        alone = {"terms": [(X, m["W"].astype(np.float32))], "bias": m["bias"].astype(np.float32), "act": m["act"],
+                 "shape": (X.shape[0], m["W"].shape[1])}
+        Ya, _, _ = sim.run_job(alone, f"pj_al{i}")
+        got = np.vstack(outs)
+        bad += int(np.sum(mr.fmt_bits(got, a.fmt) != mr.fmt_bits(Ya, a.fmt)))
+    line = f"{a.fmt} N={N} T={a.tile} pack_jobs: {len(models)} models in {N // (N >> job['pack']['shift'])} blocks, mismatches {bad}"
+    print(line, flush=True)
+    log.write(line + "\n")
+    return bad
+
+
+def pack_main(argv=None):
+    """Packed layers on sienna_layer: each job's block equals the job alone on the RTL and its golden, bit for bit; cycles packed vs alone."""
+    ap = argparse.ArgumentParser(description=pack_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="pack")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--rows", type=int, nargs="+", default=[2], help="row tiles per packed layer; several run in turn")
+    ap.add_argument("--format", dest="fmt", default="int8", choices=sorted(mr.FORMATS))
+    ap.add_argument("--act", choices=sorted(set(ACTS)), help="every entry holds this activation (a same-activation cycle sweep); default the mixed table")
+    a = ap.parse_args(argv)
+    a.acts = [a.act] * 8 if a.act else ACTS
+    work = os.path.join(ROOT, "testbenches", "results", "pack")
+    os.makedirs(work, exist_ok=True)
+    sim = mr.RtlLayer(a.n, a.lanes, work, a.fmt, a.tile)
+    sim.build()
+    log = open(os.path.join(work, f"pack_regression_{a.fmt}_N{a.n}_T{a.tile}{'_' + a.act if a.act else ''}.log"), "w")
+    bad = 0
+    for R in a.rows:
+        for sh in range(1, a.n.bit_length() - 1):
+            bad += run_case(a, sim, a.n, sh, R, 900 + sh, log)
+    if a.act is None:  # the correctness cases below choose their own activations
+        if a.fmt != "int8":
+            bad += run_case(a, sim, a.n, 2, a.rows[0], 990, log, zero_rows=True)  # Review Focus 3: signed zeros
+        bad += run_models(a, sim, log)
+    tail = f"PACK REGRESSION {'PASS' if bad == 0 else 'FAIL'}: {bad} mismatching outputs"
+    print(tail, flush=True)
+    log.write(tail + "\n")
+    sys.exit(1 if bad else 0)
+
+
+# ── gemm (was gemm_sweep.py) ─────────────────────────────────────────────────
+
+GRID_M = [1, 16, 64, 256, 1024]
+GRID_K = [16, 64, 256, 1024]
+GRID_N = [16, 64, 256]
+# A BERT-base / small-LLM layer with 128 tokens: projections, MLP, attention scores and values, and one decode step.
+TRANSFORMER = [
+    ("qkv_proj_128tok", 128, 768, 768),
+    ("mlp_up_128tok", 128, 768, 3072),
+    ("mlp_down_128tok", 128, 3072, 768),
+    ("attn_scores", 128, 64, 128),
+    ("attn_values", 128, 128, 64),
+    ("decode_proj_1tok", 1, 768, 768),
+    ("decode_mlp_up_1tok", 1, 768, 3072),
+]
+
+
+def exact_layer(A, B, bias, act, N, fmt, T=4):
+    """Bit-exact output of sienna_layer for one product in a narrow format: per output tile, the depth blocks as passes in
+    order (format_layer's order), the bias with the first, then the lane; T is the build's tile size."""
+    f = fpu.FORMATS[fmt]
+    M, K = A.shape
+    C = B.shape[1]
+    rt, ct, dt = -(-M // N), -(-C // N), -(-K // N)
+    Ap = np.zeros((rt * N, dt * N), np.float32)
+    Ap[:M, :K] = A
+    Bp = np.zeros((dt * N, ct * N), np.float32)
+    Bp[:K, :C] = B
+    bp = np.zeros(ct * N, np.float32)
+    if bias is not None:
+        bp[: bias.size] = bias
+    rom = gpnae_model.read_rom(os.path.join(mr.ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
+    lane = gpnae_model.Lane(f, rom)
+    Y = np.zeros((rt * N, ct * N), np.int64)
+    for c in range(ct):
+        for r in range(rt):
+            passes = [(mr.fmt_bits(Ap[r * N:(r + 1) * N, t * N:(t + 1) * N], fmt), mr.fmt_bits(Bp[t * N:(t + 1) * N, c * N:(c + 1) * N], fmt))
+                      for t in range(dt)]
+            b = mr.fmt_bits(bp[c * N:(c + 1) * N], fmt) if bias is not None else None
+            Ct = mesh_model.matmul(f, passes, N, T, 1, b)
+            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = lane.run(Ct, mr.activation_to_code(act))
+    return Y[:M, :C]
+
+
+def run_int8(a, sim, shapes) -> None:
+    """int8 on the layer engine: TFLite-PTQ-quantized products must equal the model bit for bit; the quantization error is reported, not gated."""
+    rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
+    peak = a.n * a.n
+    head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
+            f"{'slot use':>8} {'mism':>6} {'q err':>8} {'wall s':>6}")
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
+                 f"peak {peak} MAC/cycle", head):
+        print(line, flush=True)
+        rep.write(line + "\n")
+    cases = [(name, m, k, n, "linear") for name, m, k, n in shapes]
+    cases += [(f"layer_{act}_bias", 64, 48, 40, act) for act in ("tanh", "sigmoid", "selu")]
+    rows, bad = [], 0
+    for name, m, k, n, act in cases:
+        rng = np.random.RandomState(m * 7 + k * 13 + n)
+        A, B = rng.uniform(-1, 1, (m, k)), rng.uniform(-1, 1, (k, n))
+        bias = None if act == "linear" else rng.uniform(-0.5, 0.5, n)
+        A_q, s_a, z_a = mr.quant_act(A)
+        B_q, s_w = mr.quant_weights(B)
+        hw_bias = mr.fold_bias(bias, s_a, s_w, z_a, B_q)
+        req = mr.requant_params(mr.wrap32(mr.imatmul(A_q, B_q) + hw_bias[None, :]), s_a, s_w, act)
+        job = {"terms": [(A_q.astype(np.float32), B_q.astype(np.float32))], "bias": hw_bias, "act": act,
+               "shape": (m, n), "req": req}
+        t0 = time.time()
+        y, sets, cyc = sim.run_job(job, name)
+        mism = int(np.sum(y != mr.int8_layer_exact(A_q, B_q, hw_bias, req, act)))
+        ref = A @ B + (0.0 if bias is None else bias[None, :])
+        if act != "linear":
+            ref = mr.apply_activation(ref.astype(np.float32), act).astype(np.float64)
+        if act == "tanh":
+            deq = y / 128.0  # D-4: tanh y * 128, zero point 0
+        elif act == "sigmoid":
+            deq = (y + 128) / 256.0  # sigmoid y * 256, zero point -128
+        elif act == "selu":
+            deq = (y - req["zout"]) * req["s_selu"]
+        else:
+            deq = (y - req["zp"]) * req["s_out"]
+        err = float(np.max(np.abs(deq - ref)) / (np.max(np.abs(ref)) or 1.0))
+        macs = m * k * n
+        r = {"shape": name, "M": m, "K": k, "N": n, "act": act, "sets": sets, "cycles": cyc, "macs": macs,
+             "mac_per_cycle": macs / cyc if cyc else 0, "pe_use": macs / (cyc * peak) if cyc else 0,
+             "slot_use": macs / (sets * a.n ** 3), "mism": mism, "err": err, "wall": time.time() - t0}
+        rows.append(r)
+        line = (f"{name:<22} {m:>5} {k:>5} {n:>5} {sets:>7} {cyc:>10} {r['mac_per_cycle']:>9.1f} {100 * r['pe_use']:>6.1f}% "
+                f"{100 * r['slot_use']:>7.1f}% {mism:>6} {err:>8.1e} {r['wall']:>6.0f}")
+        print(line, flush=True)
+        rep.write(line + "\n")
+        rep.flush()
+        json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
+        if mism:
+            print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
+            bad += 1
+    line = f"GEMM int8: {len(rows)} cases, {bad} with outputs that differ from the bit-exact model"
+    print(line, flush=True)
+    rep.write(line + "\n")
+    if bad:
+        sys.exit(1)
+
+
+def gemm_main(argv=None):
+    """Model-agnostic benchmark: C = A (M x K) @ B (K x N) on the RTL over a grid of shapes, plus transformer-sized shapes."""
+    ap = argparse.ArgumentParser(description=gemm_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="gemm")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile", type=int, default=4, help="mesh tile size T the RTL is built with")
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "gemm"))
+    ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL")
+    ap.add_argument("--quick", action="store_true", help="a few small shapes only")
+    ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
+                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(mr.FORMATS),
+                    help="format of A and B on the layer engine; int8 sums in int32 and requantizes")
+    ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
+    a = ap.parse_args(argv)
+    if a.fmt_name == "int8" and (a.emulate or a.engine != "layer"):
+        ap.error("int8 runs on the layer engine only")
+    os.makedirs(a.work, exist_ok=True)
+    if a.emulate:
+        sim = mr.Emulator(a.n, a.lanes, a.work, tile_size=a.tile)
+    elif a.engine == "layer":
+        sim = mr.RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile)
+    else:
+        sim = mr.RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile)
+    sim.build()
+    shapes = [(f"grid_{m}x{k}x{n}", m, k, n) for m in GRID_M for k in GRID_K for n in GRID_N] + TRANSFORMER
+    if a.quick:
+        shapes = [s for s in shapes if s[1] * s[2] * s[3] <= 64 * 64 * 64][:6]
+    if a.fmt_name == "int8":
+        run_int8(a, sim, shapes)
+        return
+    rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
+    peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
+    head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and sums; "
+                 f"peak {peak} MAC/cycle", head):
+        print(line, flush=True)
+        rep.write(line + "\n")
+    rows = []
+    for name, m, k, n in shapes:
+        rng = np.random.RandomState(m * 7 + k * 13 + n)
+        A = mr.op_round(rng.uniform(-1, 1, (m, k)), a.fmt_name)
+        B = mr.op_round(rng.uniform(-1, 1, (k, n)), a.fmt_name)
+        job = {"terms": [(A, B)], "bias": None, "act": "linear", "shape": (m, n)}
+        t0 = time.time()
+        y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.RtlLayer) else mr.run_job_hw(job, sim, name)
+        ref = A.astype(np.float64) @ B.astype(np.float64)
+        err = float(np.max(np.abs(y - ref)) / (np.max(np.abs(ref)) or 1.0))
+        mism = 0
+        if a.fmt_name != "fp32" and isinstance(sim, mr.RtlLayer):  # narrow formats: every output bit-exact
+            mism = int(np.sum(mr.fmt_bits(y, a.fmt_name) != exact_layer(A, B, None, "linear", a.n, a.fmt_name, a.tile)))
+        macs = m * k * n
+        r = {"shape": name, "M": m, "K": k, "N": n, "sets": sets, "cycles": cyc, "macs": macs,
+             "mac_per_cycle": macs / cyc if cyc else 0, "pe_use": macs / (cyc * peak) if cyc else 0,
+             "slot_use": macs / (sets * a.n ** 3), "err": err, "wall": time.time() - t0}
+        rows.append(r)
+        line = (f"{name:<22} {m:>5} {k:>5} {n:>5} {sets:>7} {cyc:>10} {r['mac_per_cycle']:>9.1f} {100 * r['pe_use']:>6.1f}% "
+                f"{100 * r['slot_use']:>7.1f}% {err:>8.1e} {r['wall']:>6.0f}")
+        print(line, flush=True)
+        rep.write(line + "\n")
+        rep.flush()
+        json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
+        if a.fmt_name == "fp32" and err > 1e-4:
+            print(f"FAIL {name}: error {err:.2e} above 1e-4", flush=True)
+            sys.exit(1)
+        if a.fmt_name != "fp32" and mism:
+            print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
+            sys.exit(1)
+    if isinstance(sim, mr.RtlLayer):
+        # The polynomial activations through the layer engine, with a bias; GPNAE approximates within about 2%.
+        rng = np.random.RandomState(5)
+        A = mr.op_round(rng.uniform(-1, 1, (64, 48)), a.fmt_name)
+        B = mr.op_round(rng.uniform(-0.3, 0.3, (48, 40)), a.fmt_name)
+        b = mr.op_round(rng.uniform(-0.5, 0.5, 40), a.fmt_name)
+        for act in ("tanh", "sigmoid", "selu"):
+            y, sets, cyc = sim.run_job({"terms": [(A, B)], "bias": b, "act": act, "shape": (64, 40)}, f"act_{act}")
+            ref = mr.apply_activation((A.astype(np.float64) @ B + b).astype(np.float32), act)
+            err = float(np.max(np.abs(y - ref)) / np.max(np.abs(ref)))
+            line = f"layer_{act}_bias{'':<9} {64:>5} {48:>5} {40:>5} {sets:>7} {cyc:>10}  max err {err:.1e} of the output range"
+            print(line, flush=True)
+            rep.write(line + "\n")
+            if a.fmt_name == "fp32" and err > 3e-2:
+                print(f"FAIL layer_{act}: error {err:.2e} above 3e-2", flush=True)
+                sys.exit(1)
+            if a.fmt_name != "fp32":  # narrow formats: bit-exact against the model; the error above is reported, not gated
+                mism = int(np.sum(mr.fmt_bits(y, a.fmt_name) != exact_layer(A, B, b, act, a.n, a.fmt_name, a.tile)))
+                print(f"  layer_{act}: {mism} outputs differ from the bit-exact model", flush=True)
+                rep.write(f"  layer_{act}: {mism} outputs differ from the bit-exact model\n")
+                if mism:
+                    sys.exit(1)
+
+
+# ── perf (was perf_analysis.py) ──────────────────────────────────────────────
+
+REPORT = os.path.join(ROOT, "testbenches", "results", "perf", "pipeline_performance_report.log")
+CONFIGS = [t["name"] for t in PIPELINE_TESTS]
+
+
+GEOM = {"n": 16, "tile_size": 4, "lanes": 32}  # set from the command line in perf_main()
+
+
+def run(name: str, num_sets: int, build_dir: str) -> str:
+    cfg = next(t for t in PIPELINE_TESTS if t["name"] == name)
+    generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
+    cmd = ["make", "verilator", "TRACE=0", "EXTRA_FLAGS=-DPERF", f"VERILATOR_DIR={build_dir}",
+           f"FMT={GEOM.get('fmt_name', 'fp32')}", f"N={GEOM['n']}", f"TILE={GEOM['tile_size']}", f"LANES={GEOM['lanes']}",
+           "GEN_PKG=0"]  # the package generate_vectors just wrote
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    raw_dir = os.path.join(os.path.dirname(REPORT), "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    open(os.path.join(raw_dir, f"{name}_N{GEOM['n']}.log"), "w").write(r.stdout + r.stderr)  # to re-parse without a rerun
+    return r.stdout + r.stderr
+
+
+def events(raw: str) -> dict:
+    """PERF lines of the first plain stream pass, as {kind: [(cycle, value, value2), ...]}."""
+    ev, on = {}, False
+    for m in re.finditer(r"^PERF (\d+) (\w+)(?: (-?\d+))?(?: (-?\d+))?", raw, re.M):
+        c, kind = int(m.group(1)), m.group(2)
+        a = int(m.group(3)) if m.group(3) is not None else None
+        b = int(m.group(4)) if m.group(4) is not None else None
+        if kind == "PASS":
+            if on:
+                break  # only the first stream pass, which has no overrun and no reset
+            on = b == 0
+            continue
+        if on:
+            ev.setdefault(kind, []).append((c, a, b))
+    return ev
+
+
+def leaves(ev: dict, kind: str, idle: int) -> tuple:
+    """Cycles a state machine leaves and re-enters its idle state: one pair per set it takes."""
+    up, down, prev = [], [], idle
+    for c, a, _ in ev.get(kind, []):
+        if prev == idle and a != idle:
+            up.append(c)
+        if prev != idle and a == idle:
+            down.append(c)
+        prev = a
+    return up, down
+
+
+def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
+    """Per-set stage times; with passes > 1 only every passes-th set outputs (the others are partial sums)."""
+    load, start = [c for c, _, _ in ev["HOST_LOAD"]], [c for c, _, _ in ev["HOST_START"]]
+    launch = [c for c, a, _ in ev.get("MESH", []) if a == 1]
+    written = [c for c, a, _ in ev.get("MESH", []) if a == 7]
+    reduce = [c for c, a, _ in ev.get("MESH", []) if a == 5]
+    g_up, g_dn = leaves(ev, "G", 0)
+    p_up, p_dn = leaves(ev, "P", 0)
+    done = [c for c, _, _ in ev["DONE"]]
+    n = min(k_sets, len(done), len(start), len(launch), passes * min(len(written), len(g_dn)))
+    n -= n % passes  # whole outputs only
+    sets = []
+    for k in range(n):
+        j, f = k // passes, k - k % passes  # output index (reduce, write and activation are per output); its first set
+        s = dict(load=start[k] - load[k], wait_mesh=launch[k] - start[k], mesh=None, wait_act=None, act=None, out=None,
+                 latency=None)
+        if (k + 1) % passes == 0:  # the set that completes an output
+            s.update(mesh=written[j] - launch[f], wait_act=g_up[j] - written[j], act=g_dn[j] - g_up[j],
+                     out=done[k] - g_dn[j], latency=done[k] - start[f])
+        sets.append(s)
+    last = lambda k: (k + 1) % passes == 0
+    gap = lambda xs: [xs[k] - xs[k - 1] for k in range(1, min(n, len(xs)))]
+    gaps = gap(done)
+    full = [done[k] for k in range(n) if last(k)]
+    per_out = [b - a for a, b in zip(full, full[1:])]
+    steady = [g / passes for g in per_out[len(per_out) // 2:]]  # cycles per set: an output's interval over its passes
+    lanes = [a / (GEOM["lanes"] * b) for _, a, b in ev.get("LANES", []) if b]
+    pool = [d - u for u, d in zip(p_up, p_dn)]  # sets that output; partial sums skip pooling
+    return dict(sets=sets, gaps=gaps, steady=steady, n=n, launch_gaps=gap(launch), host_gaps=gap(start),
+                first_latency=next((x["latency"] for x in sets if x["latency"] is not None), 0),
+                act_gaps=gap(g_up), pool=pool, lanes=lanes, reduce_to_written=[w - r for r, w in zip(reduce, written)])
+
+
+DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
+FMT_KNOBS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # (EXP_W, MAN_W) of each build
+FMT_PKG = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
+
+
+def rtl_lat() -> tuple:
+    """sienna_fmt_pkg's unit latencies, parsed from the RTL: ({fmt: (mul_lat, add_lat)}, fx_lat, req_lat)."""
+    raw = open(FMT_PKG).read()
+
+    def body(fn: str, form: str) -> tuple:
+        m = re.search(rf"function automatic int {fn}\([^)]*\);(.*?)endfunction", raw, re.S)
+        b = re.fullmatch(form, re.sub(r"//[^\n]*", "", m.group(1)).strip()) if m else None
+        if not b:
+            raise RuntimeError(f"perf_analysis: {FMT_PKG}: {fn}() is not in the form the model reads; update rtl_lat()")
+        return tuple(int(x) for x in b.groups())
+
+    mi, mw, mhi, mlo = body("mul_lat", r"if \(is_int\(exp_w\)\) return (\d+);\s*return \(man_w \+ 1 > (\d+)\) \? (\d+) : (\d+);")
+    ai, af = body("add_lat", r"return is_int\(exp_w\) \? (\d+) : (\d+);")
+    unit = {f: ((mi if e == 0 else mhi if m + 1 > mw else mlo), (ai if e == 0 else af)) for f, (e, m) in FMT_KNOBS.items()}
+    return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0]
+
+
+UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()  # mul_lat and add_lat per format, fxMac, tfliteRequant
+MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]  # valid in to done out; perf_main() sets the build's format's values
+MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
+FMT = "fp32"  # the build's format; perf_main() sets it
+
+
+def degree(act: str) -> int:
+    """The polynomial degree of act's coefficient set in the build's format: Task 10's SETS_INT8 in int8."""
+    if FMT == "int8":
+        return gpnae_model.SETS_INT8[mr.activation_to_code(act)][1]
+    return DEGREE[act]
+
+
+def pkg() -> dict:
+    """The generated test_config_pkg's integer parameters: the geometry this run was built with."""
+    raw = open(os.path.join(ROOT, "testbenches", "test_config_pkg.sv")).read()
+    return {k: int(v) for k, v in re.findall(r"localparam int (\w+) = (-?\d+);", raw)}
+
+
+def clog2(x: int) -> int:
+    return max(0, (x - 1).bit_length())
+
+
+def model(cfg: dict, collapse: bool = True) -> dict:
+    """Cycles each stage should take per set, from the RTL's structure."""
+    P = pkg()
+    N, T, lanes = P["N"], P["TILE_SIZE"], P["NUM_LANES"]
+    per_lane = P["SRAM_DEPTH"] // lanes
+    K = N if collapse else T  # depth each array multiplies
+    U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (6 in fp32 and bf16, 2 in int8)
+    RP = 1 if collapse else N // T  # depth slices summed per output tile
+    LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
+    words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split())
+    rows = -(-words // P["HOST_WORDS"])
+    m = dict(
+        # TB_sienna_top: one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
+        host=rows + 3,
+        # Broadcast T rows plus commit, the array feed of K products, the reducer's T^2 reads: whichever is longest.
+        mesh=max(T + 2, K, T * T),
+        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 2,
+        # then T^2 reads and the tree.
+        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 2 + T * T + LAT,
+        per_lane=per_lane, LAT=LAT)
+    act = cfg.get("act")
+    windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
+              ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
+    m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
+    if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+        m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done; int8 leaves while the requantize drains
+    elif act in DEGREE and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+        m["act"] = lane_stage(act, P, collapse)
+    return m
+
+
+def lane_params() -> tuple:
+    """gpnae_poly's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_top overrides either."""
+    poly = open(os.path.join(ROOT, "GPNAE", "src", "gpnae_poly.sv")).read()
+    inst = re.search(r"gpnae_poly #\((.*?)\) gpnae_inst", open(os.path.join(ROOT, "src", "sienna_top.sv")).read(), re.S)
+    k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
+    if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
+        raise RuntimeError("perf_analysis: gpnae_poly's K / TAIL_CONTEXTS defaults not found, or sienna_top overrides them")
+    return int(k.group(1)), int(t.group(1))
+
+
+GROUP_K, TAIL_CTX = lane_params()  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults
+DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
+
+
+def lane_inputs(k: int, P: dict, collapse: bool) -> list:
+    """Set k's activation inputs from the bit-exact mesh model, row-major as the wide read hands them to the lanes."""
+    rd = lambda f: np.array([int(w, 16) for w in open(os.path.join(mr.TB_DIR, f)).read().split()], np.int64)
+    n, f = P["N"], fpu.FORMATS[FMT]
+    A, B = (rd(f"matrix_{s}_{k}.mem").reshape(n, n) for s in ("west", "north"))
+    C = mesh_model.matmul(f, [(A, B)], n, P["TILE_SIZE"], int(collapse), rd(f"bias_{k}.mem") if P["HAS_BIAS"] else None)
+    return mr.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16 rounds every sum: tails shift
+
+
+def in_tail(x: float, act: str) -> bool:
+    """gpnae_poly's sig_in_tail: past the fitted range, gpnae_tail computes the element."""
+    return x < -4.0 if act == "selu" else abs(x) > (3.5 if act == "sigmoid" else 4.0)
+
+
+def tail_ops(x: float, act: str) -> int:
+    """gpnae_tail's cycles for one element alone, from its first state to T_DONE: each step is request, issue, unit, state update."""
+    cm, ca = MUL_LAT + 2, ADD_LAT + 2
+    a = x if act == "selu" else -abs(x) if act == "sigmoid" else -2 * abs(x)  # e^a, a <= 0
+    if act == "tanh" and abs(x) >= 64.0:
+        a = -math.inf  # x's exponent at BIAS + 6: the underflow path
+    out = ca if act == "tanh" or (act == "sigmoid" and x >= 0) else 0  # 1 - 2s, 1 - s, or s as it is
+    if abs(a) > 104.0:  # e^a underflows: straight to the closing steps
+        return cm if act == "selu" else ca + cm + ca + cm + out
+    mant, m = math.frexp(abs(a))  # |a| = mant * 2^m, mant in [0.5, 1): the Taylor z = a / 2^m and m doublings back
+    z = -mant if m > 0 else a
+    m = max(m, 0)
+    ops = 10 * (cm + ca) + cm  # Taylor e^z - 1 from 1/11!: ten multiply-add rounds, then d = z * acc
+    if act == "selu":
+        return ops + m * (ca + cm) + cm  # m rounds of d = d * (d + 2), then lambda * alpha * d
+    ops += ca  # E = 1 + d
+    for j in range(m):  # E squared m times, cut short once E drops below 2^-63
+        if z * 2 ** j < -63 * math.log(2):
+            ops += 1
+            break
+        ops += cm
+    return ops + ca + cm + ca + cm + out  # u = 1 - E, v = E u, w = 1 - v, s = E w, then the output step
+
+
+def lane_cycles(xs: list, act: str, s: int) -> int:
+    """Cycle of a lane's last done_o, its first G_CAP at s: groups of GROUP_K run capture, load, MAC, post and emit in turn."""
+    int8, tanh, ncoef, loop = FMT == "int8", act == "tanh", degree(act) + 1, MAC_LAT[FMT]
+    for g in range(0, len(xs), GROUP_K):
+        grp = xs[g:g + GROUP_K]
+        n = len(grp)
+        # G_CAP n + 3, then G_LOAD n and G_LDRAIN to barrel_mac's RUN: the float lane loads while capturing unless tanh squares.
+        if int8:
+            run = s + 2 * n + MUL_LAT + 7 + (FX_LAT + 1 if tanh else 0)
+        else:
+            run = s + (2 * n + MUL_LAT + 7 if tanh else n + 5)
+        post = run + ncoef * max(n, loop + 1) + loop + 3 + n  # RUN rounds of max(n, loop + 1), DRAIN loop + 2, EMIT n: G_POST
+        if int8:  # result flag MUL_LAT (+ REQ_LAT for SELU) after the issue; sigmoid in place; tanh's saturated inputs read as unsaturated
+            lat = [MUL_LAT + REQ_LAT if act == "selu" else MUL_LAT if tanh else -1] * n
+        else:
+            lat = [(-1 if x >= 0 else DN_LAT[FMT]) if act == "sigmoid" else MUL_LAT for x in grp]
+        ready = [post + i + 2 + lat[i] for i in range(n)]
+        if not int8:  # tail elements start as captured, one per cycle, on TAIL_CTX contexts; unit contention is not modelled
+            free, last = [-1] * TAIL_CTX, -1
+            for i, x in enumerate(grp):
+                if in_tail(x, act):
+                    c = free.index(min(free))
+                    t0 = max(s + 4 + i, last + 1, free[c])
+                    ops = tail_ops(x, act)
+                    free[c], last, ready[i] = t0 + 2 + ops, t0, t0 + 3 + ops
+        e = post + n - 1  # G_EMIT from post + n: one element per cycle once its result is in
+        for r in ready:
+            e = max(e + 1, r)
+        s = e + 2  # G_NEXT, then the next group's G_CAP
+    return e + 1
+
+
+def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
+    """Activation stage cycles of a lane set (median over the streamed sets): FEED to the cycle after every lane is collected."""
+    per_lane, lanes = P["SRAM_DEPTH"] // P["NUM_LANES"], P["NUM_LANES"]
+    start = per_lane + 3 + (REQ_LAT if FMT == "int8" else 0)  # last_i: FEED, LATCH, the wide reads, the fill count, the requantize
+    if FMT == "int8":  # no tail path: every set costs the same
+        return lane_cycles([0.0] * per_lane, act, start + 1) + 2
+    out = []
+    for k in range(P["NUM_SETS"]):
+        xs = lane_inputs(k, P, collapse)
+        out.append(max(lane_cycles(xs[L * per_lane:(L + 1) * per_lane], act, start + 1) for L in range(lanes)) + 2)
+    return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
+
+
+def fmt_table(rows: list, cols: list) -> list:
+    w = [max(len(str(c)), *(len(str(r[i])) for r in rows)) for i, c in enumerate(cols)]
+    line = "  " + "  ".join(str(c).rjust(w[i]) for i, c in enumerate(cols))
+    out = [line, "  " + "  ".join("-" * x for x in w)]
+    out += ["  " + "  ".join(str(r[i]).rjust(w[i]) for i in range(len(cols))) for r in rows]
+    return out
+
+
+def med(xs: list) -> int:
+    return int(statistics.median(xs)) if xs else 0
+
+
+def summary_cols() -> list:
+    """The summary table's columns; int8 counts integer operations and TOPS where the floats count FLOP and GFLOPS."""
+    op, rate = ("OP/cyc", "TOPS*") if FMT == "int8" else ("FLOP/cyc", "GFLOPS*")
+    return ["config", "latency", "cycles/set", op, rate, "PE use", "limit", "its cycles",
+            "host model", "mesh model", "mesh lat model", "mesh lat", "sim"]
+
+
+def one_config(name: str, args) -> tuple:
+    """(detail lines, summary row) for one regression config."""
+    flop = 2 * args.n ** 3
+    op = "OP" if FMT == "int8" else "FLOP"
+    rate = lambda s: flop / s * args.clock_mhz / (1e6 if FMT == "int8" else 1000)  # TOPS in int8, GFLOPS otherwise
+    rate_s = lambda s: f"{rate(s):.3f} TOPS" if FMT == "int8" else f"{rate(s):.1f} GFLOPS"
+    cfg = next(t for t in PIPELINE_TESTS if t["name"] == name)
+    if args.reparse:  # the saved trace; only the stimulus is regenerated, for the model's geometry
+        generate_vectors({**GEOM, **cfg, "num_sets": args.sets})
+        raw = open(os.path.join(args.reparse, f"{name}_N{args.n}.log"), errors="ignore").read()
+    else:
+        raw = run(name, args.sets, args.build_dir)
+    mdl = model(cfg, not args.slices)
+    if "RESULT: PASSED" not in raw or "Assertion failed" in raw:
+        return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
+    a = analyse(events(raw), args.sets, cfg.get("accum_passes", 1))
+    s = a["sets"]
+    P = cfg.get("accum_passes", 1)
+    first = next(x for x in s if x["mesh"] is not None)  # the first output's last set
+    steady = statistics.mean(a["steady"]) if a["steady"] else 0
+    # Each stage's own cost per set: the host's start interval; activation runs one set at a time; the mesh is
+    # pipelined, so its cost is its tightest launch interval, not the time a set spends inside it. Activation and
+    # pooling run once per output, so an accumulate config spreads them over its P sets.
+    stage = {"host": min(a["host_gaps"] or [0]), "mesh": min(a["launch_gaps"] or [0]),
+             "activation": round(med([x["act"] for x in s if x["act"] is not None]) / P), "pooling": round(med(a["pool"]) / P)}
+    lim = max(stage, key=stage.get)
+    L = [f"--- {name}", ""]
+    dash = lambda v: "-" if v is None else v  # a partial-sum set has no output of its own
+    L += fmt_table([[k, x["load"], x["wait_mesh"], x["mesh"], x["wait_act"], x["act"], dash(x["out"]), dash(x["latency"])]
+                    for k, x in enumerate(s)],
+                   ["set", "load", "wait", "mesh", "wait", "activ", "pool+out", "latency"])
+    L += ["",
+          f"  Stage cost per set: host load {stage['host']}, mesh launch interval min {stage['mesh']} median "
+          f"{med(a['launch_gaps'])}, activation {stage['activation']}, pooling {stage['pooling']} (cycles)",
+          f"  Mesh inside  : reduce start to result written {med(a['reduce_to_written'])} cycles (median)"
+          + (f"; GPNAE lanes busy {100 * statistics.median(a['lanes']):.0f}% of a round" if a["lanes"] else ""),
+          f"  Completion gaps: {a['gaps']}",
+          f"  Steady state : {steady:.1f} cycles per set (mean of the last {len(a['steady'])} output intervals"
+          + (f", each over its {cfg['accum_passes']} depth passes" if cfg.get("accum_passes", 1) > 1 else "")
+          + f"); first-output latency {a['first_latency']} cycles",
+          f"  Limit        : {lim} ({stage[lim]} cycles per set)",
+          f"  Design model : host {mdl['host']} (measured {stage['host']}), mesh interval {mdl['mesh']} (measured min "
+          f"{stage['mesh']}, host-bound), mesh latency {mdl['mesh_lat']} (measured {first['mesh']} on the first output"
+          + (f", over its {P} depth passes" if P > 1 else "") + "), "
+          + f"activation {mdl.get('act', '-')} (measured {stage['activation']})"
+          + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}",
+          f"  Matmul rate  : {flop} {op} per set -> {flop / steady:.1f} {op}/cycle, {rate_s(steady)}"
+          f" at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
+          f" {args.n ** 2} MAC/cycle" if steady else "", ""]
+    row = [name, a["first_latency"], f"{steady:.1f}", f"{flop / steady:.1f}", f"{rate(steady):.3f}" if FMT == "int8" else f"{rate(steady):.1f}",
+           f"{100 * flop / 2 / steady / args.n ** 2:.0f}%", lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"],
+           first["mesh"], "pass"]
+    return L, row
+
+
+def header(args) -> list:
+    return ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
+            f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  "
+            f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
+            " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
+            " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
+            " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.", ""]
+
+
+def footer(args, summary: list) -> list:
+    L = ["=" * 100, " SUMMARY", "=" * 100]
+    L += fmt_table(summary, summary_cols())
+    L += [" latency = host start of the first output's first set to its completion pulse, on an idle pipeline; cycles/set",
+          " counts each depth pass of an accumulate config as a set. host/mesh model: cycles per set the",
+          " design needs (host N+3 is TB_sienna_top's handshake; the mesh alone needs max(T+2, K, T^2)).",
+          " mesh lat model: launch to result written, 3T+K+T^2+LAT+16; mesh lat: the same, measured on set 0."]
+    unit = "TOPS (2 x MACs per second)" if FMT == "int8" else "GFLOPS"
+    L += [f" * {unit} at an ASSUMED {args.clock_mhz:.0f} MHz clock, not a timing result; they count the set's"
+          f" {2 * args.n ** 3}-{'OP' if FMT == 'int8' else 'FLOP'} matmul only.",
+          " PE use = multiply-accumulates per cycle over the mesh's N^2. limit = the stage with the largest cost per set."]
+    return L
+
+
+def perf_main(argv=None) -> None:
+    """Cycle, latency and throughput analysis of the streamed SIENNA pipeline from TB_sienna_top's PERF trace."""
+    ap = argparse.ArgumentParser(description=perf_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="perf")
+    ap.add_argument("--sets", type=int, default=24, help="streamed sets; 24 fits every accumulate and mixed pattern")
+    ap.add_argument("--configs", nargs="*", default=CONFIGS)
+    ap.add_argument("--clock-mhz", type=float, default=950.0,
+                    help="assumed clock for GFLOPS; no timing run has demonstrated one")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--build-dir", default=os.environ.get("PERF_BUILD_DIR", os.path.join(ROOT, "Verilator_perf")))
+    ap.add_argument("--report", default=REPORT)
+    ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
+    ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
+    ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(UNIT_LAT), help="number format of the build")
+    args = ap.parse_args(argv)
+    global MUL_LAT, ADD_LAT, FMT
+    MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
+    FMT = args.fmt_name
+    fmts = {t["name"]: t.get("formats", tuple(UNIT_LAT)) for t in PIPELINE_TESTS}
+    args.configs = [c for c in args.configs if args.fmt_name in fmts[c]]  # int8-only tests run only in int8
+    GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
+    os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
+    if args.merge:
+        parts = [json.load(open(f)) for f in args.merge]
+        L = header(args) + [x for p in parts for x in p["lines"]] + footer(args, [r for p in parts for r in p["rows"]])
+    else:
+        lines, rows = [], []
+        for name in args.configs:
+            d, r = one_config(name, args)
+            lines += d
+            rows.append(r)
+            print("\n".join(d), flush=True)
+        json.dump({"lines": lines, "rows": rows}, open(os.path.splitext(args.report)[0] + ".json", "w"))
+        L = header(args) + lines + footer(args, rows)
+    open(args.report, "w").write("\n".join(L) + "\n")
+    print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
+    print(f"\nReport: {args.report}")
+
+
+# ── oracle (was tflite_oracle.py) ────────────────────────────────────────────
+
+tf = tflite = FUSED = ACT_FN = REF = None  # TensorFlow, the tflite reader and what needs them; _tf_imports() sets them
+
+
+def _tf_imports() -> None:
+    """TensorFlow and the tflite flatbuffer reader, for oracle, pack-models and gpnae-tflite only: regression.py imports without them."""
+    global tf, tflite, FUSED, ACT_FN, REF
+    import tensorflow as tf
+    import tflite
+    FUSED = {"none": tflite.ActivationFunctionType.NONE, "relu": tflite.ActivationFunctionType.RELU,
+             "relu6": tflite.ActivationFunctionType.RELU6}
+    ACT_FN = {"none": tf.identity, "relu": tf.nn.relu, "relu6": tf.nn.relu6}
+    REF = tf.lite.experimental.OpResolverType.BUILTIN_REF
+
+
+FC_IN, FC_OUT = 64, 16
+CONV_HW, CONV_CIN, CONV_COUT = 8, 16, 16
+MODELS = {  # name: (layer, fused activation); seed 0 of each is saved for G4
+    "fc64x16_linear": ("fc", "none"),
+    "fc64x16_relu": ("fc", "relu"),
+    "conv3x3_8x8x16_linear": ("conv", "none"),
+    "conv3x3_8x8x16_relu6": ("conv", "relu6"),
+    "conv3x3_8x8x16_relu6_wide": ("conv", "relu6"),
+}
+OUT_RANGE = {"conv3x3_8x8x16_relu6_wide": (-1.0, 8.0)}  # output fake-quantized wider than relu6, so the fused clamp is not int8's
+OP_NAME = {"fc": "FULLY_CONNECTED", "conv": "CONV_2D"}
+ROUNDINGS = ("DOUBLE", "SINGLE")
+MIN_DISCRIMINATING = 100  # outputs where the two roundings differ: the pick must rest on evidence
+MIN_UNCLAMPED = 0.25  # per model: the comparison must not be dominated by saturated outputs
+N_SAVED = 64  # test inputs and interpreter outputs kept per npz for G4
+MIN_SAVED_DISC = {"fc": 1, "conv": 50}  # discriminating outputs each saved npz must hold, so G4 sees a wrong rounding
+
+
+def build_model(layer, act, seed, out_range=None):
+    """One layer: per-channel weight magnitudes over two decades; input range with max >= 1.5 |min|, so the zero point is not 0."""
+    rng = np.random.default_rng(seed)
+    lo = -rng.uniform(0.2, 2.0)
+    hi = -lo * rng.uniform(1.5, 4.0)
+    cout = FC_OUT if layer == "fc" else CONV_COUT
+    sig = np.exp(rng.uniform(np.log(0.01), np.log(1.0), cout))
+    if layer == "fc":
+        in_shape = (1, FC_IN)
+        w = rng.standard_normal((FC_IN, cout)) * sig
+    else:
+        in_shape = (1, CONV_HW, CONV_HW, CONV_CIN)
+        w = rng.standard_normal((3, 3, CONV_CIN, cout)) * sig
+    wc = tf.constant(w.astype(np.float32))
+    bc = tf.constant((rng.standard_normal(cout) * 0.5).astype(np.float32))
+    act_fn = ACT_FN[act]
+
+    @tf.function(input_signature=[tf.TensorSpec(in_shape, tf.float32)])
+    def layer_fn(x):
+        y = tf.matmul(x, wc) if layer == "fc" else tf.nn.conv2d(x, wc, strides=1, padding="SAME")
+        y = act_fn(tf.nn.bias_add(y, bc))
+        return y if out_range is None else tf.quantization.fake_quant_with_min_max_args(y, *out_range, num_bits=8)
+
+    rep_rng = np.random.default_rng(seed + 1000)
+
+    def representative():
+        for _ in range(200):
+            yield [rep_rng.uniform(lo, hi, in_shape).astype(np.float32)]
+
+    holder = tf.Module()
+    holder.layer_fn = layer_fn
+    conv = tf.lite.TFLiteConverter.from_concrete_functions([layer_fn.get_concrete_function()], holder)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = representative
+    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    conv.inference_input_type = tf.int8
+    conv.inference_output_type = tf.int8
+    return conv.convert(), lo, hi
+
+
+def interpreter(model, resolver):
+    it = tf.lite.Interpreter(model_content=model, experimental_op_resolver_type=resolver)
+    it.allocate_tensors()
+    return it
+
+
+def invoke_all(it, xs):
+    i, o = it.get_input_details()[0]["index"], it.get_output_details()[0]["index"]
+    ys = []
+    for x in xs:
+        it.set_tensor(i, x[None].astype(np.int8))
+        it.invoke()
+        ys.append(it.get_tensor(o)[0].astype(np.int64))
+    return np.stack(ys)
+
+
+def fused_activation(model):
+    """The fused activation of the model's only operator, read from the flatbuffer."""
+    op = tflite.Model.GetRootAsModel(model, 0).Subgraphs(0).Operators(0)
+    opt = (tflite.Conv2DOptions if op.BuiltinOptionsType() == tflite.BuiltinOptions.Conv2DOptions else tflite.FullyConnectedOptions)()
+    t = op.BuiltinOptions()
+    opt.Init(t.Bytes, t.Pos)
+    return opt.FusedActivationFunction()
+
+
+def extract(it, model, layer, act):
+    """The op's tensors and quantization; stops unless the graph is one int8 FULLY_CONNECTED or CONV_2D with fused activation."""
+    ops = it._get_ops_details()  # private in TF 2.x: op_name, inputs, outputs per op
+    names = [o["op_name"] for o in ops]
+    if names != [OP_NAME[layer]]:
+        sys.exit(f"G0: FAIL, expected one {OP_NAME[layer]}, the converter produced {names}")
+    if fused_activation(model) != FUSED[act]:
+        sys.exit(f"G0: FAIL, fused activation {fused_activation(model)}, expected {act} ({FUSED[act]})")
+    xi, wi, bi = (int(i) for i in ops[0]["inputs"][:3])
+    oi = int(ops[0]["outputs"][0])
+    td = {t["index"]: t for t in it.get_tensor_details()}
+    qp = {i: td[i]["quantization_parameters"] for i in (xi, wi, bi, oi)}
+    inp, out = it.get_input_details()[0], it.get_output_details()[0]
+    if (inp["index"], out["index"]) != (xi, oi) or td[xi]["dtype"] != np.int8 or td[oi]["dtype"] != np.int8:
+        sys.exit("G0: FAIL, the layer's input and output are not the graph's int8 input and output")
+    if td[wi]["dtype"] != np.int8 or td[bi]["dtype"] != np.int32 or np.any(qp[wi]["zero_points"] != 0):
+        sys.exit("G0: FAIL, weights are not symmetric int8 or the bias is not int32")
+    p = {"layer": layer, "activation": act, "in_shape": tuple(int(d) for d in inp["shape"]),
+         "w_q": it.get_tensor(wi).astype(np.int64), "b_q": it.get_tensor(bi).astype(np.int64),
+         "w_scales": qp[wi]["scales"].astype(np.float32),
+         "in_scale": np.float32(qp[xi]["scales"][0]), "in_zp": int(qp[xi]["zero_points"][0]),
+         "out_scale": np.float32(qp[oi]["scales"][0]), "out_zp": int(qp[oi]["zero_points"][0])}
+    p["amin"], p["amax"] = mr.activation_range(act, p["out_scale"], p["out_zp"])
+    return p
+
+
+def reference(p, xs, rounding, folded=False, scale_product=None):
+    args = (xs, p["w_q"], p["b_q"], p["in_zp"], p["w_scales"], p["in_scale"], p["out_scale"], p["out_zp"], p["amin"],
+            p["amax"], rounding)
+    if p["layer"] == "fc":
+        return mr.fc_int8(*args, folded=folded, scale_product=scale_product).astype(np.int64)
+    return mr.conv2d_int8(*args, folded=folded).astype(np.int64)
+
+
+def test_inputs(p, lo, hi, n, rng):
+    """Mostly the calibration distribution quantized with the model's input parameters; a tenth uniform over all of int8."""
+    shape = (n,) + p["in_shape"][1:]
+    xq = np.clip(np.round(rng.uniform(lo, hi, shape) / p["in_scale"]) + p["in_zp"], -128, 127).astype(np.int64)
+    k = n // 10
+    xq[:k] = rng.integers(-128, 128, (k,) + shape[1:])
+    return xq
+
+
+def pick_saved(disc_in, k, n):
+    """Indices of the saved inputs: the most discriminating first (up to n), then alternately calibration and uniform ones."""
+    top = [int(i) for i in np.argsort(-disc_in, kind="stable") if disc_in[i] > 0][:n]
+    rest = [i for i in range(disc_in.size) if i not in set(top)]
+    fill = [i for pair in itertools.zip_longest([i for i in rest if i >= k], [i for i in rest if i < k]) for i in pair if i is not None]
+    return np.array(sorted(top + fill[:n - len(top)]))
+
+
+def save(out, name, model, p, xs, ys, rounding):
+    with open(os.path.join(out, name + ".tflite"), "wb") as f:
+        f.write(model)
+    mults, shifts = mr.layer_multipliers(p["layer"], p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], rounding)
+    np.savez(os.path.join(out, name + ".npz"), layer=p["layer"], activation=p["activation"], in_shape=np.array(p["in_shape"]),
+             w_q=p["w_q"].astype(np.int8), b_q=p["b_q"].astype(np.int32), w_scales=p["w_scales"], in_scale=p["in_scale"],
+             in_zp=p["in_zp"], out_scale=p["out_scale"], out_zp=p["out_zp"], act_min=p["amin"], act_max=p["amax"],
+             mults=mults, shifts=shifts, x_test=xs.astype(np.int8), y_test=ys.astype(np.int8), rounding=rounding,
+             tf_version=tf.__version__)
+
+
+def oracle_main(argv=None) -> None:
+    """Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against model_runner's reference kernels in both roundings; pins the rounding."""
+    ap = argparse.ArgumentParser(description=oracle_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="oracle")
+    ap.add_argument("--out", required=True, help="directory for the G4 models, npz files and rounding files")
+    ap.add_argument("--report", required=True, help="G0 report (.log)")
+    ap.add_argument("--seeds", type=int, default=8, help="models per kind; seed 0 is saved")
+    ap.add_argument("--inputs", type=int, default=1000, help="random test inputs per model")
+    a = ap.parse_args(argv)
+    _tf_imports()
+    os.makedirs(a.out, exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(a.report)), exist_ok=True)
+    lines = [f"G0 TFLite oracle: TensorFlow {tf.__version__}, numpy {np.__version__}, op resolver BUILTIN_REF, "
+             f"{a.seeds} seeds x {len(MODELS)} models, {a.inputs} inputs each"]
+    tot = {"outputs": 0, "DOUBLE": 0, "SINGLE": 0, "disc": 0, "folded": 0}
+    problems, keep, clamp_models = [], {}, []
+    for name, (layer, act) in MODELS.items():
+        for seed in range(a.seeds):
+            model, lo, hi = build_model(layer, act, seed, OUT_RANGE.get(name))
+            it = interpreter(model, REF)
+            p = extract(it, model, layer, act)
+            xs = test_inputs(p, lo, hi, a.inputs, np.random.default_rng(seed + 2000))
+            ys = invoke_all(it, xs)
+            ys_default = invoke_all(interpreter(model, tf.lite.experimental.OpResolverType.AUTO), xs)
+            want = {r: reference(p, xs, r) for r in ROUNDINGS}
+            mism = {r: int(np.sum(ys != want[r])) for r in ROUNDINGS}
+            dflt = {r: int(np.sum(ys_default != want[r])) for r in ROUNDINGS}
+            disc_in = (want["DOUBLE"] != want["SINGLE"]).reshape(len(xs), -1).sum(axis=1)
+            disc = int(disc_in.sum())
+            nontrivial = p["amin"] > -128 or p["amax"] < 127
+            full = dict(p, amin=-128, amax=127)
+            act_hits = {r: int(np.sum(reference(full, xs, r) != want[r])) for r in ROUNDINGS} if nontrivial else None
+            fold = sum(int(np.sum(reference(p, xs, r, folded=True) != want[r])) for r in ROUNDINGS)
+            unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
+            _, shifts = mr.layer_multipliers(layer, p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], "DOUBLE")
+            per_ch = p["w_scales"].size > 1
+            lines.append(f"{name} seed {seed}: in scale {p['in_scale']:.6g} zp {p['in_zp']}, out scale {p['out_scale']:.6g} "
+                         f"zp {p['out_zp']}, act [{p['amin']}, {p['amax']}], weights "
+                         f"{'per-channel' if per_ch else 'per-tensor'} ({p['w_scales'].size}), shifts [{shifts.min()}, "
+                         f"{shifts.max()}], outputs {ys.size}, mismatches DOUBLE {mism['DOUBLE']} SINGLE {mism['SINGLE']}, "
+                         f"discriminating {disc}, folded {fold}, unclamped {100 * unclamped:.1f}%, "
+                         f"default resolver (info) DOUBLE {dflt['DOUBLE']} SINGLE {dflt['SINGLE']}"
+                         + (f", outputs the fused clamp changes DOUBLE {act_hits['DOUBLE']} SINGLE {act_hits['SINGLE']}"
+                            if nontrivial else ""))
+            if nontrivial:
+                clamp_models.append((f"{name} seed {seed}", act_hits))
+            if layer == "fc" and not per_ch and min(mism.values()) > 0:
+                alt = {r: int(np.sum(ys != reference(p, xs, r, scale_product="double"))) for r in ROUNDINGS}
+                lines.append(f"  diagnostic: per-tensor FC with a double scale product: DOUBLE {alt['DOUBLE']} SINGLE {alt['SINGLE']}")
+            if p["in_zp"] == 0:
+                problems.append(f"{name} seed {seed}: input zero point is 0")
+            if layer == "conv" and (not per_ch or np.unique(p["w_scales"]).size < 2):
+                problems.append(f"{name} seed {seed}: conv weights are not per-channel")
+            if unclamped < MIN_UNCLAMPED:
+                problems.append(f"{name} seed {seed}: only {100 * unclamped:.1f}% of outputs unclamped")
+            tot["outputs"] += ys.size
+            tot["disc"] += disc
+            tot["folded"] += fold
+            for r in ROUNDINGS:
+                tot[r] += mism[r]
+            if seed == 0:
+                idx = pick_saved(disc_in, a.inputs // 10, N_SAVED)
+                sd, need = int(disc_in[idx].sum()), MIN_SAVED_DISC[layer]
+                lines.append(f"  saved {name}: {idx.size} inputs ({int(np.sum(idx < a.inputs // 10))} uniform int8, "
+                             f"{int(np.sum(idx >= a.inputs // 10))} calibration), discriminating outputs {sd} (need {need}, "
+                             f"the {a.inputs} test inputs hold {disc})")
+                if sd < need:
+                    problems.append(f"saved {name}: {sd} discriminating outputs, need {need} (at most {disc} available)")
+                keep[name] = (model, p, xs[idx], ys[idx])
+    lines.append(f"totals: outputs {tot['outputs']}, mismatches DOUBLE {tot['DOUBLE']} SINGLE {tot['SINGLE']}, "
+                 f"discriminating {tot['disc']}, folded {tot['folded']}")
+    winners = [r for r in ROUNDINGS if tot[r] == 0]
+    if len(winners) != 1:
+        problems.append(f"{len(winners)} roundings match every output; exactly one must")
+    elif not any(h[winners[0]] > 0 for _, h in clamp_models):
+        problems.append(f"no model has a non-trivial fused clamp that changes an output ({len(clamp_models)} non-trivial)")
+    if tot["disc"] < MIN_DISCRIMINATING:
+        problems.append(f"only {tot['disc']} discriminating outputs (need {MIN_DISCRIMINATING})")
+    if tot["folded"]:
+        problems.append(f"SIENNA's folded zero-point algebra differs from TFLite's on {tot['folded']} outputs")
+    if problems:
+        lines += [f"problem: {m}" for m in problems] + ["G0: FAIL"]
+    else:
+        rounding = winners[0]
+        for name, (model, p, xs, ys) in keep.items():
+            save(a.out, name, model, p, xs, ys, rounding)
+        with open(os.path.join(a.out, "rounding.txt"), "w") as f:
+            f.write(rounding + "\n")
+        lines += [f"ROUNDING: {rounding}", "G0: PASS"]
+    with open(a.report, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    sys.exit(1 if problems else 0)
+
+
+def activation_int8(op, in_scale, in_zp):
+    """TFLite's int8 TANH or LOGISTIC (reference kernels) on every int8 input; returns (outputs, input scale, input zero point)."""
+    lo, hi = in_scale * (-128 - in_zp), in_scale * (127 - in_zp)
+    grid = np.linspace(lo, hi, 256, dtype=np.float32).reshape(1, 256)
+    model = tf.keras.Sequential([tf.keras.Input(shape=(256,)),
+                                 tf.keras.layers.Activation({"tanh": "tanh", "logistic": "sigmoid"}[op])])
+    conv = tf.lite.TFLiteConverter.from_keras_model(model)
+    conv.optimizations = [tf.lite.Optimize.DEFAULT]
+    conv.representative_dataset = lambda: iter([[grid]])
+    conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    conv.inference_input_type = tf.int8
+    conv.inference_output_type = tf.int8
+    interp = tf.lite.Interpreter(model_content=conv.convert(),
+                                 experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    interp.allocate_tensors()
+    ops = {d["op_name"] for d in interp._get_ops_details()}
+    assert ops == {op.upper()}, f"expected one int8 {op.upper()} op, got {ops}"
+    i, o = interp.get_input_details()[0], interp.get_output_details()[0]
+    want = {"tanh": (1 / 128, 0), "logistic": (1 / 256, -128)}[op]
+    assert abs(o["quantization"][0] - want[0]) < 1e-12 and o["quantization"][1] == want[1], o["quantization"]
+    interp.set_tensor(i["index"], np.arange(-128, 128, dtype=np.int8).reshape(1, 256))
+    interp.invoke()
+    s, z = i["quantization"]
+    return interp.get_tensor(o["index"]).reshape(256).astype(np.int64), float(s), int(z)
+
+
+# ── pack-models (was tflite_pack_models.py) ──────────────────────────────────
+
+PACK_MODELS = {  # name: (layer, act, inputs, outputs); the first three fit blocks of 8, the last two blocks of 16
+    "fc8x8_linear": ("fc", "none", 8, 8),
+    "fc8x4_relu": ("fc", "relu", 8, 4),
+    "fc6x8_relu6": ("fc", "relu6", 6, 8),
+    "conv3x3_6x6x1x8_linear": ("conv", "none", 1, 8),
+    "fc16x16_relu": ("fc", "relu", 16, 16),
+}
+
+
+def pack_models_main(argv=None) -> None:
+    """Five small int8 TFLite layers for packing, saved as the oracle saves its G4 models; arg: output directory."""
+    ap = argparse.ArgumentParser(description=pack_models_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="pack-models")
+    ap.add_argument("out", help="output directory")
+    out = ap.parse_args(argv).out
+    _tf_imports()
+    global FC_IN, FC_OUT, CONV_CIN, CONV_COUT, CONV_HW
+    os.makedirs(out, exist_ok=True)
+    rounding = open(os.path.join(ROOT, "testbenches", "tflite_int8", "rounding.txt")).read().strip()
+    for name, (layer, act, cin, cout) in PACK_MODELS.items():
+        FC_IN, FC_OUT, CONV_CIN, CONV_COUT, CONV_HW = cin, cout, cin, cout, 6
+        model, lo, hi = build_model(layer, act, 0)
+        it = interpreter(model, REF)
+        p = extract(it, model, layer, act)
+        xs = test_inputs(p, lo, hi, 32, np.random.default_rng(2000))
+        ys = invoke_all(it, xs)
+        unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
+        save(out, name, model, p, xs, ys, rounding)
+        print(f"{name}: in zp {p['in_zp']} out zp {p['out_zp']} act [{p['amin']}, {p['amax']}] unclamped {100 * unclamped:.1f}% "
+              f"y [{ys.min()}, {ys.max()}] w_scales {p['w_scales'].size}")
+    shutil.copy(os.path.join(ROOT, "testbenches", "tflite_int8", "rounding.txt"), out)
+
+
+# ── gpnae-tflite (was gpnae_int8_tflite.py) ──────────────────────────────────
+
+def gpnae_tflite_main(argv=None):
+    """GPNAE's int8 tanh and sigmoid (the lane model, bit-exact with the RTL at G2) against TFLite's int8 TANH and LOGISTIC; reported, not gated."""
+    p = argparse.ArgumentParser(description=gpnae_tflite_main.__doc__)
+    p.add_argument("--action", choices=ACTIONS, default="gpnae-tflite")
+    p.add_argument("--report", required=True)
+    a = p.parse_args(argv)
+    _tf_imports()
+    lane = gpnae_model.Lane(gpnae_model.INT8, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", gpnae_model.coeff_file(gpnae_model.INT8))))
+    q = np.arange(-128, 128, dtype=np.int64)
+    L = ["GPNAE int8 lane against TFLite int8 (BUILTIN_REF), every int8 input; the input quantization is the converter's",
+         f"{'op':<9}{'s_in':>11}{'z_in':>6}{'equal':>7}{'|d|=1':>7}{'max |d|':>8}{'TFLite-exact':>13}{'lane-exact':>11}"]
+    for act, code, op in (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic")):
+        for case in gpnae_model.INT8_CASES[act]:
+            tfl, s, z = activation_int8(op, case.s_in, case.z_in)
+            c = case._replace(s_in=s, z_in=z)
+            hw = lane.run(q, code, gpnae_model.int8_params(c, code))
+            ex = gpnae_model.exact_int8(q, code, c)
+            d = np.abs(hw - tfl)
+            L.append(f"{op:<9}{s:>11.6f}{z:>6}{int((d == 0).sum()):>7}{int((d == 1).sum()):>7}{int(d.max()):>8}"
+                     f"{int(np.abs(tfl - ex).max()):>13}{int(np.abs(hw - ex).max()):>11}")
+    os.makedirs(os.path.dirname(os.path.abspath(a.report)), exist_ok=True)
+    open(a.report, "w").write("\n".join(L) + "\n")
+    print("\n".join(L))
+
+
+# ── rq-vectors (was testbenches/gen_rq_lanes.py) ─────────────────────────────
+
+RQ_N, RQ_LANES, RQ_SETS = 16, 32, 6  # TB_requant_lanes' geometry
+RQ_PER = RQ_N * RQ_N // RQ_LANES
+PACKED_SETS = (1, 2, 5)  # set 3 is unpacked at an odd multiple of RQ_PER beats, so a beat counter that ignores clear_i is caught
+SEP_SLOTS, SEP_BOUND, SEP_TRIES, SEP_BATCH = 4, 1 << 20, 1 << 20, 1 << 16  # accumulators that separate DOUBLE from SINGLE
+
+
+def separating(rng, mult: int, shift: int, zp: int, amin: int, amax: int):
+    """A small accumulator (|acc| < SEP_BOUND) whose requantize differs between DOUBLE and SINGLE for this channel, or None."""
+    for _ in range(SEP_TRIES // SEP_BATCH):
+        a = rng.randint(-SEP_BOUND + 1, SEP_BOUND, SEP_BATCH).astype(np.int64)
+        hit = np.flatnonzero(ipu.requant(a, mult, shift, zp, amin, amax, "DOUBLE") != ipu.requant(a, mult, shift, zp, amin, amax, "SINGLE"))
+        if hit.size:
+            return int(a[hit[0]])
+    return None
+
+
+def rq_vectors_main(argv=None) -> None:
+    """Vectors for TB_requant_lanes through its channel map, expected values from ipu.requant in model_runner's rounding; arg: output .mem path."""
+    ap = argparse.ArgumentParser(description=rq_vectors_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="rq-vectors")
+    ap.add_argument("path", help="output .mem path")
+    path = ap.parse_args(argv).path
+    rng = np.random.RandomState(8)
+    out = [RQ_SETS]
+    for s in range(RQ_SETS):
+        mult = rng.randint(1 << 30, 1 << 31, RQ_N).astype(np.int64)
+        if s == 0:
+            mult[0], mult[1] = (1 << 31) - 1, 1 << 30  # the largest multiplier and the smallest normalized one
+        shift = -((s * RQ_N + np.arange(RQ_N)) % 32).astype(np.int64)  # every right shift 0..31 across the sets
+        zp = int(rng.randint(-128, 128))
+        amin, amax = [(-128, 127), (zp, 127), (zp, min(127, zp + 50)), (-128, 127), (-40, 40), (-128, zp)][s]
+        amin, amax = min(amin, amax), max(amin, amax)
+        small = rng.randint(-(1 << 15), 1 << 15, (RQ_PER, RQ_LANES))
+        full = rng.randint(-(1 << 31), (1 << 31) - 1, (RQ_PER, RQ_LANES))
+        acc = np.where(rng.rand(RQ_PER, RQ_LANES) < 0.5, small, full).astype(np.int64)
+        if s == 0:
+            acc[0, :4] = [-(1 << 31), (1 << 31) - 1, 0, -1]
+        packed = s in PACKED_SETS  # lane k takes column k % RQ_N, and its block's zero point and clamp
+        c = (np.arange(RQ_LANES)[None, :] % RQ_N + 0 * np.arange(RQ_PER)[:, None]) if packed else \
+            (np.arange(RQ_LANES)[None, :] * RQ_PER + np.arange(RQ_PER)[:, None]) % RQ_N  # channel of lane k at beat b
+        if packed:
+            ents = []
+            for _ in range(4):  # zero point, then a clamp low <= high
+                z = int(rng.randint(-128, 128))
+                lo_, hi_ = sorted(int(v) for v in rng.randint(-128, 128, 2))
+                ents.append((z, lo_, hi_))
+            blk = (np.arange(RQ_LANES) % RQ_N) // (RQ_N // 4)  # four blocks of RQ_N / 4 columns
+            zpL = np.array([ents[e][0] for e in blk]); aminL = np.array([ents[e][1] for e in blk]); amaxL = np.array([ents[e][2] for e in blk])
+        else:
+            zpL, aminL, amaxL = np.full(RQ_LANES, zp), np.full(RQ_LANES, amin), np.full(RQ_LANES, amax)
+        srng, found = np.random.RandomState(1900 + s), []
+        for ch in (np.arange(RQ_N) + 5 * s) % RQ_N:
+            k0 = int(ch)  # packed: lane ch reads channel ch at every beat
+            a = separating(srng, int(mult[ch]), int(shift[ch]), int(zpL[k0]), int(aminL[k0]), int(amaxL[k0]))
+            if a is None:
+                continue
+            if packed:
+                b, k = len(found) % RQ_PER, int(ch) + RQ_N * (len(found) % (RQ_LANES // RQ_N))
+            else:
+                b, k = int(ch) % RQ_PER, 8 + 2 * len(found) + int(ch) // RQ_PER
+            assert c[b, k] == ch
+            acc[b, k] = a
+            found.append(int(ch))
+            if len(found) == SEP_SLOTS:
+                break
+        if not found:
+            raise RuntimeError(f"set {s}: no channel has a small accumulator that separates DOUBLE from SINGLE")
+        print(f"set {s}{' (packed)' if packed else ''}: DOUBLE/SINGLE separating accumulators on channels {found}")
+        want = np.stack([ipu.requant(acc[:, k], mult[c[:, k]], shift[c[:, k]], int(zpL[k]), int(aminL[k]), int(amaxL[k]),
+                                     mr.ROUNDING) for k in range(RQ_LANES)], axis=1)
+        out += [int(packed)] + zpL.tolist() + aminL.tolist() + amaxL.tolist() + mult.tolist() + shift.tolist()
+        for b in range(RQ_PER):
+            out += acc[b].tolist() + [int(v) for v in want[b]]
+    with open(path, "w") as f:
+        f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in out))
+
+
+MAINS = {"pack": pack_main, "gemm": gemm_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
+         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main}  # each parses its own options (regression.py --action A --help)
+
 if __name__ == "__main__":
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)  # no abbreviation: pack's --act is not --action
+    pre.add_argument("--action", choices=ACTIONS, default="regression")
+    pre_args, rest = pre.parse_known_args()
+    if pre_args.action in MAINS:
+        MAINS[pre_args.action](rest)
+        sys.exit(0)
     p = argparse.ArgumentParser(description="SIENNA Pipeline Unified Tool")
     p.add_argument(
         "--action",
         default="regression",
-        choices=["regression", "gen", "pkg", "analyze"],
-        help="Action to perform; pkg writes test_config_pkg.sv and one --test's stimulus (default %s)" % PKG_DEFAULT_TEST,
+        choices=ACTIONS,
+        help="Action to perform; pkg writes test_config_pkg.sv and one --test's stimulus (default %s); "
+             "pack, gemm, perf, oracle, pack-models, gpnae-tflite and rq-vectors take their own options (--action A --help)" % PKG_DEFAULT_TEST,
     )
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)

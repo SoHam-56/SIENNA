@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""perf_analysis on saved PERF traces (N=16, T=4, bf16, 24 streamed sets) and its activation-stage model of the GPNAE lanes."""
+"""regression.py's perf section (was perf_analysis.py) on saved PERF traces (N=16, T=4, bf16, 24 streamed sets) and its activation-stage model of the GPNAE lanes."""
 import contextlib
 import os
 import statistics
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import perf_analysis as pa  # noqa: E402
+import regression as pa  # noqa: E402
 
 FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")
 
@@ -33,7 +33,7 @@ def test_single_pass_unchanged():
 
 @contextlib.contextmanager
 def fmt(f):
-    """perf_analysis's build format for the block, restored afterwards so no test depends on the order they run in."""
+    """The perf section's build format for the block, restored afterwards so no test depends on the order they run in."""
     old = pa.FMT, pa.MUL_LAT, pa.ADD_LAT
     pa.FMT, (pa.MUL_LAT, pa.ADD_LAT) = f, pa.UNIT_LAT[f]
     try:

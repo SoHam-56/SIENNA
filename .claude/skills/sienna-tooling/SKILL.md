@@ -83,7 +83,7 @@ never the other way round.
 ### Makefile
 
 Every target keeps its name and arguments and calls the new script: `regression`, `pkg`, `pack`, `gemm`,
-`perf-analysis`, `model`, `tflite` (and a new `check` for `regression.py --action all`). test_makefile_fmt's checks move into
+`perf-analysis`, `model`, `tflite` (and a new `check` for `regression.py --action all`; since 2026-10-05 the gate is `make regression` and the pipeline suite `make pipeline`). test_makefile_fmt's checks move into
 `selftest` and follow the new recipes.
 
 ## Rules
@@ -129,7 +129,8 @@ The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.m
 | `gpnae_int8_tflite.py --report F` | `regression.py --action gpnae-tflite --report F` | |
 | `testbenches/gen_rq_lanes.py OUT` | `regression.py --action rq-vectors OUT` | |
 | `python3 test_makefile_fmt.py` (and the other four `test_*.py`) | `regression.py --action selftest` (38 tests) | |
-| | `regression.py --action all [--format --n --tile --lanes]` | `make check` |
+| | `regression.py --action all [--format --n --tile --lanes]` | `make regression` (was `make check`) |
+| `make regression` (the pipeline suite) | `regression.py --action regression` (unchanged) | `make pipeline` |
 | `tflite_int8_run.py [--n --tile-size --lanes --models --work]` | `model_runner.py --action tflite` (same options) | `make tflite` |
 | `tflite_pack_run.py [--n --tile-size --lanes --models]` | `model_runner.py --action tflite --pack` (same options) | |
 | `model_runner.py --model-dir D ...` | unchanged (`--action model` is the default) | `make model` |
@@ -193,6 +194,8 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 - No `make -n` self-test for the gemm recipe's `--tile`.
 
 ### Gate
+
+`make check` below is today's `make regression` (renamed 2026-10-05, Soham); the pipeline suite it runs is `make pipeline`.
 
 Each task compared its flows on the farm with the final packing gate (`pkf_*`): regression words and cycles
 (`int8_cmp_reg.py`), pack, gemm, TFLite and model result lines, the perf report, rq-vectors, the oracle and pack-models

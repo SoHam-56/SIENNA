@@ -2469,9 +2469,21 @@ def test_check_reported_steps():
     args = lambda fmt: argparse.Namespace(fmt=fmt, n=16, tile=4, lanes=32)
     steps = {f: {n: (argv, g) for n, argv, g in check_steps(args(f))} for f in ("fp32", "bf16", "int8")}
     assert "GPNAE_MODEL=hw" in steps["bf16"]["gpnae-verilator"][0] and steps["bf16"]["gpnae-verilator"][1]  # bit-exact, gated
-    assert not steps["bf16"]["gpnae-accuracy"][1] and steps["fp32"]["gpnae-accuracy"][1]  # bf16 accuracy reported only
-    assert "gpnae-accuracy" not in steps["int8"] and "GPNAE_MODEL=hw" not in steps["int8"]["gpnae-verilator"][0]
+    assert "GPNAE_MODEL=exact" in steps["bf16"]["gpnae-accuracy"][0] and not steps["bf16"]["gpnae-accuracy"][1]  # reported only
+    for f in ("fp32", "int8"):  # one gated accuracy step: fp32's hw model of negative sigmoid does not match the RTL (GPNAE item)
+        assert "gpnae-accuracy" not in steps[f] and "GPNAE_MODEL=exact" in steps[f]["gpnae-verilator"][0] and steps[f]["gpnae-verilator"][1]
+    assert all(g for f in ("fp32", "int8") for _, g in steps[f].values())
     assert [n for n, (_, g) in steps["bf16"].items() if not g] == ["gpnae-accuracy"]
+    with tempfile.TemporaryDirectory() as d:
+        leak = os.path.join(d, "env.log")
+        os.environ["GPNAE_MODEL"], saved_mf = "hw", os.environ.get("MAKEFLAGS")
+        os.environ["MAKEFLAGS"] = " -- TEST=selu"
+        try:
+            run_step([sys.executable, "-c", "import os; print(sorted(set(os.environ) & {'GPNAE_MODEL', 'MAKEFLAGS', 'TEST'}))"], leak)
+        finally:
+            del os.environ["GPNAE_MODEL"]
+            os.environ.pop("MAKEFLAGS") if saved_mf is None else os.environ.__setitem__("MAKEFLAGS", saved_mf)
+        assert open(leak).read().strip() == "[]", open(leak).read()
     global CHECK_DIR
     saved, py = CHECK_DIR, [sys.executable, "-c"]
     with tempfile.TemporaryDirectory() as d:
@@ -2892,19 +2904,23 @@ REPORTED = {("gpnae-accuracy", "bf16")}  # open accuracy items (sienna-uniform-f
 def check_steps(a) -> list:
     """The gate's steps as (name, argv, gated): the self-tests, then make targets in the build's format, N, TILE and LANES."""
     mk = lambda target, *extra: ["make", target, f"FMT={a.fmt}", f"N={a.n}", f"TILE={a.tile}", f"LANES={a.lanes}", f"PYTHON={sys.executable}", *extra]
-    gpnae = [("gpnae-verilator", mk("gpnae-verilator"))] if a.fmt == "int8" else \
-        [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator"))]  # float: bit-exact, then accuracy
+    gpnae = [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator", "GPNAE_MODEL=exact"))] \
+        if a.fmt == "bf16" else [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=exact"))]  # bf16: bit-exact gated, accuracy reported
     steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]), ("sm-verilator", mk("sm-verilator")),
              *gpnae, ("regression", mk("regression")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
     steps += [("tflite", mk("tflite"))] if a.fmt == "int8" else []
     return [(name, argv, (name, a.fmt) not in REPORTED) for name, argv in steps]
 
 
+STEP_ENV_DROP = ("MAKEFLAGS", "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES", "GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K")  # make check's own variables must not narrow a step
+
+
 def run_step(argv: list, log_path: str) -> str:
     """Runs one step with its output teed to log_path: PASS, or FAIL naming the exit status or the firing the log holds."""
+    env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
     with open(log_path, "w") as log:
         try:
-            p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+            p = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         except OSError as e:
             log.write(f"cannot run {argv[0]}: {e}\n")
             return f"FAIL (cannot run: {e})"
@@ -2917,7 +2933,7 @@ def run_step(argv: list, log_path: str) -> str:
 
 
 def all_main(argv=None, steps=check_steps) -> None:
-    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA regression, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any step failed."""
+    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA regression, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
     ap = argparse.ArgumentParser(description=all_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="all")
     ap.add_argument("--format", dest="fmt", default="fp32", choices=sorted(mr.FORMATS))

@@ -108,7 +108,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   sigmoid 7.22% (12.68% at range 8), tanh 8.59%, against the regression's 6.25% tolerance. The
   hardware matches its bit-exact model; the error is the lane design at 8 significand bits
   (sigmoid's 1 - P near -3.5, power-basis Horner for tanh). `2026-09-28_gpnae_gate.txt` (sienna-report history) has the table.
-  Decided for the gate 2026-10-05 (Soham, option 2): `make check FMT=bf16` gates bit-exactness and reports this
+  Decided for the gate 2026-10-05 (Soham, option 2): `make regression FMT=bf16` (was `make check`) gates bit-exactness and reports this
   accuracy, not gated (sienna-tooling). Improving the fit (earlier tail hand-off for negative sigmoid, a split tanh
   range) is still open and would change GPNAE's coefficients, so it needs Soham's go-ahead.
 - **fp32 gpnae_model, negative sigmoid.** `regression.py --lane poly --format fp32 --model hw` fails 9 of 10 patterns,

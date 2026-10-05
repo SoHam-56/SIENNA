@@ -8,9 +8,12 @@ Contains:
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
   5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors
+  6. Tool self-tests (--action selftest) and the one-verdict gate (--action all, make check)
 """
 
 import argparse
+import contextlib
+import functools
 import itertools
 import json
 import math
@@ -21,6 +24,7 @@ import statistics
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 
@@ -46,7 +50,7 @@ from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "all")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -2295,8 +2299,575 @@ def rq_vectors_main(argv=None) -> None:
         f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in out))
 
 
+# ── Self-tests ───────────────────────────────────────────────────────────────
+# (were test_makefile_fmt.py, test_pack_jobs.py, test_perf_analysis.py, test_regression_parse.py, test_tflite_ref.py)
+
+reg = pa = sys.modules[__name__]  # the moved tests name this module reg or pa
+SELFTESTS = []  # the registry: --action selftest runs exactly these, in order, whatever else is named test_*
+
+
+def selftest(fn):
+    """Registers fn as a self-test."""
+    SELFTESTS.append(fn)
+    return fn
+
+
+def perf_selftest(fn):
+    """Registers a self-test of the perf section; perf_init() runs first, as at perf's entry."""
+
+    @functools.wraps(fn)
+    def run():
+        perf_init()
+        fn()
+
+    return selftest(run)
+
+
+# ── tool: Makefile FMT flow (was test_makefile_fmt.py) ──
+
+MAKE_ENV = {k: v for k, v in os.environ.items() if k not in ("MAKEFLAGS", "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES")}  # an outer make's variables would leak in
+
+
+def make_n(*args) -> subprocess.CompletedProcess:
+    """make -n from the repo root: prints recipes, runs nothing but parse-time checks."""
+    return subprocess.run(["make", "-s", "-n", *args], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
+
+
+def fixture_pkg(d: str, fmt: str, n: int = 16, tile: int = 4, lanes: int = 32, drop: tuple = ()) -> str:
+    """A fixture test_config_pkg.sv in d, written by regression.py's own writer, minus the localparams in drop."""
+    path = os.path.join(d, f"pkg_{fmt}_{n}_{tile}_{lanes}{'_old' if drop else ''}.sv")
+    items = reg._config_items({"n": n, "tile_size": tile, "lanes": lanes}, fmt, "relu", 4, 15, 1, [], False, 1)
+    reg.write_sv_package(path, [x for x in items if x[0] not in drop])
+    return path
+
+
+def pkg_guard(pkg: str, *args) -> tuple:
+    """(exit, output) of the shell make -n prints for pkg-check GEN_PKG=0 on pkg."""
+    r = make_n("pkg-check", "GEN_PKG=0", f"PKG_FILE={pkg}", *args)
+    assert r.returncode == 0, r.stderr
+    g = subprocess.run(["bash", "-c", r.stdout], capture_output=True, text=True)
+    return g.returncode, g.stdout + g.stderr
+
+
+@selftest
+def test_guard_passes_matching_package():
+    with tempfile.TemporaryDirectory() as d:
+        for f in reg.FORMATS:
+            rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={f}")
+            assert rc == 0 and f"matches FMT={f} N=16 TILE=4 LANES=32" in out, out
+
+
+@selftest
+def test_guard_rejects_other_format():
+    with tempfile.TemporaryDirectory() as d:
+        for f in reg.FORMATS:
+            for want in reg.FORMATS:
+                if want != f:
+                    rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={want}")
+                    assert rc != 0 and f"but FMT={want} needs" in out, (f, want, out)
+
+
+@selftest
+def test_guard_rejects_pre_format_package():
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = pkg_guard(fixture_pkg(d, "fp32", drop=("EXP_W", "MAN_W", "IS_INT")), "FMT=fp32")
+        assert rc != 0 and "EXP_W=missing" in out, out
+
+
+@selftest
+def test_guard_checks_geometry():
+    with tempfile.TemporaryDirectory() as d:
+        big = fixture_pkg(d, "bf16", 32, 8)
+        rc, out = pkg_guard(big, "FMT=bf16")  # a stale same-format package of another size
+        assert rc != 0 and "N=32 TILE_SIZE=8 NUM_LANES=32, but the build asks for N=16 TILE=4 LANES=32" in out, out
+        rc, out = pkg_guard(big, "FMT=bf16", "N=32", "TILE=8")
+        assert rc == 0 and "N=32 TILE=8 LANES=32" in out, out
+        rc, out = pkg_guard(fixture_pkg(d, "int8"), "FMT=int8", "LANES=64")
+        assert rc != 0 and "LANES=64" in out, out
+
+
+@selftest
+def test_guard_missing_file():
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = pkg_guard(os.path.join(d, "none.sv"), "FMT=fp32")
+        assert rc != 0 and "missing or unreadable" in out, out
+
+
+@selftest
+def test_parse_time_rejections():
+    r = make_n("regression", "FMT=fp16")
+    assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
+    for t in ("regression", "verilator", "lint", "pkg", "pack"):
+        r = make_n(t, "COLLAPSE_K=0")
+        assert r.returncode != 0 and "sienna_ck0.sh" in r.stderr, (t, r.stderr)
+    r = make_n("lint", "COLLAPSE_K=2")
+    assert r.returncode != 0 and "Invalid COLLAPSE_K=2" in r.stderr, r.stderr
+    for t in ("help", "sm-verilator"):  # the only targets collapse-k 0 is meaningful for, or harmless in
+        r = make_n(t, "COLLAPSE_K=0")
+        assert r.returncode == 0, (t, r.stderr)
+
+
+@selftest
+def test_pack_target():
+    r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
+    assert r.returncode == 0 and r.stdout.split() == "py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    r = make_n("pack", "FMT=fp16")
+    assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+
+
+@selftest
+def test_check_target():
+    r = make_n("check", "FMT=int8", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
+    assert r.returncode == 0 and r.stdout.split() == "py regression.py --action all --format int8 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    r = make_n("check", "FMT=fp16")
+    assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+
+
+@selftest
+def test_pkg_action_refusals():
+    run = lambda *a: subprocess.run([sys.executable, "regression.py", "--action", "pkg", *a], cwd=ROOT, capture_output=True, text=True)
+    r = run("--format", "fp32", "--test", "no_such_test")
+    assert r.returncode != 0 and "no pipeline test named 'no_such_test'" in r.stderr, r.stderr
+    only8 = next(t["name"] for t in reg.PIPELINE_TESTS if t.get("formats") == ("int8",))
+    r = run("--format", "fp32", "--test", only8)
+    assert r.returncode != 0 and f"test '{only8}' runs only in int8, not fp32" in r.stderr, r.stderr
+    assert "formats" not in next(t for t in reg.PIPELINE_TESTS if t["name"] == reg.PKG_DEFAULT_TEST)  # the default runs everywhere
+
+
+@selftest
+def test_fmt_fields_match_formats():
+    mk = open(os.path.join(ROOT, "Makefile")).read()
+    fields = {f: tuple(int(x) for x in v.split()) for f, v in re.findall(r"^FMT_FIELDS_(\w+) = ([\d ]+)$", mk, re.M)}
+    assert re.search(r"^FORMATS = (.*)$", mk, re.M).group(1).split() == list(reg.FORMATS)
+    assert fields == {f: (*reg.FORMATS[f], int(f == "int8")) for f in reg.FORMATS}, fields
+
+
+# ── tool: _parse_log (was test_regression_parse.py) ──
+
+LOG_CLEAN = """  Total     : 512
+  Exact     : 512
+  Tol pass  : 0
+  Failed    : 0
+pipeline_complete_o asserted @ 3165000  (311 cycles)
+RESULT: PASSED
+"""
+
+LOG_FIRED = ("[3165000] %Error: sienna_top.sv:1128: Assertion failed in TB_sienna_top.dut.a_pack_one_pass: "
+             "sienna_top: a packed set cannot be a partial sum or continue one\n")
+
+
+@selftest
+def test_clean_log_passes():
+    r = reg._parse_log(LOG_CLEAN)
+    assert r["status"] == "PASS" and r["total"] == 512 and r["cyc"] == 311, r
+
+
+@selftest
+def test_assertion_firing_fails():
+    r = reg._parse_log(LOG_CLEAN + LOG_FIRED)  # the TB's own counts still read clean
+    assert r["status"] == "ASSERT" and r["failed"] == 1 and "a_pack_one_pass" in r["fired"], r
+
+
+@selftest
+def test_assertion_without_error_prefix_fails():
+    r = reg._parse_log(LOG_CLEAN + "Assertion failed in TB_sienna_top.dut.a_credit_accept\n")
+    assert r["status"] == "ASSERT", r
+
+
+@selftest
+def test_error_line_fails():
+    r = reg._parse_log(LOG_CLEAN + "%Error: TB_sienna_top.sv:12: some runtime error\n")
+    assert r["status"] == "ASSERT", r
+
+
+@selftest
+def test_warning_is_not_a_firing():
+    r = reg._parse_log("%Warning-UNUSEDSIGNAL: sienna_top.sv:40: Signal is not used\n" + LOG_CLEAN)
+    assert r["status"] == "PASS", r
+
+
+# ── tool: pack_jobs and the packed-layer prechecks (was test_pack_jobs.py) ──
+
+
+def _models(rng, shapes, acts):
+    return [{"W": rng.uniform(-1, 1, (K, C)), "bias": rng.uniform(-1, 1, C), "act": a, "req": None,
+             "inputs": [rng.uniform(-1, 1, (m, K)) for m in ms]} for (K, C, ms), a in zip(shapes, acts)]
+
+
+@selftest
+def test_round_trip_float():
+    rng = np.random.RandomState(3)
+    models = _models(rng, [(5, 3, [2, 7]), (8, 8, [1]), (2, 6, [4, 4, 3])], ["tanh", "relu", "linear"])
+    job, recipe = mr.pack_jobs(models, 32, int8=False)
+    (A, B), = job["terms"]
+    assert job["pack"]["shift"] == 2 and A.shape == (32, 32) and B.shape == (32, 32)  # b = 8, rows padded to N
+    Y = A @ B + job["bias"][None, :]
+    for m, outs in zip(models, mr.unpack(Y, recipe)):
+        for x, y in zip(m["inputs"], outs):
+            assert np.allclose(y, x @ m["W"] + m["bias"]), "a job's rows and columns came back wrong"
+    pk = job["pack"]
+    assert pk["map"][:3] == [0, 1, 2] and set(pk["map"][3:]) == {0}, "each model's block must point at its own entry"
+    assert [e[0] for e in pk["ents"][:3]] == ["tanh", "relu", "linear"] and len(pk["ents"]) == 8
+
+
+@selftest
+def test_partial_packing_and_entries():
+    rng = np.random.RandomState(4)
+    models = _models(rng, [(3, 3, [1]), (4, 2, [2])], ["selu", "selu"])
+    job, recipe = mr.pack_jobs(models, 16, int8=False)
+    pk = job["pack"]
+    assert pk["shift"] == 2 and pk["map"][:4] == [0, 0, 0, 0] and pk["ents"][0][0] == "selu"  # same setting, one entry; blocks 2, 3 empty
+    Y = job["terms"][0][0] @ job["terms"][0][1]
+    assert np.all(Y[:, 8:] == 0), "an empty block's columns must stay zero before bias"
+
+
+@selftest
+def test_refusals():
+    rng = np.random.RandomState(5)
+    big = _models(rng, [(9, 4, [1])], ["linear"])
+    for bad, why in ((big, "K > N/2"), (_models(rng, [(2, 2, [1])] * 9, ["tanh", "relu", "linear", "selu", "sigmoid", "tanh",
+                                                                          "relu", "linear", "selu"]), "more models than blocks")):
+        try:
+            mr.pack_jobs(bad, 16, int8=False)
+        except ValueError:
+            continue
+        raise AssertionError(f"pack_jobs accepted {why}")
+
+
+@selftest
+def test_refuses_wide_output():
+    rng = np.random.RandomState(6)
+    try:
+        mr.pack_jobs(_models(rng, [(2, 9, [1])], ["linear"]), 16, int8=False)
+    except ValueError:
+        return
+    raise AssertionError("pack_jobs accepted C > N/2")
+
+
+def _int8_model(rng, i, act="linear"):
+    req = dict(mult=np.array([1000 + 10 * i, 2000 + 10 * i]), shift=np.array([i, i + 1]), zp=i, amin=-128, amax=127, mx=0, shx=0,
+               mout=0, shout=0, zout=0)
+    return {"W": rng.randint(-5, 5, (2, 2)).astype(float), "bias": rng.randint(-9, 9, 2), "act": act, "req": req,
+            "inputs": [rng.randint(-5, 5, (3, 2)).astype(float)]}
+
+
+@selftest
+def test_int8_layout_and_entry_limit():
+    rng = np.random.RandomState(7)
+    models = [_int8_model(rng, i) for i in range(9)]  # K = C = 2 at N = 32: b = 2, 16 blocks, 9 distinct zero points
+    try:
+        mr.pack_jobs(models, 32, int8=True)
+    except ValueError as e:
+        assert "distinct" in str(e), f"refused for the wrong reason: {e}"
+    else:
+        raise AssertionError("pack_jobs accepted 9 settings in a set that holds 8")
+    job, recipe = mr.pack_jobs(models[:8], 32, int8=True)
+    pk, q = job["pack"], job["req"]
+    assert pk["shift"] == 4 and pk["map"] == list(range(8)) + [0] * 8 and len(pk["ents"]) == 8
+    assert q["zp"] == 0 and all(q[x] == models[0]["req"][x] for x in ("amin", "amax", "mx", "shx", "mout", "shout", "zout"))
+    assert [e[1]["zp"] for e in pk["ents"]] == list(range(8)) and "mult" not in pk["ents"][3][1], "entries carry the output words only"
+    assert job["bias"].dtype == np.int64 and q["mult"].shape == (32,) and q["shift"].shape == (32,)
+    for c, m in enumerate(models[:8]):
+        assert list(q["mult"][2 * c:2 * c + 2]) == list(m["req"]["mult"]) and list(q["shift"][2 * c:2 * c + 2]) == list(m["req"]["shift"])
+        assert list(job["bias"][2 * c:2 * c + 2]) == list(m["bias"]), f"model {c}'s bias is not at its columns"
+    assert not np.any(q["mult"][16:]) and not np.any(q["shift"][16:]) and not np.any(job["bias"][16:]), "padding columns must be zero"
+    Y = job["terms"][0][0] @ job["terms"][0][1] + job["bias"][None, :]
+    for m, outs in zip(models[:8], mr.unpack(Y, recipe)):
+        assert np.array_equal(outs[0], m["inputs"][0] @ m["W"] + m["bias"])
+
+
+@selftest
+def test_int8_shared_entry():
+    rng = np.random.RandomState(8)
+    a, b, c = _int8_model(rng, 0), _int8_model(rng, 0), _int8_model(rng, 0, "relu")
+    b["req"] = dict(b["req"], mult=np.array([5, 6]))  # a column's own multiplier is not part of the entry
+    job, _ = mr.pack_jobs([a, b, c], 16, int8=True)
+    assert job["pack"]["map"][:3] == [0, 0, 1] and [e[0] for e in job["pack"]["ents"][:2]] == ["linear", "relu"]
+
+
+@selftest
+def test_selu_saturation_refused():
+    # Review Focus 5: an int8 SELU entry whose lane input reaches x >= 487.29 must be refused, not packed.
+    req = dict(mult=np.full(2, 1 << 30), shift=np.zeros(2, np.int64), zp=-128, amin=-128, amax=127, mx=(1 << 15) - 1, shx=0,
+               mout=1, shout=0, zout=0)
+    assert np.any(mr.selu_saturates(req["mx"], req["shx"], req["zp"], np.arange(req["amin"], req["amax"] + 1))), \
+        "the test's req does not saturate"
+    m = {"W": np.ones((2, 2)), "bias": None, "act": "selu", "req": req, "inputs": [np.ones((1, 2))]}
+    try:
+        mr.pack_jobs([m], 16, int8=True)
+    except ValueError:
+        return
+    raise AssertionError("pack_jobs accepted a saturating SELU entry")
+
+
+def _packed(N, rng_seed=9):
+    rng = np.random.RandomState(rng_seed)
+    job, _ = mr.pack_jobs(_models(rng, [(3, 3, [2]), (2, 4, [3])], ["tanh", "relu"]), N, int8=False)
+    return job
+
+
+def _refused(job, N, lanes, why):
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            mr.RtlLayer(N, lanes, d).run_job(job, "t")  # every refusal is raised before the simulator would run
+        except ValueError as e:
+            assert not os.listdir(d), f"{why}: a layer file was written before the refusal"
+            return str(e)
+    raise AssertionError(f"RtlLayer accepted {why}")
+
+
+@selftest
+def test_precheck_accepts_legal():
+    for N, lanes in ((16, 32), (32, 32), (64, 64), (64, 128), (8, 8)):
+        job = _packed(N)
+        cfg, _, _, (M, C, rt, _) = mr.format_layer(job, N)
+        mr.pack_precheck(job["pack"], cfg, (M, C, rt), N, lanes)
+
+
+@selftest
+def test_precheck_lanes():
+    assert "NUM_LANES" in _refused(_packed(64), 64, 32, "N = 64 at the default 32 lanes")
+    assert "NUM_LANES" in _refused(_packed(16), 16, 24, "24 lanes at N = 16")
+
+
+@selftest
+def test_precheck_collapse_k0():
+    old = mr.COLLAPSE_K
+    mr.COLLAPSE_K = 0
+    try:
+        assert "collapse-k 0" in _refused(_packed(16), 16, 32, "a packed layer on the collapse-k 0 mesh")
+    finally:
+        mr.COLLAPSE_K = old
+
+
+@selftest
+def test_precheck_residual():
+    job = _packed(16)
+    A = job["terms"][0][0]
+    job["terms"].append((np.ones_like(A), np.eye(16, dtype=np.float32)))  # an identity term is format_layer's residual
+    assert "residual" in _refused(job, 16, 32, "a packed layer with a residual")
+
+
+@selftest
+def test_precheck_table():
+    for edit, why in ((lambda pk: pk.update(map=pk["map"][:-1]), "a map shorter than N/2"),
+                      (lambda pk: pk.update(map=pk["map"] + [0]), "a map longer than N/2"),
+                      (lambda pk: pk["map"].__setitem__(1, 8), "a map entry past the table"),
+                      (lambda pk: pk.update(ents=pk["ents"][:7]), "7 table entries"),
+                      (lambda pk: pk.update(shift=0), "pack shift 0"),
+                      (lambda pk: pk.update(shift=4), "pack shift log2(N)")):
+        job = _packed(16)
+        edit(job["pack"])
+        _refused(job, 16, 32, why)
+
+
+# ── tool: perf section (was test_perf_analysis.py) ──
+
+PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")
+
+
+def perf_trace(name):
+    return pa.events(open(os.path.join(PERF_FIX, f"{name}_N16_T4_bf16.trace")).read())
+
+
+@perf_selftest
+def test_accumulate_outputs_every_third_set():
+    a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
+    assert a["first_latency"] == 133  # host start of pass 0 to the completion of pass 2, read off the trace by hand
+    assert statistics.mean(a["steady"]) == 19.0  # cycles per depth pass: 57 per output of 3 passes
+    outs = [x for x in a["sets"] if x["latency"] is not None]
+    assert len(outs) == 8 and all(x["latency"] > 0 and x["out"] >= 0 for x in outs)
+    assert all(x["latency"] is None and x["out"] is None for k, x in enumerate(a["sets"]) if (k + 1) % 3)
+
+
+@perf_selftest
+def test_single_pass_unchanged():
+    a = pa.analyse(perf_trace("matmul_relu_nopool"), 24)
+    assert a["first_latency"] == a["sets"][0]["latency"] == 95  # the pre-fix report's value
+    assert statistics.mean(a["steady"]) == 19.0
+    assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
+
+
+@contextlib.contextmanager
+def perf_fmt(f):
+    """The perf section's build format for the block, restored afterwards so no test depends on the order they run in."""
+    old = pa.FMT, pa.MUL_LAT, pa.ADD_LAT
+    pa.FMT, (pa.MUL_LAT, pa.ADD_LAT) = f, pa.UNIT_LAT[f]
+    try:
+        yield
+    finally:
+        pa.FMT, pa.MUL_LAT, pa.ADD_LAT = old
+
+
+@perf_selftest
+def test_rtl_lat():
+    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's mul_lat, add_lat, as parsed
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 16, 4)  # fx_lat, req_lat, gpnae_poly's K, TAIL_CONTEXTS
+
+
+@perf_selftest
+def test_lane_stage_int8():
+    with perf_fmt("int8"):  # no tail path, so the stage is data-free; each value derived from gpnae_poly_int8 and barrel_mac, and measured
+        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
+        assert stage("selu", 16) == 96 and stage("tanh", 16) == 107  # sp_p16t2
+        assert stage("selu", 32) == 327 and stage("tanh", 32) == 365  # sp_p32t2, sp_p32t4
+        assert stage("selu", 8) == 53 and stage("tanh", 8) == 56  # sp_p8t2
+
+
+@perf_selftest
+def test_lane_group_float():
+    with perf_fmt("fp32"):  # one group, no tail element: last_i at per_lane + 3, so the first G_CAP at per_lane + 4
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 195 and pa.lane_cycles([0.0] * 2, "tanh", 6) + 2 == 183
+    with perf_fmt("bf16"):
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 143 and pa.lane_cycles([0.0] * 32, "tanh", 36) + 2 == 529
+
+
+@perf_selftest
+def test_tail_ops_fp32():
+    with perf_fmt("fp32"):  # multiply 8 + 2, add 5 + 2 cycles per gpnae_tail step, by hand
+        assert pa.tail_ops(5.0, "tanh") == 10 * 17 + 10 + 7 + 4 * 10 + 7 + 10 + 7 + 10 + 7  # a = -10: four squarings
+        assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # a = -5: three doublings
+        assert pa.tail_ops(60.0, "tanh") == 7 + 10 + 7 + 10 + 7  # |a| = 120 > 104: e^a underflows
+        assert pa.tail_ops(-4.5, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10  # x < 0 keeps s, no output step
+        assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
+
+
+# ── tool: TFLite reference kernels (was test_tflite_ref.py) ──
+
+TFLITE_QM = [  # real -> (mult, shift): frexp, then the mantissa * 2^31 rounded half away from zero
+    (0.5, (1 << 30, 0)),
+    (1.0, (1 << 30, 1)),
+    (0.75, (1610612736, 0)),
+    (0.1, (1717986918, -3)),  # 0.8 * 2^31 = 1717986918.4
+    (2.0 ** -32, (1 << 30, -31)),  # shift -31 is kept
+    (2.0 ** -33, (0, 0)),  # shift -32 flushes to zero
+    (0.0, (0, 0)),
+    (1.0 - 2.0 ** -40, (1 << 30, 1)),  # the mantissa rounds to 2^31: halved, shift + 1
+    (1.0 / 255.0, (1077952576, -7)),
+    (0.5 + 2.0 ** -32, ((1 << 30) + 1, 0)),  # 2^30 + 0.5 rounds away from zero; numpy.round would give 2^30
+]
+
+
+@selftest
+def test_tflite_ref():
+    fails = checks = 0
+
+    def check(what, got, want):
+        nonlocal fails, checks
+        checks += 1
+        g, w = np.asarray(got), np.asarray(want)
+        if g.shape != w.shape or np.any(g != w):
+            fails += 1
+            print(f"[FAIL] {what}: got {g.tolist()}, want {w.tolist()}")
+
+    ref = mr
+    for real, want in TFLITE_QM:
+        check(f"quantize_multiplier({real!r})", ref.quantize_multiplier(real), want)
+    check("quantize_multiplier(2^31, SINGLE)", ref.quantize_multiplier(2.0 ** 31, "SINGLE"), ((1 << 31) - 1, 30))
+    check("quantize_multiplier(2^31, DOUBLE)", ref.quantize_multiplier(2.0 ** 31, "DOUBLE"), (1 << 30, 32))
+    check("relu6 range", ref.activation_range("relu6", 0.05, -128), (-128, -8))  # 6 / 0.05 = 120 levels
+    check("relu range", ref.activation_range("relu", 0.1, 3), (3, 127))
+    check("relu6 above int8", ref.activation_range("relu6", 0.02, -10), (-10, 127))  # 300 levels: capped
+    check("none range", ref.activation_range("none", 0.1, 3), (-128, 127))
+
+    # FC: acc = 3 * (10 + 2) - 4 * (-20 + 2) + b = 108 + b; scale 0.5 * 0.25 / 1.0 = 2^-3 (QM (2^30, -2)); out zp 3.
+    x, w = np.array([[10, -20]]), np.array([[3, -4]])
+    fc_cases = [(100, 29, 29),  # 208 / 8 = 26
+                (104, 30, 30),  # 212 / 8 = 26.5: a positive tie, both up
+                (-176, -6, -5)]  # -68 / 8 = -8.5: DOUBLE away (-9), SINGLE up (-8)
+    for b, dbl, sgl in fc_cases:
+        for r, want in (("DOUBLE", dbl), ("SINGLE", sgl)):
+            for folded in (False, True):
+                check(f"fc b={b} {r} folded={folded}",
+                      ref.fc_int8(x, w, np.array([b]), -2, [0.25], 0.5, 1.0, 3, -128, 127, r, folded=folded), [[want]])
+
+    # Conv 3x3 SAME on 2x2: in-image taps of (x - 1) give [[49, 43], [31, 25]]; QM (2^30, 0) makes each a positive tie; out zp -3.
+    xc = np.array([1, 2, 3, 4]).reshape(1, 2, 2, 1)
+    wc = np.arange(1, 10).reshape(1, 3, 3, 1)
+    for r in ("DOUBLE", "SINGLE"):
+        for folded in (False, True):
+            check(f"conv {r} folded={folded}",
+                  ref.conv2d_int8(xc, wc, np.array([0]), 1, [1.0], 0.5, 1.0, -3, -128, 127, r, folded=folded),
+                  np.array([22, 19, 13, 10]).reshape(1, 2, 2, 1))
+    check("fold_input_zp", ref.fold_input_zp(np.array([0]), np.ones((1, 3, 3, 1)), 1), [-9])
+    check("im2col_same corner", ref.im2col_same(xc, 3, 3, 1)[0], [1, 1, 1, 1, 1, 2, 1, 3, 4])  # pad value 1 outside
+    print(f"test_tflite_ref: {checks} checks, {fails} failures")
+    print(f"RESULT: {'PASSED' if fails == 0 else 'FAILED'}")
+    assert fails == 0, f"{fails} of {checks} checks failed"
+
+
+def selftest_main(argv=None) -> None:
+    """Runs every registered self-test (the tools only, no simulator): PASS or FAIL per test, exit 1 if any fails."""
+    argparse.ArgumentParser(description=selftest_main.__doc__).add_argument("--action", choices=ACTIONS, default="selftest")
+    bad = 0
+    for t in SELFTESTS:
+        try:
+            t()
+            print(f"PASS {t.__name__}")
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            bad += 1
+            print(f"FAIL {t.__name__}: {e!r}")
+    print(f"ALL {len(SELFTESTS)} PASSED" if bad == 0 else f"{bad} of {len(SELFTESTS)} FAILED")
+    sys.exit(1 if bad else 0)
+
+
+# ── all (the one-verdict gate) ───────────────────────────────────────────────
+
+CHECK_DIR = os.path.join(ROOT, "testbenches", "results", "check")
+FIRING = re.compile(r"^.*(?:Assertion failed|%Error).*$", re.M)  # _parse_log's witness: a firing assertion leaves the exit status clean
+
+
+def check_steps(a) -> list:
+    """The gate's steps as (name, argv): the self-tests, then make targets in the build's format, N, TILE and LANES."""
+    mk = lambda target, *extra: ["make", target, f"FMT={a.fmt}", f"N={a.n}", f"TILE={a.tile}", f"LANES={a.lanes}", f"PYTHON={sys.executable}", *extra]
+    steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]), ("sm-verilator", mk("sm-verilator")),
+             ("gpnae-verilator", mk("gpnae-verilator")), ("regression", mk("regression")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
+    return steps + ([("tflite", mk("tflite"))] if a.fmt == "int8" else [])
+
+
+def run_step(argv: list, log_path: str) -> str:
+    """Runs one step with its output teed to log_path: PASS, or FAIL naming the exit status or the firing the log holds."""
+    with open(log_path, "w") as log:
+        try:
+            p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        except OSError as e:
+            log.write(f"cannot run {argv[0]}: {e}\n")
+            return f"FAIL (cannot run: {e})"
+        for line in p.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+        rc = p.wait()
+    fired = FIRING.search(open(log_path, errors="replace").read())
+    return f"FAIL (exit {rc})" if rc else f"FAIL (log: {fired.group(0).strip()[:60]})" if fired else "PASS"
+
+
+def all_main(argv=None, steps=check_steps) -> None:
+    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA regression, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any step failed."""
+    ap = argparse.ArgumentParser(description=all_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="all")
+    ap.add_argument("--format", dest="fmt", default="fp32", choices=sorted(mr.FORMATS))
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    a = ap.parse_args(argv)
+    os.makedirs(CHECK_DIR, exist_ok=True)
+    tag = f"{a.fmt}_N{a.n}_T{a.tile}_L{a.lanes}"
+    rows = []
+    for name, cmd in steps(a):
+        log_path = os.path.join(CHECK_DIR, f"{name}_{tag}.log")
+        print(hdr(f"\n=== check: {name}  ({' '.join(cmd)}) ==="), flush=True)
+        t0 = time.time()
+        rows.append((name, run_step(cmd, log_path), time.time() - t0, log_path))
+    failed = sum(v != "PASS" for _, v, _, _ in rows)
+    table = [f"CHECK {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, s, p in rows]
+    table.append(f"CHECK {'PASS' if failed == 0 else 'FAIL'}: {len(rows) - failed} of {len(rows)} steps passed")
+    open(os.path.join(CHECK_DIR, f"check_{tag}.log"), "w").write("\n".join(table) + "\n")
+    print("\n" + "\n".join(table))
+    sys.exit(1 if failed else 0)
+
+
 MAINS = {"pack": pack_main, "gemm": gemm_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
-         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main}  # each parses its own options (regression.py --action A --help)
+         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "selftest": selftest_main, "all": all_main}  # each parses its own options (regression.py --action A --help)
 
 if __name__ == "__main__":
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)  # no abbreviation: pack's --act is not --action

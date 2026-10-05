@@ -292,6 +292,7 @@ help:
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
+	@echo "  make check FMT=int8               - One verdict: self-tests, sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
 	@echo "Utility Targets:"
@@ -554,6 +555,10 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
+# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
+check:
+	$(PYTHON) regression.py --action all --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
 # ─────────────────────────────────────────────────────────────────────────────
@@ -572,4 +577,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite pack
+        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite pack check

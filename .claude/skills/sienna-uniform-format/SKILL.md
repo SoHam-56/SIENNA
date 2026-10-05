@@ -108,6 +108,13 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   sigmoid 7.22% (12.68% at range 8), tanh 8.59%, against the regression's 6.25% tolerance. The
   hardware matches its bit-exact model; the error is the lane design at 8 significand bits
   (sigmoid's 1 - P near -3.5, power-basis Horner for tanh). `2026-09-28_gpnae_gate.txt` (sienna-report history) has the table.
+  Decided for the gate 2026-10-05 (Soham, option 2): `make check FMT=bf16` gates bit-exactness and reports this
+  accuracy, not gated (sienna-tooling). Improving the fit (earlier tail hand-off for negative sigmoid, a split tanh
+  range) is still open and would change GPNAE's coefficients, so it needs Soham's go-ahead.
+- **fp32 gpnae_model, negative sigmoid.** `regression.py --lane poly --format fp32 --model hw` fails 9 of 10 patterns,
+  sigmoid only (20-51% of outputs differ; SELU and tanh exact): the model's `fpAdder(P, -1)` for `fp32_down` does not
+  match the RTL. Seen in `g11_hw32` (2026-09-28) and `tlb_check_fp32` (2026-10-05). The RTL's accuracy is fine (0.06%
+  worst); the model is the gap. Not changed (GPNAE is published work).
 - **Findings in published units, reported and not changed.** D-1: fp32Adder raises overflow with
   underflow when a cancellation's exponent goes negative (the result is correctly zero; SIENNA does
   not use the flag). D-6: fp32Adder gives -0 for x + (-x) when the first operand is negative (IEEE

@@ -7,8 +7,9 @@ description: Use when running, changing or extending SIENNA's Python tooling - t
 
 **Status: implemented and verified 2026-10-05 on branch `tooling` (SIENNA only; not pushed), gated tree 7b711bd
 (b396aeb..7b711bd; the commit after it changes only this skill). Final gate `tlf_*` (`sienna_report/tooling_gate.log`):
-all 106 packing-gate configurations identical to `pkf_*`, `make check` passes in fp32 and int8; `make check FMT=bf16`
-fails only on GPNAE's bf16 activation accuracy, the open decision of 2026-09-28 (see Gate).** Design approved 2026-10-05 (Soham:
+all 106 packing-gate configurations identical to `pkf_*`. Follow-ups the same day (Soham: "go with option 2, and do the
+layering now"): model_runner laid out in eight layered sections (2a88978) and `make check` passing in fp32, bf16 and
+int8 at 972464c, bf16 accuracy reported, not gated (see Gate).** Design approved 2026-10-05 (Soham:
 "keep submodule scripts, delete old ones, go ahead"). Soham asked for exactly two
 Python scripts in SIENNA: one for hardware sanity, one that runs models and stands as the reference host software a
 software team builds its own layer from ("this model runner is supposed to be the compiler").
@@ -113,7 +114,7 @@ driver needs.
 Commits on `tooling` (SIENNA; the submodules are untouched: SystolicMesh b1a2c31, GPNAE 0d407a7, AriL cb46ced):
 d49a829 (TB_sienna_layer -> TB_model_run), 3cc5675 (Task 1), 21fbc8f (Task 2), 3217ed7 and 3584a1f (Task 3), ff91381
 (Task 4), fb68726 (comments) and the skill commits. The only tracked Python outside the submodules is `model_runner.py`
-(1,353 lines) and `regression.py` (2,923 lines); the check is the global-constraints command in the implementation plan.
+(1,349 lines) and `regression.py` (3,017 lines); the check is the global-constraints command in the implementation plan.
 The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.md`) has the full record.
 
 ### Command map (old -> new)
@@ -127,7 +128,7 @@ The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.m
 | `tflite_pack_models.py D` | `regression.py --action pack-models D` | |
 | `gpnae_int8_tflite.py --report F` | `regression.py --action gpnae-tflite --report F` | |
 | `testbenches/gen_rq_lanes.py OUT` | `regression.py --action rq-vectors OUT` | |
-| `python3 test_makefile_fmt.py` (and the other four `test_*.py`) | `regression.py --action selftest` (34 tests) | |
+| `python3 test_makefile_fmt.py` (and the other four `test_*.py`) | `regression.py --action selftest` (38 tests) | |
 | | `regression.py --action all [--format --n --tile --lanes]` | `make check` |
 | `tflite_int8_run.py [--n --tile-size --lanes --models --work]` | `model_runner.py --action tflite` (same options) | `make tflite` |
 | `tflite_pack_run.py [--n --tile-size --lanes --models]` | `model_runner.py --action tflite --pack` (same options) | |
@@ -141,11 +142,14 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 
 ### Departures from the design above, each with its reason
 
-1. **model_runner gained sections but was not reorganised.** It has `# ── Numerics ──`, `# ── Device build ──` and
-   `# ── TFLite runs ──`; the frontend, tiling and packing, the layer-file writer (inside `RtlLayer`), the backends and
-   the CLI stay in their old order without new headers, and there is no contents block or separate device-protocol
-   encoder / decoder. The plan was a behaviour-preserving move (code moved verbatim); the layered reorganisation is
-   left as a next step.
+1. **model_runner has eight sections, not six** (2a88978, after the plan's tasks): a contents block, then 1 Numerics,
+   2 Frontend, 3 Middle end, 4 Device protocol, 5 Device build, 6 Backends, 7 Runtime (`execute`, `macs_of`), 8 CLI.
+   The build package and the graph executor fit none of the six layers. The device protocol is `write_layer` (moved
+   out of `RtlLayer.run_job`) and `read_outputs` for TB_model_run, plus `write_sets` for TB_sienna_model.
+   `RtlSets.run_job` replaces the free function `run_job_hw`, so all three backends are used as `build()`,
+   `run_job(job, tag)`. Every other definition is AST-identical to before. The 9 layer files compared offline are
+   byte-identical, and the `tlr_` farm runs (pack in three formats, TFLite single-layer and packed, gemm, model bf16,
+   model sets fp32) are identical to `pkf_`. `test_layer_file_format` pins the file layout.
 2. **`# ── Device build ──` in model_runner** (`write_sv_package`, `_config_items`, `SETS_IN_FLIGHT`, `COLLAPSE_K`, and a
    new `write_build_pkg(N, T, lanes, fmt)`) so every global has one owner; `--collapse-k` sets `model_runner.COLLAPSE_K`.
    `write_build_pkg` writes only `test_config_pkg.sv` (byte-identical, checked in scratch copies); the old build path
@@ -169,7 +173,12 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
    `_tf_imports()` after argument parsing, so regression.py imports without TensorFlow.
 9. **`--action all`'s verdict per step** is the exit status plus a scan for `Assertion failed` / `%Error` in the step's
    log; logs go to `testbenches/results/check/`. It follows GPNAE's own contract: the int8 sigmoid accuracy shortfall
-   is printed "reported, not gated", so `make check` passes with it (an open int8 item, not a tooling one).
+   is printed "reported, not gated", so `make check` passes with it (an open int8 item, not a tooling one). In bf16
+   (f10f49d, fixed in 972464c) GPNAE is two steps: `gpnae-verilator` with `GPNAE_MODEL=hw` (bit-exact against the
+   lane model, gated) and `gpnae-accuracy` (against the functions, in `REPORTED`: shown, not counted). fp32 keeps
+   one gated accuracy step because gpnae_model's fp32 negative sigmoid does not match the RTL (`--model hw` fails 9 of
+   10 patterns, sigmoid only, as `g11_hw32` did on 2026-09-28; a GPNAE item). The steps run without make check's own
+   variables (`STEP_ENV_DROP`), so `make check TEST=x` cannot narrow a gated step.
 10. **regression.py keeps an unused `get_polynomial_terms` import** for the untracked `run_real_model.py`.
 
 ### Known gaps (deferred minors, from the ledger)
@@ -177,8 +186,10 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 - `--action selftest` does not parse its arguments (`--action selftest --bogus` runs the tests).
 - `--action all` does not flush per line, so a piped console lags; its table names log paths inside the run's tree.
 - perf helpers called without `perf_init()` meet None globals (only `perf_main` and the perf self-tests call it).
-- model_runner's `ACTIONS` sits at the bottom of the file; the `--action` / `--pack` arguments are declared in the
-  sub-parsers for help only.
+- model_runner's `--action` / `--pack` arguments are declared in the sub-parsers for help only.
+- `pack_precheck` (Middle end) reads `COLLAPSE_K`, owned by Device build: a reach-in across sections.
+- In bf16 the two GPNAE steps write the same GPNAE result files, so only the accuracy run's report stays on disk
+  (each step's console log in `testbenches/results/check/` keeps both).
 - No `make -n` self-test for the gemm recipe's `--tile`.
 
 ### Gate
@@ -195,9 +206,12 @@ summary by `sienna_jobs/tlf_gate_summary.py`, launcher `sienna_jobs/tlf_msgs/`).
   TB_sienna_multi. The only text difference is the int8 pack log's info line naming `model_runner.py --action tflite
   --pack` instead of `tflite_pack_run.py` (21fbc8f).
 - `make check` passes in fp32 (6 of 6 steps) and int8 (7 of 7); its regression, pack and tflite match the pkf runs.
-- `make check FMT=bf16` fails at `gpnae-verilator`: GPNAE's regression gates bf16 accuracy against the exact functions
-  at 6.25% and gets sigmoid 7.22% and tanh 8.59% worst, exactly the open item in the `sienna-uniform-format` skill.
-  The lane is bit-exact against its model on this tree (diagnostic `tlf_x_gpnae_bf16_hw`, `--model hw`: 7200 of
-  7200). Not a tooling fault, and the check was not loosened; bf16 `make check` cannot pass until that decision.
+- `make check FMT=bf16` failed at `gpnae-verilator` on 7b711bd: GPNAE's regression gates bf16 accuracy against the
+  exact functions at 6.25% and gets tanh 8.59% worst (sigmoid 7.22%), the open item in `sienna-uniform-format`.
+  The lane is bit-exact against its model (`tlf_x_gpnae_bf16_hw`, `--model hw`: 7200 of 7200). Soham chose to report
+  it, not gate it (2026-10-05); departure 9 has how.
+- Follow-up gate on 972464c (`tlh_check_*`, `make check N=16 TILE=4`): fp32 6 of 6, bf16 6 of 6 gated with
+  `gpnae-accuracy` reported (worst 8.59% against 6.25%, unchanged; bit-exact step 0.0000%), int8 7 of 7. Each run's
+  regression words and cycles, pack log and (int8) TFLite lines are identical to the `pkf_` runs.
 - /proj/work was at its quota during the gate, so the run outputs live on `/proj/scratch/spramanik/sienna_tlf`,
   symlinked into `sienna_jobs/runs` and `snaps`.

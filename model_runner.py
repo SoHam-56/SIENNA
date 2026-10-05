@@ -494,24 +494,24 @@ def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
 
 
 class LayerSim:
-    """TB_sienna_layer: one layer per run; software writes the configuration and the streams, then reads the results."""
+    """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
     def __init__(self, N, lanes, work, fmt_name="fp32", tile_size=4):
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
-        self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_layer_sim")
+        self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
 
     def build(self):
         t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
         regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N,
                                      "fmt_name": self.fmt_name, **t})
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_layer", "TESTBENCH=TB_sienna_layer.sv", "TRACE=0",
+        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0",
                             f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
                             "GEN_PKG=0"],  # the package generate_vectors just wrote
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_sienna_layer build failed")
+            raise RuntimeError("TB_model_run build failed")
 
     def run_job(self, job, tag):
         N = self.N

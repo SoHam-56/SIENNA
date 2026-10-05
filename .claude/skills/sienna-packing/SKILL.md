@@ -68,7 +68,7 @@ Storage estimate (arithmetic, not synthesized): an int8 entry is about 96 bits, 
 to N/2 blocks is about 0.9 kbit per set id, about 14 kbit for 16 ids at N = 64. Per-column copies of every int8
 parameter would be about 98 kbit at N = 64, which is why the table.
 
-`sienna_layer` takes the same as layer configuration; `TB_sienna_layer`'s layer file gains them. Packing is refused
+`sienna_layer` takes the same as layer configuration; `TB_model_run`'s layer file gains them. Packing is refused
 (elaboration error, or an assertion on accept for runtime values) when: N does not divide NUM_LANES; the build pools
 (POOL_H * POOL_W > 1) and pack_shift_i != 0; COLLAPSE_K = 0 and pack_shift_i != 0; a map entry is >= P; accumulate is
 set with pack_shift_i != 0 (no multi-pass packing).
@@ -225,7 +225,7 @@ n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis.
 - `sienna_layer`'s `a_pack_shape` has never been seen to fire: `pack_precheck` refuses its cases first, so only a
   hand-written layer file reaches it.
 - `sienna_layer`'s assertions that mix its inputs (`cfg_load_i`, `a_valid_i`, `w_valid_i`) with state, `a_pack_shape`
-  among them, are aligned only because `TB_sienna_layer` drives 1 ns after the edge; an edge-driving host would be
+  among them, are aligned only because `TB_model_run` drives 1 ns after the edge; an edge-driving host would be
   checked one edge late (not converted to registered terms, Task 9 audit).
 - The packed TFLite models have full-range clamps only (TFLite folds their ReLU into the zero point); a non-trivial
   per-entry clamp is covered by `TB_requant_lanes` and `int8_packed_zp_random_nopool`, not end to end.
@@ -233,7 +233,7 @@ n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis.
   entry 0 (the set's activation).
 - Untested: an unpacked set with `pack_map_i[0] != 0`; a weight-cached packed B reused with a different shift; packed
   sets interleaved with unpacked accumulate pairs; the outputs of empty blocks (partial packing) are not compared.
-- `PACK_ENTRIES` is a parameter of `sienna_top` and `sienna_layer`, but 8 is hard-coded in `TB_sienna_layer`,
+- `PACK_ENTRIES` is a parameter of `sienna_top` and `sienna_layer`, but 8 is hard-coded in `TB_model_run`,
   `model_runner.PACK_ENTRIES` and `regression.py`.
 - Without a pre-packing reference (pass/fail only): SIENNA regression N = 16 T = 2, 8, 16 and N = 32 fp32 / bf16;
   N = 8 is compared only to Task 5's packing tree.

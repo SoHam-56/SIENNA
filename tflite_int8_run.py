@@ -11,9 +11,8 @@ import numpy as np
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import model_runner as mr  # noqa: E402
-import tflite_ref  # noqa: E402
 
-reg = mr.regression
+reg = mr
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
 
 
@@ -63,10 +62,10 @@ def load_layer(path: str) -> dict:
             raise ValueError(f"{path}: dilation is not supported")
         d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
     fa = opt.FusedActivationFunction()
-    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations tflite_ref.activation_range defines
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations mr.activation_range defines
     if fa not in acts:
         raise ValueError(f"{path}: fused activation {fa} is not supported")
-    d["act_range"] = tflite_ref.activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
+    d["act_range"] = mr.activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
     return d
 
 
@@ -76,11 +75,11 @@ def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
     z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
     w = flt["data"].astype(np.int64)
     cout = w.shape[0]
-    if str(saved["rounding"]) != tflite_ref.ROUNDING:
-        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {tflite_ref.ROUNDING}")
+    if str(saved["rounding"]) != mr.ROUNDING:
+        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {mr.ROUNDING}")
     mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
     kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
-    rm, rs = tflite_ref.layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, tflite_ref.ROUNDING)
+    rm, rs = mr.layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, mr.ROUNDING)
     if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
         raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
     if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):

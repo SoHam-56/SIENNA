@@ -12,7 +12,7 @@ sys.path.insert(0, ROOT)
 import gemm_sweep as gs  # noqa: E402
 import model_runner as mr  # noqa: E402
 
-reg = mr.regression
+reg = mr
 ACTS = ["linear", "tanh", "relu", "selu", "sigmoid", "linear", "relu", "tanh"]
 
 

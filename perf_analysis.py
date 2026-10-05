@@ -14,6 +14,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
+import model_runner as mr  # noqa: E402
 import regression as reg  # noqa: E402
 
 REPORT = os.path.join(ROOT, "testbenches", "results", "perf", "pipeline_performance_report.log")
@@ -129,7 +130,7 @@ FMT = "fp32"  # the build's format; main() sets it
 def degree(act: str) -> int:
     """The polynomial degree of act's coefficient set in the build's format: Task 10's SETS_INT8 in int8."""
     if FMT == "int8":
-        return reg.gpnae_model.SETS_INT8[reg.activation_to_code(act)][1]
+        return reg.gpnae_model.SETS_INT8[mr.activation_to_code(act)][1]
     return DEGREE[act]
 
 
@@ -152,7 +153,7 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (6 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
     LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
-    words = len(open(os.path.join(reg.TB_DIR, "matrix_west_0.mem")).read().split())
+    words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split())
     rows = -(-words // P["HOST_WORDS"])
     m = dict(
         # TB_sienna_top: one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
@@ -190,11 +191,11 @@ DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or
 
 def lane_inputs(k: int, P: dict, collapse: bool) -> list:
     """Set k's activation inputs from the bit-exact mesh model, row-major as the wide read hands them to the lanes."""
-    rd = lambda f: np.array([int(w, 16) for w in open(os.path.join(reg.TB_DIR, f)).read().split()], np.int64)
+    rd = lambda f: np.array([int(w, 16) for w in open(os.path.join(mr.TB_DIR, f)).read().split()], np.int64)
     n, f = P["N"], reg.fpu.FORMATS[FMT]
     A, B = (rd(f"matrix_{s}_{k}.mem").reshape(n, n) for s in ("west", "north"))
     C = reg.mesh_model.matmul(f, [(A, B)], n, P["TILE_SIZE"], int(collapse), rd(f"bias_{k}.mem") if P["HAS_BIAS"] else None)
-    return reg.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16 rounds every sum: tails shift
+    return mr.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16 rounds every sum: tails shift
 
 
 def in_tail(x: float, act: str) -> bool:

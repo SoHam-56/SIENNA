@@ -27,14 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPN
 import mesh_model  # noqa: E402
 import gpnae_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
-import ipu  # noqa: E402
-import tflite_ref  # noqa: E402
-
-COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for the bit-exact golden
+import model_runner as mr  # noqa: E402  the numerics and the device build package, one owner each
+from model_runner import (  # noqa: E402
+    FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _check_rounding, _config_items, activate_int8, activation_to_code,
+    apply_activation, bits_float, drop_zp, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
+    quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
 
 # Ensure we can import the mesh helpers
-ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
 
 from conv_tests import _basic_pair, _general_pair, _im2col_patches, _kernel_size
@@ -42,7 +41,6 @@ from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
-TB_DIR = os.path.join(ROOT, "testbenches")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -62,44 +60,6 @@ hdr = lambda s: f"{_O}{_B}{s}{_X}"
 # =============================================================================
 
 
-# Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
-# No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
-SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its banks, ACC_BANKS=RESULT_BANKS=4); the testbenches read it from the package
-
-ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
-
-# Number formats a build may use, as (exponent bits, mantissa bits); every word of the pipeline is in the build's format.
-FORMATS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # int8: EXP_W = 0, 8-bit two's-complement codes
-
-
-def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
-    """x rounded to the operand format (nearest, ties to even), as float32; subnormals flush to zero as the RTL reads them."""
-    x = np.asarray(x, dtype=np.float32)
-    if fmt == "fp32":
-        return x
-    if fmt == "int8":  # int8 codes, as float32 values holding integers
-        return np.clip(np.rint(x), -128, 127).astype(np.float32)
-    if fmt == "bf16":
-        u = x.view(np.uint32).astype(np.uint64)
-        u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
-        y = u.astype(np.uint32).view(np.float32)
-        return np.where((u.astype(np.uint32) & 0x7F800000) == 0, np.copysign(np.float32(0), y), y).astype(np.float32)
-    h = x.astype(np.float16)
-    h = np.where((h.view(np.uint16) & 0x7C00) == 0, np.copysign(np.float16(0), h), h)
-    return h.astype(np.float32)
-
-
-def op_hex(data, fmt: str) -> list:
-    """Values as hex words of the operand format, after rounding: 8 digits for fp32, 4 for bf16 and fp16."""
-    v = op_round(np.asarray(data, dtype=np.float32).flatten(), fmt)
-    if fmt == "int8":
-        return [f"{int(b) & 0xFF:02x}" for b in v.astype(np.int64)]
-    if fmt == "fp32":
-        return [f"{int(b):08x}" for b in v.view(np.uint32)]
-    bits = (v.view(np.uint32) >> 16) if fmt == "bf16" else v.astype(np.float16).view(np.uint16)
-    return [f"{int(b):04x}" for b in bits]
-
-
 def write_op_mem(path: str, data, fmt: str) -> None:
     """Operands as hex words of the format's width; fp32 keeps the 8-digit words of write_mem."""
     if fmt == "fp32":
@@ -107,44 +67,6 @@ def write_op_mem(path: str, data, fmt: str) -> None:
         return
     with open(path, "w") as fh:
         fh.write("".join(w + "\n" for w in op_hex(data, fmt)))
-
-# Polynomial terms per activation, as passed to the TYTAN controller.
-ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
-
-
-def activation_to_code(act: str) -> int:
-    key = act.lower()
-    if key not in ACTIVATION_CODES:
-        raise ValueError(
-            f"unsupported activation {act!r}: GPNAE implements only "
-            f"{sorted(ACTIVATION_CODES)}. Control word 0 is not a pass-through "
-            f"mode -- selecting it stalls the pipeline until timeout."
-        )
-    return ACTIVATION_CODES[key]
-
-
-def get_polynomial_terms(act: str) -> int:
-    key = act.lower()
-    if key not in ACTIVATION_TERMS:
-        raise ValueError(f"unsupported activation {act!r}")
-    return ACTIVATION_TERMS[key]
-
-
-def apply_activation(x: np.ndarray, act: str) -> np.ndarray:
-    act = act.lower()
-    if act == "selu":
-        alpha = 1.6732632423543772848170429916717
-        scale = 1.0507009873554804934193349852946
-        return scale * np.where(
-            x > 0, x, alpha * (np.exp(np.clip(x, -50, 50)) - 1)
-        ).astype(np.float32)
-    if act == "sigmoid":
-        return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
-    if act == "tanh":
-        return np.tanh(x).astype(np.float32)
-    if act == "relu":
-        return np.where(x > 0, x, np.float32(0.0)).astype(np.float32)
-    return x.copy()  # linear
 
 
 def apply_maxpool_2d(
@@ -244,17 +166,6 @@ def apply_dropout(x: np.ndarray, p=0.5, training=False, seed=1, num_lanes=16) ->
     return out.reshape(x.shape)
 
 
-def fmt_bits(x, fmt: str) -> np.ndarray:
-    """Values already rounded to the format (op_round), as its bit patterns."""
-    x = np.asarray(x, dtype=np.float32)
-    return np.array([int(h, 16) for h in op_hex(x, fmt)], dtype=np.int64).reshape(x.shape)
-
-
-def bits_float(b, fmt: str) -> np.ndarray:
-    f = fpu.FORMATS[fmt]
-    return (np.asarray(b, dtype=np.int64) << (23 - f.m)).astype(np.uint32).view(np.float32)
-
-
 def write_bits(path: str, bits, fmt: str) -> None:
     d = (fpu.FORMATS[fmt].w + 3) // 4
     with open(path, "w") as fh:
@@ -302,7 +213,7 @@ def _golden_bits(passes, bias, cfg: dict, act: str, drop_seed: int, fmt: str) ->
     f = fpu.FORMATS[fmt]
     N = cfg.get("n", 16)
     C = mesh_model.matmul(f, [(_pad_square(a, N), _pad_square(b, N)) for a, b in passes], N, cfg.get("tile_size", 4),
-                          cfg.get("collapse_k", COLLAPSE_K), bias)
+                          cfg.get("collapse_k", mr.COLLAPSE_K), bias)
     rom = gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
     A = gpnae_model.Lane(f, rom).run(C, activation_to_code(act))
     P = _maxpool_bits(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1), f)
@@ -323,101 +234,6 @@ def _dropout_bits(P, cfg: dict, drop_seed: int, f) -> np.ndarray:
 # ===== int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden =====
 
 REQ_HEAD = 8  # layer-wide words heading requant_<k>.mem: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout
-
-
-def wrap32(x) -> np.ndarray:
-    """int64 values wrapped to int32, as the mesh's two's-complement accumulate does."""
-    return ((np.asarray(x, dtype=np.int64) + (1 << 31)) % (1 << 32)) - (1 << 31)
-
-
-def imatmul(a, b) -> np.ndarray:
-    """Exact integer product: int8 x int8 terms and their sums stay below 2^53, so float64 holds every partial sum."""
-    return np.rint(np.asarray(a, np.float64) @ np.asarray(b, np.float64)).astype(np.int64)
-
-
-def quant_act(x) -> tuple:
-    """(q, scale, zero point) of an activation tensor as TFLite PTQ picks them: asymmetric int8 over its range widened to hold 0."""
-    x = np.asarray(x, dtype=np.float64)
-    lo, hi = min(0.0, float(x.min())), max(0.0, float(x.max()))
-    scale = (hi - lo) / 255.0 if hi > lo else 1.0
-    zp = int(np.clip(np.rint(-128.0 - lo / scale), -128, 127))
-    return np.clip(np.rint(x / scale) + zp, -128, 127).astype(np.int64), scale, zp
-
-
-def quant_weights(w) -> tuple:
-    """(q, per-column scales) of a weight matrix as TFLite quantizes weights: symmetric per output channel, zero point 0, codes -127..127."""
-    w = np.asarray(w, dtype=np.float64)
-    s = np.max(np.abs(w), axis=0) / 127.0
-    s = np.where(s > 0, s, 1.0)
-    return np.clip(np.rint(w / s[None, :]), -127, 127).astype(np.int64), s
-
-
-def fold_bias(bias, s_a: float, s_w, z_a: int, B_q) -> np.ndarray:
-    """The mesh's int32 bias: TFLite's bias minus z_a * sum_k B_q[k, c], so the mesh's sum of a * w is TFLite's sum of (a - z_a) * w."""
-    B_q = np.asarray(B_q, np.int64)
-    b_q = np.zeros(B_q.shape[1], np.int64) if bias is None else \
-        np.rint(np.asarray(bias, np.float64) / (s_a * np.asarray(s_w, np.float64))).astype(np.int64)
-    return wrap32(b_q - z_a * B_q.sum(axis=0))
-
-
-def requantize(acc, rq: dict) -> np.ndarray:
-    """ipu.requant of int32 sums (rows x channels) with channel c's multiplier and shift on column c."""
-    acc = np.asarray(acc, np.int64)
-    m = np.broadcast_to(np.asarray(rq["mult"], np.int64)[None, :acc.shape[1]], acc.shape)
-    s = np.broadcast_to(np.asarray(rq["shift"], np.int64)[None, :acc.shape[1]], acc.shape)
-    return np.asarray(ipu.requant(acc, m, s, rq["zp"], rq["amin"], rq["amax"], tflite_ref.ROUNDING), np.int64)
-
-
-def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
-    """Requantize and GPNAE parameters for int32 sums acc (rows x channels) as TFLite PTQ picks them; with rng, random words per channel."""
-    acc = np.asarray(acc, np.int64)
-    s_w = np.asarray(s_w, np.float64)
-    real = acc * (s_a * s_w)[None, :]
-    if act == "relu":
-        real = np.maximum(real, 0.0)
-    _, s_out, z_out = quant_act(real)
-    qm = [tflite_ref.quantize_multiplier(s_a * float(s) / s_out) for s in s_w]
-    mult = np.array([m for m, _ in qm], np.int64)
-    shift = np.array([e for _, e in qm], np.int64)
-    if rng is not None:  # every normalized multiplier, and right shifts 0..12 (TFLite's left shift can overflow int32)
-        mult = rng.randint(1 << 30, 1 << 31, s_w.size).astype(np.int64)
-        shift = rng.randint(-12, 1, s_w.size).astype(np.int64)
-    mx, shx = gpnae_model.rescale_params(s_out)
-    rq = dict(mult=mult, shift=shift, zp=z_out, amin=max(-128, z_out) if act == "relu" else -128, amax=127,
-              mx=mx, shx=shx, s_out=s_out)
-    if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
-        rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
-    x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
-    x_hi = gpnae_model.SELU_POS_SAT / 2048.0  # the lane's SELU: Q4.11 below 0, lambda * x exact up to here (int32 in 2^-22)
-    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, x_hi).astype(np.float32), "selu"))
-    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -22 / s_selu)  # the lane's SELU value, in units of 2^-22, to its int8 code (D-4)
-    rq.update(mout=int(mout), shout=int(shout), zout=z_selu, s_selu=s_selu)
-    return rq
-
-
-def selu_saturates(mx: int, shx: int, z_in: int, q) -> np.ndarray:
-    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in), unsaturated, to x >= 487.29, where lambda * x leaves int32 in 2^-22."""
-    return gpnae_model.selu_pos_saturates(gpnae_model.rescale_wide(np.asarray(q, np.int64), int(z_in), int(mx), int(shx)))
-
-
-def int8_lane():
-    f = gpnae_model.FORMATS["int8"]
-    return gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
-
-
-def activate_int8(R, act: str, rq: dict) -> np.ndarray:
-    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters."""
-    code = activation_to_code(act)
-    R = np.asarray(R, np.int64)
-    if code in (4, 5):
-        return R.copy()
-    par = gpnae_model.Int8Params(mx=rq["mx"], shx=rq["shx"], zin=rq["zp"], mout=rq["mout"], shout=rq["shout"], zout=rq["zout"])
-    return np.asarray(int8_lane().run(R, code, par), np.int64)
-
-
-def drop_zp(act: str, rq: dict) -> int:
-    """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
-    return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
 
 
 def _maxpool_int(x, ph: int, pw: int, pad: int) -> np.ndarray:
@@ -444,24 +260,6 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
         return C, R, A, P, P.copy()
     keep = dropout_keep(P.size, cfg.get("dropout_p", 0.5), drop_seed, cfg.get("lanes", 32))
     return C, R, A, P, np.where(keep, P.flatten(), drop_zp(act, rq)).reshape(P.shape)
-
-
-def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
-    """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
-    assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
-               for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
-    acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
-    return activate_int8(requantize(acc, rq), act, rq)
-
-
-def _check_rounding() -> None:
-    """sienna_fmt_pkg::REQ_ROUNDING must be the variant G0 pinned, as ipu and tflite_ref read it, or golden and RTL round apart."""
-    pkg = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
-    m = re.search(r'localparam string REQ_ROUNDING\s*=\s*"(\w+)"', open(pkg).read())
-    rtl = m.group(1) if m else "(no REQ_ROUNDING)"
-    if tflite_ref.ROUNDING is None or rtl != tflite_ref.ROUNDING or ipu.REQ_ROUNDING != tflite_ref.ROUNDING:
-        raise ValueError(f"sienna_fmt_pkg rounds {rtl}, ipu.REQ_ROUNDING is {ipu.REQ_ROUNDING}, "
-                         f"tflite_ref.ROUNDING (rounding.txt) is {tflite_ref.ROUNDING}")
 
 
 def _decoy_params(N: int) -> dict:
@@ -605,59 +403,6 @@ def build_conv_matrices(N: int, conv_type: str, seed: int, stride=None) -> tuple
         K = _kernel_size(N)
         return _basic_pair(img_size=K * K, K=K, seed=seed)
     return _general_pair(N, seed)[0]  # 3x3 kernel, depth zero-padded to N
-
-
-def write_sv_package(path: str, items: list) -> None:
-    with open(path, "w") as f:
-        f.write("// Auto-Generated Configuration Package\npackage test_config_pkg;\n\n")
-        for name, val, vtype in items:
-            kw = "shortreal" if vtype == "float" else "int"
-            f.write(f"  localparam {kw} {name} = {val};\n")
-        f.write("\nendpackage\n")
-
-
-def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
-                  use_bias: bool, drop_seed: int) -> list:
-    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
-    N = cfg.get("n", 16)
-    sram_depth = N * N
-    return [
-        ("N", N, "int"),
-        ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
-        ("NUM_LANES", cfg.get("lanes", 32), "int"),
-        ("HOST_WORDS", cfg.get("host_words", N), "int"),
-        ("EXP_W", FORMATS[fmt][0], "int"),
-        ("MAN_W", FORMATS[fmt][1], "int"),
-        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
-        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
-        ("IS_INT", int(fmt == "int8"), "int"),
-        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
-        ("SRAM_DEPTH", sram_depth, "int"),
-        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
-        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
-        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
-        ("IN_ROWS", N, "int"),
-        ("IN_COLS", N, "int"),
-        ("POOL_H", cfg.get("pool_h", 2), "int"),
-        ("POOL_W", cfg.get("pool_w", 2), "int"),
-        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
-        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
-        ("PADDING", cfg.get("padding", 1), "int"),
-        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
-        ("LFSR_WIDTH", 32, "int"),
-        ("CONTROL_WIDTH", 3, "int"),
-        ("NUM_SETS", num_sets, "int"),
-        ("SETS_IN_FLIGHT", credits, "int"),
-        ("HAS_BIAS", int(use_bias), "int"),
-        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
-        ("ACCUM_PASSES", passes, "int"),
-        ("MIXED_LEN", len(mixed), "int"),
-        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
-        ("PACKED", int(bool(cfg.get("packed", False))), "int"),
-        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
-        ("DROPOUT_SEED", drop_seed, "int"),
-        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
-    ]
 
 
 def float_to_hex_str(f: float) -> str:
@@ -1303,7 +1048,7 @@ def write_pkg(N: int, T: int, test: str, lanes: int = 32, host_words: int = None
     bad = {k: got.get(k) for k in want if got.get(k) != want[k]}
     if bad:
         sys.exit(f"[ERROR] pkg: {path} has {bad}, expected {want}")
-    print(f"PACKAGE OK: {fmt_name} {test} N={N} TILE={T} LANES={lanes} COLLAPSE_K={COLLAPSE_K} -> {path}")
+    print(f"PACKAGE OK: {fmt_name} {test} N={N} TILE={T} LANES={lanes} COLLAPSE_K={mr.COLLAPSE_K} -> {path}")
 
 
 def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, host_words: int = None,
@@ -1311,7 +1056,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     _check_dropout_generator()
     print(hdr(f"\n{'═'*70}\n  SIENNA PIPELINE — Regression Suite\n{'═'*70}"))
     tests_to_run = [t for t in PIPELINE_TESTS if fmt_name in t.get("formats", tuple(FORMATS))]  # int8-only tests skip the floats
-    if COLLAPSE_K == 0:  # the collapse-k 0 mesh refuses packed sets (a_pack_collapsed), as the mesh regression skips them
+    if mr.COLLAPSE_K == 0:  # the collapse-k 0 mesh refuses packed sets (a_pack_collapsed), as the mesh regression skips them
         tests_to_run = [t for t in tests_to_run if not t.get("packed")]
 
     if target_test:
@@ -1403,7 +1148,7 @@ if __name__ == "__main__":
         "--test", type=str, default=None, help="regression: tests whose name contains this; pkg: one exact test name"
     )
     args, unknown = p.parse_known_args()
-    COLLAPSE_K = args.collapse_k
+    mr.COLLAPSE_K = args.collapse_k
 
     if args.action == "regression":
         run_regression(args.matrix_size, args.tile_size, args.test, args.lanes, args.host_words, args.fmt_name)

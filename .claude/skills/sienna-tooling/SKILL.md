@@ -5,8 +5,10 @@ description: Use when running, changing or extending SIENNA's Python tooling - t
 
 # SIENNA tooling: two scripts
 
-**Status: implemented 2026-10-05 on branch `tooling` (SIENNA only; not pushed): b396aeb..fb68726 plus this skill's
-commit; the final gate (`tlf_*`, `sienna_report/tooling_gate.log`) is pending.** Design approved 2026-10-05 (Soham:
+**Status: implemented and verified 2026-10-05 on branch `tooling` (SIENNA only; not pushed), gated tree 7b711bd
+(b396aeb..7b711bd; the commit after it changes only this skill). Final gate `tlf_*` (`sienna_report/tooling_gate.log`):
+all 106 packing-gate configurations identical to `pkf_*`, `make check` passes in fp32 and int8; `make check FMT=bf16`
+fails only on GPNAE's bf16 activation accuracy, the open decision of 2026-09-28 (see Gate).** Design approved 2026-10-05 (Soham:
 "keep submodule scripts, delete old ones, go ahead"). Soham asked for exactly two
 Python scripts in SIENNA: one for hardware sanity, one that runs models and stands as the reference host software a
 software team builds its own layer from ("this model runner is supposed to be the compiler").
@@ -184,5 +186,18 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 Each task compared its flows on the farm with the final packing gate (`pkf_*`): regression words and cycles
 (`int8_cmp_reg.py`), pack, gemm, TFLite and model result lines, the perf report, rq-vectors, the oracle and pack-models
 files; all identical (task reports in the ledger directory). `tl4_check_int8` (`make check FMT=int8 N=16 TILE=4`) passed
-every step. The final gate reruns the packing gate's list with prefix `tlf_` on the final tree and records it in
-`sienna_report/tooling_gate.log` (a new file beside `packing_gate.log`, which stays the packing record).
+every step. The final gate reran the packing gate's list with prefix `tlf_` on 7b711bd (snapshot from clean tracked trees) and
+is recorded in `sienna_report/tooling_gate.log` (a new file beside `packing_gate.log`, which stays the packing record;
+summary by `sienna_jobs/tlf_gate_summary.py`, launcher `sienna_jobs/tlf_msgs/`). 108 of 109 runs pass:
+- All 106 `pkf_` configurations pass and are identical to their `pkf_` run: regression words and cycles at N = 8, 16
+  (T = 2-16) and 32 and collapse-k 0, the mesh sweeps, the unit benches, `make pack` at every N / T and format and the
+  8 `--act` sweeps, the TFLite single-layer and packed runs, gemm, the four lints, `make model`, `--engine sets` and
+  TB_sienna_multi. The only text difference is the int8 pack log's info line naming `model_runner.py --action tflite
+  --pack` instead of `tflite_pack_run.py` (21fbc8f).
+- `make check` passes in fp32 (6 of 6 steps) and int8 (7 of 7); its regression, pack and tflite match the pkf runs.
+- `make check FMT=bf16` fails at `gpnae-verilator`: GPNAE's regression gates bf16 accuracy against the exact functions
+  at 6.25% and gets sigmoid 7.22% and tanh 8.59% worst, exactly the open item in the `sienna-uniform-format` skill.
+  The lane is bit-exact against its model on this tree (diagnostic `tlf_x_gpnae_bf16_hw`, `--model hw`: 7200 of
+  7200). Not a tooling fault, and the check was not loosened; bf16 `make check` cannot pass until that decision.
+- /proj/work was at its quota during the gate, so the run outputs live on `/proj/scratch/spramanik/sienna_tlf`,
+  symlinked into `sienna_jobs/runs` and `snaps`.

@@ -33,7 +33,7 @@ $(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a 
 endif
 endif
 
-# EXP_W MAN_W IS_INT of each FMT, as regression.py's FORMATS writes them into test_config_pkg.sv.
+# EXP_W MAN_W IS_INT of each FMT, as model_runner.py's FORMATS writes them into test_config_pkg.sv.
 FMT_FIELDS_fp32 = 8 23 0
 FMT_FIELDS_bf16 = 8 7 0
 FMT_FIELDS_int8 = 0 7 1

@@ -118,7 +118,7 @@ module sienna_layer #(
     return (x + DIM_W'(N - 1)) / DIM_W'(N);
   endfunction
 
-  // Polynomial terms per activation, the same table regression.py uses.
+  // Polynomial terms per activation, the same table as model_runner.py's ACTIVATION_TERMS.
   function automatic logic [ADDR_LINES:0] terms(input logic [CONTROL_WIDTH-1:0] a);
     case (a)
       3'b001:  return 14;

@@ -262,7 +262,7 @@ help:
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
 	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1); 0 only for sm-verilator, as TB_sienna_top builds 1"
-	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); regression: name filter"
+	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"
 	@echo "  verilator, lint, debug, perf and vcs run make pkg first, then check its format and N/TILE/LANES"
@@ -287,13 +287,13 @@ help:
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
 	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
-	@echo "  make regression FMT=int8          - Full pipeline regression (TEST=<substring> narrows it)"
+	@echo "  make pipeline FMT=int8            - Full pipeline regression (TEST=<substring> narrows it)"
 	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make check FMT=int8               - One verdict: self-tests, sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
+	@echo "  make regression FMT=int8          - One verdict: self-tests, sm-verilator, gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
 	@echo "                                      bf16: gpnae-verilator is bit-exact and gpnae-accuracy is reported, not gated"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
@@ -510,7 +510,7 @@ check-files:
 		echo "  $$missing file(s) missing!"; exit 1; \
 	fi
 
-regression:
+pipeline:
 	@echo "=== Running Sienna Pipeline Regression: FMT=$(FMT) ==="
 	$(PYTHON) regression.py \
 		--matrix-size $(N) \
@@ -559,8 +559,8 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), regression, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
-check:
+# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), pipeline, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
+regression:
 	$(PYTHON) regression.py --action all --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,4 +581,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv regression pkg pkg-check model gemm perf-analysis tflite pack check
+        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack regression

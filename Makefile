@@ -279,6 +279,7 @@ help:
 	@echo "Individual Module Targets:"
 	@echo "  make sm-verilator      - Systolic Mesh only: its regression in FMT at N, TILE, COLLAPSE_K"
 	@echo "  make gpnae-verilator   - GPNAE only: its regression in FMT on gpnae_poly, the lane sienna_top uses"
+	@echo "  make gpnae-verilator GPNAE_MODEL=hw - the same, bit-exact against the lane model instead of accuracy"
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
@@ -411,9 +412,11 @@ sm-verilator:
 		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)"
 
 # GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
+# GPNAE_MODEL: exact (accuracy against the functions) or hw (bit-exact against gpnae_poly's model); int8 always runs both.
+GPNAE_MODEL ?= exact
 gpnae-verilator:
-	@echo "=== GPNAE only: FMT=$(FMT), gpnae_poly lane ==="
-	cd GPNAE && $(PYTHON) regression.py --lane poly --format $(FMT)
+	@echo "=== GPNAE only: FMT=$(FMT), gpnae_poly lane, model $(GPNAE_MODEL) ==="
+	cd GPNAE && $(PYTHON) regression.py --lane poly --format $(FMT) --model $(GPNAE_MODEL)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS

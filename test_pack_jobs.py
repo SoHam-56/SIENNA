@@ -123,11 +123,11 @@ def _packed(N, rng_seed=9):
 def _refused(job, N, lanes, why):
     with tempfile.TemporaryDirectory() as d:
         try:
-            mr.LayerSim(N, lanes, d).run_job(job, "t")  # every refusal is raised before the simulator would run
+            mr.RtlLayer(N, lanes, d).run_job(job, "t")  # every refusal is raised before the simulator would run
         except ValueError as e:
             assert not os.listdir(d), f"{why}: a layer file was written before the refusal"
             return str(e)
-    raise AssertionError(f"LayerSim accepted {why}")
+    raise AssertionError(f"RtlLayer accepted {why}")
 
 
 def test_precheck_accepts_legal():

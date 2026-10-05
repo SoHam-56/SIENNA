@@ -135,11 +135,11 @@ def main():
         ap.error("int8 runs on the layer engine only")
     os.makedirs(a.work, exist_ok=True)
     if a.emulate:
-        sim = mr.EmuSim(a.n, a.lanes, a.work)
+        sim = mr.Emulator(a.n, a.lanes, a.work)
     elif a.engine == "layer":
-        sim = mr.LayerSim(a.n, a.lanes, a.work, a.fmt_name)
+        sim = mr.RtlLayer(a.n, a.lanes, a.work, a.fmt_name)
     else:
-        sim = mr.Sim(a.n, a.lanes, a.work, a.host_gaps)
+        sim = mr.RtlSets(a.n, a.lanes, a.work, a.host_gaps)
     sim.build()
     shapes = [(f"grid_{m}x{k}x{n}", m, k, n) for m in GRID_M for k in GRID_K for n in GRID_N] + TRANSFORMER
     if a.quick:
@@ -161,11 +161,11 @@ def main():
         B = mr.op_round(rng.uniform(-1, 1, (k, n)), a.fmt_name)
         job = {"terms": [(A, B)], "bias": None, "act": "linear", "shape": (m, n)}
         t0 = time.time()
-        y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.LayerSim) else mr.run_job_hw(job, sim, name)
+        y, sets, cyc = sim.run_job(job, name) if isinstance(sim, mr.RtlLayer) else mr.run_job_hw(job, sim, name)
         ref = A.astype(np.float64) @ B.astype(np.float64)
         err = float(np.max(np.abs(y - ref)) / (np.max(np.abs(ref)) or 1.0))
         mism = 0
-        if a.fmt_name != "fp32" and isinstance(sim, mr.LayerSim):  # narrow formats: every output bit-exact
+        if a.fmt_name != "fp32" and isinstance(sim, mr.RtlLayer):  # narrow formats: every output bit-exact
             mism = int(np.sum(mr.fmt_bits(y, a.fmt_name) != exact_layer(A, B, None, "linear", a.n, a.fmt_name)))
         macs = m * k * n
         r = {"shape": name, "M": m, "K": k, "N": n, "sets": sets, "cycles": cyc, "macs": macs,
@@ -184,7 +184,7 @@ def main():
         if a.fmt_name != "fp32" and mism:
             print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
             sys.exit(1)
-    if isinstance(sim, mr.LayerSim):
+    if isinstance(sim, mr.RtlLayer):
         # The polynomial activations through the layer engine, with a bias; GPNAE approximates within about 2%.
         rng = np.random.RandomState(5)
         A = mr.op_round(rng.uniform(-1, 1, (64, 48)), a.fmt_name)

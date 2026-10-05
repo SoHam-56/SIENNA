@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Runs tflite float models end to end on the SIENNA RTL: every multiply-accumulate on the pipeline, host only reshapes and softmax."""
+"""Runs tflite float models end to end on the SIENNA RTL: every multiply-accumulate on the pipeline, host only reshapes and softmax (--action model, the default; --action tflite runs the int8 TFLite layers)."""
 import argparse
+import glob
 import json
 import math
 import os
@@ -369,7 +370,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
 
 
 def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
-    """test_config_pkg.sv of the model simulators' build (Sim, LayerSim): matmul_relu_nopool's configuration in fmt, no stimulus."""
+    """test_config_pkg.sv of the model simulators' build (RtlSets, RtlLayer): matmul_relu_nopool's configuration in fmt, no stimulus."""
     os.makedirs(TB_DIR, exist_ok=True)
     if fmt == "int8":
         _check_rounding()
@@ -631,7 +632,7 @@ def read_outputs(path, fmt="fp32"):
 # =============================================================================
 
 
-class Sim:
+class RtlSets:
     """The TB_sienna_model binary, built once per configuration and run once per layer."""
 
     def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
@@ -674,7 +675,7 @@ class Sim:
         return outs, n, cyc
 
 
-class EmuSim(Sim):
+class Emulator(RtlSets):
     """Numpy stand-in for the RTL with the same set stream: checks tiling and reassembly, not the hardware."""
 
     def build(self):
@@ -852,7 +853,7 @@ def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
         raise ValueError(f"{tag}: a packed layer needs all {PACK_ENTRIES} table entries, not {len(pk['ents'])}")
 
 
-class LayerSim:
+class RtlLayer:
     """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
     def __init__(self, N, lanes, work, fmt_name="fp32", tile_size=4):
@@ -979,7 +980,7 @@ def execute(model, x, sim=None, log=None):
         if sim is None:
             y = ref.astype(np.float32)
             n = cyc = 0
-        elif isinstance(sim, LayerSim):
+        elif isinstance(sim, RtlLayer):
             y, n, cyc = sim.run_job(job, f"L{li:02d}")
         else:
             y, n, cyc = run_job_hw(job, sim, f"L{li:02d}")
@@ -1059,8 +1060,199 @@ MODELS = {
 }
 
 
-def main():
+# ── TFLite runs ──────────────────────────────────────────────────────────────
+
+MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
+
+
+def load_layer(path: str) -> dict:
+    """The one CONV_2D or FULLY_CONNECTED operator of an int8 .tflite, with its tensors' codes and quantization."""
+    import tflite
+    from tflite.ActivationFunctionType import ActivationFunctionType as AF
+    from tflite.BuiltinOperator import BuiltinOperator as BO
+
+    names = {v: k for k, v in BO.__dict__.items() if not k.startswith("_")}
+    m = tflite.Model.GetRootAsModel(open(path, "rb").read(), 0)
+    g = m.Subgraphs(0)
+    code = lambda op: m.OperatorCodes(op.OpcodeIndex())
+    kinds = [names[max(code(g.Operators(i)).BuiltinCode(), code(g.Operators(i)).DeprecatedBuiltinCode())]
+             for i in range(g.OperatorsLength())]
+    if kinds not in (["CONV_2D"], ["FULLY_CONNECTED"]):
+        raise ValueError(f"{path}: operators {kinds}; expected one CONV_2D or FULLY_CONNECTED with int8 input and output")
+    op = g.Operators(0)
+
+    def tensor(i):
+        if i < 0:
+            return None
+        t = g.Tensors(i)
+        q = t.Quantization()
+        buf = m.Buffers(t.Buffer()).DataAsNumpy()
+        data = None
+        if not isinstance(buf, int) and buf is not None and len(buf):
+            data = np.frombuffer(buf.tobytes(), dtype={9: np.int8, 2: np.int32}[t.Type()]).reshape(tuple(t.ShapeAsNumpy()))
+        return dict(type=t.Type(), shape=tuple(t.ShapeAsNumpy()), data=data,
+                    scale=np.atleast_1d(q.ScaleAsNumpy()).astype(np.float32),
+                    zp=np.atleast_1d(q.ZeroPointAsNumpy()).astype(np.int64))
+
+    ins = [op.Inputs(j) for j in range(op.InputsLength())]
+    inp, flt = tensor(ins[0]), tensor(ins[1])
+    bias = tensor(ins[2]) if len(ins) > 2 else None
+    out = tensor(op.Outputs(0))
+    if inp["type"] != 9 or flt["type"] != 9 or out["type"] != 9:  # 9 is INT8
+        raise ValueError(f"{path}: input, filter and output must be int8")
+    if np.any(flt["zp"] != 0):
+        raise ValueError(f"{path}: TFLite's int8 filters are symmetric; a non-zero filter zero point is not supported")
+    opt = (tflite.Conv2DOptions if kinds[0] == "CONV_2D" else tflite.FullyConnectedOptions)()
+    t = op.BuiltinOptions()
+    opt.Init(t.Bytes, t.Pos)
+    d = dict(kind=kinds[0], input=inp, filter=flt, bias=bias, output=out)
+    if kinds[0] == "CONV_2D":
+        if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
+            raise ValueError(f"{path}: dilation is not supported")
+        d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
+    fa = opt.FusedActivationFunction()
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations activation_range defines
+    if fa not in acts:
+        raise ValueError(f"{path}: fused activation {fa} is not supported")
+    d["act_range"] = activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
+    return d
+
+
+def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
+    """(int8 job for RtlLayer, output shape) of one layer on the interpreter's input codes x; saved is the layer's G0 npz."""
+    inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
+    z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
+    w = flt["data"].astype(np.int64)
+    cout = w.shape[0]
+    if str(saved["rounding"]) != ROUNDING:
+        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {ROUNDING}")
+    mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
+    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
+    rm, rs = layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, ROUNDING)
+    if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
+        raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
+    if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):
+        raise ValueError(f"clamp {layer['act_range']} differs from the npz's ({int(saved['act_min'])}, {int(saved['act_max'])})")
+    if layer["kind"] == "CONV_2D":
+        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
+                          pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
+        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
+        W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
+        shape = (len(x), oh, ow, cout)
+    else:
+        W = w.T
+        X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
+        shape = (X.shape[0], cout)
+    bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
+    hw_bias = wrap32(bq - z_in * W.sum(axis=0))
+    amin, amax = layer["act_range"]
+    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
+    job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
+           "req": req}
+    return job, shape
+
+
+def tflite_main(argv=None):
+    """Runs testbenches/tflite_int8/'s single-layer int8 models through sienna_layer in int8, bit for bit against the interpreter's saved outputs."""
+    ap = argparse.ArgumentParser(description=tflite_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="tflite")
+    ap.add_argument("--pack", action="store_true", help="run the packed TFLite layers instead (python model_runner.py --action tflite --pack --help)")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--models", default=MODEL_DIR, help="<name>.tflite files, each with <name>.npz holding x_test and y_test")
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "int8"))
+    a = ap.parse_args(argv)
+    os.makedirs(a.work, exist_ok=True)
+    rep = open(os.path.join(a.work, f"tflite_int8_N{a.n}_T{a.tile_size}.log"), "w")
+
+    def log(s):
+        print(s, flush=True)
+        rep.write(s + "\n")
+        rep.flush()
+
+    paths = sorted(glob.glob(os.path.join(a.models, "*.tflite")))
+    if not paths:
+        log(f"no .tflite models in {a.models}")
+        sys.exit(1)
+    sim = RtlLayer(a.n, a.lanes, a.work, "int8", a.tile_size)
+    t0 = time.time()
+    sim.build()
+    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
+    bad, covered = 0, False
+    for path in paths:
+        name = os.path.basename(path)[:-len(".tflite")]
+        ref = np.load(path[:-len(".tflite")] + ".npz")
+        x, y = ref["x_test"], ref["y_test"].astype(np.int64)
+        layer = load_layer(path)
+        job, shape = job_of(layer, x, ref)
+        X, W = job["terms"][0]
+        low = int8_layer_exact(X.astype(np.int64), W.astype(np.int64), job["bias"], job["req"], "linear").reshape(shape)
+        got, sets, cyc = sim.run_job(job, name)
+        got = got.reshape(shape)
+        want = y.reshape(shape)
+        per_channel = layer["filter"]["scale"].size > 1
+        z_in = int(layer["input"]["zp"][0])
+        padded = layer["kind"] == "CONV_2D" and layer["same"]
+        covered |= padded and per_channel and z_in != 0
+        m_rtl, m_low = int(np.sum(got != want)), int(np.sum(low != want))
+        bad += int(m_rtl != 0)
+        log(f"MODEL {name}: {layer['kind']} out {shape} z_in {z_in} {'per-channel' if per_channel else 'per-tensor'} "
+            f"{'SAME-padded' if padded else 'unpadded'} clamp {layer['act_range']}: RTL {m_rtl}/{want.size} differ from the "
+            f"interpreter, host lowering {m_low}/{want.size}; {sets} sets, {cyc} cycles")
+    if not covered:
+        log("no SAME-padded per-channel conv with a non-zero input zero point among the models")
+        bad += 1
+    log(f"TFLITE_INT8: {len(paths)} models, {bad} failing")
+    log("RESULT: PASSED" if bad == 0 else "RESULT: FAILED")
+    sys.exit(1 if bad else 0)
+
+
+GROUPS = [["fc8x8_linear", "fc8x4_relu", "fc6x8_relu6"], ["conv3x3_6x6x1x8_linear", "fc16x16_relu"]]
+
+
+def model_of(path):
+    """(pack_jobs model, output shape, interpreter's outputs) of one saved .tflite with its npz."""
+    ref = np.load(path[:-len(".tflite")] + ".npz")
+    layer = load_layer(path)
+    job, shape = job_of(layer, ref["x_test"], ref)
+    (X, W), = job["terms"]
+    return {"W": W, "bias": job["bias"], "act": "linear", "req": job["req"], "inputs": [X]}, shape, ref["y_test"].astype(np.int64)
+
+
+def tflite_pack_main(argv=None):
+    """Groups of TFLite layers share one packed sienna_layer layer; every model's outputs must equal the interpreter's bit for bit."""
+    ap = argparse.ArgumentParser(description=tflite_pack_main.__doc__)
+    ap.add_argument("--n", type=int, default=32)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--models", default=os.path.join(ROOT, "testbenches", "tflite_int8_pack"))
+    a = ap.parse_args(argv)
+    work = os.path.join(ROOT, "testbenches", "results", "int8")
+    os.makedirs(work, exist_ok=True)
+    rep = open(os.path.join(work, f"tflite_pack_N{a.n}_T{a.tile_size}.log"), "w")
+    sim = RtlLayer(a.n, a.lanes, work, "int8", a.tile_size)
+    sim.build()
+    bad = 0
+    for g, names in enumerate(GROUPS):
+        got = [model_of(os.path.join(a.models, f"{n}.tflite")) for n in names]
+        job, recipe = pack_jobs([m for m, _, _ in got], a.n, int8=True)
+        Y, sets, cyc = sim.run_job(job, f"tflp{g}")
+        for (m, shape, y), outs, n in zip(got, unpack(Y, recipe), names):
+            mism = int(np.sum(np.vstack(outs).reshape(shape) != y.reshape(shape)))
+            bad += int(mism != 0)
+            line = f"PACKED {n} (group {g}, b = {a.n >> job['pack']['shift']}): {mism}/{y.size} differ from the interpreter; {sets} sets, {cyc} cycles"
+            print(line, flush=True)
+            rep.write(line + "\n")
+    tail = f"TFLITE_PACK: {sum(len(x) for x in GROUPS)} models in {len(GROUPS)} packed layers, {bad} failing"
+    print(tail)
+    rep.write(tail + "\nRESULT: " + ("PASSED" if bad == 0 else "FAILED") + "\n")
+    sys.exit(1 if bad else 0)
+
+
+def model_main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
     ap.add_argument("--models", default="resnet8,ad01,kws,vww")
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
@@ -1076,9 +1268,9 @@ def main():
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
                     help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.fmt_name == "int8":
-        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with tflite_int8_run.py")
+        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
     os.makedirs(a.work, exist_ok=True)
     report = os.path.join(a.work, f"model_report_N{a.n}.log")
     js = os.path.join(a.work, f"model_results_N{a.n}.json")
@@ -1092,11 +1284,11 @@ def main():
     sim = None
     if not a.no_sim:
         if a.emulate:
-            sim = EmuSim(a.n, a.lanes, a.work, a.host_gaps)
+            sim = Emulator(a.n, a.lanes, a.work, a.host_gaps)
         elif a.engine == "layer":
-            sim = LayerSim(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
+            sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
         else:
-            sim = Sim(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
+            sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
         t0 = time.time()
         sim.build()
         log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
@@ -1138,6 +1330,23 @@ def main():
         results[name]["source"] = source
         json.dump(results, open(js, "w"), indent=1)
     log(f"\nreport {report}\nresults {js}")
+
+
+
+ACTIONS = ("model", "tflite")
+
+
+def main():
+    pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    pre.add_argument("--action", choices=ACTIONS, default="model")
+    pre.add_argument("--pack", action="store_true")
+    a, rest = pre.parse_known_args()
+    if a.action == "model":
+        if a.pack:
+            pre.error("--pack belongs to --action tflite")
+        model_main(rest)
+    else:
+        (tflite_pack_main if a.pack else tflite_main)(rest)
 
 
 if __name__ == "__main__":

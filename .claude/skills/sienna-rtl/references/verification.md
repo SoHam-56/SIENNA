@@ -39,7 +39,7 @@ than values. See known-issues #7 — including a portable `f32()` replacement.
 
 ## Full-pipeline flow
 
-`regression.py` is generator, orchestrator and scoreboard in one file.
+`regression.py` is generator, orchestrator and scoreboard in one file; its numerics (format rounding, `apply_activation`, int8 quantization and requantize) come from `model_runner.py`.
 
 1. `generate_vectors(cfg)` builds A and B, runs the NumPy golden model end to end — `_ref_matmul` → `apply_activation` → `apply_maxpool_2d` → `apply_dropout` — and writes `matrix_west.mem`, `matrix_north.mem`, `expected_output.mem` into `testbenches/`.
 2. It also writes `testbenches/test_config_pkg.sv` and a human-readable `<test>_expected_flow.txt` showing the value of every intermediate stage.

@@ -5,11 +5,13 @@ description: Use when running, changing or extending SIENNA's Python tooling - t
 
 # SIENNA tooling: two scripts
 
-**Status: design approved 2026-10-05 (Soham: "keep submodule scripts, delete old ones, go ahead"); implementation in progress.** Branch `tooling` (SIENNA). Soham asked for exactly two
+**Status: implemented 2026-10-05 on branch `tooling` (SIENNA only; not pushed): b396aeb..fb68726 plus this skill's
+commit; the final gate (`tlf_*`, `sienna_report/tooling_gate.log`) is pending.** Design approved 2026-10-05 (Soham:
+"keep submodule scripts, delete old ones, go ahead"). Soham asked for exactly two
 Python scripts in SIENNA: one for hardware sanity, one that runs models and stands as the reference host software a
 software team builds its own layer from ("this model runner is supposed to be the compiler").
 
-## What exists today (main b1cfacb)
+## Before the move (main b1cfacb)
 
 17 tracked Python files at the SIENNA root and one under testbenches/, about 4,700 lines:
 
@@ -104,6 +106,83 @@ driver needs.
 - A real-silicon backend (a driver speaking the same per-set interface as the device protocol).
 - Moving the submodules' scripts.
 
-## Done
+## As built (2026-10-05)
 
-- TB_sienna_layer renamed TB_model_run (file, module, binary, make arguments, references; it had no dump block).
+Commits on `tooling` (SIENNA; the submodules are untouched: SystolicMesh b1a2c31, GPNAE 0d407a7, AriL cb46ced):
+d49a829 (TB_sienna_layer -> TB_model_run), 3cc5675 (Task 1), 21fbc8f (Task 2), 3217ed7 and 3584a1f (Task 3), ff91381
+(Task 4), fb68726 (comments) and the skill commits. The only tracked Python outside the submodules is `model_runner.py`
+(1,353 lines) and `regression.py` (2,923 lines); the check is the global-constraints command in the implementation plan.
+The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.md`) has the full record.
+
+### Command map (old -> new)
+
+| Before | Now | make |
+|---|---|---|
+| `pack_regression.py [--n --tile --lanes --rows --format --act]` | `regression.py --action pack` (same options) | `make pack` |
+| `gemm_sweep.py [--n --lanes --work --emulate --quick --engine --format --host-gaps]` | `regression.py --action gemm` (same, plus `--tile`, default 4) | `make gemm [TILE=]` |
+| `perf_analysis.py [--sets --configs --n --tile-size --lanes --slices --merge --format ...]` | `regression.py --action perf` (same options) | `make perf-analysis` |
+| `tflite_oracle.py --out D --report F [--seeds --inputs]` | `regression.py --action oracle` (same options) | |
+| `tflite_pack_models.py D` | `regression.py --action pack-models D` | |
+| `gpnae_int8_tflite.py --report F` | `regression.py --action gpnae-tflite --report F` | |
+| `testbenches/gen_rq_lanes.py OUT` | `regression.py --action rq-vectors OUT` | |
+| `python3 test_makefile_fmt.py` (and the other four `test_*.py`) | `regression.py --action selftest` (34 tests) | |
+| | `regression.py --action all [--format --n --tile --lanes]` | `make check` |
+| `tflite_int8_run.py [--n --tile-size --lanes --models --work]` | `model_runner.py --action tflite` (same options) | `make tflite` |
+| `tflite_pack_run.py [--n --tile-size --lanes --models]` | `model_runner.py --action tflite --pack` (same options) | |
+| `model_runner.py --model-dir D ...` | unchanged (`--action model` is the default) | `make model` |
+| `import tflite_ref`; `regression.FORMATS`, `op_round`, `quant_act`, `int8_layer_exact`, `write_sv_package`, ... | `model_runner.X` (regression.py imports them by name, so `regression.X` still resolves) | |
+| `model_runner.LayerSim`, `Sim`, `EmuSim` | `RtlLayer`, `RtlSets`, `Emulator` (no aliases) | |
+| `TB_sienna_layer` | `TB_model_run` | |
+
+Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N*.log`, `tflite_int8_N*_T*.log`,
+`pipeline_performance_report.log`), so the farm comparison scripts read them as before.
+
+### Departures from the design above, each with its reason
+
+1. **model_runner gained sections but was not reorganised.** It has `# ── Numerics ──`, `# ── Device build ──` and
+   `# ── TFLite runs ──`; the frontend, tiling and packing, the layer-file writer (inside `RtlLayer`), the backends and
+   the CLI stay in their old order without new headers, and there is no contents block or separate device-protocol
+   encoder / decoder. The plan was a behaviour-preserving move (code moved verbatim); the layered reorganisation is
+   left as a next step.
+2. **`# ── Device build ──` in model_runner** (`write_sv_package`, `_config_items`, `SETS_IN_FLIGHT`, `COLLAPSE_K`, and a
+   new `write_build_pkg(N, T, lanes, fmt)`) so every global has one owner; `--collapse-k` sets `model_runner.COLLAPSE_K`.
+   `write_build_pkg` writes only `test_config_pkg.sv` (byte-identical, checked in scratch copies); the old build path
+   also wrote stimulus `.mem` files that neither TB_model_run nor TB_sienna_model reads.
+3. **model_runner appends the submodule directories to `sys.path`** (not insert): GPNAE and SystolicMesh each have a
+   `regression.py`, and with insert `import regression` after `import model_runner` loaded SystolicMesh's.
+4. **perf reads the RTL in `perf_init()`, not at import** (ruling, Task 3 review): verbatim, `import regression` parsed
+   sienna_fmt_pkg.sv, gpnae_poly.sv and sienna_top.sv, so an RTL change perf cannot read broke every action. perf's
+   results are identical; its errors start "regression.py --action perf:".
+5. **Self-tests are an explicit registry** (`@selftest`, `@perf_selftest` runs `perf_init()` first), not collected by
+   name: the oracle's helper `test_inputs` is a global `test_*` too. Clashing fixture names were renamed (ENV ->
+   MAKE_ENV, write_pkg -> fixture_pkg, ...); 33 moved tests plus one new `test_check_target` = 34; output follows
+   source order.
+6. **Option spellings were kept per script**, so `--tile` (pack, gemm, all) and `--tile-size` (regression, perf,
+   model, tflite) both exist; the Makefile passes the right one. The spec's `--tile` for `--action tflite` is
+   `--tile-size`.
+7. **`make gemm` takes TILE** (the "ignores TILE" warning is gone): `--tile` goes to RtlLayer, both `exact_layer` calls,
+   and RtlSets / Emulator; default 4 keeps the old results.
+8. **Renames inside regression.py to avoid clashes in one namespace:** the pack-models list is `PACK_MODELS`, the
+   rq-vectors constants `RQ_N`, `RQ_LANES`, `RQ_SETS`, `RQ_PER`; the oracle's TensorFlow-built constants are made in
+   `_tf_imports()` after argument parsing, so regression.py imports without TensorFlow.
+9. **`--action all`'s verdict per step** is the exit status plus a scan for `Assertion failed` / `%Error` in the step's
+   log; logs go to `testbenches/results/check/`. It follows GPNAE's own contract: the int8 sigmoid accuracy shortfall
+   is printed "reported, not gated", so `make check` passes with it (an open int8 item, not a tooling one).
+10. **regression.py keeps an unused `get_polynomial_terms` import** for the untracked `run_real_model.py`.
+
+### Known gaps (deferred minors, from the ledger)
+
+- `--action selftest` does not parse its arguments (`--action selftest --bogus` runs the tests).
+- `--action all` does not flush per line, so a piped console lags; its table names log paths inside the run's tree.
+- perf helpers called without `perf_init()` meet None globals (only `perf_main` and the perf self-tests call it).
+- model_runner's `ACTIONS` sits at the bottom of the file; the `--action` / `--pack` arguments are declared in the
+  sub-parsers for help only.
+- No `make -n` self-test for the gemm recipe's `--tile`.
+
+### Gate
+
+Each task compared its flows on the farm with the final packing gate (`pkf_*`): regression words and cycles
+(`int8_cmp_reg.py`), pack, gemm, TFLite and model result lines, the perf report, rq-vectors, the oracle and pack-models
+files; all identical (task reports in the ledger directory). `tl4_check_int8` (`make check FMT=int8 N=16 TILE=4`) passed
+every step. The final gate reruns the packing gate's list with prefix `tlf_` on the final tree and records it in
+`sienna_report/tooling_gate.log` (a new file beside `packing_gate.log`, which stays the packing record).

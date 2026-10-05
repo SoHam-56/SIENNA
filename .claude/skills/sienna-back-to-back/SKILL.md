@@ -37,7 +37,7 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 | `pack_map_i` | sampled with the start: the table entry (0..7) of each column block; entry 0 is the per-set ports below |
 | `pack_act_i`, int8 `pack_zp_i` `pack_min_i` `pack_max_i` `pack_mx_i` `pack_shx_i` `pack_mout_i` `pack_shout_i` `pack_zout_i` | sampled with the start: table entries 1..7 (activation; requantize zero point and clamp; GPNAE words), held per set id like `activation_function_i` |
 
-Measured by `perf_analysis.py` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
+Measured by `perf_analysis.py`, now `regression.py --action perf` (12 streamed sets, N=16, T=4, farm, 2026-09-24) on the current
 defaults: 32 lanes, one-row host writes (`HOST_WORDS = N`), synchronous `SystolicArray` mesh tiles. GFLOPS count the
 8192-FLOP matmul at an **assumed** 950 MHz; no timing run exists.
 
@@ -61,8 +61,8 @@ What each change bought, all measured the same way:
 
 The mesh stage is 77 cycles per set (broadcast 4, tiles 42, reduce 29). It is no longer on the
 critical path; activation is. gpnae_tail now works on four out-of-range elements at once
-(`TAIL_CONTEXTS`), sharing one multiplier and one adder, bit-identical to running them in turn. `python3 perf_analysis.py`
-regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes`, `--n` and
+(`TAIL_CONTEXTS`), sharing one multiplier and one adder, bit-identical to running them in turn. `python3 regression.py --action perf`
+(`make perf-analysis`) regenerates `testbenches/results/perf/pipeline_performance_report.log`; `--lanes`, `--n` and
 `--tile-size` pick another geometry.
 
 ### Larger N (measured 2026-09-24)
@@ -257,7 +257,7 @@ failures, and identical data cannot distinguish a correct second matmul from a
 reused first one. That distinction is what exposed the stale-output bug: feeding
 a different second matrix produced byte-identical results.
 
-`NUM_SETS` must come from `regression.py`'s `write_sv_package()`.
+`NUM_SETS` must come from `write_sv_package()` (model_runner.py, called by regression.py).
 `test_config_pkg.sv` is generated and hand edits survive until the next run.
 
 ## Known hazard, not solved

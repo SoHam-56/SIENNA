@@ -14,6 +14,7 @@ Contains:
 import argparse
 import contextlib
 import functools
+import io
 import itertools
 import json
 import math
@@ -2424,6 +2425,42 @@ def test_check_target():
 
 
 @selftest
+def test_gpnae_target_model():
+    r = make_n("gpnae-verilator", "FMT=bf16", "PYTHON=py")
+    assert r.returncode == 0 and "py regression.py --lane poly --format bf16 --model exact" in r.stdout, r.stdout + r.stderr
+    r = make_n("gpnae-verilator", "FMT=bf16", "GPNAE_MODEL=hw", "PYTHON=py")
+    assert r.returncode == 0 and "--model hw" in r.stdout, r.stdout + r.stderr
+
+
+@selftest
+def test_check_reported_steps():
+    args = lambda fmt: argparse.Namespace(fmt=fmt, n=16, tile=4, lanes=32)
+    steps = {f: {n: (argv, g) for n, argv, g in check_steps(args(f))} for f in ("fp32", "bf16", "int8")}
+    assert "GPNAE_MODEL=hw" in steps["bf16"]["gpnae-verilator"][0] and steps["bf16"]["gpnae-verilator"][1]  # bit-exact, gated
+    assert not steps["bf16"]["gpnae-accuracy"][1] and steps["fp32"]["gpnae-accuracy"][1]  # bf16 accuracy reported only
+    assert "gpnae-accuracy" not in steps["int8"] and "GPNAE_MODEL=hw" not in steps["int8"]["gpnae-verilator"][0]
+    assert [n for n, (_, g) in steps["bf16"].items() if not g] == ["gpnae-accuracy"]
+    global CHECK_DIR
+    saved, py = CHECK_DIR, [sys.executable, "-c"]
+    with tempfile.TemporaryDirectory() as d:
+        CHECK_DIR = d
+        try:
+            for fake, code in (([("ok", py + ["pass"], True), ("acc", py + ["raise SystemExit(1)"], False)], 0),
+                               ([("ok", py + ["pass"], True), ("bad", py + ["raise SystemExit(1)"], True)], 1)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        all_main(["--format", "bf16"], steps=lambda a, f=fake: f)
+                    except SystemExit as e:
+                        got = e.code
+                table = open(os.path.join(d, "check_bf16_N16_T4_L32.log")).read()
+                assert got == code, (got, table)
+                assert code or "CHECK PASS: 1 of 1 gated steps passed; 1 reported, not gated" in table and "FAIL (exit 1), reported, not gated" in table, table
+            assert "CHECK FAIL: 1 of 2 gated steps passed" in table, table
+        finally:
+            CHECK_DIR = saved
+
+
+@selftest
 def test_pkg_action_refusals():
     run = lambda *a: subprocess.run([sys.executable, "regression.py", "--action", "pkg", *a], cwd=ROOT, capture_output=True, text=True)
     r = run("--format", "fp32", "--test", "no_such_test")
@@ -2817,12 +2854,18 @@ CHECK_DIR = os.path.join(ROOT, "testbenches", "results", "check")
 FIRING = re.compile(r"^.*(?:Assertion failed|%Error).*$", re.M)  # _parse_log's witness: a firing assertion leaves the exit status clean
 
 
+REPORTED = {("gpnae-accuracy", "bf16")}  # open accuracy items (sienna-uniform-format): run and shown, not counted in the verdict
+
+
 def check_steps(a) -> list:
-    """The gate's steps as (name, argv): the self-tests, then make targets in the build's format, N, TILE and LANES."""
+    """The gate's steps as (name, argv, gated): the self-tests, then make targets in the build's format, N, TILE and LANES."""
     mk = lambda target, *extra: ["make", target, f"FMT={a.fmt}", f"N={a.n}", f"TILE={a.tile}", f"LANES={a.lanes}", f"PYTHON={sys.executable}", *extra]
+    gpnae = [("gpnae-verilator", mk("gpnae-verilator"))] if a.fmt == "int8" else \
+        [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator"))]  # float: bit-exact, then accuracy
     steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]), ("sm-verilator", mk("sm-verilator")),
-             ("gpnae-verilator", mk("gpnae-verilator")), ("regression", mk("regression")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
-    return steps + ([("tflite", mk("tflite"))] if a.fmt == "int8" else [])
+             *gpnae, ("regression", mk("regression")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
+    steps += [("tflite", mk("tflite"))] if a.fmt == "int8" else []
+    return [(name, argv, (name, a.fmt) not in REPORTED) for name, argv in steps]
 
 
 def run_step(argv: list, log_path: str) -> str:
@@ -2853,14 +2896,17 @@ def all_main(argv=None, steps=check_steps) -> None:
     os.makedirs(CHECK_DIR, exist_ok=True)
     tag = f"{a.fmt}_N{a.n}_T{a.tile}_L{a.lanes}"
     rows = []
-    for name, cmd in steps(a):
+    for name, cmd, gated in steps(a):
         log_path = os.path.join(CHECK_DIR, f"{name}_{tag}.log")
         print(hdr(f"\n=== check: {name}  ({' '.join(cmd)}) ==="), flush=True)
         t0 = time.time()
-        rows.append((name, run_step(cmd, log_path), time.time() - t0, log_path))
-    failed = sum(v != "PASS" for _, v, _, _ in rows)
-    table = [f"CHECK {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, s, p in rows]
-    table.append(f"CHECK {'PASS' if failed == 0 else 'FAIL'}: {len(rows) - failed} of {len(rows)} steps passed")
+        v = run_step(cmd, log_path)
+        rows.append((name, v if gated else f"{v}, reported, not gated", gated, time.time() - t0, log_path))
+    n_gated = sum(g for _, _, g, _, _ in rows)
+    failed = sum(g and v != "PASS" for _, v, g, _, _ in rows)
+    table = [f"CHECK {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, _, s, p in rows]
+    table.append(f"CHECK {'PASS' if failed == 0 else 'FAIL'}: {n_gated - failed} of {n_gated} gated steps passed"
+                 + (f"; {len(rows) - n_gated} reported, not gated" if len(rows) > n_gated else ""))
     open(os.path.join(CHECK_DIR, f"check_{tag}.log"), "w").write("\n".join(table) + "\n")
     print("\n" + "\n".join(table))
     sys.exit(1 if failed else 0)

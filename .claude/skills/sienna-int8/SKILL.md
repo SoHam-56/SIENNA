@@ -100,7 +100,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   the bias comes with the first pass (the mesh's rule). Partial passes may carry anything: the regression gives them decoys.
 - The requantize stage is `src/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 4 cycles
   (`req_lat()`; 3 before the split below) at the lane feed; `sienna_top` holds each set's parameters by set id and copies the per-channel words at `g_accept`.
-  It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `regression._check_rounding()` checks that the
+  It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `model_runner._check_rounding()` checks that the
   package, `ipu.REQ_ROUNDING` and `rounding.txt` agree.
 - `sienna_layer` in int8 always takes a bias beat per column block; its int32 bias, multipliers and shifts come on
   `w_bias_i`, `w_req_mult_i`, `w_req_shift_i` beside it. A residual pass adds raw int8 codes (no rescale: 2b); in
@@ -140,7 +140,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 - Final fix: the int8 host lowering (`model_runner`) rejects SELU layers whose input range reaches x = 487.29, where
   lambda * x leaves int32 in 2^-22; the regression's SELU tests print "SELU saturation: k of n lane inputs at
   x >= 487.29" and check any such input bit-exact against the saturating golden. The one check is
-  `regression.selu_saturates(mx, shx, z_in, q)`, the lane's own unsaturated rescale of code q reaching
+  `model_runner.selu_saturates(mx, shx, z_in, q)` (regression.py imports it), the lane's own unsaturated rescale of code q reaching
   `gpnae_model.SELU_POS_SAT` (997960 in 2^-11), positive side only.
 - SELU fix A (Soham 2026-09-30): the SELU post stage works in 2^-22: x * P and -lambda*alpha * 1.0 as they are, and
   lambda * x on the unsaturated 24-bit rescale (POSTM is `intMultiplier` W = 24), floored by 2^3 and saturated to
@@ -167,7 +167,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   carries its own sideband, so two sets' beats could share the pipeline safely. It holds at `req_lat()` = 4 by
   construction with 0 margin, from the fixed 5-cycle chain (last read t, `g_done` t+1, G_IDLE t+2, G_FEED t+3, read
   enable t+4, `wide_valid` t+5); its firing at 5 marks where the invariant stops, not where the design breaks.
-- Activation model (5b, 2026-10-01): `perf_analysis.lane_stage` walks the lane FSMs per group of 16 (capture, load,
+- Activation model (5b, 2026-10-01): `lane_stage` (regression.py's perf section, was `perf_analysis.lane_stage`) walks the lane FSMs per group of 16 (capture, load,
   barrel_mac's rounds, drain and emit, the post stage, emit, G_NEXT) and, in fp32 and bf16, gpnae_tail's op chain per
   tail element on its 4 contexts, on the bit-exact mesh model's inputs. Against the g8p and ov_5a runs (N = 8-64, every
   T and format) it is exact or 1-7 cycles (at most 0.4%) low; gpnae_tail's shared-unit grants and one result per cycle

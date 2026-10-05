@@ -104,7 +104,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 - Activation stream, per block, per row tile: the depth tiles of A, then the residual tile.
 - Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
 - The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache and waits for `wc_region_busy_o` before overwriting a half.
-- Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default) and `gemm_sweep.py` format the streams with `format_layer()`, which only rearranges data.
+- Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default, backend `RtlLayer`) and `regression.py --action gemm` format the streams with `format_layer()`, which only rearranges data.
 
 ---
 
@@ -121,7 +121,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 | `2'b10` | sigmoid | 15 | MAC → sigtan, `select_sub = 2'b00` |
 | `2'b11` | tanh | 30 | input doubled, MAC → sigtan, `select_sub = 2'b01` |
 
-These encodings match `activation_to_code()` and `get_polynomial_terms()` in `regression.py`.
+These encodings match `activation_to_code()` and `get_polynomial_terms()` in `model_runner.py` (regression.py imports them).
 
 The pipeline instantiates `gpnae_poly`, not `gpnae.sv`. Its control word is 3 bits and adds two modes that bypass the polynomial:
 
@@ -202,7 +202,7 @@ The adder and multiplier handle NaN, infinity and signaling-NaN explicitly and e
 
 ## Parameter propagation
 
-`regression.py` writes `testbenches/test_config_pkg.sv`; `TB_sienna_top.sv` imports it and passes the values down to `sienna_top`, which derives its local parameters and passes them to the leaf modules. The chain is:
+`regression.py` writes `testbenches/test_config_pkg.sv` (with model_runner.py's `write_sv_package()`); `TB_sienna_top.sv` imports it and passes the values down to `sienna_top`, which derives its local parameters and passes them to the leaf modules. The chain is:
 
 ```
 regression.py  →  test_config_pkg.sv  →  TB_sienna_top  →  sienna_top  →  leaf modules

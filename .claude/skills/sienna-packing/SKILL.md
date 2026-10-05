@@ -76,8 +76,8 @@ set with pack_shift_i != 0 (no multi-pass packing).
 **A packing build needs NUM_LANES = N or a multiple of it.** The Makefile's default `LANES = 32` packs at N = 8, 16 and
 32, but an N = 64 build needs `LANES=64` or `128`. In simulation a packed start on any other lane count fires
 `a_pack_lanes`; silicon has no assertions, so the set would read past the result bank and come back silently wrong. The
-host must not issue it: `model_runner.pack_precheck` (LayerSim, before the layer file is written) refuses with ValueError
-a lane count N does not divide, collapse-k 0 (`regression.COLLAPSE_K`), a residual input, a shift outside
+host must not issue it: `model_runner.pack_precheck` (RtlLayer, before the layer file is written) refuses with ValueError
+a lane count N does not divide, collapse-k 0 (`model_runner.COLLAPSE_K`), a residual input, a shift outside
 1 .. log2(N) - 1, a map that is not N/2 entries in 0 .. 7, and a table that is not 8 entries.
 
 ## Mesh: the out-of-block skip
@@ -119,7 +119,8 @@ a lane count N does not divide, collapse-k 0 (`regression.COLLAPSE_K`), a residu
   and its zero point is already folded into its columns' bias.
 - Golden: a packed job's golden is the job computed alone (`int8_layer_exact`, `exact_layer` with the build's T);
   with the skip they are identical by construction, so no packed golden is needed beyond the existing ones.
-- `gemm_sweep.exact_layer` hard-codes T = 4 (`mesh_model.matmul(f, passes, N, 4, 1, b)`); it must take T.
+- `exact_layer` (regression.py's gemm section, was `gemm_sweep.exact_layer`) takes T; `--action pack` and
+  `--action gemm` pass the build's tile (`make gemm TILE=`; gemm_sweep.py hard-coded 4).
 
 ## Verification (bottom up, N <= 32; one N = 64 sweep after check-in)
 
@@ -144,6 +145,10 @@ a lane count N does not divide, collapse-k 0 (`regression.COLLAPSE_K`), a residu
 - Float signed zero (D-6) on exact cancellations: allowed to differ only between +0 and -0, never in value.
 
 ## As built (2026-10-04)
+
+Script and class names in this section are those of 2026-10-04; the `sienna-tooling` skill maps them to today's
+commands (`pack_regression.py` is `regression.py --action pack`, `tflite_pack_run.py` is
+`model_runner.py --action tflite --pack`, LayerSim is `RtlLayer`).
 
 Verified tree: SIENNA `packing` 8d7a4b2, SystolicMesh `packing` b1a2c31 (not pushed; GPNAE and ArithmeticLibrary
 unchanged). The final gate (`pkf_*`, `packing_gate.log` section 8) ran Task 9's full list on exactly those commits, after
@@ -229,7 +234,7 @@ n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis.
   checked one edge late (not converted to registered terms, Task 9 audit).
 - The packed TFLite models have full-range clamps only (TFLite folds their ReLU into the zero point); a non-trivial
   per-entry clamp is covered by `TB_requant_lanes` and `int8_packed_zp_random_nopool`, not end to end.
-- Per-entry int8 SELU saturation is refused in `pack_jobs` only; the RTL has no per-entry check, and LayerSim checks
+- Per-entry int8 SELU saturation is refused in `pack_jobs` only; the RTL has no per-entry check, and RtlLayer checks
   entry 0 (the set's activation).
 - Untested: an unpacked set with `pack_map_i[0] != 0`; a weight-cached packed B reused with a different shift; packed
   sets interleaved with unpacked accumulate pairs; the outputs of empty blocks (partial packing) are not compared.

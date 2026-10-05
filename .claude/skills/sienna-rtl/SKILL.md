@@ -114,20 +114,23 @@ make pkg FMT=bf16 TEST=matmul_random_tanh       # test_config_pkg.sv + that test
 make verilator FMT=int8                         # make pkg, then the package guard, then build and run
 make lint FMT=bf16                              # also through pkg and the guard; so are debug, perf and vcs
 make regression FMT=int8 N=16 TILE=4            # 41 tests in int8, 32 in fp32 and bf16 (each with its packed tests)
-make gemm FMT=int8 QUICK=1 PYTHON=<venv>/bin/python
+make gemm FMT=int8 QUICK=1 PYTHON=<venv>/bin/python   # regression.py --action gemm; takes TILE
 make model FMT=bf16 MODEL_DIR=<dir>             # model_runner.py has no default model dir; it refuses int8
-make perf-analysis FMT=bf16                     # perf_analysis.py; make perf is still the profiling build
-make tflite FMT=int8 PYTHON=<venv>/bin/python   # refuses any FMT but int8
-make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on sienna_layer (pack_regression.py)
+make perf-analysis FMT=bf16                     # regression.py --action perf; make perf is still the profiling build
+make tflite FMT=int8 PYTHON=<venv>/bin/python   # model_runner.py --action tflite; refuses any FMT but int8
+make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on sienna_layer (regression.py --action pack)
 make sm-verilator FMT=int8                      # SystolicMesh's regression at N, TILE, COLLAPSE_K
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses
+make check FMT=int8 PYTHON=<venv>/bin/python    # one verdict (regression.py --action all): selftest, sm-verilator, gpnae-verilator, regression, pack, gemm QUICK=1, tflite (int8); farm
 ```
 
-- **`make verilator` rewrites the package and stimulus.** After `make gen-matmul` / `gen-conv`, or anything else that wrote its own, build with `GEN_PKG=0` and that package's `FMT`, `N`, `TILE`, `LANES`. `regression.py`, `model_runner.py` and `perf_analysis.py` pass all of them to the make they run.
-- **The guard (`pkg-check`)** stops the build before Verilator unless the package's `EXP_W`, `MAN_W`, `IS_INT`, `N`, `TILE_SIZE` and `NUM_LANES` are those of `FMT`, `N`, `TILE`, `LANES`. A pre-format package (no `EXP_W`) fails it in every FMT. `test_makefile_fmt.py` covers it without a build.
+SIENNA's Python is two scripts: `regression.py` (hardware sanity, every check above behind `--action`) and `model_runner.py` (the host stack: numerics, lowering, tiling, packing, the layer file, backends `RtlLayer` / `RtlSets` / `Emulator`). The `sienna-tooling` skill has their actions and the map from the deleted scripts (`pack_regression.py`, `gemm_sweep.py`, `perf_analysis.py`, `tflite_*.py`, `test_*.py`).
+
+- **`make verilator` rewrites the package and stimulus.** After `make gen-matmul` / `gen-conv`, or anything else that wrote its own, build with `GEN_PKG=0` and that package's `FMT`, `N`, `TILE`, `LANES`. `regression.py` (every action, perf included) and `model_runner.py` pass all of them to the make they run.
+- **The guard (`pkg-check`)** stops the build before Verilator unless the package's `EXP_W`, `MAN_W`, `IS_INT`, `N`, `TILE_SIZE` and `NUM_LANES` are those of `FMT`, `N`, `TILE`, `LANES`. A pre-format package (no `EXP_W`) fails it in every FMT. `regression.py --action selftest` covers it without a build.
 - `COLLAPSE_K` must be 0 or 1, and 0 is refused for every target but `sm-verilator` and `help`: `TB_sienna_top` has no parameters, so it always builds `sienna_top`'s default, 1. A collapse-k 0 SIENNA build is `sienna_jobs/cmds/sienna_ck0.sh`.
 - The tracked `testbenches/test_config_pkg.sv` is the fp32 default (`make pkg FMT=fp32 N=16 TILE=4`). Every build overwrites it, so don't commit it from a run.
-- `PYTHON` (default `python3`) runs the scripts; `tflite` and `model` need the `tflite` package, which the farm has in `sienna_jobs/venv`.
+- `PYTHON` (default `python3`) runs the scripts; `tflite`, `model` and `make check FMT=int8` need the `tflite` package, which the farm has in `sienna_jobs/venv`.
 - **Packing ports.** `sienna_top` takes `pack_shift_i`, `pack_map_i` and table entries 1..7 (`pack_act_i`; int8 `pack_zp_i`, `pack_min_i`, `pack_max_i`, `pack_mx_i`, `pack_shx_i`, `pack_mout_i`, `pack_shout_i`, `pack_zout_i`) with each start; tied to 0 they give today's results and cycles. `sienna_layer` takes the same as layer configuration (`cfg_pack_*`, the layer file's L, P and E lines). Packing needs `LANES` = N or a multiple: the default 32 cannot pack at N = 64 (use `LANES=64` or `128`). The `sienna-packing` skill has the rules and refusals.
 - `gpnae-verilator` rewrites GPNAE's tracked `testbenches/gpnae_test_config.svh` for FMT, as GPNAE's regression always does.
 
@@ -163,7 +166,7 @@ that does not apply to an already-tracked file, so it wants `git rm --cached` �
 
 ## Things that will bite you
 
-**`testbenches/test_config_pkg.sv` is generated, not source.** `regression.py`'s `write_sv_package()` overwrites it on every `--action gen` and on every regression test. Hand-edits survive exactly until the next run. To change a test's configuration, change the entry in `PIPELINE_TESTS` or the `generate_vectors()` defaults in `regression.py`.
+**`testbenches/test_config_pkg.sv` is generated, not source.** `write_sv_package()` (model_runner.py's Device build section, called by regression.py) overwrites it on every `--action gen` and on every regression test. Hand-edits survive exactly until the next run. To change a test's configuration, change the entry in `PIPELINE_TESTS` or the `generate_vectors()` defaults in `regression.py`.
 
 **The pass criterion is a tolerance, not bit-exactness.** The FP32 adder and multiplier truncate rather than round (`fp32Adder.sv` takes `norm_man[25:3]`, `fp32Multiplier.sv` takes `raw_product[46:24]`), so hardware results sit a few ULP below the NumPy reference. In a typical random-data run 0–15% of elements match exactly and the rest pass on tolerance. **A low exact-match rate is normal and is not the bug you are looking for.** Real failures show up as `[FAIL]`, as `act=MISSING`, or as a timeout. GPNAE's own suite passes on either a relative or an absolute bound (`numpy.isclose` semantics): near zero, the fp32 evaluation of `e^x - 1` cancels, so a correct result with a negligible absolute error still shows a large relative error. `matmul_ident_selu` is the exception at 100% exact: an identity matrix gives only `selu(1.0)` and `selu(0.0)`, each a single exact multiply.
 
@@ -173,7 +176,7 @@ Be aware the tolerance check does not measure what it claims: every testbench in
 
 **`--Wno-MODDUP` is hiding duplicate module definitions.** Both `GPNAE/ArithmeticLibrary` and `SystolicMesh/ArithmeticLibrary` are compiled into the same Verilator build, and both define `fp32Adder`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned`. `cntlz8` is defined twice as well, now by the two `ArithmeticLibrary` checkouts rather than by GPNAE's own copy, which has been removed — a GPNAE-only build is clean. Whichever definition the tool takes silently wins. Today the copies are functionally identical — the diffs are only `logic` vs `wire`/`reg` port declarations — so nothing is broken, but editing one copy will produce changes that appear to do nothing. Edit both, or consolidate. Vivado flags this as `CRITICAL WARNING [Synth 8-9873]`.
 
-**An assertion on a host-driven input samples it one cycle late.** `TB_sienna_top`, `TB_SystolicMesh`, `TB_sienna_model` and `TB_sienna_multi` drive inputs right after the clock edge. Verilator's flops see the new value at that edge, but a concurrent assertion samples the value from before it, so a term combinational from such an input meets state the edge has already changed: `host_accept`-based checks never fired, and the old `a_read_outstanding` missed a read taken on the edge its result was written. Assertions that mix a host input with state therefore check registered copies taken at the edge (`sa_*` and `wcw_q`/`rd_q` in `SystolicMesh.sv`, `acc_*` in `sienna_top.sv`). `TB_sienna_layer` and the unit benches drive 1 ns after the edge, so they are aligned either way. With `+verilator+error+limit` a firing changes neither the exit code nor the TB's counts: `regression.py`, the mesh's `regression.py` and `LayerSim` fail a log that holds `Assertion failed` (and SIENNA's on any `%Error`).
+**An assertion on a host-driven input samples it one cycle late.** `TB_sienna_top`, `TB_SystolicMesh`, `TB_sienna_model` and `TB_sienna_multi` drive inputs right after the clock edge. Verilator's flops see the new value at that edge, but a concurrent assertion samples the value from before it, so a term combinational from such an input meets state the edge has already changed: `host_accept`-based checks never fired, and the old `a_read_outstanding` missed a read taken on the edge its result was written. Assertions that mix a host input with state therefore check registered copies taken at the edge (`sa_*` and `wcw_q`/`rd_q` in `SystolicMesh.sv`, `acc_*` in `sienna_top.sv`). `TB_model_run` and the unit benches drive 1 ns after the edge, so they are aligned either way. With `+verilator+error+limit` a firing changes neither the exit code nor the TB's counts: `regression.py`, the mesh's `regression.py` and model_runner's `RtlLayer` and `RtlSets` fail a log that holds `Assertion failed` (and SIENNA's on any `%Error`).
 
 **Coefficient memory is binary, everything else is hex.** `taylor_coeffs.mem` is loaded with `$readmemb` (`GPNAE/src/TYTAN/Memory/ROM.v`) and holds 32-character binary lines. Every matrix `.mem` is `$readmemh`. Writing a coefficient table in hex fails silently, producing zeros or X.
 

@@ -13,7 +13,8 @@ only when Soham asks (headless Chrome: `google-chrome --headless=new --print-to-
 
 `python3 /proj/work/spramanik/sienna_jobs/report/build_report.py /proj/work/spramanik/sienna_report/sienna_report.html`
 runs on the login node (pure Python, no simulation). Charts are inline SVG from `report/svgplot.py`
-(no matplotlib on this system). Check the render with a headless Chrome screenshot before telling Soham.
+(no matplotlib on this system). build_report.py and `g4_table.py` import SIENNA's `regression.py` (`PIPELINE_TESTS`,
+the perf section's `events()`; was perf_analysis.py). Check the render with a headless Chrome screenshot before telling Soham.
 
 ## Sections (Soham's order, 2026-09-28)
 
@@ -30,7 +31,7 @@ runs on the login node (pure Python, no simulation). Charts are inline SVG from 
 - Tables and charts, highlights only; no dumps of every result. One consistent config per chart series.
 - Day-one comparisons use the same tests at the same N and T. Day one ran one set at a time, so its
   cycles per set are load + latency (a lower bound).
-- Accumulate configs: use `g4_table.py`'s values (perf_analysis before f1cc285 mis-reported them).
+- Accumulate configs: use `g4_table.py`'s values (perf_analysis, now `regression.py --action perf`, before f1cc285 mis-reported them).
 
 ## history/
 

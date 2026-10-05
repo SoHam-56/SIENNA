@@ -13,7 +13,8 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | File | Lines | Status | What it is |
 |---|---|---|---|
 | `Makefile` | 406 | live | All build, lint, wave, regression and clean targets. `DESIGN_FILES` is the authoritative source list |
-| `regression.py` | 557 | live | Golden model, stimulus generator, orchestrator and scoreboard |
+| `regression.py` | 2,923 | live | Hardware sanity: golden model, stimulus generator, orchestrator and scoreboard, and every check behind `--action` (pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors, selftest, all = `make check`); see the `sienna-tooling` skill |
+| `model_runner.py` | 1,353 | live | Host software stack: numerics (format rounding, TFLite quantization, requantize, int8 golden), device build package, TFLite lowering, tiling, packing, the layer file, backends `RtlLayer` / `RtlSets` / `Emulator`, `--action model` and `--action tflite [--pack]` |
 | `run_real_model.py` | 116 | live, untracked | Runs a PyTorch checkpoint's weights through the pipeline |
 | `README.md` | 1 | — | Contains only the title |
 | `performance_analysis_report.log` | — | untracked | Latency and throughput analysis; mixes measured and modeled figures |
@@ -37,7 +38,9 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | File | Status | What it is |
 |---|---|---|
 | `TB_sienna_top.sv` | live | The full-pipeline testbench. 474 lines |
-| `test_config_pkg.sv` | **generated** | Written by `regression.py`. Edits are lost on the next run |
+| `test_config_pkg.sv` | **generated** | Written by `regression.py` and `model_runner.py` (`write_sv_package()`). Edits are lost on the next run |
+| `TB_model_run.sv` | live | Layer-file testbench of `sienna_layer` (was `TB_sienna_layer`); `model_runner.RtlLayer` builds it once and runs one layer per invocation |
+| `TB_sienna_model.sv` | live | Host-driven set engine on `sienna_top`; `model_runner.RtlSets` (`--engine sets`) |
 | `matrix_west.mem`, `matrix_north.mem`, `expected_output.mem` | generated | Stimulus and golden output, hex |
 | `hardware_trace.txt` | output | Stage-by-stage hardware values, parsed by `regression.py` |
 | `pipeline_lane_status.txt` | output | Per-lane FSM snapshots. The first place to look for a stall |

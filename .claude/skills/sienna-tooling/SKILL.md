@@ -5,7 +5,7 @@ description: Use when running, changing or extending SIENNA's Python tooling - t
 
 # SIENNA tooling: two scripts
 
-**Status: design for review (2026-10-04), not implemented.** Branch `tooling` (SIENNA). Soham asked for exactly two
+**Status: design approved 2026-10-05 (Soham: "keep submodule scripts, delete old ones, go ahead"); implementation in progress.** Branch `tooling` (SIENNA). Soham asked for exactly two
 Python scripts in SIENNA: one for hardware sanity, one that runs models and stands as the reference host software a
 software team builds its own layer from ("this model runner is supposed to be the compiler").
 
@@ -85,8 +85,8 @@ Every target keeps its name and arguments and calls the new script: `regression`
 
 - Behaviour-preserving: every flow must produce the same files and results as before the move (regression words and
   cycles, model outputs, GEMM rows, pack and TFLite verdicts), proven on the farm against the pkf_ gate runs.
-- The old scripts are removed once the new ones are proven (git keeps their history); nothing else changes in RTL or
-  testbenches. The submodules are untouched.
+- The old scripts are deleted once the new ones are proven (Soham approved; git keeps their history); nothing else
+  changes in RTL or testbenches. The submodules keep their own scripts, untouched.
 - One-line comments and docstrings; sections marked with one-line headers.
 - Reports stay .log; farm tooling stays in sienna_jobs (outside git).
 

@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import tflite_ref as ref  # noqa: E402
+import model_runner as ref  # noqa: E402
 
 fails = checks = 0
 

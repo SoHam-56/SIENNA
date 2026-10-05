@@ -2,6 +2,7 @@
 """Runs tflite float models end to end on the SIENNA RTL: every multiply-accumulate on the pipeline, host only reshapes and softmax."""
 import argparse
 import json
+import math
 import os
 import re
 import struct
@@ -13,10 +14,369 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
-import regression  # noqa: E402
+sys.path.append(os.path.join(ROOT, "GPNAE"))  # appended: the submodules have their own regression.py, which must not shadow ours
+sys.path.append(os.path.join(ROOT, "SystolicMesh"))
+import gpnae_model  # noqa: E402
+from mesh_model import fpu  # noqa: E402
+sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
+import ipu  # noqa: E402
+from ipu import quantize_multiplier, round_half_away  # noqa: E402,F401  re-exported: TFLite's QuantizeMultiplier and TfLiteRound, one copy in AriL
 
 ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
 HW_BIAS = True  # the mesh adds the bias; False lowers it as a ones column and an extra depth row
+
+
+# ── Numerics ─────────────────────────────────────────────────────────────────
+
+# Activation control words: 001/010/011 are the GPNAE polynomial modes, 100/101 bypass the polynomial.
+# No entry for 0 on purpose: a code the RTL does not implement must not be reachable from a test.
+ACTIVATION_CODES = {"selu": 1, "sigmoid": 2, "tanh": 3, "relu": 4, "linear": 5}
+
+# Number formats a build may use, as (exponent bits, mantissa bits); every word of the pipeline is in the build's format.
+FORMATS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # int8: EXP_W = 0, 8-bit two's-complement codes
+
+
+def op_round(x: np.ndarray, fmt: str) -> np.ndarray:
+    """x rounded to the operand format (nearest, ties to even), as float32; subnormals flush to zero as the RTL reads them."""
+    x = np.asarray(x, dtype=np.float32)
+    if fmt == "fp32":
+        return x
+    if fmt == "int8":  # int8 codes, as float32 values holding integers
+        return np.clip(np.rint(x), -128, 127).astype(np.float32)
+    if fmt == "bf16":
+        u = x.view(np.uint32).astype(np.uint64)
+        u = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16) << 16
+        y = u.astype(np.uint32).view(np.float32)
+        return np.where((u.astype(np.uint32) & 0x7F800000) == 0, np.copysign(np.float32(0), y), y).astype(np.float32)
+    h = x.astype(np.float16)
+    h = np.where((h.view(np.uint16) & 0x7C00) == 0, np.copysign(np.float16(0), h), h)
+    return h.astype(np.float32)
+
+
+def op_hex(data, fmt: str) -> list:
+    """Values as hex words of the operand format, after rounding: 8 digits for fp32, 4 for bf16 and fp16."""
+    v = op_round(np.asarray(data, dtype=np.float32).flatten(), fmt)
+    if fmt == "int8":
+        return [f"{int(b) & 0xFF:02x}" for b in v.astype(np.int64)]
+    if fmt == "fp32":
+        return [f"{int(b):08x}" for b in v.view(np.uint32)]
+    bits = (v.view(np.uint32) >> 16) if fmt == "bf16" else v.astype(np.float16).view(np.uint16)
+    return [f"{int(b):04x}" for b in bits]
+
+
+# Polynomial terms per activation, as passed to the TYTAN controller.
+ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
+
+
+def activation_to_code(act: str) -> int:
+    key = act.lower()
+    if key not in ACTIVATION_CODES:
+        raise ValueError(
+            f"unsupported activation {act!r}: GPNAE implements only "
+            f"{sorted(ACTIVATION_CODES)}. Control word 0 is not a pass-through "
+            f"mode -- selecting it stalls the pipeline until timeout."
+        )
+    return ACTIVATION_CODES[key]
+
+
+def get_polynomial_terms(act: str) -> int:
+    key = act.lower()
+    if key not in ACTIVATION_TERMS:
+        raise ValueError(f"unsupported activation {act!r}")
+    return ACTIVATION_TERMS[key]
+
+
+def apply_activation(x: np.ndarray, act: str) -> np.ndarray:
+    act = act.lower()
+    if act == "selu":
+        alpha = 1.6732632423543772848170429916717
+        scale = 1.0507009873554804934193349852946
+        return scale * np.where(
+            x > 0, x, alpha * (np.exp(np.clip(x, -50, 50)) - 1)
+        ).astype(np.float32)
+    if act == "sigmoid":
+        return (1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))).astype(np.float32)
+    if act == "tanh":
+        return np.tanh(x).astype(np.float32)
+    if act == "relu":
+        return np.where(x > 0, x, np.float32(0.0)).astype(np.float32)
+    return x.copy()  # linear
+
+
+def fmt_bits(x, fmt: str) -> np.ndarray:
+    """Values already rounded to the format (op_round), as its bit patterns."""
+    x = np.asarray(x, dtype=np.float32)
+    return np.array([int(h, 16) for h in op_hex(x, fmt)], dtype=np.int64).reshape(x.shape)
+
+
+def bits_float(b, fmt: str) -> np.ndarray:
+    f = fpu.FORMATS[fmt]
+    return (np.asarray(b, dtype=np.int64) << (23 - f.m)).astype(np.uint32).view(np.float32)
+
+
+def wrap32(x) -> np.ndarray:
+    """int64 values wrapped to int32, as the mesh's two's-complement accumulate does."""
+    return ((np.asarray(x, dtype=np.int64) + (1 << 31)) % (1 << 32)) - (1 << 31)
+
+
+def imatmul(a, b) -> np.ndarray:
+    """Exact integer product: int8 x int8 terms and their sums stay below 2^53, so float64 holds every partial sum."""
+    return np.rint(np.asarray(a, np.float64) @ np.asarray(b, np.float64)).astype(np.int64)
+
+
+def quant_act(x) -> tuple:
+    """(q, scale, zero point) of an activation tensor as TFLite PTQ picks them: asymmetric int8 over its range widened to hold 0."""
+    x = np.asarray(x, dtype=np.float64)
+    lo, hi = min(0.0, float(x.min())), max(0.0, float(x.max()))
+    scale = (hi - lo) / 255.0 if hi > lo else 1.0
+    zp = int(np.clip(np.rint(-128.0 - lo / scale), -128, 127))
+    return np.clip(np.rint(x / scale) + zp, -128, 127).astype(np.int64), scale, zp
+
+
+def quant_weights(w) -> tuple:
+    """(q, per-column scales) of a weight matrix as TFLite quantizes weights: symmetric per output channel, zero point 0, codes -127..127."""
+    w = np.asarray(w, dtype=np.float64)
+    s = np.max(np.abs(w), axis=0) / 127.0
+    s = np.where(s > 0, s, 1.0)
+    return np.clip(np.rint(w / s[None, :]), -127, 127).astype(np.int64), s
+
+
+def fold_bias(bias, s_a: float, s_w, z_a: int, B_q) -> np.ndarray:
+    """The mesh's int32 bias: TFLite's bias minus z_a * sum_k B_q[k, c], so the mesh's sum of a * w is TFLite's sum of (a - z_a) * w."""
+    B_q = np.asarray(B_q, np.int64)
+    b_q = np.zeros(B_q.shape[1], np.int64) if bias is None else \
+        np.rint(np.asarray(bias, np.float64) / (s_a * np.asarray(s_w, np.float64))).astype(np.int64)
+    return wrap32(b_q - z_a * B_q.sum(axis=0))
+
+
+def requantize(acc, rq: dict) -> np.ndarray:
+    """ipu.requant of int32 sums (rows x channels) with channel c's multiplier and shift on column c."""
+    acc = np.asarray(acc, np.int64)
+    m = np.broadcast_to(np.asarray(rq["mult"], np.int64)[None, :acc.shape[1]], acc.shape)
+    s = np.broadcast_to(np.asarray(rq["shift"], np.int64)[None, :acc.shape[1]], acc.shape)
+    return np.asarray(ipu.requant(acc, m, s, rq["zp"], rq["amin"], rq["amax"], ROUNDING), np.int64)
+
+
+def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
+    """Requantize and GPNAE parameters for int32 sums acc (rows x channels) as TFLite PTQ picks them; with rng, random words per channel."""
+    acc = np.asarray(acc, np.int64)
+    s_w = np.asarray(s_w, np.float64)
+    real = acc * (s_a * s_w)[None, :]
+    if act == "relu":
+        real = np.maximum(real, 0.0)
+    _, s_out, z_out = quant_act(real)
+    qm = [quantize_multiplier(s_a * float(s) / s_out) for s in s_w]
+    mult = np.array([m for m, _ in qm], np.int64)
+    shift = np.array([e for _, e in qm], np.int64)
+    if rng is not None:  # every normalized multiplier, and right shifts 0..12 (TFLite's left shift can overflow int32)
+        mult = rng.randint(1 << 30, 1 << 31, s_w.size).astype(np.int64)
+        shift = rng.randint(-12, 1, s_w.size).astype(np.int64)
+    mx, shx = gpnae_model.rescale_params(s_out)
+    rq = dict(mult=mult, shift=shift, zp=z_out, amin=max(-128, z_out) if act == "relu" else -128, amax=127,
+              mx=mx, shx=shx, s_out=s_out)
+    if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
+        rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
+    x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
+    x_hi = gpnae_model.SELU_POS_SAT / 2048.0  # the lane's SELU: Q4.11 below 0, lambda * x exact up to here (int32 in 2^-22)
+    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, x_hi).astype(np.float32), "selu"))
+    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -22 / s_selu)  # the lane's SELU value, in units of 2^-22, to its int8 code (D-4)
+    rq.update(mout=int(mout), shout=int(shout), zout=z_selu, s_selu=s_selu)
+    return rq
+
+
+def selu_saturates(mx: int, shx: int, z_in: int, q) -> np.ndarray:
+    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in), unsaturated, to x >= 487.29, where lambda * x leaves int32 in 2^-22."""
+    return gpnae_model.selu_pos_saturates(gpnae_model.rescale_wide(np.asarray(q, np.int64), int(z_in), int(mx), int(shx)))
+
+
+def int8_lane():
+    f = gpnae_model.FORMATS["int8"]
+    return gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+
+
+def activate_int8(R, act: str, rq: dict) -> np.ndarray:
+    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters."""
+    code = activation_to_code(act)
+    R = np.asarray(R, np.int64)
+    if code in (4, 5):
+        return R.copy()
+    par = gpnae_model.Int8Params(mx=rq["mx"], shx=rq["shx"], zin=rq["zp"], mout=rq["mout"], shout=rq["shout"], zout=rq["zout"])
+    return np.asarray(int8_lane().run(R, code, par), np.int64)
+
+
+def drop_zp(act: str, rq: dict) -> int:
+    """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
+    return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
+
+
+def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
+    """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
+    assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
+               for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
+    acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
+    return activate_int8(requantize(acc, rq), act, rq)
+
+
+def _check_rounding() -> None:
+    """sienna_fmt_pkg::REQ_ROUNDING must be the variant G0 pinned, as ipu and ROUNDING read it, or golden and RTL round apart."""
+    pkg = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
+    m = re.search(r'localparam string REQ_ROUNDING\s*=\s*"(\w+)"', open(pkg).read())
+    rtl = m.group(1) if m else "(no REQ_ROUNDING)"
+    if ROUNDING is None or rtl != ROUNDING or ipu.REQ_ROUNDING != ROUNDING:
+        raise ValueError(f"sienna_fmt_pkg rounds {rtl}, ipu.REQ_ROUNDING is {ipu.REQ_ROUNDING}, "
+                         f"model_runner.ROUNDING (rounding.txt) is {ROUNDING}")
+
+
+ROUNDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "tflite_int8", "rounding.txt")
+ROUNDING = open(ROUNDING_FILE).read().strip() if os.path.exists(ROUNDING_FILE) else None  # G0's pinned variant; None before G0
+
+
+def effective_scale(in_scale, w_scale, out_scale, product: str) -> float:
+    """The real multiplier of TFLite's Prepare: 'double' is the per-channel path, 'float32' the per-tensor FC path."""
+    i, w, o = np.float32(in_scale), np.float32(w_scale), np.float32(out_scale)
+    if product == "double":
+        return float(i) * float(w) / float(o)
+    if product == "float32":
+        return float(i * w) / float(o)
+    raise ValueError(product)
+
+
+def layer_multipliers(layer, w_scales, in_scale, out_scale, cout, rounding, scale_product=None):
+    """Per output channel (mult, shift); a single weight scale is per tensor and broadcast (conv still takes the double path)."""
+    ws = np.atleast_1d(np.asarray(w_scales, dtype=np.float32))
+    product = scale_product or ("double" if layer == "conv" or ws.size > 1 else "float32")
+    pairs = [quantize_multiplier(effective_scale(in_scale, ws[c if ws.size > 1 else 0], out_scale, product), rounding)
+             for c in range(cout)]
+    return np.array([m for m, _ in pairs], dtype=np.int64), np.array([s for _, s in pairs], dtype=np.int64)
+
+
+def activation_range(activation: str, out_scale, out_zp: int):
+    """TFLite CalculateActivationRangeQuantized for int8: bounds quantized as zp + round(f / scale), f / scale in float32."""
+    def quant(f):
+        return int(out_zp) + round_half_away(float(np.float32(f) / np.float32(out_scale)))
+    if activation == "none":
+        return -128, 127
+    if activation == "relu":
+        return max(-128, quant(0.0)), 127
+    if activation == "relu6":
+        return max(-128, quant(0.0)), min(127, quant(6.0))
+    raise ValueError(activation)
+
+
+def fold_input_zp(b_q, w_q, in_zp):
+    """SIENNA's bias: b - in_zp * sum(w) per output channel, wrapped to int32, so the mesh sees no zero point."""
+    w = np.asarray(w_q, dtype=np.int64).reshape(np.shape(w_q)[0], -1)
+    return ipu.sx(np.asarray(b_q, dtype=np.int64) - int(in_zp) * w.sum(axis=1), 32)
+
+
+def im2col_same(x_q, kh, kw, pad_value):
+    """NHWC patches of a stride-1 SAME convolution padded with pad_value; rows (b, y, x), columns (kh, kw, cin)."""
+    x = np.asarray(x_q, dtype=np.int64)
+    b, h, w, c = x.shape
+    ph, pw = (kh - 1) // 2, (kw - 1) // 2
+    xp = np.pad(x, ((0, 0), (ph, kh - 1 - ph), (pw, kw - 1 - pw), (0, 0)), constant_values=pad_value)
+    cols = [xp[:, dy:dy + h, dx:dx + w, :] for dy in range(kh) for dx in range(kw)]
+    return np.stack(cols, axis=3).reshape(b * h * w, kh * kw * c)
+
+
+def fc_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False,
+            scale_product=None):
+    """reference_integer_ops::FullyConnected(PerChannel), requantized per channel; folded=True is SIENNA's algebra (fold_input_zp bias)."""
+    x = np.asarray(x_q, dtype=np.int64)
+    w = np.asarray(w_q, dtype=np.int64)
+    b = np.zeros(w.shape[0], dtype=np.int64) if b_q is None else np.asarray(b_q, dtype=np.int64)
+    acc = x @ w.T + fold_input_zp(b, w, in_zp) if folded else (x - int(in_zp)) @ w.T + b
+    mult, shift = layer_multipliers("fc", w_scales, in_scale, out_scale, w.shape[0], rounding, scale_product)
+    return ipu.requant(ipu.sx(acc, 32), mult, shift, out_zp, amin, amax, rounding).astype(np.int8)
+
+
+def conv2d_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False):
+    """reference_integer_ops::ConvPerChannel, stride 1, SAME (outside taps skipped); folded=True pads with in_zp and folds the bias."""
+    x = np.asarray(x_q, dtype=np.int64)
+    w = np.asarray(w_q, dtype=np.int64)
+    bsz, h, wd, _ = x.shape
+    cout, kh, kw, _ = w.shape
+    b = np.zeros(cout, dtype=np.int64) if b_q is None else np.asarray(b_q, dtype=np.int64)
+    wm = w.reshape(cout, -1)
+    if folded:
+        acc = im2col_same(x, kh, kw, int(in_zp)) @ wm.T + fold_input_zp(b, w, in_zp)
+    else:
+        acc = im2col_same(x - int(in_zp), kh, kw, 0) @ wm.T + b
+    mult, shift = layer_multipliers("conv", w_scales, in_scale, out_scale, cout, rounding)
+    acc = ipu.sx(acc, 32).reshape(bsz, h, wd, cout)
+    return ipu.requant(acc, mult, shift, out_zp, amin, amax, rounding).astype(np.int8)
+
+
+# ── Device build ─────────────────────────────────────────────────────────────
+
+SETS_IN_FLIGHT = 2 + 2 + 4 + 4 + 2 + 1  # sienna_top's default credits (its banks, ACC_BANKS=RESULT_BANKS=4); the testbenches read it from the package
+
+COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for the bit-exact golden
+TB_DIR = os.path.join(ROOT, "testbenches")
+
+
+def write_sv_package(path: str, items: list) -> None:
+    with open(path, "w") as f:
+        f.write("// Auto-Generated Configuration Package\npackage test_config_pkg;\n\n")
+        for name, val, vtype in items:
+            kw = "shortreal" if vtype == "float" else "int"
+            f.write(f"  localparam {kw} {name} = {val};\n")
+        f.write("\nendpackage\n")
+
+
+def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
+                  use_bias: bool, drop_seed: int) -> list:
+    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
+    N = cfg.get("n", 16)
+    sram_depth = N * N
+    return [
+        ("N", N, "int"),
+        ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
+        ("NUM_LANES", cfg.get("lanes", 32), "int"),
+        ("HOST_WORDS", cfg.get("host_words", N), "int"),
+        ("EXP_W", FORMATS[fmt][0], "int"),
+        ("MAN_W", FORMATS[fmt][1], "int"),
+        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
+        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
+        ("IS_INT", int(fmt == "int8"), "int"),
+        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
+        ("SRAM_DEPTH", sram_depth, "int"),
+        ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
+        ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
+        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
+        ("IN_ROWS", N, "int"),
+        ("IN_COLS", N, "int"),
+        ("POOL_H", cfg.get("pool_h", 2), "int"),
+        ("POOL_W", cfg.get("pool_w", 2), "int"),
+        ("STRIDE_ROWS", cfg.get("pool_h", 2), "int"),
+        ("STRIDE_COLS", cfg.get("pool_w", 2), "int"),
+        ("PADDING", cfg.get("padding", 1), "int"),
+        ("DROPOUT_P_PERCENT", int(round(cfg.get("dropout_p", 0.5) * 100)), "int"),
+        ("LFSR_WIDTH", 32, "int"),
+        ("CONTROL_WIDTH", 3, "int"),
+        ("NUM_SETS", num_sets, "int"),
+        ("SETS_IN_FLIGHT", credits, "int"),
+        ("HAS_BIAS", int(use_bias), "int"),
+        ("WEIGHT_CACHE", int(bool(cfg.get("cached", False))), "int"),
+        ("ACCUM_PASSES", passes, "int"),
+        ("MIXED_LEN", len(mixed), "int"),
+        ("MIXED_ACTS", sum(activation_to_code(a) << (4 * i) for i, a in enumerate(mixed)), "int"),
+        ("PACKED", int(bool(cfg.get("packed", False))), "int"),
+        ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
+        ("DROPOUT_SEED", drop_seed, "int"),
+        ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
+    ]
+
+
+def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
+    """test_config_pkg.sv of the model simulators' build (Sim, LayerSim): matmul_relu_nopool's configuration in fmt, no stimulus."""
+    os.makedirs(TB_DIR, exist_ok=True)
+    if fmt == "int8":
+        _check_rounding()
+    cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "pool_h": 1, "pool_w": 1, "padding": 0}
+    drop_seed = 0x2ACE0000 + 42 + int(os.environ.get("SIENNA_SEED", "0"))  # the generators' seed, so the package matches theirs
+    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                     _config_items(cfg, fmt, "relu", SETS_IN_FLIGHT + 2, SETS_IN_FLIGHT, 1, [], fmt == "int8", drop_seed))
 
 
 # =============================================================================
@@ -254,7 +614,7 @@ def read_outputs(path, fmt="fp32"):
             else:
                 cur.append(int(line, 16))
         return [((np.array(s, np.int64) + 128) % 256) - 128 for s in sets]
-    sh = 23 - regression.FORMATS[fmt][1]
+    sh = 23 - FORMATS[fmt][1]
     sets = []
     cur = None
     for line in open(path):
@@ -282,11 +642,10 @@ class Sim:
         self.sets = 0
 
     def build(self):
-        t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
-        regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N, **t})
+        write_build_pkg(self.N, self.T, self.lanes, "fp32")
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
                             "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
-                            "GEN_PKG=0"],  # the package generate_vectors just wrote, which is fp32
+                            "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
@@ -448,7 +807,7 @@ def pack_jobs(models: list, N: int, int8: bool) -> tuple:
         q = m.get("req")
         if int8:
             mult[c * b:c * b + cc], shift[c * b:c * b + cc] = q["mult"], q["shift"]
-            if m["act"] == "selu" and np.any(regression.selu_saturates(q["mx"], q["shx"], q["zp"], np.arange(q["amin"], q["amax"] + 1))):
+            if m["act"] == "selu" and np.any(selu_saturates(q["mx"], q["shx"], q["zp"], np.arange(q["amin"], q["amax"] + 1))):
                 raise ValueError(f"model {c}: its SELU input range reaches x = 487.29, where the int8 lane saturates")
         key = (m["act"],) + (tuple(int(q[x]) for x in ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) if int8 else ())
         if key not in keys:
@@ -483,7 +842,7 @@ def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
         raise ValueError(f"{tag}: a packed layer takes no residual input")
     if lanes % N:
         raise ValueError(f"{tag}: packing needs NUM_LANES ({lanes}) to be N ({N}) or a multiple of it")
-    if regression.COLLAPSE_K == 0:
+    if COLLAPSE_K == 0:
         raise ValueError(f"{tag}: the collapse-k 0 mesh refuses packed sets")
     if not 1 <= pk["shift"] < N.bit_length() - 1:
         raise ValueError(f"{tag}: pack shift {pk['shift']} is outside 1 .. log2(N) - 1 = {N.bit_length() - 2}")
@@ -502,12 +861,10 @@ class LayerSim:
         self.cycles = self.sets = self.words = 0
 
     def build(self):
-        t = next(x for x in regression.PIPELINE_TESTS if x["name"] == "matmul_relu_nopool")
-        regression.generate_vectors({"n": self.N, "tile_size": self.T, "lanes": self.lanes, "host_words": self.N,
-                                     "fmt_name": self.fmt_name, **t})
+        write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0",
                             f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
-                            "GEN_PKG=0"],  # the package generate_vectors just wrote
+                            "GEN_PKG=0"],  # the package write_build_pkg just wrote
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
@@ -519,7 +876,7 @@ class LayerSim:
         if int8 and job.get("req") is None:
             raise ValueError(f"{tag}: an int8 job needs its requantize parameters (job['req'])")
         rq = job.get("req")
-        if int8 and job["act"] == "selu" and regression.selu_saturates(rq["mx"], rq["shx"], rq["zp"], rq["amax"]):  # the clamp's top code
+        if int8 and job["act"] == "selu" and selu_saturates(rq["mx"], rq["shx"], rq["zp"], rq["amax"]):  # the clamp's top code
             raise ValueError(f"{tag}: SELU layer input range reaches x = 487.29: the int8 lane saturates lambda * x at int32 (512)")
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
         pk = job.get("pack")
@@ -538,7 +895,7 @@ class LayerSim:
                     q = rq_e or {}
                     f.write(f"E {ACT_CODES[act]} " + " ".join(str(int(q.get(x, 0))) for x in
                                                             ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) + "\n")
-            f.write("\n".join(regression.op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
+            f.write("\n".join(op_hex(np.concatenate([a.ravel(), w.ravel()]), self.fmt_name)))
             f.write("\n")
             if int8:
                 f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in layer_epilogue(job, N).ravel()))
@@ -616,8 +973,8 @@ def execute(model, x, sim=None, log=None):
         _, ref_float = job_reference(job)
         fmt = getattr(sim, "fmt_name", "fp32")
         if fmt != "fp32":  # the hardware takes rounded operands; judge it on those, and report the format's own cost apart
-            job = dict(job, terms=[(regression.op_round(X, fmt), regression.op_round(W, fmt)) for X, W in job["terms"]],
-                       bias=None if job["bias"] is None else regression.op_round(job["bias"], fmt))
+            job = dict(job, terms=[(op_round(X, fmt), op_round(W, fmt)) for X, W in job["terms"]],
+                       bias=None if job["bias"] is None else op_round(job["bias"], fmt))
         _, ref = job_reference(job)
         if sim is None:
             y = ref.astype(np.float32)
@@ -708,7 +1065,7 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
     ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(regression.FORMATS),
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS),
                     help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against tflite_ref in both roundings; pins the rounding."""
+"""Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against model_runner's reference kernels in both roundings; pins the rounding."""
 import argparse
 import itertools
 import os
@@ -10,7 +10,7 @@ import tensorflow as tf
 import tflite
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import tflite_ref as ref  # noqa: E402
+import model_runner as ref  # noqa: E402
 
 FC_IN, FC_OUT = 64, 16
 CONV_HW, CONV_CIN, CONV_COUT = 8, 16, 16

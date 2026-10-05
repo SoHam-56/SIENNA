@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vectors for TB_requant_lanes through its channel map, expected values from ipu.requant in tflite_ref's rounding; arg: output .mem path."""
+"""Vectors for TB_requant_lanes through its channel map, expected values from ipu.requant in model_runner's rounding; arg: output .mem path."""
 import os
 import sys
 
@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
 import ipu  # noqa: E402
-import tflite_ref  # noqa: E402
+import model_runner as mr  # noqa: E402
 
 N, LANES, SETS = 16, 32, 6  # TB_requant_lanes' geometry
 PER = N * N // LANES
@@ -75,7 +75,7 @@ def main(path: str) -> None:
             raise RuntimeError(f"set {s}: no channel has a small accumulator that separates DOUBLE from SINGLE")
         print(f"set {s}{' (packed)' if packed else ''}: DOUBLE/SINGLE separating accumulators on channels {found}")
         want = np.stack([ipu.requant(acc[:, k], mult[c[:, k]], shift[c[:, k]], int(zpL[k]), int(aminL[k]), int(amaxL[k]),
-                                     tflite_ref.ROUNDING) for k in range(LANES)], axis=1)
+                                     mr.ROUNDING) for k in range(LANES)], axis=1)
         out += [int(packed)] + zpL.tolist() + aminL.tolist() + amaxL.tolist() + mult.tolist() + shift.tolist()
         for b in range(PER):
             out += acc[b].tolist() + [int(v) for v in want[b]]

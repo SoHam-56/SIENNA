@@ -104,7 +104,7 @@ def test_selu_saturation_refused():
     # Review Focus 5: an int8 SELU entry whose lane input reaches x >= 487.29 must be refused, not packed.
     req = dict(mult=np.full(2, 1 << 30), shift=np.zeros(2, np.int64), zp=-128, amin=-128, amax=127, mx=(1 << 15) - 1, shx=0,
                mout=1, shout=0, zout=0)
-    assert np.any(mr.regression.selu_saturates(req["mx"], req["shx"], req["zp"], np.arange(req["amin"], req["amax"] + 1))), \
+    assert np.any(mr.selu_saturates(req["mx"], req["shx"], req["zp"], np.arange(req["amin"], req["amax"] + 1))), \
         "the test's req does not saturate"
     m = {"W": np.ones((2, 2)), "bias": None, "act": "selu", "req": req, "inputs": [np.ones((1, 2))]}
     try:
@@ -143,12 +143,12 @@ def test_precheck_lanes():
 
 
 def test_precheck_collapse_k0():
-    old = mr.regression.COLLAPSE_K
-    mr.regression.COLLAPSE_K = 0
+    old = mr.COLLAPSE_K
+    mr.COLLAPSE_K = 0
     try:
         assert "collapse-k 0" in _refused(_packed(16), 16, 32, "a packed layer on the collapse-k 0 mesh")
     finally:
-        mr.regression.COLLAPSE_K = old
+        mr.COLLAPSE_K = old
 
 
 def test_precheck_residual():

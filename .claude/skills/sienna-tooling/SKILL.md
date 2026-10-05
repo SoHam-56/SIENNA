@@ -1,6 +1,6 @@
 ---
 name: sienna-tooling
-description: Use when running, changing or extending SIENNA's Python tooling - the two scripts sienna_check.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, one-verdict gate) and sienna_run.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (regression.py, model_runner.py, pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
+description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, one-verdict gate) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
 ---
 
 # SIENNA tooling: two scripts
@@ -34,14 +34,16 @@ their models (mesh_model, gpnae_model, fpu, ipu), as today.
 
 ## The two scripts
 
-### sienna_run.py — the host software stack (what a software developer reads and rebuilds)
+### model_runner.py — the host software stack (what a software developer reads and rebuilds)
+
+Keeps today's name; it grows from today's model_runner.py.
 
 Organised top to bottom as the layers a driver/compiler has, each a labelled section with a short public API:
 
 1. **Numerics** (reference arithmetic the host must reproduce): format rounding and bit patterns (fp32, bf16, int8),
    TFLite post-training quantization (`quant_act`, `quant_weights`, `fold_bias`), `requant_params`, `requantize`,
    the int8 lane and layer golden (`int8_layer_exact`), and the TFLite reference kernels now in tflite_ref.py.
-   Moved here from regression.py and tflite_ref.py because the compiler needs them, and sienna_check imports them.
+   Moved here from regression.py and tflite_ref.py because the compiler needs them, and regression.py imports them.
 2. **Frontend**: TFLite loading (`load_tflite`, `load_layer`), lowering each op to GEMM jobs (`lower_op`, `im2col`,
    `fuse_add`, global average pool), the int8 job builder (`job_of`).
 3. **Middle end**: tiling into N x N sets (`format_layer`, `layer_epilogue`), packing (`pack_jobs`, `unpack`,
@@ -54,28 +56,29 @@ Organised top to bottom as the layers a driver/compiler has, each a labelled sec
    (TB_sienna_model, the host-driven set engine; was Sim), `Emulator` (numpy stand-in; was EmuSim). Same interface:
    `build()`, `run_job(job, tag) -> (outputs, sets, cycles)`.
 6. **CLI**:
-   - `sienna_run.py model --model-dir D [--models ...] [--format fp32|bf16|int8] [--n] [--tile] [--lanes] [--engine layer|sets|emulate] [--count] [--no-sim]` (was model_runner.py)
-   - `sienna_run.py tflite --models D [--pack] [--n] [--tile] [--lanes]` (was tflite_int8_run.py and, with `--pack`, tflite_pack_run.py)
+   - `model_runner.py --action model` (default) `--model-dir D [--models ...] [--format fp32|bf16|int8] [--n] [--tile] [--lanes] [--engine layer|sets|emulate] [--count] [--no-sim]` (today's CLI)
+   - `model_runner.py --action tflite --models D [--pack] [--n] [--tile] [--lanes]` (was tflite_int8_run.py and, with `--pack`, tflite_pack_run.py)
 
-### sienna_check.py — hardware sanity (one place to prove the RTL is right)
+### regression.py — hardware sanity (one place to prove the RTL is right)
 
-Imports sienna_run for numerics and backends; never the other way round.
+Named as SystolicMesh's and GPNAE's own `regression.py` (Soham, 2026-10-05), so every repo has its hardware check under
+the same name. It keeps today's `--action` interface and grows it; it imports model_runner for numerics and backends,
+never the other way round.
 
-- `regression [--format] [--n] [--tile] [--lanes] [--test SUBSTR] [--collapse-k]` — the pipeline regression (was regression.py), with its tests, goldens and stimulus writers
-- `pkg --format --n --tile --lanes --test NAME` — test_config_pkg.sv and one test's stimulus (was regression.py --action pkg; `make pkg` and the guard use it)
-- `gen`, `analyze` — regression.py's other actions
-- `pack [--format] [--n] [--tile] [--act] [--rows ...]` — packed layers vs each job alone (was pack_regression.py)
-- `gemm [--format] [--n] [--quick] [--engine]` — GEMM sweep (was gemm_sweep.py)
-- `perf ...` — streamed-set performance analysis (was perf_analysis.py)
-- `oracle --out D --report F` — gate G0 (was tflite_oracle.py); `pack-models D` (was tflite_pack_models.py); `gpnae-tflite` (was gpnae_int8_tflite.py)
-- `rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
-- `selftest` — every tool self-test now in test_*.py, pure Python, no simulator
-- `all [--format] [--n] [--tile] [--lanes]` — one verdict: selftest, the SystolicMesh and GPNAE regressions (via make), the SIENNA regression, pack, gemm quick, and tflite (int8); prints a table and exits non-zero on any failure (farm launching stays in sienna_jobs, outside git)
+- `--action regression` (default) `[--format] [--n] [--tile] [--lanes] [--test SUBSTR] [--collapse-k]` — the pipeline regression, as today
+- `--action pkg --test NAME` — test_config_pkg.sv and one test's stimulus (`make pkg` and the guard use it), as today; `gen`, `analyze` as today
+- `--action pack [--act] [--rows ...]` — packed layers vs each job alone (was pack_regression.py)
+- `--action gemm [--quick] [--engine]` — GEMM sweep (was gemm_sweep.py)
+- `--action perf ...` — streamed-set performance analysis (was perf_analysis.py)
+- `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite` (was gpnae_int8_tflite.py)
+- `--action rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
+- `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
+- `--action all` — one verdict: selftest, the SystolicMesh and GPNAE regressions (via make), the SIENNA regression, pack, gemm quick, and tflite (int8); prints a table and exits non-zero on any failure (farm launching stays in sienna_jobs, outside git)
 
 ### Makefile
 
 Every target keeps its name and arguments and calls the new script: `regression`, `pkg`, `pack`, `gemm`,
-`perf-analysis`, `model`, `tflite` (and a new `check` for `sienna_check.py all`). test_makefile_fmt's checks move into
+`perf-analysis`, `model`, `tflite` (and a new `check` for `regression.py --action all`). test_makefile_fmt's checks move into
 `selftest` and follow the new recipes.
 
 ## Rules
@@ -89,9 +92,9 @@ Every target keeps its name and arguments and calls the new script: `regression`
 
 ## Size and trade-off (Soham chose two files)
 
-sienna_check.py will be about 3,000 lines and sienna_run.py about 1,500. To keep them readable: a contents block at the
+regression.py will be about 3,000 lines and model_runner.py about 1,500. To keep them readable: a contents block at the
 top of each, sections in the order above, no cross-section reach-ins (sections call each other through their public
-functions), and sienna_run's sections ordered so a reader can stop at the device protocol and know everything a
+functions), and model_runner's sections ordered so a reader can stop at the device protocol and know everything a
 driver needs.
 
 ## Out of scope (possible next steps)

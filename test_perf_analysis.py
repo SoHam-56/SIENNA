@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import regression as pa  # noqa: E402
 
+pa.perf_init()  # the RTL's unit latencies and lane parameters, parsed once
 FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")
 
 

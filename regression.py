@@ -1564,7 +1564,7 @@ def rtl_lat() -> tuple:
         m = re.search(rf"function automatic int {fn}\([^)]*\);(.*?)endfunction", raw, re.S)
         b = re.fullmatch(form, re.sub(r"//[^\n]*", "", m.group(1)).strip()) if m else None
         if not b:
-            raise RuntimeError(f"perf_analysis: {FMT_PKG}: {fn}() is not in the form the model reads; update rtl_lat()")
+            raise RuntimeError(f"regression.py --action perf: {FMT_PKG}: {fn}() is not in the form the model reads; update rtl_lat()")
         return tuple(int(x) for x in b.groups())
 
     mi, mw, mhi, mlo = body("mul_lat", r"if \(is_int\(exp_w\)\) return (\d+);\s*return \(man_w \+ 1 > (\d+)\) \? (\d+) : (\d+);")
@@ -1573,8 +1573,8 @@ def rtl_lat() -> tuple:
     return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0]
 
 
-UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()  # mul_lat and add_lat per format, fxMac, tfliteRequant
-MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]  # valid in to done out; perf_main() sets the build's format's values
+UNIT_LAT = FX_LAT = REQ_LAT = None  # mul_lat and add_lat per format, fxMac, tfliteRequant; perf_init() parses them
+MUL_LAT = ADD_LAT = None  # valid in to done out; perf_init() sets fp32's, perf_main() the build's format's values
 MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
 FMT = "fp32"  # the build's format; perf_main() sets it
 
@@ -1633,11 +1633,19 @@ def lane_params() -> tuple:
     inst = re.search(r"gpnae_poly #\((.*?)\) gpnae_inst", open(os.path.join(ROOT, "src", "sienna_top.sv")).read(), re.S)
     k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
     if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
-        raise RuntimeError("perf_analysis: gpnae_poly's K / TAIL_CONTEXTS defaults not found, or sienna_top overrides them")
+        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS defaults not found, or sienna_top overrides them")
     return int(k.group(1)), int(t.group(1))
 
 
-GROUP_K, TAIL_CTX = lane_params()  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults
+GROUP_K = TAIL_CTX = None  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults; perf_init() parses them
+
+
+def perf_init() -> None:
+    """Parses the RTL's unit latencies and lane parameters for the perf model; at perf's entry, not at import, so an unparsable RTL fails only perf."""
+    global UNIT_LAT, FX_LAT, REQ_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX
+    UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()
+    MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]
+    GROUP_K, TAIL_CTX = lane_params()
 DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
 
 
@@ -1837,8 +1845,9 @@ def perf_main(argv=None) -> None:
     ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
     ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
     ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(UNIT_LAT), help="number format of the build")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FMT_KNOBS), help="number format of the build")
     args = ap.parse_args(argv)
+    perf_init()
     global MUL_LAT, ADD_LAT, FMT
     MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
     FMT = args.fmt_name

@@ -290,7 +290,7 @@ help:
 	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (gemm_sweep.py; T=4)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (perf_analysis.py)"
-	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit; needs FMT=int8"
+	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (pack_regression.py)"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
@@ -545,7 +545,7 @@ perf-analysis:
 
 tflite:
 	@[ "$(FMT)" = int8 ] || { echo "ERROR: make tflite runs the int8 TFLite models only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
-	$(PYTHON) tflite_int8_run.py \
+	$(PYTHON) model_runner.py --action tflite \
 		--n $(N) \
 		--tile-size $(TILE) \
 		--lanes $(LANES)

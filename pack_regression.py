@@ -102,7 +102,7 @@ def run_models(a, sim, log):
             m["W"], m["bias"] = reg.op_round(m["W"], a.fmt), reg.op_round(m["bias"], a.fmt)
             m["inputs"] = [reg.op_round(x, a.fmt) for x in m["inputs"]]
     if a.fmt == "int8":
-        log.write("int8 pack_jobs case: covered by tflite_pack_run.py (Task 8)\n")
+        log.write("int8 pack_jobs case: covered by model_runner.py --action tflite --pack (Task 8)\n")
         return 0
     job, recipe = mr.pack_jobs(models, N, int8=False)
     Y, _, _ = sim.run_job(job, "pj")
@@ -132,7 +132,7 @@ def main():
     a.acts = [a.act] * 8 if a.act else ACTS
     work = os.path.join(ROOT, "testbenches", "results", "pack")
     os.makedirs(work, exist_ok=True)
-    sim = mr.LayerSim(a.n, a.lanes, work, a.fmt, a.tile)
+    sim = mr.RtlLayer(a.n, a.lanes, work, a.fmt, a.tile)
     sim.build()
     log = open(os.path.join(work, f"pack_regression_{a.fmt}_N{a.n}_T{a.tile}{'_' + a.act if a.act else ''}.log"), "w")
     bad = 0

@@ -8,7 +8,7 @@ Contains:
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
   5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors
-  6. Tool self-tests (--action selftest) and the one-verdict gate (--action all, make check)
+  6. Tool self-tests (--action selftest) and the one-verdict gate (--action all, make regression)
 """
 
 import argparse
@@ -2396,9 +2396,9 @@ def test_guard_missing_file():
 
 @selftest
 def test_parse_time_rejections():
-    r = make_n("regression", "FMT=fp16")
+    r = make_n("pipeline", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
-    for t in ("regression", "verilator", "lint", "pkg", "pack"):
+    for t in ("pipeline", "regression", "verilator", "lint", "pkg", "pack"):
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode != 0 and "sienna_ck0.sh" in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
@@ -2417,11 +2417,12 @@ def test_pack_target():
 
 
 @selftest
-def test_check_target():
-    r = make_n("check", "FMT=int8", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
+def test_regression_target():
+    r = make_n("regression", "FMT=int8", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
     assert r.returncode == 0 and r.stdout.split() == "py regression.py --action all --format int8 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
-    r = make_n("check", "FMT=fp16")
+    r = make_n("regression", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+    assert make_n("check").returncode != 0  # the gate's old name is gone
 
 
 @selftest
@@ -2496,10 +2497,10 @@ def test_check_reported_steps():
                         all_main(["--format", "bf16"], steps=lambda a, f=fake: f)
                     except SystemExit as e:
                         got = e.code
-                table = open(os.path.join(d, "check_bf16_N16_T4_L32.log")).read()
+                table = open(os.path.join(d, "regression_bf16_N16_T4_L32.log")).read()
                 assert got == code, (got, table)
-                assert code or "CHECK PASS: 1 of 1 gated steps passed; 1 reported, not gated" in table and "FAIL (exit 1), reported, not gated" in table, table
-            assert "CHECK FAIL: 1 of 2 gated steps passed" in table, table
+                assert code or "REGRESSION PASS: 1 of 1 gated steps passed; 1 reported, not gated" in table and "FAIL (exit 1), reported, not gated" in table, table
+            assert "REGRESSION FAIL: 1 of 2 gated steps passed" in table, table
         finally:
             CHECK_DIR = saved
 
@@ -2894,7 +2895,7 @@ def selftest_main(argv=None) -> None:
 
 # ── all (the one-verdict gate) ───────────────────────────────────────────────
 
-CHECK_DIR = os.path.join(ROOT, "testbenches", "results", "check")
+CHECK_DIR = os.path.join(ROOT, "testbenches", "results", "regression")
 FIRING = re.compile(r"^.*(?:Assertion failed|%Error).*$", re.M)  # _parse_log's witness: a firing assertion leaves the exit status clean
 
 
@@ -2907,12 +2908,12 @@ def check_steps(a) -> list:
     gpnae = [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator", "GPNAE_MODEL=exact"))] \
         if a.fmt == "bf16" else [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=exact"))]  # bf16: bit-exact gated, accuracy reported
     steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]), ("sm-verilator", mk("sm-verilator")),
-             *gpnae, ("regression", mk("regression")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
+             *gpnae, ("pipeline", mk("pipeline")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
     steps += [("tflite", mk("tflite"))] if a.fmt == "int8" else []
     return [(name, argv, (name, a.fmt) not in REPORTED) for name, argv in steps]
 
 
-STEP_ENV_DROP = ("MAKEFLAGS", "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES", "GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K")  # make check's own variables must not narrow a step
+STEP_ENV_DROP = ("MAKEFLAGS", "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES", "GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K")  # make regression's own variables must not narrow a step
 
 
 def run_step(argv: list, log_path: str) -> str:
@@ -2933,7 +2934,7 @@ def run_step(argv: list, log_path: str) -> str:
 
 
 def all_main(argv=None, steps=check_steps) -> None:
-    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA regression, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
+    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA pipeline, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
     ap = argparse.ArgumentParser(description=all_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="all")
     ap.add_argument("--format", dest="fmt", default="fp32", choices=sorted(mr.FORMATS))
@@ -2952,10 +2953,10 @@ def all_main(argv=None, steps=check_steps) -> None:
         rows.append((name, v if gated else f"{v}, reported, not gated", gated, time.time() - t0, log_path))
     n_gated = sum(g for _, _, g, _, _ in rows)
     failed = sum(g and v != "PASS" for _, v, g, _, _ in rows)
-    table = [f"CHECK {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, _, s, p in rows]
-    table.append(f"CHECK {'PASS' if failed == 0 else 'FAIL'}: {n_gated - failed} of {n_gated} gated steps passed"
+    table = [f"REGRESSION {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, _, s, p in rows]
+    table.append(f"REGRESSION {'PASS' if failed == 0 else 'FAIL'}: {n_gated - failed} of {n_gated} gated steps passed"
                  + (f"; {len(rows) - n_gated} reported, not gated" if len(rows) > n_gated else ""))
-    open(os.path.join(CHECK_DIR, f"check_{tag}.log"), "w").write("\n".join(table) + "\n")
+    open(os.path.join(CHECK_DIR, f"regression_{tag}.log"), "w").write("\n".join(table) + "\n")
     print("\n" + "\n".join(table))
     sys.exit(1 if failed else 0)
 

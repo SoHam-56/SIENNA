@@ -20,13 +20,13 @@ Times assume a 950 MHz clock ([why](#performance)).
 
 ![SIENNA dataflow](docs/sienna_dataflow.svg)
 
-What makes it fast, stage by stage:
+Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, then the activation function on the result. What makes it fast, stage by stage:
 
-- **Matrix engine** ([SystolicMesh](https://github.com/SoHam-56/SystolicMesh)). Each small systolic array owns one output tile and runs the full depth, so every array finishes at the same time. Double-buffered inputs, partial-sum banks in every PE and four result banks let one set load while the previous one multiplies and the one before is read out. A weight cache keeps reused weights on chip.
-- **Activation** ([GPNAE](https://github.com/SoHam-56/GPNAE)). SELU, sigmoid and tanh are fitted polynomials, not an exponential followed by a divider. A barrel multiply-accumulate unit interleaves inputs so it never waits on its own pipeline. 32 lanes fill in parallel from one wide read.
-- **Pipeline.** A credit scheme keeps up to 15 sets in flight. The host starts a new set the moment a buffer frees up, and each set carries its own activation function.
-- **Layer engine.** `sienna_layer` schedules a whole network layer in hardware: tiling, weight reuse, bias, residual adds, depthwise convolution and the int8 epilogue. The host only streams data.
-- **Packing.** Layers too small to fill the mesh share one matrix multiply, each in its own diagonal block. The processing elements skip everything outside their block.
+- **Matrix engine** ([SystolicMesh](https://github.com/SoHam-56/SystolicMesh)). The mesh is a grid of small systolic arrays, and each one computes its own block of the result from start to finish, so they all finish together and nothing has to be combined afterwards. Inputs, running sums and results each have spare buffers, so the next set loads while the current one multiplies and the previous result is read out. Weights that a layer reuses stay in an on-chip cache instead of being sent again.
+- **Activation** ([GPNAE](https://github.com/SoHam-56/GPNAE)). Sigmoid, tanh and SELU are usually computed from e^x, which takes a long series of terms and, for sigmoid and tanh, a slow division. SIENNA instead approximates each function directly with a short polynomial, which needs only multiplies and adds. A tanh takes about 21 cycles instead of 747 in the published design. Each lane's multiply-add unit works on many inputs in turn, so it starts a new operation every cycle, and 32 lanes run side by side.
+- **Pipeline.** Up to 15 sets are in flight at once, each stage working on a different one. The hardware tells the host when there is room, so the host starts the next set without waiting for the previous one to finish. Each set can use a different activation function.
+- **Layer engine.** `sienna_layer` runs a whole network layer on its own. It splits the layer into sets, reuses weights, and adds the bias and any skip connection. It handles depthwise convolution and, in int8, the rescaling of each output channel. The host only streams the data in.
+- **Packing.** A layer much smaller than the mesh would leave most of it idle. Several such layers are packed side by side into one matrix multiply, each in its own block, and run together. The hardware ignores everything outside each layer's block, so every result is identical to running the layers one at a time.
 - **One design, three formats.** fp32, bf16 and int8 (int32 sums, TensorFlow Lite requantization) build from the same RTL. bf16 and int8 match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
 
 ---

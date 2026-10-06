@@ -27,7 +27,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 - **Pipeline.** Up to 15 sets are in flight at once, each stage working on a different one. The hardware tells the host when there is room, so the host starts the next set without waiting for the previous one to finish. Each set can use a different activation function.
 - **Layer engine.** `sienna_layer` runs a whole network layer on its own. It splits the layer into sets, reuses weights, and adds the bias and any skip connection. It handles depthwise convolution and, in int8, the rescaling of each output channel. The host only streams the data in.
 - **Packing.** A layer much smaller than the mesh would leave most of it idle. Several such layers are packed side by side into one matrix multiply, each in its own block, and run together. The hardware ignores everything outside each layer's block, so every result is identical to running the layers one at a time.
-- **One design, three formats.** fp32, bf16 and int8 (int32 sums, TensorFlow Lite requantization) build from the same RTL. bf16 and int8 match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
+- **Number format chosen at build time.** One build parameter makes the whole pipeline fp32, bf16 or int8 (int32 sums, TensorFlow Lite rescaling). It selects the multipliers, adders and activation lanes for that format, and each build runs that one format. bf16 and int8 builds match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
 
 ---
 
@@ -80,7 +80,7 @@ The same small jobs, run one at a time and packed into shared sets (N = 32), wit
 
 ### Compared with other accelerators
 
-**Matrix engine.** Multiply-accumulates per cycle do not depend on the clock, so they compare designs fairly. Most edge accelerators are integer-only; SIENNA runs fp32, bf16 and int8 on one mesh.
+**Matrix engine.** Multiply-accumulates per cycle do not depend on the clock, so they compare designs fairly. Most edge accelerators are integer-only; SIENNA builds in fp32, bf16 or int8 from the same source, one format per build.
 
 | Design | Origin | MACs per cycle | Formats | Peak, as published |
 |---|---|---|---|---|

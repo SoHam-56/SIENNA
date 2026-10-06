@@ -1160,7 +1160,7 @@ def model_main(argv=None):
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS),
-                    help="format of every layer's inputs and weights on the layer engine; sums and results stay fp32")
+                    help="the layer engine's build format for inputs, weights, sums and results (bf16 sums in bf16, so error grows with depth); --engine sets is fp32")
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))

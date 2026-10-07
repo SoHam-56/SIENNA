@@ -29,10 +29,47 @@ module TB_sienna_model;
   logic weight_cached_i, wc_write_enable_i;
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
-  logic [1:0] wc_region_busy_o;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
+
+  // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
+  localparam int PACK_ENTRIES = 8;
+  `include "sienna_set_side.svh"
+  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk ();
+  credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
+  logic [1:0] host_cnt;
+  set_side_t side;
+  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
+                                              .has_credit_o(), .count_o(host_cnt));
+  always_comb begin
+    side               = '0;
+    side.weight_tile   = weight_tile_i;
+    side.weight_cached = weight_cached_i;
+    side.accumulate    = accumulate_i;
+    side.bias_valid    = bias_valid_i;
+    side.train         = training_mode_i;
+    side.seed          = dropout_seed_i;
+    side.terms         = num_terms_i;
+    side.act[0]        = activation_function_i;
+    side.zp[0]         = req_zp_i;
+    side.amin[0]       = req_min_i;
+    side.amax[0]       = req_max_i;
+    side.mx[0]         = gp_mx_i;
+    side.shx[0]        = gp_shx_i;
+    side.mout[0]       = gp_mout_i;
+    side.shout[0]      = gp_shout_i;
+    side.zout[0]       = gp_zout_i;
+    side.mult          = req_mult_i;
+    side.shift         = req_shift_i;
+  end
+  // The host loads a set only while it holds a credit, so the gate never drops a start; it keeps the put sampled alike at the edge the host drives it.
+  assign host_lnk.put = start_pipeline_i && pipeline_ready_o;
+  assign host_lnk.data = side;
+  assign wc_lnk[0].put = 1'b0;
+  assign wc_lnk[0].data = 1'b0;
+  assign wc_lnk[1].put = 1'b0;
+  assign wc_lnk[1].data = 1'b0;
 
   logic north_write_enable_i, north_write_reset_i;
   logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;  // operands in the package's format
@@ -42,8 +79,9 @@ module TB_sienna_model;
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
-  logic                                  pipeline_ready_o;
+  logic                                  pipeline_ready_o;  // this host holds a staging credit
   logic                        [ID_W-1:0] done_set_id_o;
+  assign pipeline_ready_o = (host_cnt != 0);
   logic systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb;
   logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
 
@@ -76,40 +114,11 @@ module TB_sienna_model;
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
-      .start_pipeline_i           (start_pipeline_i),
-      .training_mode_i            (training_mode_i),
-      .accumulate_i               (accumulate_i),
-      .bias_valid_i               (bias_valid_i),
+      .host                       (host_lnk),  // unpacked sets: the sideband's pack fields and entries 1.. stay zero
       .bias_i                     (bias_i),
-      .req_mult_i                 (req_mult_i),
-      .req_shift_i                (req_shift_i),
-      .req_zp_i                   (req_zp_i),
-      .req_min_i                  (req_min_i),
-      .req_max_i                  (req_max_i),
-      .gp_mx_i                    (gp_mx_i),
-      .gp_shx_i                   (gp_shx_i),
-      .gp_mout_i                  (gp_mout_i),
-      .gp_shout_i                 (gp_shout_i),
-      .gp_zout_i                  (gp_zout_i),
-      .pack_shift_i               ('0),  // packing: the model TB streams unpacked sets
-      .pack_map_i                 ('0),
-      .pack_act_i                 ('0),
-      .pack_zp_i                  ('0),
-      .pack_min_i                 ('0),
-      .pack_max_i                 ('0),
-      .pack_mx_i                  ('0),
-      .pack_shx_i                 ('0),
-      .pack_mout_i                ('0),
-      .pack_shout_i               ('0),
-      .pack_zout_i                ('0),
-      .weight_cached_i            (weight_cached_i),
-      .weight_tile_i              (weight_tile_i),
+      .wc_region                  (wc_lnk),
       .wc_write_enable_i          (wc_write_enable_i),
       .wc_write_addr_i            (wc_write_addr_i),
-      .wc_region_busy_o           (wc_region_busy_o),
-      .dropout_seed_i             (dropout_seed_i),
-      .activation_function_i      (activation_function_i),
-      .num_terms_i                (num_terms_i),
       .north_write_enable_i       (north_write_enable_i),
       .north_write_data_i         (north_write_data_i),
       .north_write_reset_i        (north_write_reset_i),
@@ -119,7 +128,6 @@ module TB_sienna_model;
       .final_result_o             (final_result_o),
       .result_valid_o             (result_valid_o),
       .pipeline_complete_o        (pipeline_complete_o),
-      .pipeline_ready_o           (pipeline_ready_o),
       .done_set_id_o              (done_set_id_o),
       .systolic_busy_o            (systolic_busy_tb),
       .gpnae_busy_o               (gpnae_busy_tb),
@@ -166,7 +174,7 @@ module TB_sienna_model;
       if (dut.g_accept) $display("EV %0d act", cycle);
       if (dut.p_accept || dut.p_null) $display("EV %0d pool", cycle);
       if (pipeline_complete_o) $display("EV %0d done", cycle);
-      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, dut.credits, dut.mesh_input_ready);
+      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, !dut.entry_full, dut.l1_cnt > dut.l0_out);
       if (dut.systolic_array_inst.arrays_final && !dut.systolic_array_inst.reduce_start)
         $display("EV %0d blocked red%0d bank%0d", cycle, dut.systolic_array_inst.reducers_ready,
                  dut.systolic_array_inst.out_state[dut.systolic_array_inst.out_wr]);

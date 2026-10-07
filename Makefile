@@ -16,6 +16,8 @@ PYTHON ?= python3
 # model_runner.py has no default model directory, so make model needs one.
 MODEL_DIR ?=
 QUICK ?= 0
+# Register stages on sienna_top's host, staging and result links (L0, L1, L3), a TB_sienna_top parameter; 0 is wires.
+LINK_STAGES ?= 0
 
 FORMATS = fp32 bf16 int8
 # Exactly one word, and one of FORMATS: anything left after filter-out, or a word count but 1, stops make.
@@ -23,7 +25,7 @@ ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
 $(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
 endif
 
-# COLLAPSE_K is 0 or 1, and 0 only for sm-verilator: TB_sienna_top has no parameters, so -G cannot reach sienna_top's.
+# COLLAPSE_K is 0 or 1, and 0 only for sm-verilator: TB_sienna_top passes only LINK_STAGES (and FAULT) to sienna_top, so -G cannot reach sienna_top's.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
@@ -117,8 +119,15 @@ MAXPOOL_FILES = \
 DROPOUT_FILES = \
 	dropout.sv
 
+CREDIT_FILES = \
+	credit_link_if.sv \
+	credit_counter.sv \
+	credit_reg.sv \
+	credit_link_checker.sv
+
 DESIGN_FILES = \
 	$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv \
+	$(addprefix $(SM_LIB_DIR)/Common/src/,$(CREDIT_FILES)) \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
 	$(addprefix $(SM_DIR)/,$(SM_FILES)) \
 	$(addprefix $(SM_LIB_DIR)/,$(SM_LIB_FILES)) \
@@ -224,6 +233,9 @@ VERILATOR_FLAGS = \
 
 # Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK; SIM_ARGS go to the simulator (e.g. +verilator+rand+reset+2)
 VERILATOR_FLAGS += $(EXTRA_FLAGS)
+ifneq ($(LINK_STAGES),0)
+VERILATOR_FLAGS += -GLINK_STAGES=$(LINK_STAGES)
+endif
 
 ifeq ($(TRACE),fst)
 VERILATOR_FLAGS += --trace-fst --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE -DTRACE_FST

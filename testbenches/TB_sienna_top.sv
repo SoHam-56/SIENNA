@@ -2,7 +2,11 @@
 
 import test_config_pkg::*;
 
-module TB_sienna_top;
+// LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide; -DTB_FAULT4: forced L3 framing and completion faults.
+module TB_sienna_top #(
+    parameter int LINK_STAGES = 0,
+    parameter int FAULT       = 0
+);
 
   // ── Localparams from generated SV package ─────────────────────────────
   localparam string WEST_INPUT_FILE = "matrix_west.mem";
@@ -10,7 +14,6 @@ module TB_sienna_top;
   localparam string EXPECTED_OUTPUT_FILE = "expected_output.mem";
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
-  localparam int OVR_WORDS = 4 * HOST_WORDS;  // words loaded before the no-credit start
   localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);  // set ids count accepted starts modulo 2^ID_W
 
   // ── Timeout / heartbeat ───────────────────────────────────────────────
@@ -24,7 +27,6 @@ module TB_sienna_top;
 
   // ── DUT I/O ───────────────────────────────────────────────────────────
   logic clk_i, rstn_i;
-  logic                     start_pipeline_i;
   logic                     training_mode_i;
   logic                     accumulate_i;  // this set is a partial sum
   logic                     bias_valid_i;  // this set carries a bias row
@@ -49,10 +51,44 @@ module TB_sienna_top;
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
   logic                     wc_write_enable_i;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
-  logic [1:0]               wc_region_busy_o;
+  logic                     wc_last_i;  // this set is the last of its cache region's fill
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
+  localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;  // result beats per set
+
+  // ── Links: this TB is the host (L0) and the weight-cache writer (L2), each with a counter and a checker ──
+  `include "sienna_set_side.svh"
+  localparam int SIDE_W = $bits(set_side_t);
+  credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk ();
+  credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
+  logic [1:0] host_cnt;  // staging credits this host holds
+  logic       wc_cnt[2];  // per cache region: its credit is held
+  bit         wc_open_tb[2];  // per region: a fill is open (put, its last set not yet put)
+  logic       drained;  // nothing in flight for a while: every credit must be home
+  int         tb_inflight, quiet_cyc;  // sets put and not complete; cycles with none
+  localparam int QUIET_TB = 16 + 4 * LINK_STAGES;
+  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
+                                              .has_credit_o(), .count_o(host_cnt));
+  credit_link_checker #(.SLOTS(2)) chk_host (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(host_lnk));
+  for (genvar r = 0; r < 2; r++) begin : G_WC
+    credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(wc_lnk[r].put), .credit_i(wc_lnk[r].credit),
+                                           .has_credit_o(), .count_o(wc_cnt[r]));
+    credit_link_checker #(.SLOTS(1)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained && !wc_open_tb[r]), .lnk(wc_lnk[r]));
+  end
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) begin
+      tb_inflight <= 0;
+      quiet_cyc   <= 0;
+    end else begin
+      tb_inflight <= tb_inflight + int'(host_lnk.put) - int'(pipeline_complete_o);
+      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+    end
+  assign drained = (quiet_cyc == QUIET_TB);
+  bit acc_on = 0;  // the accumulate pass is running
+  // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
+  int over_admit = 0;
+  always @(negedge clk_i) if (rstn_i && tb_inflight + int'(host_cnt) > SETS_IN_FLIGHT) over_admit++;
 
   logic north_write_enable_i, north_write_reset_i;
   logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;  // operands in the package's format
@@ -62,7 +98,6 @@ module TB_sienna_top;
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
-  logic                                  pipeline_ready_o;
   logic                        [ID_W-1:0] done_set_id_o;
   logic systolic_busy_tb, gpnae_busy_tb;
   logic maxpool_busy_tb, dropout_busy_tb;
@@ -109,44 +144,18 @@ module TB_sienna_top;
       .PADDING          (PADDING),
       .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
       .LFSR_WIDTH       (LFSR_WIDTH),
-      .FIFO_DEPTH       (FIFO_DEPTH)
+      .FIFO_DEPTH       (FIFO_DEPTH),
+      .WC_TILES         (WC_TILES),
+      .PACK_ENTRIES     (PACK_ENTRIES),
+      .LINK_STAGES      (LINK_STAGES)
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
-      .start_pipeline_i           (start_pipeline_i),
-      .training_mode_i            (training_mode_i),
-      .accumulate_i               (accumulate_i),
-      .bias_valid_i               (bias_valid_i),
+      .host                       (host_lnk),
       .bias_i                     (bias_i),
-      .req_mult_i                 (req_mult_i),
-      .req_shift_i                (req_shift_i),
-      .req_zp_i                   (req_zp_i),
-      .req_min_i                  (req_min_i),
-      .req_max_i                  (req_max_i),
-      .gp_mx_i                    (gp_mx_i),
-      .gp_shx_i                   (gp_shx_i),
-      .gp_mout_i                  (gp_mout_i),
-      .gp_shout_i                 (gp_shout_i),
-      .gp_zout_i                  (gp_zout_i),
-      .pack_shift_i               (pack_shift_i),
-      .pack_map_i                 (pack_map_i),
-      .pack_act_i                 (pack_act_i),
-      .pack_zp_i                  (pack_zp_i),
-      .pack_min_i                 (pack_min_i),
-      .pack_max_i                 (pack_max_i),
-      .pack_mx_i                  (pack_mx_i),
-      .pack_shx_i                 (pack_shx_i),
-      .pack_mout_i                (pack_mout_i),
-      .pack_shout_i               (pack_shout_i),
-      .pack_zout_i                (pack_zout_i),
-      .weight_cached_i            (weight_cached_i),
-      .weight_tile_i              (weight_tile_i),
+      .wc_region                  (wc_lnk),
       .wc_write_enable_i          (wc_write_enable_i),
       .wc_write_addr_i            (wc_write_addr_i),
-      .wc_region_busy_o           (wc_region_busy_o),
-      .dropout_seed_i             (dropout_seed_i),
-      .activation_function_i      (activation_function_i),
-      .num_terms_i                (num_terms_i),
       .north_write_enable_i       (north_write_enable_i),
       .north_write_data_i         (north_write_data_i),
       .north_write_reset_i        (north_write_reset_i),
@@ -156,7 +165,6 @@ module TB_sienna_top;
       .final_result_o             (final_result_o),
       .result_valid_o             (result_valid_o),
       .pipeline_complete_o        (pipeline_complete_o),
-      .pipeline_ready_o           (pipeline_ready_o),
       .done_set_id_o              (done_set_id_o),
       .systolic_busy_o            (systolic_busy_tb),
       .gpnae_busy_o               (gpnae_busy_tb),
@@ -167,6 +175,70 @@ module TB_sienna_top;
   );
 
   wire [4:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
+  wire res_ready = dut.systolic_array_inst.out_full[dut.systolic_array_inst.out_rd];  // the mesh holds a finished result
+
+  // The sideband of the set being put, from the per-set signals above; entry 0 of each table is the set's own.
+  function automatic set_side_t side_now();
+    set_side_t s;
+    s               = '0;
+    s.wc_last       = wc_last_i;
+    s.weight_tile   = weight_tile_i;
+    s.weight_cached = weight_cached_i;
+    s.accumulate    = accumulate_i;
+    s.bias_valid    = bias_valid_i;
+    s.train         = training_mode_i;
+    s.seed          = dropout_seed_i;
+    s.terms         = num_terms_i;
+    s.pack_shift    = pack_shift_i;
+    s.pack_map      = pack_map_i;
+    s.act           = {pack_act_i, activation_function_i};
+    s.zp            = {pack_zp_i, req_zp_i};
+    s.amin          = {pack_min_i, req_min_i};
+    s.amax          = {pack_max_i, req_max_i};
+    s.mx            = {pack_mx_i, gp_mx_i};
+    s.shx           = {pack_shx_i, gp_shx_i};
+    s.mout          = {pack_mout_i, gp_mout_i};
+    s.shout         = {pack_shout_i, gp_shout_i};
+    s.zout          = {pack_zout_i, gp_zout_i};
+    s.mult          = req_mult_i;
+    s.shift         = req_shift_i;
+    return s;
+  endfunction
+
+  // Waits for a staging credit; the edge after a put has not counted it yet, so callers leave a cycle after each put.
+  task automatic wait_credit();
+    while (host_cnt == 0) @(posedge clk_i);
+  endtask
+
+  // Puts the set whose rows were just written, its sideband in the data and bias_i beside it; link signals change on the falling edge, so counters, checkers and the DUT all sample the same put.
+  task automatic host_put();
+    @(negedge clk_i);
+    if (host_cnt == 0) begin
+      failed++;
+      $display("  [FAIL] The host put a set with no staging credit");
+    end
+    host_lnk.data = side_now();
+    host_lnk.put  = 1'b1;
+    @(negedge clk_i);
+    host_lnk.put  = 1'b0;
+    if (wc_last_i) wc_open_tb[weight_tile_i[$clog2(WC_TILES)-1]] = 1'b0;
+  endtask
+
+  // Opens a fill of cache region r: waits for its credit and puts; the rows follow.
+  logic [1:0] wc_put_tb = '0;  // per region: this TB's put; interface arrays take constant indices only
+  assign wc_lnk[0].put = wc_put_tb[0];
+  assign wc_lnk[1].put = wc_put_tb[1];
+  assign wc_lnk[0].data = 1'b0;
+  assign wc_lnk[1].data = 1'b0;
+  task automatic wc_open(input int r);
+    @(negedge clk_i);
+    while (wc_cnt[r] == 1'b0) @(negedge clk_i);
+    wc_put_tb[r] = 1'b1;
+    @(negedge clk_i);
+    wc_put_tb[r] = 1'b0;
+    wc_open_tb[r] = 1'b1;
+    @(posedge clk_i);
+  endtask
 
   // Manual binary32 decode; $bitstoshortreal leaves the bit pattern as an integer under Verilator.
   function automatic real f32(input logic [31:0] b);
@@ -266,9 +338,9 @@ module TB_sienna_top;
   int   prev_state = -1;
   always @(posedge clk_i) begin
     if (trace_states && dut_stage !== prev_state) begin
-      $display("  [FSM] @%0t state %0d -> %0d  (coll_complete=%0b mult_complete=%0b)",
+      $display("  [FSM] @%0t state %0d -> %0d  (res_ready=%0b mult_complete=%0b)",
                $time, prev_state, dut_stage,
-               dut.systolic_collection_complete, dut.systolic_mult_complete);
+               res_ready, dut.systolic_mult_complete);
       prev_state = dut_stage;
     end
   end
@@ -284,7 +356,12 @@ module TB_sienna_top;
   task automatic reset();
     $display("\n[STAGE] Reset");
     rstn_i = 0;
-    start_pipeline_i = 0;
+    host_lnk.put = 1'b0;
+    host_lnk.data = '0;
+    wc_put_tb = '0;
+    wc_open_tb[0] = 1'b0;
+    wc_open_tb[1] = 1'b0;
+    wc_last_i = 1'b0;
     training_mode_i = 1'b0;
     accumulate_i = 1'b0;
     bias_valid_i = 1'b0;
@@ -315,10 +392,30 @@ module TB_sienna_top;
     west_write_data_i = '0;
     activation_function_i = '0;
     num_terms_i = '0;
-    repeat (10) @(posedge clk_i);
+    repeat (10) begin
+      @(negedge clk_i);
+      // Review Focus 1: while reset is held every producer count is 0 and no consumer advertises a credit.
+      if (host_cnt != 0 || wc_cnt[0] || wc_cnt[1] || dut.l1_cnt != 0 || dut.l6_cnt != 0 || dut.sets_out != 0 || dut.l0_out != 0 ||
+          dut.systolic_array_inst.res_cnt != 0 || host_lnk.credit || wc_lnk[0].credit || wc_lnk[1].credit || dut.l3_grant ||
+          dut.l6_credit || dut.systolic_array_inst.stg_credit) begin
+        failed++;
+        $display("  [FAIL] In reset: host %0d, regions %0d %0d, staging %0d, act banks %0d, sets %0d, granted %0d, results %0d; credits out %0b%0b%0b%0b%0b%0b",
+                 host_cnt, wc_cnt[0], wc_cnt[1], dut.l1_cnt, dut.l6_cnt, dut.sets_out, dut.l0_out, dut.systolic_array_inst.res_cnt,
+                 host_lnk.credit, wc_lnk[0].credit, wc_lnk[1].credit, dut.l3_grant, dut.l6_credit, dut.systolic_array_inst.stg_credit);
+      end
+    end
+    @(posedge clk_i);
     rstn_i = 1;
     north_write_reset_i = 0;
     west_write_reset_i = 0;
+    if (FAULT == 1) begin  // a put with no credit and no rows, the cycle reset ends
+      @(negedge clk_i);
+      host_lnk.data = side_now();
+      host_lnk.put = 1'b1;
+      @(negedge clk_i);
+      host_lnk.put = 1'b0;
+      $display("  [FAULT 1] put with no credit and no rows @ %0t", $time);
+    end
     repeat (5) @(posedge clk_i);
     $display("  Reset complete @ %0t", $time);
   endtask
@@ -370,11 +467,11 @@ module TB_sienna_top;
         $display("  stage states {g,p} = %0d", dut_stage);
         $display("  filled_total=%0d  total_elements=%0d  all_collected=%0b", dut.filled_total,
                  dut.total_elements, dut.all_collected);
-        $display("  systolic_collection_complete=%0b  wide_read=%0b  disp_done=%0b",
-                 dut.systolic_collection_complete, dut.systolic_read_enable, dut.disp_done);
-        // IDLE only exits on start && both mesh queues non-empty; print that gate verbatim.
-        $display("  start gate: start_pipeline_i=%0b north_queue_empty=%0b west_queue_empty=%0b",
-                 start_pipeline_i, dut.north_queue_empty, dut.west_queue_empty);
+        $display("  res_ready=%0b  result beat=%0b  l3_armed=%0b  disp_done=%0b",
+                 res_ready, dut.wide_rd_valid, dut.l3_armed, dut.disp_done);
+        // The host side of L0 and the mesh's staging side of L1.
+        $display("  host credits=%0d sets_out=%0d granted=%0d staging=%0d north_queue_empty=%0b west_queue_empty=%0b",
+                 host_cnt, dut.sets_out, dut.l0_out, dut.l1_cnt, dut.north_queue_empty, dut.west_queue_empty);
         for (int i = 0; i < 4; i++)
           $display("  lane %0d: fill_count=%0d done_count=%0d load_finalized=%0b collected=%0b",
                    i, dut.fill_count[i], dut.done_count[i], dut.load_finalized[i],
@@ -446,9 +543,9 @@ module TB_sienna_top;
                    real'($bitstoshortreal(dut.fifo2_wr_data[lane])), dut.fifo2_wr_data[lane]);
         end
       end
-      // Console Print: Data exiting Dropout to final Output, dec in the build's format (int8: the signed code)
+      // Console Print: Data exiting Dropout to final Output, dec in the build's format (int8: the signed code); not for the accumulate pass, which main never ran
       for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.dropout_valid_out[lane]) begin
+        if (dut.dropout_valid_out[lane] && !acc_on) begin
           if (EXP_W == 0)
             $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%0d  hex=%08x", $time, lane,
                      $signed(dut.dropout_data_out[lane][7:0]), dut.dropout_data_out[lane]);
@@ -601,10 +698,15 @@ module TB_sienna_top;
     end
   endtask
 
-  // With WEIGHT_CACHE, set k's B is written once into cache tile k and the set sends only A.
+  // With WEIGHT_CACHE, set k's B is written once into cache tile k of region 0, one fill, and the set sends only A.
   task automatic write_cache();
     logic [DATA_WIDTH-1:0] q[$];
     if (WEIGHT_CACHE == 0) return;
+    if (NUM_SETS > WC_TILES / 2) begin
+      $display("[FATAL] %0d cached sets do not fit cache region 0 (%0d tiles)", NUM_SETS, WC_TILES / 2);
+      $finish;
+    end
+    wc_open(0);
     for (int k = 0; k < NUM_SETS; k++) begin
       read_mem_file($sformatf("matrix_north_%0d.mem", k), q);
       for (int i = 0; i < N * N; i += HOST_WORDS) begin
@@ -669,6 +771,7 @@ module TB_sienna_top;
   // A finished set waits for a result bank: the mesh is held up by the consumer.
   wire mesh_blocked = dut.systolic_array_inst.arrays_final && dut.systolic_array_inst.reducers_ready &&
                       !dut.systolic_array_inst.reduce_start;
+  int withheld = 0;  // cycles the full entry kept a free staging bank from the host
 
   always_ff @(posedge clk_i) begin
     if (stream_on) begin
@@ -686,10 +789,10 @@ module TB_sienna_top;
     if (stream_on) begin
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
-      // Not the cycle the stage accepts the result: it never waited.
-      if (maxpool_busy_tb && dut.systolic_collection_complete && !dut.g_accept) pool_with_result++;
+      // A finished result sits in the mesh, not being pushed, while pooling runs.
+      if (maxpool_busy_tb && res_ready && !dut.wide_rd_valid) pool_with_result++;
       if (mesh_blocked) bp_mesh++;  // a finished set waits because no result bank is free
-      if (int'(dut.g_state) == 0 && dut.systolic_collection_complete && dut.act_full[dut.act_wr])
+      if (int'(dut.g_state) == 0 && res_ready && dut.act_full[dut.act_wr])
         bp_act++;  // a mesh result waits because both activation banks are full
       if (n_started - stream_bounds.size() > max_in_flight)
         max_in_flight = n_started - stream_bounds.size();
@@ -700,8 +803,7 @@ module TB_sienna_top;
   int rq_id[$], rq_bank[$], rq_byp[$];
   int ov_rq = 0, rq_wait = 0;
   int ov_lane = 0, rq_hold = 0, rq_null_wait = 0, rq_null_pass = 0, rd_in = 0;  // rd_in: wide reads of the stage's set so far
-  wire next_ready = dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
-                    !dut.systolic_read_enable && !dut.systolic_release;  // g_accept's terms but the stage state and the bank
+  wire next_ready = res_ready && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id];  // the next set's result is ready to push
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0) begin
@@ -712,14 +814,13 @@ module TB_sienna_top;
         rd_in = 0;
       end else begin
         if (stream_on && rq_id.size() != 0) begin
-          // Overlap: set k's beats still in the requantize pipeline while the activation stage holds set k+1.
-          if (int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) begin
+          // Overlap: set k's beats still in the requantize pipeline while the stage holds set k+1 or has granted its beats.
+          if ((int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) || (int'(dut.g_state) == 0 && dut.l3_armed)) begin
             ov_rq++;
-            if (rq_byp[0] != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
+            if (rq_byp[0] != 0 && int'(dut.g_state) != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
           end
-          // A ReLU or linear set's reads are all in, the next result is ready with a free bank, yet not accepted: the drain holds it.
-          else if (rq_byp[0] != 0 && !dut.g_accept && !dut.wide_rd_valid && !dut.systolic_read_enable && !dut.systolic_release &&
-                   dut.systolic_collection_complete && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id] &&
+          // A ReLU or linear set's beats are all in, the next result is ready with a free bank, yet no beats granted: the drain holds it.
+          else if (rq_byp[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready &&
                    !dut.act_full[rq_bank[0] == 0])
             rq_wait++;
           // The draining ReLU or linear set still holds the stage, not leaving this cycle, though the next set could start.
@@ -783,10 +884,11 @@ module TB_sienna_top;
     $display("  [Stream] set %0d: %0d outputs, %0d mismatches", k, n_act, errs);
   endtask
 
-  task automatic stream_all_sets(input int id_base, input bit overrun);
+  // overrun: before set SETS_IN_FLIGHT the host waits until every admitted set is in flight and shows it gets no credit; close_fill: the last set closes the cache fill.
+  task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill);
     automatic longint t0 = $time;
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s", NUM_SETS,
-             overrun ? $sformatf(", with a start pulsed on set %0d while no credit is free", SETS_IN_FLIGHT) : "");
+             overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "");
     stream_results.delete();
     stream_bounds.delete();
     stream_ids.delete();
@@ -825,56 +927,36 @@ module TB_sienna_top;
               apply_requant(k);
               apply_pack(k);
               apply_weight(k);
+              wc_last_i = close_fill && (WEIGHT_CACHE != 0) && (k == NUM_SETS - 1);
 `ifdef PERF
-              while (!pipeline_ready_o && !overrun) @(posedge clk_i);
+              if (!overrun) wait_credit();
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
 `endif
               if (overrun && k == SETS_IN_FLIGHT) begin
-                automatic int waited = 0;
-                // A credit returns only as pooling leaves P_WAIT, at least 13 cycles away from any other state.
-                while (!(dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) && waited < 2000) begin
+                automatic int waited = 0, held = 0, free_bank = 0;
+                // The host cannot put without a credit: wait until every admitted set is in flight, then count the cycles it gets none.
+                while (!(host_cnt == 0 && dut.entry_full) && waited < 2000) begin
                   @(posedge clk_i);
                   waited++;
                 end
-                if (dut.mesh_input_ready && dut.credits == 0 && int'(dut.p_state) != 2) begin
-                  load_range(0, OVR_WORDS);
-                  if (pipeline_ready_o) begin
-                    failed++;
-                    $display("  [FAIL] Overrun not exercised: pipeline_ready_o high before the start");
+                if (host_cnt == 0 && dut.entry_full) begin
+                  while (host_cnt == 0) begin
+                    held++;
+                    if (dut.l1_cnt > dut.l0_out) free_bank++;  // a staging bank the full entry keeps from the host
+                    @(posedge clk_i);
                   end
-                  start_pipeline_i = 1;
-                  @(posedge clk_i);
-                  start_pipeline_i = 0;
-                  repeat (2) @(posedge clk_i);
-                  // An accepted start would rewind the mesh write pointer; a rejected one leaves it at OVR_WORDS.
-                  if (int'(dut.systolic_array_inst.ptr_A) != OVR_WORDS) begin
-                    failed++;
-                    $display("  [FAIL] A start without a credit was taken: ptr_A=%0d credits=%0d",
-                             dut.systolic_array_inst.ptr_A, dut.credits);
-                  end else $display("  [Stream] start with no credit ignored; the load resumes at word %0d", OVR_WORDS);
-                  load_range(OVR_WORDS, west_data_queue.size());
-                  while (!pipeline_ready_o) @(posedge clk_i);
-                end else begin
-                  $display("  [Stream] credit overrun not reached: the pipeline drains faster than the host loads");
-                  while (!pipeline_ready_o) @(posedge clk_i);
-                  load_inputs();
-                end
-              end else begin
-                while (!pipeline_ready_o) @(posedge clk_i);
-                load_inputs();
+                  $display("  [Stream] entry full: the host held no credit for %0d cycles, %0d of them with a staging bank free", held,
+                           free_bank);
+                end else $display("  [Stream] entry never full: the pipeline drains faster than the host loads");
               end
-              if (!pipeline_ready_o) begin
-                failed++;
-                $display("  [FAIL] Start pulsed while pipeline_ready_o is low");
-              end
-              start_pipeline_i = 1;
+              wait_credit();
+              load_inputs();
 `ifdef PERF
               $display("PERF %0d HOST_START %0d", int'($time / 10), k);
 `endif
-              @(posedge clk_i);
-              start_pipeline_i = 0;
+              host_put();
               n_started++;
-              @(posedge clk_i);  // let the credit land before sampling ready again
+              @(posedge clk_i);  // the spent credit is counted on this edge
             end
           end
           begin : verifier
@@ -940,6 +1022,10 @@ module TB_sienna_top;
       failed++;
       $display("  [FAIL] %0d sets in flight, the credit limit is %0d", max_in_flight, SETS_IN_FLIGHT);
     end
+    if (over_admit > 0) begin
+      failed++;
+      $display("  [FAIL] %0d cycles with sets in flight plus credits held above %0d", over_admit, SETS_IN_FLIGHT);
+    end
   endtask
 
   // ── Reset with sets in flight ─────────────────────────────────────────
@@ -959,25 +1045,23 @@ module TB_sienna_top;
           apply_requant(k);
           apply_pack(k);
           apply_weight(k);
-          while (!pipeline_ready_o) @(posedge clk_i);
+          wait_credit();
           load_inputs();
-          start_pipeline_i = 1;
-          @(posedge clk_i);
-          start_pipeline_i = 0;
+          host_put();
           @(posedge clk_i);
         end
       end
     join_none
-    while (!(gpnae_busy_tb && dut.credits <= SETS_IN_FLIGHT - 2) && waited < TIMEOUT_CYCLES) begin
+    while (!(gpnae_busy_tb && dut.sets_out >= 2) && waited < TIMEOUT_CYCLES) begin
       @(posedge clk_i);
       waited++;
     end
-    if (!(gpnae_busy_tb && dut.credits <= SETS_IN_FLIGHT - 2)) begin
+    if (!(gpnae_busy_tb && dut.sets_out >= 2)) begin
       failed++;
       $display("  [FAIL] Never reached two sets in flight before the reset");
     end
     disable fork;
-    $display("  [Reset] resetting with %0d sets in flight, stages {g,p}=%0d", SETS_IN_FLIGHT - dut.credits, dut_stage);
+    $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.sets_out, host_cnt, dut_stage);
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
@@ -990,18 +1074,139 @@ module TB_sienna_top;
       failed++;
       $display("  [FAIL] %0d cycles of output after reset with nothing started", stray);
     end
-    if (!pipeline_ready_o || dut.credits != SETS_IN_FLIGHT || dut_stage != 0) begin
+    // Review Focus 1: every consumer advertised its slots again and every producer counted them from 0.
+    if (host_cnt != 2 || dut.l1_cnt != 2 || dut.l0_out != 2 || dut.sets_out != 0 || dut.l6_cnt != 2 || !dut.l3_armed ||
+        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage != 0) begin
       failed++;
-      $display("  [FAIL] Not idle after reset: ready=%0b credits=%0d stages=%0d", pipeline_ready_o,
-               dut.credits, dut_stage);
-    end else $display("  [Reset] idle after reset: all credits free, no stray output");
-    stream_all_sets(0, 0);
+      $display("  [FAIL] Not idle after reset: host %0d (2), staging %0d (2), granted %0d (2), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
+               host_cnt, dut.l1_cnt, dut.l0_out, dut.sets_out, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE,
+               wc_cnt[0], wc_cnt[1], dut_stage);
+    end else $display("  [Reset] idle after reset: every link re-advertised (host 2, staging 2, act banks 2, results %0d, regions 1 1), no stray output",
+                      PER_LANE);
+    write_cache();  // the reset closed the cache fill: open it again
+    stream_all_sets(0, 0, PACKED != 0);  // the accumulate pass closes the fill when it runs
+  endtask
+
+  // ── Review Focus 4: four partial sets of zeros, then set ACCUM_PASSES-1's own passes ─────
+  // Only the last set has a result: one L3 set of beats and one L6 bank; the partial sets spend no L3 or L6 credit.
+  logic [DATA_WIDTH-1:0] acc_results[$];
+  int acc_bounds[$];
+  int acc_beats = 0, acc_banks = 0;
+  always_ff @(posedge clk_i) begin
+    if (acc_on) begin
+      for (int lane = 0; lane < NUM_LANES; lane++) if (result_valid_o[lane]) acc_results.push_back(final_result_o[lane]);
+      if (pipeline_complete_o) acc_bounds.push_back(acc_results.size());
+      if (dut.wide_rd_valid) acc_beats <= acc_beats + 1;
+      if (dut.bank_done) acc_banks <= acc_banks + 1;
+    end
+  end
+
+  task automatic accum_null_pass();
+    automatic int G = ACCUM_PASSES - 1;  // the first set the stream activates; its golden is the sum of sets 0..G
+    automatic int n = 4 + ACCUM_PASSES, waited = 0, errs = 0;
+    automatic real acc_max_d = 0.0, acc_max_e = 0.0;
+    automatic logic [DATA_WIDTH-1:0] exp_q[$], bnd_q[$];
+    string info;
+    $display("\n[STAGE] ACCUMULATE: 4 partial sets of zeros, then sets 0..%0d as one sum; checkers bound", G);
+    if (PACKED != 0) begin
+      $display("  [Accum] skipped: a packed set cannot be a partial sum");
+      return;
+    end
+    while (pipeline_complete_o) @(posedge clk_i);
+    acc_results.delete();
+    acc_bounds.delete();
+    acc_beats = 0;
+    acc_banks = 0;
+    acc_on = 1;
+    for (int j = 0; j < n; j++) begin
+      automatic int k = (j < 4) ? 0 : j - 4;  // the stream set whose rows this pass sends
+      read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
+      read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
+      if (j < 4) foreach (west_data_queue[i]) west_data_queue[i] = '0;
+      accumulate_i = (j < n - 1);
+      activation_function_i = act_of(G);
+      num_terms_i = terms_of(G);
+      dropout_seed_i = set_seed(G);
+      apply_bias(0);  // the sum's bias rides its first pass only
+      if (j != 0) begin
+        bias_valid_i = 1'b0;
+        bias_i = '0;
+      end
+      apply_requant(G);
+      apply_pack(0);
+      apply_weight(k);
+      wc_last_i = (WEIGHT_CACHE != 0) && (j == n - 1);
+      wait_credit();
+      load_inputs();
+      host_put();
+      @(posedge clk_i);
+    end
+    while (acc_bounds.size() < n && waited < TIMEOUT_CYCLES) begin
+      @(posedge clk_i);
+      waited++;
+    end
+    waited = 0;
+    while (!drained && waited < 1000) begin
+      @(posedge clk_i);
+      waited++;
+    end
+    acc_on = 0;
+    read_mem_file($sformatf("expected_output_%0d.mem", G), exp_q);
+    read_mem_file($sformatf("bound_output_%0d.mem", G), bnd_q);
+    if (acc_bounds.size() != n || !drained) begin
+      failed++;
+      $display("  [FAIL] Accumulate pass: %0d of %0d sets completed, drained=%0b", acc_bounds.size(), n, drained);
+    end else begin
+      for (int j = 0; j < n - 1; j++)
+        if (acc_bounds[j] != 0) begin
+          failed++;
+          $display("  [FAIL] Accumulate pass: partial set %0d left %0d outputs", j, acc_bounds[j]);
+        end
+      if (acc_results.size() != exp_q.size()) begin
+        failed++;
+        $display("  [FAIL] Accumulate pass: %0d outputs, expected %0d", acc_results.size(), exp_q.size());
+      end
+      // int8 bit-exact; bf16 within 1/16 of the set's largest output (a wrong set misses by about the largest output): the zero passes change the order the mesh sums in, which moves cancelling sums by many ulp.
+      for (int i = 0; i < exp_q.size(); i++) begin
+        automatic real e = (EXP_W == 8 && MAN_W == 7) ? f32({16'(exp_q[i]), 16'h0}) : 0.0;
+        if (e > acc_max_e || -e > acc_max_e) acc_max_e = (e > 0.0) ? e : -e;
+      end
+      for (int i = 0; i < exp_q.size() && i < acc_results.size(); i++) begin
+        automatic real d = f32({16'(exp_q[i]), 16'h0}) - f32({16'(acc_results[i]), 16'h0});
+        if (d < 0.0) d = -d;
+        total_elements++;
+        if (acc_results[i] === exp_q[i]) exact_passed++;
+        else if (EXP_W == 8 && MAN_W == 7 && d <= acc_max_e / 16.0) begin
+          tol_passed++;
+          if (d > acc_max_d) acc_max_d = d;
+        end
+        else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
+        else begin
+          failed++;
+          errs++;
+          $display("  [FAIL] Accumulate pass [%0d] exp=0x%h got=0x%h | %s", i, exp_q[i], acc_results[i], info);
+        end
+      end
+    end
+    // Credits: one set of beats and one bank spent; drained, every link holds all its slots again.
+    if (acc_beats != PER_LANE || acc_banks != 1 || dut.l6_cnt != 2 || !dut.l3_armed ||
+        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || dut.l1_cnt != 2 || host_cnt != 2) begin
+      failed++;
+      $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (2)",
+               acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt);
+    end
+    $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d mismatches, bf16 at most %g off, largest output %g); %0d result beats and %0d activation bank spent",
+             acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), errs, acc_max_d, acc_max_e,
+             acc_beats, acc_banks);
   endtask
 
   // ── PERF trace: stage transitions per cycle, read by regression.py --action perf ──
 `ifdef PERF
   int perf_mesh_st = -1, perf_g_st = -1, perf_p_st = -1, perf_cred = -1, perf_mread = 0;
   int perf_lane_busy = 0, perf_round_cyc = 0;
+  int g_eff, entry_free;
+  assign g_eff = (dut.g_fed || dut.wide_rd_valid) ? int'(dut.g_state) : 0;  // the stage's state once its set's beats arrive
+  assign entry_free = SETS_IN_FLIGHT - int'(dut.sets_out) - int'(dut.l0_out);  // sets the entry may still admit
   initial forever begin
     @(negedge clk_i);
     if (stream_on) begin
@@ -1016,29 +1221,36 @@ module TB_sienna_top;
       if (dut.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("PERF %0d MESH 4", c);
       if (dut.systolic_array_inst.reduce_start) $display("PERF %0d MESH 5", c);
       if (dut.systolic_array_inst.set_done) $display("PERF %0d MESH 7", c);
-      if (int'(dut.g_state) != perf_g_st) begin
-        $display("PERF %0d G %0d", c, dut.g_state);
+      // The stage takes its credits ahead of the result; G counts from the set's first beat, as main's read did.
+      if (g_eff != perf_g_st) begin
+        $display("PERF %0d G %0d", c, g_eff);
         if (perf_g_st == 3) $display("PERF %0d LANES %0d %0d", c, perf_lane_busy, perf_round_cyc);
-        if (int'(dut.g_state) == 1) begin
+        if (perf_g_st == 0) begin
           perf_lane_busy = 0;
           perf_round_cyc = 0;
         end
       end
       if (int'(dut.p_state) != perf_p_st) $display("PERF %0d P %0d", c, dut.p_state);
-      if (int'(dut.credits) != perf_cred) $display("PERF %0d CREDITS %0d", c, dut.credits);
-      if (int'(dut.systolic_read_enable) != perf_mread) $display("PERF %0d MREAD %0d", c, dut.systolic_read_enable);
+      if (entry_free != perf_cred) $display("PERF %0d CREDITS %0d", c, entry_free);
+      if (int'(dut.wide_rd_valid) != perf_mread) $display("PERF %0d MREAD %0d", c, dut.wide_rd_valid);
       if (pipeline_complete_o) $display("PERF %0d DONE %0d", c, done_set_id_o);
-      if (int'(dut.g_state) == 3) begin
+      if (g_eff == 3) begin
         for (int i = 0; i < NUM_LANES; i++) if (dut.load_finalized[i] && !dut.lane_collected[i]) busy++;
         perf_lane_busy += busy;
         perf_round_cyc++;
       end
     end
-    perf_g_st    = int'(dut.g_state);
+    perf_g_st    = g_eff;
     perf_p_st    = int'(dut.p_state);
-    perf_cred    = int'(dut.credits);
-    perf_mread   = int'(dut.systolic_read_enable);
+    perf_cred    = entry_free;
+    perf_mread   = int'(dut.wide_rd_valid);
   end
+`endif
+
+  // FAULT 4 (built with -DTB_FAULT4): during the single set the first beat is not marked first and a completion finds no set outstanding.
+  bit fault4_on = 0;
+`ifdef TB_FAULT4
+  tb_fault4 u_fault4 (.on_i(fault4_on));
 `endif
 
   // ── Top-level stimulus ────────────────────────────────────────────────
@@ -1072,6 +1284,7 @@ module TB_sienna_top;
     // Clear array right before run so streaming block cleanly builds it
     // actual_results.delete();
 
+    wait_credit();
     load_inputs();
     repeat (5) @(posedge clk_i);
 
@@ -1083,15 +1296,15 @@ module TB_sienna_top;
     apply_pack(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
+    fault4_on = 1'b1;
     @(posedge clk_i);
-    start_pipeline_i = 1;
-    @(posedge clk_i);
-    start_pipeline_i = 0;
+    host_put();
     $display("  start pulse sent @ %0t", $time);
     print_status("immediately after start");
     print_lane_status("immediately after start");
 
     collect_outputs();
+    fault4_on = 0;
     verify_outputs();
 
 `ifdef BACK_TO_BACK
@@ -1123,18 +1336,17 @@ module TB_sienna_top;
       tol_passed     = 0;
       failed         = 0;
 
+      wait_credit();
       load_inputs();
       repeat (5) @(posedge clk_i);
       t_second_start = $time;
 
       @(posedge clk_i);
-      start_pipeline_i = 1;
-      $display("  [B2B] gate before pulse: state=%0d north_empty=%0b west_empty=%0b",
+      $display("  [B2B] gate before put: state=%0d north_empty=%0b west_empty=%0b credits=%0d",
+               dut_stage, dut.north_queue_empty, dut.west_queue_empty, host_cnt);
+      host_put();
+      $display("  [B2B] gate at put    : state=%0d north_empty=%0b west_empty=%0b",
                dut_stage, dut.north_queue_empty, dut.west_queue_empty);
-      @(posedge clk_i);
-      $display("  [B2B] gate at pulse   : state=%0d north_empty=%0b west_empty=%0b",
-               dut_stage, dut.north_queue_empty, dut.west_queue_empty);
-      start_pipeline_i = 0;
       @(posedge clk_i);
       $display("  [B2B] state after pulse: %0d", dut_stage);
 
@@ -1156,10 +1368,11 @@ module TB_sienna_top;
 `ifdef BACK_TO_BACK
       ids_used = 2;  // plus the back-to-back pass
 `endif
-      stream_all_sets(ids_used, 0);
-      stream_all_sets(ids_used + NUM_SETS, 1);
+      stream_all_sets(ids_used, 0, 0);
+      stream_all_sets(ids_used + NUM_SETS, 1, 0);
     end
     reset_mid_stream();
+    accum_null_pass();
 
     $display("\n==============================================");
     $display(" RESULT SUMMARY");
@@ -1191,3 +1404,18 @@ module TB_sienna_top;
   end
 
 endmodule
+
+`ifdef TB_FAULT4
+// FAULT 4: while on_i, forces the stage's first-beat flag and its set count to 0, so a_l3_frame and a_credit_return fire; its own module keeps the force out of the TB's.
+module tb_fault4 (input bit on_i);
+  initial forever begin
+    wait (on_i);
+    force TB_sienna_top.dut.l3_first = 1'b0;
+    force TB_sienna_top.dut.sets_out = '0;
+    $display("  [FAULT 4] l3_first and sets_out forced to 0 for the single set");
+    wait (!on_i);
+    release TB_sienna_top.dut.l3_first;
+    release TB_sienna_top.dut.sets_out;
+  end
+endmodule
+`endif

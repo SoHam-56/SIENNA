@@ -31,46 +31,18 @@ module sienna_top #(
     parameter int    PACK_ENTRIES      = 8,  // distinct activation / int8 output settings one packed set may mix; entry 0 is the per-set ports
     parameter int    DROPOUT_P_PERCENT = 50,
     parameter int    LFSR_WIDTH        = 32,
+    parameter int    LINK_STAGES       = 0,  // register stages on the host, staging and result links (L0, L1, L3); the write buses get as many as the put
     parameter string INPUT_A_FILE      = "matrixA.mem",
     parameter string INPUT_B_FILE      = "matrixB.mem"
 ) (
     input logic clk_i,
     input logic rstn_i,
 
-    input logic                     start_pipeline_i,
-    input logic                     training_mode_i,  // dropout mode for the set being started
-    input logic                     accumulate_i,     // 1: add this set's product to the running sum and output nothing
-    input logic                     bias_valid_i,     // with the start: add bias_i[c] to column c of this set's product
-    input logic [N-1:0][ACC_W-1:0]  bias_i,
-    input logic [N-1:0][31:0]       req_mult_i,   // int8, with the start: requantize multiplier (Q0.31) of each output channel (column)
-    input logic [N-1:0][7:0]        req_shift_i,  // int8: its shift, signed
-    input logic [7:0]               req_zp_i,     // int8, layer-wide: output zero point; dropout drops to it after ReLU or linear (D-5)
-    input logic [7:0]               req_min_i,    // int8: clamp, signed; the fused ReLU or ReLU6 lives here
-    input logic [7:0]               req_max_i,
-    input logic [15:0]              gp_mx_i,      // int8 GPNAE: rescale of the lane input to Q4.11
-    input logic [4:0]               gp_shx_i,
-    input logic [31:0]              gp_mout_i,    // int8 GPNAE: SELU's output requantize
-    input logic [7:0]               gp_shout_i,
-    input logic [7:0]               gp_zout_i,
-    input logic [2:0]                       pack_shift_i,  // with the start: a packed set of N >> pack_shift_i columns per job; 0 unpacked
-    input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pack_map_i,  // entry of each column block; an unpacked set uses block 0's
-    input logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pack_act_i,  // entries 1..: activation; entry 0 is activation_function_i
-    input logic [PACK_ENTRIES-1:1][7:0]     pack_zp_i,     // int8 entries 1..: as req_zp_i, req_min_i, req_max_i
-    input logic [PACK_ENTRIES-1:1][7:0]     pack_min_i,
-    input logic [PACK_ENTRIES-1:1][7:0]     pack_max_i,
-    input logic [PACK_ENTRIES-1:1][15:0]    pack_mx_i,     // int8 entries 1..: as gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i
-    input logic [PACK_ENTRIES-1:1][4:0]     pack_shx_i,
-    input logic [PACK_ENTRIES-1:1][31:0]    pack_mout_i,
-    input logic [PACK_ENTRIES-1:1][7:0]     pack_shout_i,
-    input logic [PACK_ENTRIES-1:1][7:0]     pack_zout_i,
-    input logic                     weight_cached_i,  // with the start: B is cache tile weight_tile_i, only A is written
-    input logic [WCTW-1:0]          weight_tile_i,
+    credit_link_if.consumer         host,  // L0: a put per set, data its sideband (sienna_set_side.svh); credits are free staging banks, withheld while SETS_IN_FLIGHT sets are in flight
+    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with the put: added to column c when the sideband's bias_valid is set
+    credit_link_if.consumer         wc_region[2],  // L2, to the mesh: a put opens a fill of that cache region; its credit returns once the fill's last set is broadcast
     input logic                     wc_write_enable_i,  // weight cache write of north_write_data_i at word wc_write_addr_i
     input logic [WCAW-1:0]          wc_write_addr_i,
-    output logic [1:0]              wc_region_busy_o,   // a started set not yet broadcast reads this cache region
-    input logic [   LFSR_WIDTH-1:0] dropout_seed_i,   // dropout seed for the set being started
-    input logic [CONTROL_WIDTH-1:0] activation_function_i,
-    input logic [     ADDR_LINES:0] num_terms_i,
     input logic                     north_write_enable_i,
     input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0]       north_write_data_i,
     input logic                     north_write_reset_i,
@@ -82,7 +54,6 @@ module sienna_top #(
     output logic [NUM_LANES-1:0] result_valid_o,  // lane's final_result_o is new this cycle
 
     output logic pipeline_complete_o,
-    output logic pipeline_ready_o,  // a credit and a staging bank are free
     output logic [ID_W-1:0] done_set_id_o,  // id of the set pipeline_complete_o reports
     output logic systolic_busy_o,
     output logic gpnae_busy_o,
@@ -163,7 +134,7 @@ module sienna_top #(
   g_state_t g_state;
   p_state_t p_state;
 
-  logic mesh_input_ready, host_accept, g_accept, g_done, p_accept, p_release, pool_done;
+  logic host_accept, g_accept, g_done, p_accept, p_release, pool_done;
   // g_done: the stage may take the next set; bank_done: bank bank_sel holds a whole set (later than g_done for an int8 ReLU or linear set).
   logic bank_done, bank_sel, byp_all_in, rq_drain;
   logic lane_v;  // a beat for the fill counters and the lanes
@@ -173,7 +144,9 @@ module sienna_top #(
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
-  logic [CRW-1:0] credits;  // sets the host may still start
+  logic [CRW-1:0] sets_out;  // sets put and not yet complete
+  logic [CRW-1:0] l0_out;  // host credits granted and not yet put
+  logic entry_full;  // SETS_IN_FLIGHT sets are in flight or granted: the entry withholds credits
   logic [CRW-1:0] mesh_sets;  // accepted sets the activation stage has not taken yet
   logic [ID_W-1:0] g_next_id, g_set_id, p_next_id, p_set_id, host_next_id;
   // Dropout mode and seed travel with each set, indexed by its id, so sets in flight keep their own.
@@ -181,7 +154,7 @@ module sienna_top #(
   logic [LFSR_WIDTH-1:0] set_seed [NUM_IDS];
   logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
   logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with each set's activation
-  logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = activation_function_i)
+  logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = the set's own)
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] g_ents;  // the activation stage's copy of its set's entry codes, taken at g_accept
@@ -205,17 +178,107 @@ module sienna_top #(
   logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:2*SRAM_DEPTH-1];
 
 
-  logic                  systolic_start;
-  logic systolic_read_enable;
-  logic [$clog2(SRAM_DEPTH)-1:0] systolic_read_addr;  // wide read index, 0 .. PER_LANE-1
-  logic [NUM_LANES-1:0][ACC_W-1:0] wide_rd_data;  // element k of lane k's block; int32 sums in int8
-  logic                                 wide_rd_valid;
+  logic [NUM_LANES-1:0][ACC_W-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8
+  logic                                 wide_rd_valid;  // a result beat arrives on L3
   logic                  systolic_mult_complete;
-  logic                  systolic_collection_complete;
-  logic systolic_reading;
-  logic systolic_release;
-  assign systolic_start = host_accept;  // the mesh queues it in a staging bank
   logic north_queue_empty, west_queue_empty;
+
+  // =========================================================================
+  // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
+  // =========================================================================
+  `include "sienna_set_side.svh"
+  localparam int SIDE_W = $bits(set_side_t);
+  localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
+  localparam int L3_W   = NUM_LANES * ACC_W + 3;  // a result beat: {packed, last, first, one word per lane}
+  localparam int L3_CRW = $clog2(PER_LANE + 1);  // a set's beats granted in one cycle
+`ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the host link is checked at time 0
+  initial
+    if ($bits(host.data) != SIDE_W || $bits(host.credit) != 1)
+      $fatal(1, "sienna_top: the host link needs data %0d bits and credit 1, found %0d and %0d", SIDE_W, $bits(host.data), $bits(host.credit));
+`endif
+  credit_link_if #(.DATA_W(SIDE_W), .CRW(1)) l0 ();  // the host link after its register stages
+  credit_link_if #(.DATA_W(STG_W), .CRW(1)) l1p ();  // staging, this side of its register stages
+  credit_link_if #(.DATA_W(STG_W), .CRW(1)) l1m ();  // staging, the mesh's side
+  credit_link_if #(.DATA_W(L3_W), .CRW(L3_CRW)) l3m ();  // results, the mesh's side
+  credit_link_if #(.DATA_W(L3_W), .CRW(L3_CRW)) l3c ();  // results, this side
+  credit_link_if #(.DATA_W(1), .CRW(1)) l6 ();  // activation bank: a put when a bank holds a whole set, data the bank
+  credit_link_if #(.DATA_W(1), .CRW(1)) wcm[2] ();  // the cache regions, to the mesh
+  credit_reg #(.STAGES(LINK_STAGES), .DATA_W(SIDE_W), .CRW(1)) l0_reg (.clk_i(clk_i), .rstn_i(rstn_i), .up(host), .dn(l0));
+  credit_reg #(.STAGES(LINK_STAGES), .DATA_W(STG_W), .CRW(1)) l1_reg (.clk_i(clk_i), .rstn_i(rstn_i), .up(l1p), .dn(l1m));
+  credit_reg #(.STAGES(LINK_STAGES), .DATA_W(L3_W), .CRW(L3_CRW)) l3_reg (.clk_i(clk_i), .rstn_i(rstn_i), .up(l3m), .dn(l3c));
+  for (genvar r = 0; r < 2; r++) begin : G_WC
+    assign wcm[r].put = wc_region[r].put;
+    assign wcm[r].data = wc_region[r].data;
+    assign wc_region[r].credit = wcm[r].credit;
+  end
+
+  logic live;  // out of reset for a cycle: no consumer here advertises before it
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) live <= 1'b0;
+    else live <= 1'b1;
+
+  // L0 and L1: a host put is the set's start and goes to the mesh at once; a staging credit passes to the host while the entry admits.
+  set_side_t side;
+  logic [1:0] l1_cnt;  // staging credits held here or passed to the host and not yet spent
+  logic l0_grant;
+  assign side = l0.data;
+  assign host_accept = l0.put;
+  assign l1p.put = l0.put;
+  assign l1p.data = {side.wc_last, side.weight_tile, side.weight_cached, side.pack_shift, side.bias_valid, side.accumulate};
+  credit_counter #(.MAX(2), .CRW(1)) l1_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(l1p.put), .credit_i(l1p.credit), .has_credit_o(),
+                                            .count_o(l1_cnt));
+  assign entry_full = (int'(sets_out) + int'(l0_out)) >= SETS_IN_FLIGHT;
+  assign l0_grant = live && (CRW'(l1_cnt) > l0_out) && !entry_full;
+  assign l0.credit = l0_grant;
+
+  // Rows, cache writes and bias pass as many stages as the put (L0 then L1), so a set's rows reach its bank before its put.
+  localparam int BUS_STAGES = 2 * LINK_STAGES;
+  localparam int BUS_W = 5 + 2 * HOST_WORDS * DATA_WIDTH + WCAW + N * ACC_W;
+  logic [BUS_W-1:0] bus_in, bus_out;
+  logic m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we;
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] m_north, m_west;
+  logic [WCAW-1:0] m_wc_addr;
+  logic [N-1:0][ACC_W-1:0] m_bias;
+  assign bus_in = {north_write_enable_i, west_write_enable_i, north_write_reset_i, west_write_reset_i, wc_write_enable_i,
+                   north_write_data_i, west_write_data_i, wc_write_addr_i, bias_i};
+  if (BUS_STAGES == 0) begin : G_BUS_WIRE
+    assign bus_out = bus_in;
+  end else begin : G_BUS_REGS
+    logic [BUS_W-1:0] bus_q[BUS_STAGES];
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) for (int i = 0; i < BUS_STAGES; i++) bus_q[i] <= '0;
+      else begin
+        bus_q[0] <= bus_in;
+        for (int i = 1; i < BUS_STAGES; i++) bus_q[i] <= bus_q[i-1];
+      end
+    assign bus_out = bus_q[BUS_STAGES-1];
+  end
+  assign {m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we, m_north, m_west, m_wc_addr, m_bias} = bus_out;
+
+  // L3: the stage grants a set's PER_LANE beats while idle with a bank reserved; it takes the next result set when its beats are granted.
+  logic l3_armed;  // beats granted for a set the stage has not taken yet
+  logic l3_grant, l6_room, rq_room;
+  logic l3_first, l3_last, l3_pk;
+  logic g_fed;  // a beat of the stage's set has arrived
+  // Not while a partial set waits to pass: the next result's beats could then arrive before the stage takes its set.
+  assign l3_grant = live && (g_state == G_IDLE) && !l3_armed && l6_room && rq_room && !(mesh_sets != 0 && set_accum[g_next_id]);
+  assign l3c.credit = l3_grant ? L3_CRW'(PER_LANE) : '0;
+  assign wide_rd_valid = l3c.put;
+  assign wide_rd_data = l3c.data[NUM_LANES*ACC_W-1:0];
+  assign {l3_pk, l3_last, l3_first} = l3c.data[L3_W-1-:3];
+
+  // L6: activation bank link inside this module; the activation stage spends a credit per bank it fills, pooling returns one per release.
+  logic [1:0] l6_cnt;  // banks the activation stage may fill
+  logic [1:0] l6_rsv;  // of those, reserved by a grant whose set has not filled its bank yet
+  logic [1:0] l6_owed;  // pooling's advertisement still to send
+  logic l6_credit;
+  credit_counter #(.MAX(2), .CRW(1)) l6_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(l6.put), .credit_i(l6.credit), .has_credit_o(),
+                                            .count_o(l6_cnt));
+  assign l6_room = l6_cnt > l6_rsv;
+  assign l6.put = bank_done;
+  assign l6.data = bank_sel;
+  assign l6_credit = p_release || (live && l6_owed != 0);
+  assign l6.credit = l6_credit;
 
   // Backend Arrays
   logic [      DATA_WIDTH-1:0] gpnae_signal_i     [NUM_LANES];
@@ -295,42 +358,28 @@ module sienna_top #(
       .COLLAPSE_K (COLLAPSE_K),
       .WC_TILES   (WC_TILES),
       .ACC_BANKS  (ACC_BANKS),
-      .RESULT_BANKS(RESULT_BANKS)
+      .RESULT_BANKS(RESULT_BANKS),
+      .RES_MAX    (PER_LANE),
+      .RES_CRW    (L3_CRW)
   ) systolic_array_inst (
       .clk_i                 (clk_i),
       .rstn_i                (rstn_i),
-      .start_matrix_mult_i   (systolic_start),
-      .partial_i             (accumulate_i),
-      .bias_valid_i          (bias_valid_i),
-      .bias_i                (bias_i),
-      .pack_shift_i          (pack_shift_i),  // sampled with systolic_start, which is host_accept
-      .weight_cached_i       (weight_cached_i),
-      .weight_tile_i         (weight_tile_i),
-      .wc_write_enable_i     (wc_write_enable_i),
-      .wc_write_addr_i       (wc_write_addr_i),
-      .wc_region_busy_o      (wc_region_busy_o),
-      .north_write_enable_i  (north_write_enable_i),
-      .north_write_data_i    (north_write_data_i),
-      .north_write_reset_i   (north_write_reset_i),
-      .west_write_enable_i   (west_write_enable_i),
-      .west_write_data_i     (west_write_data_i),
-      .west_write_reset_i    (west_write_reset_i),
+      .staging               (l1m),
+      .bias_i                (m_bias),
+      .wc_region             (wcm),
+      .wc_write_enable_i     (m_wc_we),
+      .wc_write_addr_i       (m_wc_addr),
+      .north_write_enable_i  (m_north_we),
+      .north_write_data_i    (m_north),
+      .north_write_reset_i   (m_north_rst),
+      .west_write_enable_i   (m_west_we),
+      .west_write_data_i     (m_west),
+      .west_write_reset_i    (m_west_rst),
       .north_queue_empty_o   (north_queue_empty),
       .west_queue_empty_o    (west_queue_empty),
       .matrix_mult_complete_o(systolic_mult_complete),
-      .read_enable_i         (1'b0),
-      .read_addr_i           ('0),
-      .read_data_o           (),
-      .read_valid_o          (),
-      .wide_read_enable_i    (systolic_read_enable),
-      .wide_read_index_i     (32'(systolic_read_addr)),
-      .wide_read_packed_i    (g_pack),
-      .wide_read_data_o      (wide_rd_data),
-      .wide_read_valid_o     (wide_rd_valid),
-      .collection_complete_o (systolic_collection_complete),
       .collection_active_o   (),
-      .result_release_i      (systolic_release),
-      .input_ready_o         (mesh_input_ready)
+      .result                (l3m)
   );
 
   generate
@@ -582,11 +631,8 @@ module sienna_top #(
   // =========================================================================
   logic streaming_complete;
 
-  assign pipeline_ready_o = (credits != 0) && mesh_input_ready;
-  assign host_accept = start_pipeline_i && pipeline_ready_o && (weight_cached_i || !north_queue_empty) && !west_queue_empty;
-  // Not while the previous result's read or release is in flight: its bank flag may still read full.
-  assign g_accept = (g_state == G_IDLE) && !set_accum[g_next_id] && systolic_collection_complete && !act_full[act_wr] &&
-                    !systolic_read_enable && !systolic_release;
+  // The stage takes the next real set once its beats are granted; the beats follow when the mesh has the result.
+  assign g_accept = (g_state == G_IDLE) && l3_armed && (mesh_sets != 0) && !set_accum[g_next_id];
   assign g_done = (g_state == G_ROUND) && (act_bypass ? byp_all_in : all_collected);
   logic g_null_done;  // a partial set, summed in the PEs, passes with no result and no activation bank
   assign g_null_done = (g_state == G_IDLE) && (mesh_sets != 0) && set_accum[g_next_id] && !rq_drain;
@@ -606,7 +652,12 @@ module sienna_top #(
       complete_q <= 1'b0;
       act_wr    <= 1'b0;
       act_rd    <= 1'b0;
-      credits   <= CRW'(SETS_IN_FLIGHT);
+      sets_out  <= '0;
+      l0_out    <= '0;
+      l3_armed  <= 1'b0;
+      l6_rsv    <= '0;
+      l6_owed   <= 2'd2;
+      g_fed     <= 1'b0;
       mesh_sets <= '0;
       g_next_id <= '0;
       g_set_id  <= '0;
@@ -631,16 +682,21 @@ module sienna_top #(
     end else begin
       complete_q <= pipeline_complete_o;
       if (host_accept) begin
-        set_accum[host_next_id] <= accumulate_i;
-        set_terms[host_next_id] <= num_terms_i;
-        set_pack[host_next_id] <= pack_shift_i;
-        set_map[host_next_id]  <= pack_map_i;
-        set_ents[host_next_id][0] <= activation_function_i;
-        for (int e = 1; e < PACK_ENTRIES; e++) set_ents[host_next_id][e] <= pack_act_i[e];
-        set_train[host_next_id] <= training_mode_i;
-        set_seed[host_next_id]  <= dropout_seed_i;
+        set_accum[host_next_id] <= side.accumulate;
+        set_terms[host_next_id] <= side.terms;
+        set_pack[host_next_id] <= side.pack_shift;
+        set_map[host_next_id]  <= side.pack_map;
+        set_ents[host_next_id] <= side.act;
+        set_train[host_next_id] <= side.train;
+        set_seed[host_next_id]  <= side.seed;
         host_next_id <= host_next_id + 1'b1;
       end
+      if (l3_grant) l3_armed <= 1'b1;
+      else if (g_accept) l3_armed <= 1'b0;
+      if (g_state == G_IDLE) g_fed <= 1'b0;
+      else if (wide_rd_valid) g_fed <= 1'b1;
+      l6_rsv  <= l6_rsv + 2'(l3_grant) - 2'(l6.put);
+      l6_owed <= l6_owed + 2'(p_release) - 2'(l6_credit);
       case (g_state)
         G_IDLE:     if (g_accept) g_state <= G_FEED;
         G_FEED:     g_state <= G_LATCH;
@@ -654,14 +710,15 @@ module sienna_top #(
         P_WAIT:     if (streaming_complete) p_state <= P_IDLE;
         default:    p_state <= P_IDLE;
       endcase
-      if (bank_done) act_full[bank_sel] <= 1'b1;
+      if (l6.put) act_full[l6.data] <= 1'b1;  // pooling, the L6 consumer, owns the bank flags
       if (g_done) act_wr <= ~act_wr;
       if (p_release) begin
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
       gp_sets <= gp_sets + CRW'(bank_done || g_null_done) - CRW'(pipeline_complete_o);
-      credits   <= credits - CRW'(host_accept) + CRW'(pipeline_complete_o);
+      sets_out  <= sets_out + CRW'(host_accept) - CRW'(pipeline_complete_o);
+      l0_out    <= l0_out + CRW'(l0_grant) - CRW'(host_accept);
       mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept || g_null_done);
       if (g_accept) g_set_id <= g_next_id;
       if (g_accept) begin
@@ -695,26 +752,16 @@ module sienna_top #(
     logic [PACK_ENTRIES-1:0][7:0]  pe_zp, pe_zout;
     always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
       if (host_accept) begin
-        s_mult[host_next_id]  <= req_mult_i;
-        s_shift[host_next_id] <= req_shift_i;
-        s_zp[host_next_id][0]    <= req_zp_i;
-        s_min[host_next_id][0]   <= req_min_i;
-        s_max[host_next_id][0]   <= req_max_i;
-        s_mx[host_next_id][0]    <= gp_mx_i;
-        s_shx[host_next_id][0]   <= gp_shx_i;
-        s_mout[host_next_id][0]  <= gp_mout_i;
-        s_shout[host_next_id][0] <= gp_shout_i;
-        s_zout[host_next_id][0]  <= gp_zout_i;
-        for (int e = 1; e < PACK_ENTRIES; e++) begin
-          s_zp[host_next_id][e]    <= pack_zp_i[e];
-          s_min[host_next_id][e]   <= pack_min_i[e];
-          s_max[host_next_id][e]   <= pack_max_i[e];
-          s_mx[host_next_id][e]    <= pack_mx_i[e];
-          s_shx[host_next_id][e]   <= pack_shx_i[e];
-          s_mout[host_next_id][e]  <= pack_mout_i[e];
-          s_shout[host_next_id][e] <= pack_shout_i[e];
-          s_zout[host_next_id][e]  <= pack_zout_i[e];
-        end
+        s_mult[host_next_id]  <= side.mult;
+        s_shift[host_next_id] <= side.shift;
+        s_zp[host_next_id]    <= side.zp;
+        s_min[host_next_id]   <= side.amin;
+        s_max[host_next_id]   <= side.amax;
+        s_mx[host_next_id]    <= side.mx;
+        s_shx[host_next_id]   <= side.shx;
+        s_mout[host_next_id]  <= side.mout;
+        s_shout[host_next_id] <= side.shout;
+        s_zout[host_next_id]  <= side.zout;
       end
       if (g_accept) begin
         g_mult   <= s_mult[g_next_id];
@@ -769,30 +816,8 @@ module sienna_top #(
   end
 
   // =========================================================================
-  // PARALLEL LANE FILL: each wide read gives every lane its next element at once
+  // PARALLEL LANE FILL: each result beat gives every lane its next element at once
   // =========================================================================
-  always_ff @(posedge clk_i or negedge rstn_i) begin
-    if (!rstn_i) begin
-      systolic_read_enable <= 1'b0;
-      systolic_read_addr   <= '0;
-      systolic_reading     <= 1'b0;
-      systolic_release     <= 1'b0;
-    end else begin
-      systolic_release <= 1'b0;
-      if (g_state == G_FEED) begin
-        systolic_reading     <= 1'b1;
-        systolic_read_enable <= 1'b1;
-        systolic_read_addr   <= '0;
-      end else if (systolic_read_enable) begin
-        if (systolic_read_addr == PER_LANE[$clog2(SRAM_DEPTH)-1:0] - 1'b1) begin
-          systolic_read_enable <= 1'b0;
-          systolic_reading     <= 1'b0;
-          systolic_release     <= 1'b1;  // after the last read
-        end else systolic_read_addr <= systolic_read_addr + 1'b1;
-      end
-    end
-  end
-
   logic fill_v;
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
   // int8: the lanes, the bypass write and every fill counter see requantized int8 beats, REQ_LAT cycles after the wide read.
@@ -841,8 +866,14 @@ module sienna_top #(
       tg_idx[0] <= rq_in;
       for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
     end
-    assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last read is in: the stage may leave while it drains
+    assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last beat is in: the stage may leave while it drains
     assign rq_drain   = |tg_v;
+    // Beats granted now arrive 2 or more cycles later (counter, then the mesh's registered read): grant once no beat would still be inside then.
+    localparam int RQ_HOLD = (RQL > 2) ? RQL - 2 : 0;
+    always_comb begin
+      rq_room = 1'b1;
+      for (int i = 0; i < RQ_HOLD; i++) if (tg_v[i]) rq_room = 1'b0;
+    end
     assign lane_v     = fill_v && !tg_byp[RQL-1];
     assign byp_wr     = fill_v && tg_byp[RQL-1];
     assign byp_bank   = tg_bank[RQL-1];
@@ -871,6 +902,7 @@ module sienna_top #(
     assign byp_idx    = '0;
     assign byp_all_in = (fill_count[0] == PER_LANE[FCNT_W-1:0]);
     assign rq_drain   = 1'b0;
+    assign rq_room    = 1'b1;
     assign bank_done  = g_done;
     assign bank_sel   = act_wr;
   end
@@ -1089,8 +1121,8 @@ module sienna_top #(
   assign intermediate_buffer_full_o = 1'b0;  // no buffer between the mesh and the lanes since parallel fill
   assign intermediate_buffer_empty_o = 1'b1;
 
-  assign systolic_busy_o = (mesh_sets != 0);
-  assign gpnae_busy_o = (g_state != G_IDLE);
+  assign systolic_busy_o = (mesh_sets != 0) || ((g_state != G_IDLE) && !g_fed);  // a set not yet pushed to the activation stage
+  assign gpnae_busy_o = (g_state != G_IDLE) && g_fed;  // the stage takes its set before the result: busy once a beat is in
 
   logic any_mp_active;
   always_comb begin
@@ -1110,24 +1142,54 @@ module sienna_top #(
 `ifndef SYNTHESIS
   // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
   logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
-  logic acc_credit_q, acc_mready_q;  // a credit was free and the mesh had a staging bank, at the accept
+  logic acc_credit_q, acc_mready_q;  // a host credit was granted and a staging credit held, at the put
   logic [2:0] acc_shift_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum, acc_credit_q, acc_mready_q} <= '0;
     else begin
-      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, accumulate_i, pack_shift_i, last_accum};
-      {acc_credit_q, acc_mready_q} <= {credits != 0, mesh_input_ready};
-      if (host_accept) last_accum <= accumulate_i;
+      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, side.accumulate, side.pack_shift, last_accum};
+      {acc_credit_q, acc_mready_q} <= {l0_out != 0, l1_cnt != 0};
+      if (host_accept) last_accum <= side.accumulate;
     end
+  // The mesh-side put's terms, registered: the set's rows are in its bank (B only when uncached).
+  logic mput_q, mrows_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {mput_q, mrows_q} <= '0;
+    else {mput_q, mrows_q} <= {l1m.put, !west_queue_empty && (l1m.data[5] || !north_queue_empty)};  // data[5]: weight_cached
+  // A result beat's frame: beat index within the stage's set.
+  logic [L3_CRW-1:0] l3_rx;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) l3_rx <= '0;
+    else if (g_state == G_IDLE) l3_rx <= '0;
+    else if (wide_rd_valid) l3_rx <= l3_rx + 1'b1;
   // Stage handshake invariants; live only with --assert.
-  a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) credits <= SETS_IN_FLIGHT)
-    else $error("sienna_top: more credits than SETS_IN_FLIGHT");
+  a_credit_range: assert property (@(posedge clk_i) disable iff (!rstn_i) int'(sets_out) + int'(l0_out) <= SETS_IN_FLIGHT)
+    else $error("sienna_top: more sets in flight and host credits granted than SETS_IN_FLIGHT");
   a_credit_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> acc_credit_q)
-    else $error("sienna_top: a start was accepted without a credit");
-  a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> credits < SETS_IN_FLIGHT)
-    else $error("sienna_top: a set finished with every credit already free");
-  a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> acc_mready_q)  // systolic_start is host_accept
-    else $error("sienna_top: a start was forwarded to a mesh with no free staging bank");
+    else $error("sienna_top: a host put with no host credit granted");
+  a_credit_return: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> sets_out != 0)
+    else $error("sienna_top: a set finished with no set in flight");
+  a_mesh_takes_start: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> acc_mready_q)  // the staging put is the host's
+    else $error("sienna_top: a staging put to the mesh with no staging credit");
+  a_put_has_rows: assert property (@(posedge clk_i) disable iff (!rstn_i) mput_q |-> mrows_q)
+    else $error("sienna_top: a set put to the mesh before its rows (A, and B unless cached) were written");
+  a_l3_frame: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                               wide_rd_valid |-> (g_state != G_IDLE) && (l3_first == (l3_rx == '0)) &&
+                                                 (l3_last == (int'(l3_rx) == PER_LANE - 1)) && (l3_pk == g_pack))
+    else $error("sienna_top: result beat %0d out of frame (first %0b, last %0b, packed %0b against the stage's %0b)", l3_rx, l3_first,
+                l3_last, l3_pk, g_pack);
+  // Protocol checkers on the mesh side of L1 and L3, and on L6, checked whenever the pipeline has been empty a while.
+  localparam int QUIET = 8 + 4 * LINK_STAGES;
+  int quiet_n;
+  logic drained;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) quiet_n <= 0;
+    else if (host_accept || sets_out != 0 || mesh_sets != 0 || gp_sets != 0 || g_state != G_IDLE || p_state != P_IDLE) quiet_n <= 0;
+    else if (quiet_n < QUIET) quiet_n <= quiet_n + 1;
+  assign drained = (quiet_n == QUIET);
+  credit_link_checker #(.SLOTS(2)) l1_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l1m));
+  credit_link_checker #(.SLOTS(PER_LANE)) l3_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l3m));
+  credit_link_checker #(.SLOTS(2)) l6_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l6));
   a_g_from_mesh: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> mesh_sets != 0)
     else $error("sienna_top: the activation stage took a result the host never started");
   a_act_bank_free: assert property (@(posedge clk_i) disable iff (!rstn_i) g_done |-> !act_full[act_wr])

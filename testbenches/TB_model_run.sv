@@ -72,8 +72,8 @@ module TB_model_run;
   always_ff @(posedge clk_i) begin
     if (rstn_i && dut.active && !dut.is_row_ok && dut.is_blk < dut.ct) begin
       if (dut.is_loading) st_input++;
-      else if (dut.pipe.credits == 0) st_credit++;
-      else if (!dut.pipe.mesh_input_ready) st_staging++;
+      else if (dut.l0_cnt == 0 && dut.pipe.entry_full) st_credit++;  // the entry withholds the staging credit
+      else if (dut.l0_cnt == 0) st_staging++;
       else if (dut.bias_q && !dut.bias_in[dut.is_blk[0]]) st_bias++;
       else if (dut.is_cached_pass && !(dut.tiles_in[dut.is_blk[0]] > dut.is_p)) st_tile++;
       else st_idle++;
@@ -93,8 +93,9 @@ module TB_model_run;
       if (dut.pipe.systolic_array_inst.arrays_final && !dut.pipe.systolic_array_inst.reduce_start &&
           dut.pipe.systolic_array_inst.out_state[dut.pipe.systolic_array_inst.out_wr] != 0)
         dn_resbank++;
-      if (dut.pipe.systolic_collection_complete && dut.pipe.g_state != 0) dn_actbusy++;
-      if (dut.pipe.systolic_collection_complete && dut.pipe.g_state == 0 && dut.pipe.act_full[dut.pipe.act_wr]) dn_actbank++;
+      if (dut.pipe.systolic_array_inst.out_full[dut.pipe.systolic_array_inst.out_rd] && dut.pipe.g_fed) dn_actbusy++;
+      if (dut.pipe.systolic_array_inst.out_full[dut.pipe.systolic_array_inst.out_rd] && dut.pipe.g_state == 0 &&
+          dut.pipe.act_full[dut.pipe.act_wr]) dn_actbank++;
       if (dut.pipe.act_full[dut.pipe.act_rd] && dut.pipe.p_state != 0) dn_poolbusy++;
     end
   end

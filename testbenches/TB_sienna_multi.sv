@@ -22,10 +22,14 @@ module TB_sienna_multi #(
   logic [15:0] gp_mx_i = '0;
   logic [4:0] gp_shx_i = '0;
   logic [31:0] gp_mout_i = '0;
-  logic weight_cached_i = 0, wc_write_enable_i = 0;
+  logic weight_cached_i = 0, wc_write_enable_i = 0, wc_last_i = 0;
   logic [$clog2(128)-1:0] weight_tile_i = '0;
   logic [$clog2(128*N*N)-1:0] wc_write_addr_i = '0;
-  logic [1:0] wc_region_busy_o;
+  credit_link_if #(.DATA_W(1), .CRW(1)) wc_region[2] ();  // L2: this TB streams no cached sets, so it never opens a fill
+  assign wc_region[0].put = 1'b0;
+  assign wc_region[0].data = 1'b0;
+  assign wc_region[1].put = 1'b0;
+  assign wc_region[1].data = 1'b0;
   logic [LFSR_WIDTH-1:0] dropout_seed_i = '0;
   logic [CONTROL_WIDTH-1:0] activation_function_i = ACTIVATION_CODE;
   logic [ADDR_LINES:0] num_terms_i = NUM_TERMS;

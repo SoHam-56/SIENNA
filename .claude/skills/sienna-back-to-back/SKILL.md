@@ -212,6 +212,26 @@ stage controller processing it, not attached to every data word.
 Ordering is an invariant, not a mechanism: stages are in-order and each holds one
 set, so results emerge in issue order by construction. No reorder buffer.
 
+### Module boundaries as built (checked against the RTL, 2026-10-07)
+
+The credit counter is **only at the entry** (`credits <= credits - host_accept + pipeline_complete_o`,
+`pipeline_ready_o = credits != 0 && mesh_input_ready`). It is admission control, sized to every bank
+(`SETS_IN_FLIGHT` = 15), so it never limits more than the banks do. No boundary inside uses credits:
+
+| Boundary | Protocol today | Back-pressure |
+|---|---|---|
+| host → SystolicMesh | `input_ready_o` level (a staging bank is free) + `start_matrix_mult_i` pulse | yes |
+| SystolicMesh → activation stage | `collection_complete_o` level (a result is readable) + wide read + `result_release_i` pulse | yes (valid + release) |
+| activation stage → GPNAE lane | `wr_en_i` push, lane reports `full_o` / `empty_o` / `idle_o`; out `final_result_o` + `done_o` | in yes, out no |
+| activation → pooling stage | `g_accept` needs `!act_full[act_wr]`; `p_accept` needs `act_full[act_rd]`; `p_release` frees the bank | yes (bank full/free) |
+| pooling → `Maxpool_2D` → `dropout` | `start`/`done`, `valid_in` → `out_valid` → `in_valid` → `valid_out` (dropout combinational) | no |
+| SIENNA output | `result_valid_o` only | no: a consumer cannot stall SIENNA |
+
+The host is hardware (testbench in simulation; a DMA or `sienna_layer`'s ready/valid streams in a system),
+never software: the driver (`model_runner.py`'s role) works at layer granularity. Making every module
+boundary an explicit credit interface (latency-tolerant, one protocol per IP repo, output back-pressure)
+is a separate design started 2026-10-07 (`sienna-credits` skill).
+
 The mesh releases its input staging bank as soon as `BROADCAST` has copied
 `mem_A`/`mem_B` into the per-tile queues, not when the multiply finishes. That is
 the overlap win on the input side.

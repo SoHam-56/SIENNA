@@ -23,9 +23,9 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 
 | File | Lines | Status | What it is |
 |---|---|---|---|
-| `sienna_top.sv` | 740 | live | Top level: outer FSM, fill FSM, window dispatcher, per-lane maxpool feeder |
+| `sienna_top.sv` | 1,270 | live | Top level: entry admission and the L0/L1/L3/L6/L9 links, the activation stage (lane fill on L4, collector on L5), the window dispatcher (L7 per lane), the pooling lanes (FIFO2 → Maxpool_2D → dropout on L8); the per-lane maxpool feeder FSM is gone since 2026-10-07 |
 | `fwft.sv` | — | live | First-word-fall-through FIFO on credit links (L7 in, L8 out) since 2026-10-07; no overwrite |
-| `sienna_set_side.svh` | — | live | `set_side_t`, the L0 host link's per-set sideband, included by sienna_top, sienna_layer, sienna_multi and their TBs |
+| `sienna_set_side.svh` | 24 | live | `set_side_t`, the L0 host link's per-set sideband, included by sienna_top, sienna_layer, sienna_multi and their TBs |
 
 ### `Maxpool/`, `Dropout/`
 
@@ -42,6 +42,7 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | `test_config_pkg.sv` | **generated** | Written by `regression.py` and `model_runner.py` (`write_sv_package()`). Edits are lost on the next run |
 | `TB_model_run.sv` | live | Layer-file testbench of `sienna_layer` (was `TB_sienna_layer`); `model_runner.RtlLayer` builds it once and runs one layer per invocation |
 | `TB_sienna_model.sv` | live | Host-driven set engine on `sienna_top`; `model_runner.RtlSets` (`--engine sets`) |
+| `tb_l9_sink.svh` | live | One lane's L9 consumer for the testbenches (slots, random stalls, hold, a checker and `a_l9_slots`), included by TB_model_run, TB_sienna_model and TB_sienna_multi |
 | `matrix_west.mem`, `matrix_north.mem`, `expected_output.mem` | generated | Stimulus and golden output, hex |
 | `hardware_trace.txt` | output | Stage-by-stage hardware values, parsed by `regression.py` |
 | `pipeline_lane_status.txt` | output | Per-lane FSM snapshots. The first place to look for a stall |
@@ -107,7 +108,9 @@ The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue
 | `src/TYTAN/Memory/ROM.v` | 28 | Registered-read ROM. Uses **`$readmemb`** |
 | `src/TYTAN/Memory/RAM.v` | 40 | Dual-port RAM backing the input FIFO |
 | `src/TYTAN/Memory/PE5B.v` | 42 | 32-to-5 priority encoder |
-| `src/TYTAN/Memory/InputFIFO.v` | 73 | Status-bitmap FIFO. No simultaneous read+write |
+| `src/TYTAN/Memory/InputFIFO.v` | 73 | Status-bitmap FIFO. No simultaneous read+write. Used by the published `gpnae.sv` only since 2026-10-07 |
+| `src/lane_fifo.sv` | 47 | Circular 32-entry FIFO with InputFIFO's read latency; the input FIFO of `gpnae_poly` and `gpnae_poly_int8` since 2026-10-07 (credit-legal puts while popping would reorder InputFIFO) |
+| `src/lane_link.sv` | 92 | The lanes' shared credit front end: L4 input credits (32 advertised, one per pop), `last` handling, the L5 output counter and the K-credit group start, `a_in_room` and `a_in_order` |
 | `src/TYTAN/Memory/taylor_coeffs.mem` | 30 | Coefficients, **binary** format. One short for tanh — see issue 2 |
 
 ### Testbench
@@ -135,6 +138,10 @@ Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`
 | `Multipliers/Radix4Booth/src/R4Booth.sv` | 111 | live | Contains a dead adder tree — see issue 11 |
 | `Divider/FP32/src/fp32Divider.sv` | 216 | live | ~28-stage FP32 divider |
 | `Divider/FP32/src/divu.sv` | 95 | live | Project F restoring divider, MIT licensed |
+| `Common/src/credit_link_if.sv` | 13 | live | The credit link interface (`put`, `data`, `credit`; modports producer, consumer, monitor), since 2026-10-07 |
+| `Common/src/credit_counter.sv` | 24 | live | A producer's credit count (`has_credit_o`, `count_o`), `a_no_underflow`, `a_no_overflow` |
+| `Common/src/credit_reg.sv` | 29 | live | `STAGES` register stages on a link (put and data forward, credit back); 0 is wires |
+| `Common/src/credit_link_checker.sv` | 24 | live (checks only) | Bound to a link's monitor modport: no put without a credit, outstanding credits within SLOTS, every credit back at drain |
 
 ### Library testbenches
 

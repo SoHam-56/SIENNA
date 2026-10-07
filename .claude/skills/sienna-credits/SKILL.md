@@ -177,11 +177,13 @@ Notes per link:
 
 All at N 16, T 4, from the runs named in the comparison log; GFLOPS, GOPS and µs are derived at an assumed 950 MHz (no timing run exists).
 - Outputs are identical to main: `make regression` passes in fp32, bf16 and int8 (bf16 GPNAE accuracy is the known reported item); pipeline words, mesh results, GPNAE results, GEMM, pack, TFLite and ResNet-8 match.
-- At `LINK_STAGES` 0 every config is equal or better: first-output latency is 1 cycle lower without pooling and 5 lower with pooling; activation-bound streams run 1 cycle per set faster (fp32 tanh 263.0 → 262.0); pooled ReLU/linear streams run 21.0 → 19.0 cycles per set (+10.5%).
+- At `LINK_STAGES` 0 every perf-analysis config (TB_sienna_top streams, 32/32/41 in fp32/bf16/int8) is equal or better: first-output latency is 1 cycle lower without pooling and 5 lower with pooling; activation-bound streams run 1 cycle per set faster (fp32 tanh 263.0 → 262.0); pooled ReLU/linear streams run 21.0 → 19.0 cycles per set (+10.5%).
 - ResNet-8 bf16 on the layer engine runs 51959 → 51501 cycles (−0.88%, 54.69 → 54.21 µs).
 - Why better: the mesh pushes a result as soon as its bank is full (no collect, feed, read sequence), and FIFO2 → maxpool on credits takes 4 cycles per 2x2 window where the old feeder took 6.
 - At `LINK_STAGES` 1 the latency is 4 cycles above `LINK_STAGES` 0 (one per staged link) and activation-bound streams pay +2 cycles per set (the L3 round trip); host-bound streams are unchanged except the credits-3 ReLU stream (39.3 → 40.7).
-- `sienna_layer`'s grant-then-put round trip (Task 6) costs 1 cycle per GEMM and 3 per ResNet-8 layer against the design before Task 6, and is still below main.
+- `sienna_layer`'s grant-then-put round trip (Task 6: a set's row credits are granted before the producer may put) adds 1 to 3 cycles per layer run against the design before Task 6: 1 per GEMM QUICK grid case, 3 per cached activation layer, per ResNet-8 conv or add layer and per pack job.
+- On short `sienna_layer` runs that is more than the earlier tasks saved, so these end above main: pack int8 packed 315 → 316 and its single jobs 445/884/1589 → 448/890/1602 (2/4/8 jobs); the cached residual layer 2782 → 2783; ResNet-8's first conv (L00) 2162 → 2164.
+- Longer runs stay below main: every GEMM QUICK case (−1 per grid case, −19 per activation layer), every other ResNet-8 layer, and the whole network.
 - Mesh latency (77 cycles at N 16, T 4, fp32) and GPNAE lane timing are unchanged; the GPNAE and mesh testbench cycle counts fell only because those testbenches now put and read faster.
 
 ### Known limits

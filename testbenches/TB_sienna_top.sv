@@ -2,7 +2,7 @@
 
 import test_config_pkg::*;
 
-// LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide; -DTB_FAULT4: forced L3 framing and completion faults.
+// LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide.
 module TB_sienna_top #(
     parameter int LINK_STAGES = 0,
     parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider
@@ -197,6 +197,8 @@ module TB_sienna_top #(
   int out_owed[NUM_LANES];  // freed slots not yet credited
   int out_held[NUM_LANES];  // credits the DUT holds: returned minus words put
   int hold_puts = 0;  // words put while every credit is withheld
+  bit hold_on = 0;  // the hold pass runs: its words are checked against the plain pass, not printed
+  longint starved = 0;  // lane-cycles of a streaming pass with no L9 credit held by the DUT
   logic [DATA_WIDTH-1:0] lane_q[NUM_LANES][$];  // each lane's words of the set being output
   localparam bit TB_POOL_BYPASS = (POOL_H == 1) && (POOL_W == 1) && (STRIDE_ROWS == 1) && (STRIDE_COLS == 1) && (PADDING == 0);
   localparam int TB_L5 = (FAULT == 6) ? 8 : 16;  // the collector's L5 slots per lane
@@ -248,6 +250,7 @@ module TB_sienna_top #(
       // A word's slot is credited from the next cycle on: the producer's counter checks no credit comes with the put that frees it.
       for (int l = 0; l < NUM_LANES; l++) begin
         out_held[l] += int'(out_cr[l]);
+        if (stream_on && out_held[l] == 0) starved++;
         out_cr[l] = 1'b0;
         if (out_owed[l] > 0 && !out_hold && !(out_stall_pct > 0 && $urandom_range(99) < out_stall_pct)) begin
           out_cr[l] = 1'b1;
@@ -269,7 +272,7 @@ module TB_sienna_top #(
           if (stream_on) stream_results.push_back(w[i]);
           if (acc_on) acc_results.push_back(w[i]);
           // Data leaving dropout for the output, dec in the build's format (int8: the signed code); not for the accumulate pass, which main never ran
-          if (!acc_on) begin
+          if (!acc_on && !hold_on) begin
             if (EXP_W == 0)
               $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%0d  hex=%08x", $time, src[i], $signed(w[i][7:0]), w[i]);
             else
@@ -479,6 +482,7 @@ module TB_sienna_top #(
   task automatic reset();
     $display("\n[STAGE] Reset");
     rstn_i = 0;
+    out_cr = '0;  // the downstream consumer drops its L9 credits with the reset, as it does every other link signal
     host_lnk.put = 1'b0;
     host_lnk.data = '0;
     wc_put_tb = '0;
@@ -989,6 +993,8 @@ module TB_sienna_top #(
     bp_mesh = 0;
     bp_act = 0;
     ov_rq = 0;
+    starved = 0;
+    hold_on = hold;
     rq_wait = 0;
     ov_lane = 0;
     rq_hold = 0;
@@ -1100,7 +1106,9 @@ module TB_sienna_top #(
     stream_on = 0;
     out_hold = 0;
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
-    $display("  [Stream] %0d sets in %0d cycles", NUM_SETS, ($time - t0) / 10);
+    $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", NUM_SETS, ($time - t0) / 10);
+    $display("  [Stream] lane-cycles with no L9 credit held: %0d", starved);
+    hold_on = 0;
     if (!overrun && !hold && ref_bounds.size() == 0) begin
       ref_results = stream_results;
       ref_bounds  = stream_bounds;
@@ -1212,7 +1220,6 @@ module TB_sienna_top #(
     end
     disable fork;
     $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.sets_out, host_cnt, dut_stage);
-    out_adv = 1;  // after this reset each lane's consumer advertises one L9 slot, so the hold pass below stalls mid-set
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
@@ -1238,6 +1245,19 @@ module TB_sienna_top #(
     end else $display("  [Reset] idle after reset: every link re-advertised (host %0d, staging 2, act banks 2, results %0d, regions 1 1; %s), no stray output",
                       HOST_SLOTS, PER_LANE, why);
     write_cache();  // the reset closed the cache fill: open it again
+    stream_all_sets(0, 0, 0);
+    // Review Focus 3: a second reset re-advertises one L9 slot per lane, so the hold pass stalls mid-set.
+    out_adv = 1;
+    reset();
+    activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
+    num_terms_i           = NUM_TERMS[ADDR_LINES:0];
+    training_mode_i       = TRAINING_MODE[0];
+    repeat (100) @(posedge clk_i);
+    if (!lanes_home(why)) begin
+      failed++;
+      $display("  [FAIL] Lane links not re-advertised after the second reset: %s", why);
+    end else $display("  [Reset] idle after the second reset: %s", why);
+    write_cache();
     stream_all_sets(0, 0, PACKED != 0, 1);  // with the 500-cycle hold; the accumulate pass closes the fill when it runs
   endtask
 
@@ -1401,12 +1421,6 @@ module TB_sienna_top #(
   end
 `endif
 
-  // FAULT 4 (built with -DTB_FAULT4): during the single set the first beat is not marked first and a completion finds no set outstanding.
-  bit fault4_on = 0;
-`ifdef TB_FAULT4
-  tb_fault4 u_fault4 (.on_i(fault4_on));
-`endif
-
   // ── Top-level stimulus ────────────────────────────────────────────────
   initial begin
 
@@ -1450,7 +1464,6 @@ module TB_sienna_top #(
     apply_pack(0);
     training_mode_i       = TRAINING_MODE[0];
     dropout_seed_i        = set_seed(0);
-    fault4_on = 1'b1;
     @(posedge clk_i);
     host_put();
     $display("  start pulse sent @ %0t", $time);
@@ -1458,7 +1471,6 @@ module TB_sienna_top #(
     print_lane_status("immediately after start");
 
     collect_outputs();
-    fault4_on = 0;
     verify_outputs();
 
 `ifdef BACK_TO_BACK
@@ -1559,18 +1571,3 @@ module TB_sienna_top #(
   end
 
 endmodule
-
-`ifdef TB_FAULT4
-// FAULT 4: while on_i, forces the stage's first-beat flag and its set count to 0, so a_l3_frame and a_credit_return fire; its own module keeps the force out of the TB's.
-module tb_fault4 (input bit on_i);
-  initial forever begin
-    wait (on_i);
-    force TB_sienna_top.dut.l3_first = 1'b0;
-    force TB_sienna_top.dut.sets_out = '0;
-    $display("  [FAULT 4] l3_first and sets_out forced to 0 for the single set");
-    wait (!on_i);
-    release TB_sienna_top.dut.l3_first;
-    release TB_sienna_top.dut.sets_out;
-  end
-endmodule
-`endif

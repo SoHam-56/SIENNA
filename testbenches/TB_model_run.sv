@@ -11,6 +11,8 @@ import test_config_pkg::*;
 // int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
 // FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many.
+// +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
+// -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
 module TB_model_run #(
     parameter int FAULT       = 0,
     parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
@@ -22,6 +24,7 @@ module TB_model_run #(
 
   logic clk_i = 0, rstn_i = 0;
   always #5 clk_i = ~clk_i;
+  logic por_n = 0;  // the power-on reset only: TB_STALE_HOME's A counter ignores the mid-stream reset
 
   logic cfg_load_i = 0, cfg_residual_i = 0, cfg_bias_i = 0, cfg_train_i = 0;
   logic [15:0] cfg_m_i = '0, cfg_kb_i = '0, cfg_n_i = '0;
@@ -48,8 +51,13 @@ module TB_model_run #(
   credit_link_if #(.DATA_W(N * DATA_WIDTH + (FAULT == 3 ? 1 : 0)), .CRW(RCW)) a_lnk ();
   credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW(RCW)) w_lnk ();
   logic [$clog2(2*N+1)-1:0] a_cnt, w_cnt;
+`ifdef TB_STALE_HOME
+  credit_counter #(.MAX(2 * N), .CRW(RCW)) a_cc (.clk_i(clk_i), .rstn_i(por_n), .put_i(a_lnk.put), .credit_i(a_lnk.credit),
+                                                .has_credit_o(), .count_o(a_cnt));
+`else
   credit_counter #(.MAX(2 * N), .CRW(RCW)) a_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(a_lnk.put), .credit_i(a_lnk.credit),
                                                 .has_credit_o(), .count_o(a_cnt));
+`endif
   credit_counter #(.MAX(2 * N), .CRW(RCW)) w_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(w_lnk.put), .credit_i(w_lnk.credit),
                                                 .has_credit_o(), .count_o(w_cnt));
   // The layer grants per set, bias row or tile, so nothing is outstanding when idle: a_all_back is not armed; the end checks the counts are 0.
@@ -149,7 +157,12 @@ module TB_model_run #(
   int bounds[$];
   longint t_done = 0;
   always_ff @(posedge clk_i) begin
-    if (rstn_i) begin
+    if (!rstn_i) begin  // a mid-stream reset drops the cut pass's results
+      for (int l = 0; l < NUM_LANES; l++) lane_q[l].delete();
+      res_q.delete();
+      bounds.delete();
+      t_done <= 0;
+    end else begin
       for (int l = 0; l < NUM_LANES; l++) if (res_v[l]) lane_q[l].push_back(res_d[l]);
       if (set_done_o) begin
         automatic bit any;
@@ -170,7 +183,14 @@ module TB_model_run #(
 
   // int8: the epilogue beside the next bias row; the layer says which W row it took as a block's bias.
   int ei = 0;
-  always_ff @(posedge clk_i) if (rstn_i && IS_INT && dut.wl_take_bias) ei <= ei + 1;
+  always_ff @(posedge clk_i)
+    if (!rstn_i) ei <= 0;
+    else if (IS_INT && dut.wl_take_bias) ei <= ei + 1;
+
+  // Output of any kind while the mid-stream reset's home check watches is stray.
+  bit mid_check = 0;
+  int stray = 0;
+  always @(posedge clk_i) if (mid_check && rstn_i && (res_v != '0 || set_done_o || done_o)) stray++;
 
 `ifdef PERF
   // Cycles with sets left but no A row taken, by cause, printed at the end.
@@ -215,6 +235,10 @@ module TB_model_run #(
   always @(negedge clk_i) begin
     a_lnk.put = 1'b0;
     w_lnk.put = 1'b0;
+    if (!rstn_i) begin  // the clean pass after a mid-stream reset streams from the first row
+      ai = 0;
+      wi = 0;
+    end
     if (streaming) begin
       if (FAULT == 1 && !faulted) begin
         $display("  [FAULT 1] an A row put with %0d A credits held", a_cnt);
@@ -252,11 +276,12 @@ module TB_model_run #(
     logic [31:0] w32;
     longint t0;
     bit finished;
-    int failed = 0, osp;
+    int failed = 0, osp, mid_reset = 0, msp;
 
     void'($value$plusargs("out_slots=%d", out_slots));
     void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
     void'($value$plusargs("in_stall_pct=%d", in_stall_pct));
+    void'($value$plusargs("mid_reset=%d", mid_reset));
     if (out_slots < 1 || out_slots > OUT_CAP || out_stall_pct < 0 || out_stall_pct > 90 || in_stall_pct < 0 || in_stall_pct > 90) begin
       $display("[FATAL] +out_slots=%0d must be 1..%0d and +out_stall_pct=%0d, +in_stall_pct=%0d 0..90", out_slots, OUT_CAP, out_stall_pct,
                in_stall_pct);
@@ -328,53 +353,85 @@ module TB_model_run #(
 
     repeat (5) @(posedge clk_i);
     #1 rstn_i = 1;
+    por_n = 1;
     repeat (3) @(posedge clk_i);
 
-    // Configure: the only control the software gives.
-    #1;
-    cfg_m_i = 16'(m);
-    cfg_kb_i = 16'(kb);
-    cfg_n_i = 16'(n);
-    cfg_residual_i = res[0];
-    cfg_bias_i = bias[0];
-    cfg_act_i = CONTROL_WIDTH'(act);
-    cfg_train_i = train[0];
-    cfg_seed_i = LFSR_WIDTH'(seed);
-    cfg_req_zp_i = 8'(qzp);
-    cfg_req_min_i = 8'(qmin);
-    cfg_req_max_i = 8'(qmax);
-    cfg_gp_mx_i = 16'(qmx);
-    cfg_gp_shx_i = 5'(qshx);
-    cfg_gp_mout_i = 32'(qmout);
-    cfg_gp_shout_i = 8'(qshout);
-    cfg_gp_zout_i = 8'(qzout);
-    cfg_load_i = 1;
-    @(posedge clk_i);
-    #1 cfg_load_i = 0;
-    t0 = cycle;
-    streaming = 1;
-
-    // Stream both inputs as credits arrive; a hang is this long with no row and no set leaving.
-    idle = 0;
-    finished = 0;
-    last_ai = 0;
-    last_wi = 0;
-    last_sets = 0;
-    while (!finished) begin
-      @(posedge clk_i);
-      finished = done_o;
+    for (int pass = (mid_reset > 0) ? 0 : 1; pass < 2; pass++) begin
+      // Configure: the only control the software gives.
       #1;
-      idle = (ai != last_ai || wi != last_wi || bounds.size() != last_sets) ? 0 : idle + 1;
-      last_ai = ai;
-      last_wi = wi;
-      last_sets = bounds.size();
-      if (idle > STALL_CYCLES) begin
-        $display("[FATAL] nothing moved for %0d cycles: %0d/%0d activation rows, %0d/%0d weight rows, %0d sets done", idle, ai, na, wi,
-                 nw, bounds.size());
-        $finish;
+      cfg_m_i = 16'(m);
+      cfg_kb_i = 16'(kb);
+      cfg_n_i = 16'(n);
+      cfg_residual_i = res[0];
+      cfg_bias_i = bias[0];
+      cfg_act_i = CONTROL_WIDTH'(act);
+      cfg_train_i = train[0];
+      cfg_seed_i = LFSR_WIDTH'(seed);
+      cfg_req_zp_i = 8'(qzp);
+      cfg_req_min_i = 8'(qmin);
+      cfg_req_max_i = 8'(qmax);
+      cfg_gp_mx_i = 16'(qmx);
+      cfg_gp_shx_i = 5'(qshx);
+      cfg_gp_mout_i = 32'(qmout);
+      cfg_gp_shout_i = 8'(qshout);
+      cfg_gp_zout_i = 8'(qzout);
+      cfg_load_i = 1;
+      @(posedge clk_i);
+      #1 cfg_load_i = 0;
+      t0 = cycle;
+      streaming = 1;
+
+      // Stream both inputs as credits arrive; a hang is this long with no row and no set leaving.
+      idle = 0;
+      finished = 0;
+      last_ai = 0;
+      last_wi = 0;
+      last_sets = 0;
+      while (!finished) begin
+        @(posedge clk_i);
+        finished = done_o;
+        #1;
+        idle = (ai != last_ai || wi != last_wi || bounds.size() != last_sets) ? 0 : idle + 1;
+        last_ai = ai;
+        last_wi = wi;
+        last_sets = bounds.size();
+        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0) break;  // mid-stream, with A credits held
+        if (idle > STALL_CYCLES) begin
+          $display("[FATAL] nothing moved for %0d cycles: %0d/%0d activation rows, %0d/%0d weight rows, %0d sets done", idle, ai, na, wi,
+                   nw, bounds.size());
+          $finish;
+        end
+      end
+      streaming = 0;
+      if (pass == 0) begin
+        if (finished) begin
+          $display("[FATAL] the layer finished before +mid_reset=%0d cycles: no mid-stream reset", mid_reset);
+          $finish;
+        end
+        $display("  [Reset] mid-stream, %0d cycles into the layer: %0d/%0d A rows, %0d/%0d W rows, %0d sets done, A %0d and W %0d credits held",
+                 cycle - t0, ai, na, wi, nw, bounds.size(), a_cnt, w_cnt);
+        rstn_i = 0;
+        repeat (5) @(posedge clk_i);
+        msp = out_stall_pct;
+        out_stall_pct = 0;
+        #1 rstn_i = 1;
+        mid_check = 1;
+        repeat (OUT_CAP + 64 + 8 * LINK_STAGES) @(posedge clk_i);
+        mid_check = 0;
+        // Home: no row credit held (the layer grants per set), both staging and region credits back, every L9 slot re-advertised.
+        if (a_cnt != 0 || w_cnt != 0 || int'(dut.l0_cnt) != 2 || !dut.wc_has[0] || !dut.wc_has[1] || lane_home != '1 || stray != 0 ||
+            busy_o) begin
+          $display("[FAIL] not home after the mid-stream reset: A %0d (0), W %0d (0), staging %0d (2), regions %0d %0d (1 1), lanes home %0d of %0d, %0d stray output cycles, busy %0d",
+                   a_cnt, w_cnt, dut.l0_cnt, dut.wc_has[0], dut.wc_has[1], $countones(lane_home), NUM_LANES, stray, busy_o);
+          $finish;
+        end else
+          $display("  [Reset] home: row credits 0 0, staging 2, regions 1 1, %0d lanes with %0d L9 slots each, no stray output", NUM_LANES,
+                   out_slots);
+        out_stall_pct = msp;
+        repeat (3) @(posedge clk_i);
+        continue;
       end
     end
-    streaming = 0;
     // The layer granted exactly the rows the streams hold, and every L9 slot comes home once the stalls stop.
     if (a_cnt != 0 || w_cnt != 0) begin
       failed++;

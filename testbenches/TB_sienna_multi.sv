@@ -9,6 +9,8 @@ import test_config_pkg::*;
 // +cached: sets go in fills of each region's cache (COPIES to COPIES+2 sets, B from the cache, each copy's last set of a fill marked), an uncached set after every second fill.
 // +out_slots=S (1..64) and +out_stall_pct=P on L9; +fault=1 a fill of one set, 2 a copy's first set of a fill marked, 3 a put to a copy whose turn it is not,
 // 4 the last set alone in a fill of one, then the host stops.
+// +mid_reset=C: a cut pass (cached: region 0's fill whole, region 1's opened with one set) is reset C cycles after it starts, once copy 0 holds a staging credit;
+// every count must come home with no stray output before the stream runs. -DTB_STALE_HOME keeps copy 0's staging count through that reset.
 module TB_sienna_multi #(
     parameter int COPIES      = 2,
     parameter int COLLAPSE_K  = 1,
@@ -29,6 +31,7 @@ module TB_sienna_multi #(
 
   logic clk_i = 0, rstn_i = 0;
   always #5 clk_i = ~clk_i;
+  logic por_n = 0;  // the power-on reset only: TB_STALE_HOME's copy 0 staging counter ignores the mid-stream reset
 
   logic [N-1:0][ACC_W-1:0] bias_i = '0;
   logic [N-1:0][31:0] req_mult_i = '0;  // int8 (D-2)
@@ -54,8 +57,13 @@ module TB_sienna_multi #(
   for (genvar c = 0; c < COPIES; c++) begin : G_HOST
     assign host[c].put = hput[c];
     assign host[c].data = side;
+`ifdef TB_STALE_HOME
+    credit_counter #(.MAX(2), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(c == 0 ? por_n : rstn_i), .put_i(host[c].put), .credit_i(host[c].credit),
+                                           .has_credit_o(), .count_o(hcnt[c]));
+`else
     credit_counter #(.MAX(2), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host[c].put), .credit_i(host[c].credit),
                                            .has_credit_o(), .count_o(hcnt[c]));
+`endif
     credit_link_checker #(.SLOTS(2)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk && hcnt[c] == 2'd2), .lnk(host[c]));
   end
 
@@ -328,7 +336,61 @@ module TB_sienna_multi #(
     $display("  [fill] region %0d: sets %0d..%0d at cycle %0d", r, k, k + s - 1, cyc);
   endtask
 
+  // The cut pass: sets in every copy, a fill open, then a reset mid-stream; the counts must come home with no stray output.
+  task automatic cut_pass(input int after);
+    automatic longint t0 = cyc;
+    automatic int stray = 0, waited = 0;
+    if (cached_mode) begin
+      fill_region(0, 0, COPIES);
+      for (int j = 0; j < COPIES; j++) put_set(j, 1, j, 1);  // a whole fill, each copy's set its last
+      fill_region(1, COPIES, COPIES);
+      put_set(COPIES, 1, HALF, 0);  // region 1's fill opened, one copy's set put
+    end else begin
+      for (int k = 0; k < 2 * COPIES; k++) put_set(k, 0, 0, 0);
+    end
+    while (cyc - t0 < after || hcnt[0] == 0) begin
+      @(negedge clk_i);
+      waited++;
+      if (waited > WAIT_CYCLES) begin
+        $display("[FATAL] cut pass: copy 0 held no staging credit for %0d cycles", waited);
+        $finish;
+      end
+    end
+    $display("  [Reset] mid-stream, %0d cycles after the cut pass began: %0d sets done, copy 0 holds %0d staging credits, regions %0d %0d",
+             cyc - t0, n_done, hcnt[0], wcnt[0], wcnt[1]);
+    rstn_i = 0;
+    repeat (5) @(negedge clk_i);
+    copy_sets.delete();
+    lq.delete();
+    got.delete();
+    t_start.delete();
+    t_done.delete();
+    n_done = 0;
+    tsel = 0;
+    rstn_i = 1;
+    repeat (OUT_CAP + 64 + 8 * LINK_STAGES) begin
+      @(posedge clk_i);
+      if (ov != '0 || pipeline_complete_o != '0) stray++;
+    end
+    begin
+      automatic bit home = (lane_home == '1) && wcnt[0] && wcnt[1] && copy_sel_o == '0 && dut.wc_got[0] == '0 && dut.wc_got[1] == '0 && stray == 0;
+      for (int c = 0; c < COPIES; c++) if (hcnt[c] != 2'd2) home = 0;
+      if (!home) begin
+        $display("[FAIL] not home after the mid-stream reset: copy 0 staging %0d (2), copy %0d staging %0d (2), regions %0d %0d (1 1), turn %0d (0), region returns %b %b (0 0), lanes home %0d of %0d, %0d stray output cycles",
+                 hcnt[0], COPIES - 1, hcnt[COPIES-1], wcnt[0], wcnt[1], copy_sel_o, dut.wc_got[0], dut.wc_got[1], $countones(lane_home), NL,
+                 stray);
+        $display("RESULT: FAILED");
+        $finish;
+      end else
+        $display("  [Reset] home: staging 2 in each of %0d copies, regions 1 1, turn 0, no region return pending, %0d L9 lanes with %0d slots, no stray output",
+                 COPIES, NL, out_slots);
+    end
+    lq.delete();
+  endtask
+
   initial begin
+    automatic int mid_reset = 0;
+    void'($value$plusargs("mid_reset=%d", mid_reset));
     void'($value$plusargs("out_slots=%d", out_slots));
     void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
     void'($value$plusargs("fault=%d", fault));
@@ -341,7 +403,9 @@ module TB_sienna_multi #(
              cached_mode, out_slots, out_stall_pct, fault);
     repeat (4) @(posedge clk_i);
     rstn_i = 1;
+    por_n = 1;
     repeat (4) @(negedge clk_i);
+    if (mid_reset > 0) cut_pass(mid_reset);
     if (!cached_mode) begin
       for (int k = 0; k < NUM_SETS; k++) put_set(k, 0, 0, 0);
     end else begin
@@ -436,6 +500,18 @@ module TB_sienna_multi #(
       if (ng > 0 && lo >= 0)
         $display("MULTI COPIES=%0d N=%0d lanes=%0d host_words=%0d collapse_k=%0d: steady %.1f cycles per set, %.1f FLOP/cycle",
                  COPIES, N, NUM_LANES, HOST_WORDS, COLLAPSE_K, gap_sum / ng, 2.0 * N * N * N * ng / gap_sum);
+    end
+    // A hash of every set's words in set order, for comparing runs.
+    begin
+      automatic longint unsigned h = 64'd1469598103934665603;
+      automatic int words = 0;
+      for (int k = 0; k < NUM_SETS; k++)
+        if (got.exists(k))
+          for (int i = 0; i < got[k].size(); i++) begin
+            h = (h ^ 64'(got[k][i])) * 64'd1099511628211;
+            words++;
+          end
+      $display("MULTI_HASH %016h over %0d words", h, words);
     end
     // A ternary of two strings prints as a number under Verilator, so branch instead.
     if (failed == 0) $display("RESULT: PASSED");

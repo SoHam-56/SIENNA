@@ -136,10 +136,56 @@ module sienna_layer #(
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
   logic [WCTW-1:0]               p_tile;
   logic [WCAW-1:0]               p_wc_addr;
-  logic [1:0]                    p_region_busy;
+  logic                          p_wc_last;  // the set is its block's last cached pass: the region's fill closes with it
   logic                          p_west_we, p_north_we;
   logic [LFSR_WIDTH-1:0]         p_seed;
   logic [ID_W-1:0]               p_done_id;
+
+  // The pipeline's host link (L0): this layer holds up to two staging credits and puts each set with its last row.
+  `include "sienna_set_side.svh"
+  set_side_t p_side;
+  logic [1:0] l0_cnt;
+  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) p_host ();
+  credit_counter #(.MAX(2), .CRW(1)) l0_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(p_host.put), .credit_i(p_host.credit),
+                                            .has_credit_o(), .count_o(l0_cnt));
+  assign p_ready = (l0_cnt != 0);
+  assign p_host.put = p_start;
+  assign p_host.data = p_side;
+  always_comb begin
+    p_side               = '0;
+    p_side.wc_last       = p_wc_last;
+    p_side.weight_tile   = p_tile;
+    p_side.weight_cached = p_cached;
+    p_side.accumulate    = p_acc;
+    p_side.bias_valid    = p_bias_v;
+    p_side.train         = train_q;
+    p_side.seed          = p_seed;
+    p_side.terms         = terms(act_q);
+    p_side.pack_shift    = pk_shift_q;
+    p_side.pack_map      = pk_map_q;
+    p_side.act           = {pk_act_q, act_q};
+    p_side.zp            = {pk_zp_q, rq_zp_q};
+    p_side.amin          = {pk_min_q, rq_min_q};
+    p_side.amax          = {pk_max_q, rq_max_q};
+    p_side.mx            = {pk_mx_q, gp_mx_q};
+    p_side.shx           = {pk_shx_q, gp_shx_q};
+    p_side.mout          = {pk_mout_q, gp_mout_q};
+    p_side.shout         = {pk_shout_q, gp_shout_q};
+    p_side.zout          = {pk_zout_q, gp_zout_q};
+    p_side.mult          = p_mult;
+    p_side.shift         = p_shift;
+  end
+
+  // The cache regions (L2): the loader puts once per cached block's fill, on the region of its half, when it holds that region's credit.
+  credit_link_if #(.DATA_W(1), .CRW(1)) p_wc[2] ();
+  logic wc_has[2];  // per region: its credit is held
+  logic wl_put;  // the loader opens its block's fill this cycle
+  for (genvar r = 0; r < 2; r++) begin : G_WC
+    credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(p_wc[r].put), .credit_i(p_wc[r].credit),
+                                           .has_credit_o(), .count_o(wc_has[r]));
+    assign p_wc[r].put = wl_put && (wl_blk[0] == 1'(r));
+    assign p_wc[r].data = 1'b0;
+  end
 
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
@@ -169,40 +215,11 @@ module sienna_layer #(
   ) pipe (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
-      .start_pipeline_i           (p_start),
-      .training_mode_i            (train_q),
-      .accumulate_i               (p_acc),
-      .bias_valid_i               (p_bias_v),
+      .host                       (p_host),
       .bias_i                     (p_bias),
-      .req_mult_i                 (p_mult),
-      .req_shift_i                (p_shift),
-      .req_zp_i                   (rq_zp_q),
-      .req_min_i                  (rq_min_q),
-      .req_max_i                  (rq_max_q),
-      .gp_mx_i                    (gp_mx_q),
-      .gp_shx_i                   (gp_shx_q),
-      .gp_mout_i                  (gp_mout_q),
-      .gp_shout_i                 (gp_shout_q),
-      .gp_zout_i                  (gp_zout_q),
-      .pack_shift_i               (pk_shift_q),
-      .pack_map_i                 (pk_map_q),
-      .pack_act_i                 (pk_act_q),
-      .pack_zp_i                  (pk_zp_q),
-      .pack_min_i                 (pk_min_q),
-      .pack_max_i                 (pk_max_q),
-      .pack_mx_i                  (pk_mx_q),
-      .pack_shx_i                 (pk_shx_q),
-      .pack_mout_i                (pk_mout_q),
-      .pack_shout_i               (pk_shout_q),
-      .pack_zout_i                (pk_zout_q),
-      .weight_cached_i            (p_cached),
-      .weight_tile_i              (p_tile),
+      .wc_region                  (p_wc),
       .wc_write_enable_i          (p_wc_we),
       .wc_write_addr_i            (p_wc_addr),
-      .wc_region_busy_o           (p_region_busy),
-      .dropout_seed_i             (p_seed),
-      .activation_function_i      (act_q),
-      .num_terms_i                (terms(act_q)),
       .north_write_enable_i       (p_north_we),
       .north_write_data_i         (p_north),
       .north_write_reset_i        (1'b0),
@@ -212,7 +229,6 @@ module sienna_layer #(
       .final_result_o             (final_result_o),
       .result_valid_o             (result_valid_o),
       .pipeline_complete_o        (p_complete),
-      .pipeline_ready_o           (p_ready),
       .done_set_id_o              (p_done_id),
       .systolic_busy_o            (),
       .gpnae_busy_o               (),
@@ -235,11 +251,12 @@ module sienna_layer #(
   logic [DIM_W-1:0] tiles_in[2];  // complete tiles in each half, for the block that half holds
   logic [1:0] bias_in;  // the bias row for the block each half holds is in
 
-  // The loader may start block b once the issuer has finished block b-2, whose half it overwrites,
-  // and the mesh no longer has a staged set reading that half; an uncached layer's weights come with its sets.
-  logic wl_may, wl_take_bias, wl_take_tile, is_needs_north;
-  assign wl_may = active && (wl_blk < ct) && (wl_blk <= is_blk + 1) && !p_region_busy[wl_blk[0]] &&
-                  (cached || wl_blk == is_blk);
+  // The loader may start block b once the issuer has finished block b-2, whose half it overwrites, and (cached) has opened the half's fill on its region's credit.
+  logic wl_pre, wl_may, wl_take_bias, wl_take_tile, is_needs_north;
+  logic wl_opened;  // the loader's block has its region's fill open
+  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk + 1) && (cached || wl_blk == is_blk);
+  assign wl_put = wl_pre && cached && !wl_opened && wc_has[wl_blk[0]];
+  assign wl_may = wl_pre && (!cached || wl_opened);
   assign wl_take_bias = wl_may && bias_q && !wl_bias_done && w_valid_i;
   assign wl_take_tile = wl_may && cached && (!bias_q || wl_bias_done) && (wl_tile < dt) && w_valid_i && !is_needs_north;
 
@@ -282,6 +299,7 @@ module sienna_layer #(
     p_mult     = mult_buf[is_blk[0]];
     p_shift    = shift_buf[is_blk[0]];
     p_cached   = is_cached_pass;
+    p_wc_last  = is_cached_pass && (is_r == rt - 1) && (is_p == dt - 1);
     p_tile     = WCTW'(int'(is_blk[0]) * HALF + int'(is_p));
     p_seed     = LFSR_WIDTH'(seed_q ^ (32'h85EBCA6B * n_issued));
   end
@@ -323,6 +341,7 @@ module sienna_layer #(
       wl_bias_done <= 1'b0;
       wl_tile <= '0;
       wl_row <= '0;
+      wl_opened <= 1'b0;
       tiles_in[0] <= '0;
       tiles_in[1] <= '0;
       bias_in <= '0;
@@ -373,6 +392,7 @@ module sienna_layer #(
         wl_bias_done <= 1'b0;
         wl_tile <= '0;
         wl_row <= '0;
+        wl_opened <= 1'b0;
         tiles_in[0] <= '0;
         tiles_in[1] <= '0;
         bias_in <= '0;
@@ -394,11 +414,13 @@ module sienna_layer #(
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;
+          if (wl_put) wl_opened <= 1'b1;
           if (wl_may && (!bias_q || bias_now) && (!cached || tiles_now == dt)) begin
             wl_blk <= wl_blk + 1'b1;
             wl_bias_done <= 1'b0;
             wl_tile <= '0;
             wl_row <= '0;
+            wl_opened <= 1'b0;
           end else begin
             if (wl_take_bias) wl_bias_done <= 1'b1;
             if (wl_take_tile) begin
@@ -448,8 +470,6 @@ module sienna_layer #(
   a_pack_shape: assert property (@(posedge clk_i) disable iff (!rstn_i)
                                  (cfg_load_i && !active && cfg_pack_shift_i != '0) |-> (cfg_n_i == DIM_W'(N) && cfg_kb_i == DIM_W'(N) && !cfg_residual_i))
     else $error("sienna_layer: a packed layer is N columns and N deep, without a residual");
-  a_start_taken: assert property (@(posedge clk_i) disable iff (!rstn_i) p_start |-> p_ready)
-    else $error("sienna_layer: a set's last row came when the pipeline could not take its start");
   a_one_north: assert property (@(posedge clk_i) disable iff (!rstn_i) !(p_wc_we && p_north_we))
     else $error("sienna_layer: a cache fill and a set's B row on the north bus in one cycle");
   if (IS_INT) begin : G_INT_NO_RESIDUAL  // int8 residual adds raw codes: its rescale is 2b

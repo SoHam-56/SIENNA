@@ -51,9 +51,10 @@ module sienna_multi #(
     input logic [7:0]               gp_zout_i,
     input logic                     weight_cached_i,
     input logic [$clog2(WC_TILES)-1:0] weight_tile_i,
+    input logic                     wc_last_i,  // with the start: the last set this copy takes from its cache region's fill (one per copy)
+    credit_link_if.consumer         wc_region[2],  // L2: a put opens a fill of that region in every copy; its credit returns once every copy's has
     input logic                     wc_write_enable_i,  // written into every copy's cache
     input logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i,
-    output logic [1:0]              wc_region_busy_o,
     input logic [   LFSR_WIDTH-1:0] dropout_seed_i,
     input logic [CONTROL_WIDTH-1:0] activation_function_i,
     input logic [     ADDR_LINES:0] num_terms_i,
@@ -72,8 +73,10 @@ module sienna_multi #(
     output logic [COPIES-1:0][$clog2(SETS_IN_FLIGHT+1)-1:0]  done_set_id_o
 );
   localparam int SW = $clog2(COPIES + 1);
+  localparam int PACK_ENTRIES = 8;  // sienna_top's default; sienna_multi never packs
+  `include "sienna_set_side.svh"
   logic [SW-1:0] sel;
-  logic [COPIES-1:0] ready;
+  logic [COPIES-1:0] ready;  // per copy: this side holds a staging credit of that copy
   assign copy_sel_o = sel;
   assign pipeline_ready_o = ready[sel];
 
@@ -83,15 +86,59 @@ module sienna_multi #(
     else if (start_pipeline_i && ready[sel]) sel <= (sel == SW'(COPIES - 1)) ? '0 : sel + 1'b1;
   end
 
-  logic [COPIES-1:0][1:0] copy_wc_busy;
+  // The set's sideband from the start-time ports, put to the copy whose turn it is.
+  set_side_t side;
   always_comb begin
-    wc_region_busy_o = '0;
-    for (int c = 0; c < COPIES; c++) wc_region_busy_o |= copy_wc_busy[c];
+    side               = '0;
+    side.wc_last       = wc_last_i;
+    side.weight_tile   = weight_tile_i;
+    side.weight_cached = weight_cached_i;
+    side.accumulate    = accumulate_i;
+    side.bias_valid    = bias_valid_i;
+    side.train         = training_mode_i;
+    side.seed          = dropout_seed_i;
+    side.terms         = num_terms_i;
+    side.act[0]        = activation_function_i;
+    side.zp[0]         = req_zp_i;
+    side.amin[0]       = req_min_i;
+    side.amax[0]       = req_max_i;
+    side.mx[0]         = gp_mx_i;
+    side.shx[0]        = gp_shx_i;
+    side.mout[0]       = gp_mout_i;
+    side.shout[0]      = gp_shout_i;
+    side.zout[0]       = gp_zout_i;
+    side.mult          = req_mult_i;
+    side.shift         = req_shift_i;
+  end
+
+  // L2: a fill goes to every copy at once; a region's credit goes up only when every copy has returned its own.
+  logic [COPIES-1:0] wc_cred[2];  // this cycle's region credits from each copy
+  logic [COPIES-1:0] wc_got[2];  // copies whose region credit came back and has not gone up yet
+  for (genvar r = 0; r < 2; r++) begin : G_WC
+    logic all_back;
+    assign all_back = &(wc_got[r] | wc_cred[r]);
+    assign wc_region[r].credit = all_back;
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) wc_got[r] <= '0;
+      else wc_got[r] <= all_back ? '0 : (wc_got[r] | wc_cred[r]);
   end
 
   for (genvar c = 0; c < COPIES; c++) begin : COPY
     logic mine;
+    logic [1:0] cnt;  // staging credits of this copy held here
     assign mine = (sel == SW'(c));
+    credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host ();
+    credit_link_if #(.DATA_W(1), .CRW(1)) wcc[2] ();
+    credit_counter #(.MAX(2), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host.put), .credit_i(host.credit), .has_credit_o(),
+                                           .count_o(cnt));
+    assign ready[c] = (cnt != 0);
+    assign host.put = start_pipeline_i && mine && ready[c];  // a start the copy cannot take is ignored, as before
+    assign host.data = side;
+    for (genvar r = 0; r < 2; r++) begin : G_WCC
+      assign wcc[r].put = wc_region[r].put;
+      assign wcc[r].data = wc_region[r].data;
+      assign wc_cred[r][c] = wcc[r].credit;
+    end
     sienna_top #(
         .NUM_LANES        (NUM_LANES),
         .N                (N),
@@ -122,40 +169,11 @@ module sienna_multi #(
     ) pipe (
         .clk_i                      (clk_i),
         .rstn_i                     (rstn_i),
-        .start_pipeline_i           (start_pipeline_i && mine),
-        .training_mode_i            (training_mode_i),
-        .accumulate_i               (accumulate_i),
-        .bias_valid_i               (bias_valid_i),
+        .host                       (host),
         .bias_i                     (bias_i),
-        .req_mult_i                 (req_mult_i),
-        .req_shift_i                (req_shift_i),
-        .req_zp_i                   (req_zp_i),
-        .req_min_i                  (req_min_i),
-        .req_max_i                  (req_max_i),
-        .gp_mx_i                    (gp_mx_i),
-        .gp_shx_i                   (gp_shx_i),
-        .gp_mout_i                  (gp_mout_i),
-        .gp_shout_i                 (gp_shout_i),
-        .gp_zout_i                  (gp_zout_i),
-        .pack_shift_i               ('0),  // packing: sienna_multi never packs
-        .pack_map_i                 ('0),
-        .pack_act_i                 ('0),
-        .pack_zp_i                  ('0),
-        .pack_min_i                 ('0),
-        .pack_max_i                 ('0),
-        .pack_mx_i                  ('0),
-        .pack_shx_i                 ('0),
-        .pack_mout_i                ('0),
-        .pack_shout_i               ('0),
-        .pack_zout_i                ('0),
-        .weight_cached_i            (weight_cached_i),
-        .weight_tile_i              (weight_tile_i),
+        .wc_region                  (wcc),
         .wc_write_enable_i          (wc_write_enable_i),
         .wc_write_addr_i            (wc_write_addr_i),
-        .wc_region_busy_o           (copy_wc_busy[c]),
-        .dropout_seed_i             (dropout_seed_i),
-        .activation_function_i      (activation_function_i),
-        .num_terms_i                (num_terms_i),
         .north_write_enable_i       (north_write_enable_i && mine),
         .north_write_data_i         (north_write_data_i),
         .north_write_reset_i        (north_write_reset_i && mine),
@@ -165,7 +183,6 @@ module sienna_multi #(
         .final_result_o             (final_result_o[c]),
         .result_valid_o             (result_valid_o[c]),
         .pipeline_complete_o        (pipeline_complete_o[c]),
-        .pipeline_ready_o           (ready[c]),
         .done_set_id_o              (done_set_id_o[c]),
         .systolic_busy_o            (),
         .gpnae_busy_o               (),

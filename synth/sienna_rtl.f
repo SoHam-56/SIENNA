@@ -1,4 +1,7 @@
 SystolicMesh/ArithmeticLibrary/Common/src/sienna_fmt_pkg.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_link_if.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_counter.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_reg.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Radix4Booth/src/R4Booth.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Karatsuba/src/karatsubaUnsigned.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/FP32/src/fp32Multiplier.sv

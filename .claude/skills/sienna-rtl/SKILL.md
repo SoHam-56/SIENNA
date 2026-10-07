@@ -186,7 +186,7 @@ Be aware the tolerance check does not measure what it claims: every testbench in
 
 ## Milestone tags
 
-Each repo tags its own milestones: the name says what that version contains, the number counts that repo's milestones, and the tag message gives the date and a one-line description. SIENNA and SystolicMesh share names because every SIENNA milestone so far was also a mesh change (SystolicMesh is tagged at the commit SIENNA pins); GPNAE and ArithmeticLibrary have their own. SIENNA's submodule pointers record which GPNAE and ArithmeticLibrary commit each SIENNA tag used.
+Each repo tags its own milestones: the name says what that version contains, the number counts that repo's milestones, and the tag message gives the date and a one-line description. SIENNA and SystolicMesh share names because every SIENNA milestone so far was also a mesh change (SystolicMesh is tagged at the commit SIENNA pins); GPNAE has its own; ArithmeticLibrary is a library and is not tagged. SIENNA's submodule pointers record which GPNAE and ArithmeticLibrary commit each SIENNA tag used.
 
 | Repo | Tag | Commit | Date | What it contains | Was |
 |---|---|---|---|---|---|
@@ -198,9 +198,6 @@ Each repo tags its own milestones: the name says what that version contains, the
 | GPNAE | `tytan_vdat2025` | 59c0aa6 | 2025-10-29 | the Taylor-series lane as published (VDAT 2025) | same |
 | GPNAE | `poly_lane_v1` | f1482f4 | 2026-09-25 | the fitted-polynomial lane, exact past the fits, ReLU and linear; fp32 | `pre_synthesis_v1` |
 | GPNAE | `three_formats_v2` | 0d407a7 | 2026-10-01 | the polynomial lane in fp32 or bf16, and a separate int8 lane | `pre_packing_v1` |
-| ArithmeticLibrary | `fp32_units_v1` | ea2c09b | 2026-07-26 | fp32 multiplier and adder (Booth, Karatsuba, leading-zero count) | new |
-| ArithmeticLibrary | `bf16_units_v2` | d97e270 | 2026-09-28 | float multiplier and adder at any width, the format package | new |
-| ArithmeticLibrary | `int8_units_v3` | cb46ced | 2026-10-01 | int8 multiply and add, Q4.11 multiply-add, TFLite requantize | `pre_packing_v1` |
 
 ## Conventions
 

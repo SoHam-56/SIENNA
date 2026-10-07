@@ -71,8 +71,8 @@ module sienna_layer #(
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
-    credit_link_if.consumer          a_rows,  // L10: one row of N words per put (data N*DATA_WIDTH, credit $clog2(N+1) bits); producer counter MAX 2N
-    credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; producer counter MAX 2N
+    credit_link_if.consumer          a_rows,  // L10: one row of N words per put; a set's N credits may come with the last row's put, so the producer counter needs MAX >= N+1 (a_no_overflow counts cnt + credit before the put)
+    credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
     input  logic [N-1:0][ACC_W-1:0]  w_bias_i,
     input  logic [N-1:0][31:0]       w_req_mult_i,
@@ -547,6 +547,13 @@ module sienna_layer #(
     else $error("sienna_layer: an A row arrived with no A row credit granted (no set granted, or its N rows already in)");
   a_w_granted: assert property (@(posedge clk_i) disable iff (!rstn_i) wp_q |-> wp_ok_q)
     else $error("sienna_layer: a weight row arrived with no credit granted for the row the stream is at (bias, cache tile or a set's B row)");
+  // The weight credit mux sends one grant: a bias row's must never come with a set's B rows or a tile's.
+  logic wgb_q, wgn_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {wgb_q, wgn_q} <= '0;
+    else {wgb_q, wgn_q} <= {wb_grant, (s_grant && g_need_w) || wt_grant};
+  a_w_one_grant: assert property (@(posedge clk_i) disable iff (!rstn_i) !(wgb_q && wgn_q))
+    else $error("sienna_layer: a bias row's weight credit and a set's or tile's N in one cycle: the credit mux sent only N");
   if (IS_INT) begin : G_INT_NO_RESIDUAL  // int8 residual adds raw codes: its rescale is 2b
     a_int_no_residual: assert property (@(posedge clk_i) disable iff (!rstn_i) !(cfg_load_i && !active && cfg_residual_i))
       else $error("sienna_layer: int8 residual is not supported until 2b");

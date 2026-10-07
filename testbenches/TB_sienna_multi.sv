@@ -7,7 +7,8 @@ import test_config_pkg::*;
 // Streams NUM_SETS distinct sets through sienna_multi, checks every set against its golden output, and measures throughput.
 // The host is the producer of every copy's L0 link and of both cache regions (L2), and the consumer of every copy's L9 links.
 // +cached: sets go in fills of each region's cache (COPIES to COPIES+2 sets, B from the cache, each copy's last set of a fill marked), an uncached set after every second fill.
-// +out_slots=S (1..64) and +out_stall_pct=P on L9; +fault=1 a fill of one set, 2 a copy's first set of a fill marked, 3 a put to a copy whose turn it is not.
+// +out_slots=S (1..64) and +out_stall_pct=P on L9; +fault=1 a fill of one set, 2 a copy's first set of a fill marked, 3 a put to a copy whose turn it is not,
+// 4 the last set alone in a fill of one, then the host stops.
 module TB_sienna_multi #(
     parameter int COPIES     = 2,
     parameter int COLLAPSE_K = 1
@@ -119,6 +120,7 @@ module TB_sienna_multi #(
       .west_write_enable_i (west_write_enable_i),
       .west_write_data_i   (west_write_data_i),
       .west_write_reset_i  (west_write_reset_i),
+      .drained_i           (drain_chk),
       .copy_sel_o          (copy_sel_o),
       .out                 (out_lnk),
       .pipeline_complete_o (pipeline_complete_o),
@@ -345,8 +347,10 @@ module TB_sienna_multi #(
         s = COPIES + (f % 3);
         if (fault == 1 && f == 0) s = 1;  // fewer sets than copies: a copy never sees a marked set
         if (fault == 2 && f == 0) s = COPIES + 1;
+        if (fault == 4 && k == NUM_SETS - 1) s = 1;  // a short last fill: the host stops with a copy unmarked
+        if (fault == 4 && k < NUM_SETS - 1 && k + s > NUM_SETS - 1) s = NUM_SETS - 1 - k;
         if (k + s > NUM_SETS) s = NUM_SETS - k;
-        if (s < COPIES && !(fault == 1 && f == 0)) begin
+        if (s < COPIES && !(fault == 1 && f == 0) && !(fault == 4 && k == NUM_SETS - 1)) begin
           put_set(k, 0, 0, 0);
           k++;
           continue;
@@ -355,7 +359,7 @@ module TB_sienna_multi #(
         for (int j = 0; j < s; j++) begin
           automatic bit mark;
           mark = (j >= s - COPIES);  // each copy's last set of the fill, in round-robin order
-          if (fault == 1 && f == 0) mark = 1;
+          if ((fault == 1 && f == 0) || (fault == 4 && k == NUM_SETS - 1)) mark = 1;
           if (fault == 2 && f == 0 && j == 0) begin
             mark = 1;
             $display("  [FAULT 2] set %0d marked although its copy takes set %0d of the same fill", k, k + COPIES);
@@ -364,7 +368,7 @@ module TB_sienna_multi #(
         end
         k += s;
         f++;
-        if (f % 2 == 0 && k < NUM_SETS) begin
+        if (f % 2 == 0 && k < NUM_SETS - (fault == 4 ? 1 : 0)) begin
           put_set(k, 0, 0, 0);
           k++;
         end
@@ -414,6 +418,7 @@ module TB_sienna_multi #(
     drain_chk = 1'b1;
     @(negedge clk_i);
     drain_chk = 1'b0;
+    repeat (2) @(posedge clk_i);  // the registered drain checks judge a cycle later
     // Steady state over the second half, spanning whole rounds of COPIES sets so bursts do not skew it.
     begin
       automatic longint tl[$];

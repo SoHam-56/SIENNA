@@ -65,7 +65,6 @@ TOP_FILES = \
 	sienna_top.sv \
 	requant_lanes.sv \
 	fwft.sv \
-	l9_sink.sv \
 	sienna_multi.sv \
 	sienna_layer.sv
 

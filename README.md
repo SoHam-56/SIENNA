@@ -118,7 +118,7 @@ Read them as an indication of where the architecture stands.
 ## Verification
 
 - `make regression` runs every check below and gives one verdict. It passes in fp32, bf16 and int8.
-- The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size (fp32 at 64 × 64 with one 64 × 64 array is still running). Each test streams several sets, and every element of every stage is checked.
+- The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
 - The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.
 - Assertions on every handshake run in every simulation, and a firing assertion fails the run.

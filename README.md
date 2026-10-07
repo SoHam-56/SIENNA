@@ -6,8 +6,8 @@ SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid o
 
 | | |
 |---|---|
-| **1.73 TFLOPS** sustained | 32 × 32 mesh streaming fp32 matrix multiplies at 89% of peak (1.71 TOPS in int8) |
-| **54 µs** per ResNet-8 inference | CIFAR-10 image, every multiply-accumulate on the RTL, 95% of the mesh busy |
+| **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
+| **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
 | **0 of 198 656** outputs differ | int8 layers against the TensorFlow Lite interpreter, bit for bit |
 | **35× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 21 cycles for tanh) |
 | **up to 16× faster** on small layers | by packing many small matrix multiplies into one |
@@ -44,29 +44,29 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 ### Throughput while streaming sets
 
-GFLOPS (GOPS in int8), 24 sets per run, with the activation applied to every set:
+GFLOPS (GOPS in int8), 24 sets per run, with the activation applied to every set. Each cell gives fp32 · bf16 · int8:
 
-| Activation | N = 16 fp32 | N = 16 bf16 | N = 16 int8 | N = 32 fp32 | N = 32 bf16 | N = 32 int8 |
-|---|---|---|---|---|---|---|
-| ReLU / linear, no pooling | 410 | 410 | 410 | 1 729 | 1 729 | 1 706 |
-| SELU | 36 | 50 | 80 | 111 | 128 | 190 |
-| sigmoid | 29 | 39 | 74 | 97 | 134 | 173 |
-| tanh | 30 | 41 | 72 | 100 | 118 | 170 |
+| Activation | N = 16 | N = 32 | N = 64 |
+|---|---|---|---|
+| ReLU / linear, no pooling | 410 · 410 · 410 | 1 729 · 1 729 · 1 706 | 7 434 · 7 434 · 7 434 |
+| SELU | 36 · 50 · 80 | 111 · 128 · 190 | 745 · 942 · 1 519 |
+| sigmoid | 29 · 39 · 74 | 97 · 134 · 173 | not in the N = 64 sweep |
+| tanh | 30 · 41 · 72 | 100 · 118 · 170 | 470 · 668 · 1 361 |
 
-Peak is 486 GFLOPS at N = 16 and 1.95 TFLOPS at N = 32. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the 32 activation lanes, which are fastest in int8.
+N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
 
 ### MLPerf Tiny models
 
-N = 16, fp32, every multiply-accumulate on the RTL; the host only reshapes tensors and applies softmax.
+fp32, every multiply-accumulate on the RTL; the host only reshapes tensors and applies softmax. N = 16 runs with the host driving each set, N = 64 on the layer engine (T = 2, 128 lanes):
 
-| Model | Task | MACs | Latency | Throughput |
-|---|---|---|---|---|
-| ResNet-8 | image classification (CIFAR-10) | 12.5 M | 54.1 µs | 462 GFLOPS |
-| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 168 GFLOPS |
-| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 146 GFLOPS |
-| Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs (1.34 µs per slice) | 394 GFLOPS |
+| Model | Task | MACs | Latency, N = 16 | Latency, N = 64 | Throughput, N = 64 |
+|---|---|---|---|---|---|
+| ResNet-8 | image classification (CIFAR-10) | 12.5 M | 54.1 µs | 14.0 µs | 1.79 TFLOPS |
+| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 8.5 µs | 617 GFLOPS |
+| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 39.3 µs | 381 GFLOPS |
+| Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs | 6.5 µs (0.16 µs per slice) | 3.25 TFLOPS |
 
-In fp32 the hardware picks the same class as the floating-point model on every classifier and reproduces the anomaly score to five digits. bf16 builds run within 1.1% of these times.
+In fp32 the hardware picks the same class as the floating-point model on every classifier and reproduces the anomaly score to four decimal places, at both sizes. bf16 builds run within 1.1% of these times.
 
 ### Packing small layers
 
@@ -84,6 +84,7 @@ The same small jobs, run one at a time and packed into shared sets (N = 32), wit
 
 | Design | Origin | MACs per cycle | Formats | Peak, as published |
 |---|---|---|---|---|
+| **SIENNA, N = 64** | this work, RTL | 4 096 | fp32, bf16, int8 | 7.78 TFLOPS at 950 MHz (assumed) |
 | **SIENNA, N = 32** | this work, RTL | 1 024 | fp32, bf16, int8 | 1.95 TFLOPS at 950 MHz (assumed) |
 | **SIENNA, N = 16** | this work, RTL | 256 | fp32, bf16, int8 | 486 GFLOPS at 950 MHz (assumed) |
 | Google TPU v1 [1] | industry, 28 nm silicon | 65 536 | int8 (int16 at reduced rate) | 92 TOPS at 700 MHz |
@@ -97,12 +98,12 @@ The same small jobs, run one at a time and packed into shared sets (N = 32), wit
 
 **MLPerf Tiny.** Latency per inference, set against the MLPerf Tiny v1.4 closed-division results [6]:
 
-| Benchmark | SIENNA, N = 16 | Qualcomm Sensing Hub | Renesas RA8P1 + Arm Ethos-U55 | Asygn NNPA_16x | STM32 Cortex-M7, 280 MHz |
-|---|---|---|---|---|---|
-| Image classification (ResNet-8) | 54.1 µs | 98.5 µs | 340 µs | 2.69 ms | 41.7 ms |
-| Keyword spotting (DS-CNN) | 31.4 µs | 66.5 µs | 108 µs | 567 µs | 11.5 ms |
-| Visual wake words (MobileNet) | 102.7 µs | 118 µs | 362 µs | 1.63 ms | 24.4 ms |
-| Anomaly detection (autoencoder) | 18.6 µs | 69.0 µs | 132 µs | 57.6 µs | 1.17 ms |
+| Benchmark | SIENNA, N = 64 | SIENNA, N = 16 | Qualcomm Sensing Hub | Renesas RA8P1 + Arm Ethos-U55 | Asygn NNPA_16x | STM32 Cortex-M7, 280 MHz |
+|---|---|---|---|---|---|---|
+| Image classification (ResNet-8) | 14.0 µs | 54.1 µs | 98.5 µs | 340 µs | 2.69 ms | 41.7 ms |
+| Keyword spotting (DS-CNN) | 8.5 µs | 31.4 µs | 66.5 µs | 108 µs | 567 µs | 11.5 ms |
+| Visual wake words (MobileNet) | 39.3 µs | 102.7 µs | 118 µs | 362 µs | 1.63 ms | 24.4 ms |
+| Anomaly detection (autoencoder) | 6.5 µs | 18.6 µs | 69.0 µs | 132 µs | 57.6 µs | 1.17 ms |
 
 These are not like-for-like:
 - **MLPerf Tiny:** the entries are measured on production boards running int8 models, with the whole system in the loop.
@@ -117,9 +118,9 @@ Read them as an indication of where the architecture stands.
 ## Verification
 
 - `make regression` runs every check below and gives one verdict. It passes in fp32, bf16 and int8.
-- The pipeline regression runs up to 41 tests per format (32 in fp32 and bf16, 41 in int8) on 8 × 8 to 32 × 32 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
+- The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size (fp32 at 64 × 64 with one 64 × 64 array is still running). Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
-- The int8 layers match the TensorFlow Lite interpreter bit for bit, including SAME-padded convolutions with per-channel scales and input zero points.
+- The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.
 - Assertions on every handshake run in every simulation, and a firing assertion fails the run.
 
 ---

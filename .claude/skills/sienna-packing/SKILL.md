@@ -6,7 +6,7 @@ description: Use when designing, building or verifying SIENNA's multi-job packin
 # SIENNA: multi-job packing
 
 **Status: implemented and verified 2026-10-04 on the packing branch (gated tree SIENNA 8d7a4b2, SystolicMesh b1a2c31; the commit after it changes only this skill) at N = 8-32; N = 64 after check-in.**
-Spec approved 2026-10-04; "As built" at the end lists every deviation. Tag `pre_packing_v1` (all four repos,
+Spec approved 2026-10-04; "As built" at the end lists every deviation. Tag `three_formats_v4` (all four repos,
 2026-10-04) is the design before this work.
 
 ## The problem
@@ -192,7 +192,7 @@ of the one failure (`pkg_ck0_16_int8`, packed tests on collapse-k 0, deviation 1
 (`packing_gate.log` section 7 lists the three lints on one line). The final gate (section 8) is 106 runs on 8d7a4b2 +
 b1a2c31, all pass: Task 9's 93 configurations, the 8 perf sweeps, `make model FMT=bf16`, `model_runner --engine sets`
 (TB_sienna_model) and TB_sienna_multi in three formats; each identical to Task 9's baseline and to Task 9's own run,
-the sets-engine and multi runs identical to the pre_packing_v1 tree, `make model`'s first inference per model identical
+the sets-engine and multi runs identical to the three_formats_v4 tree, `make model`'s first inference per model identical
 to a 2026-09-30 run, and no assertion fired in any of them. Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in
 fp32, bf16 and int8: READY, every row of `mg_mesh16_*`, `mg_mesh32_*_T4`, `g3i_N32_*`, `g3i_N8_*` identical in result
 and cycles. `TB_PE_pack`, `TB_PE_int8`, `TB_SystolicArray`, `TB_requant_lanes`: passed. SIENNA regression N = 16 T = 4

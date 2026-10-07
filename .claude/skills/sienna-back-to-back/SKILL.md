@@ -146,7 +146,7 @@ first set before looking anywhere else.
 
 ## Confirmed defects (fixed in phase 1, known-issues #15 has the commits)
 
-The queue, PEMesh and OutputSram rows below refer to the handshake tile removed on 2026-09-24 (git tag `legacy_tile_v1`).
+The queue, PEMesh and OutputSram rows below refer to the handshake tile removed on 2026-09-24 (git tag `handshake_tile_v1`).
 
 Measured on N=16, TILE=4, tanh, via `make verilator EXTRA_FLAGS=-DBACK_TO_BACK`.
 

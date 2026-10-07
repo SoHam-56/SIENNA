@@ -184,6 +184,18 @@ Be aware the tolerance check does not measure what it claims: every testbench in
 
 **Six copies of `taylor_coeffs.mem` exist** across the working tree and build directories, currently all identical. The Makefile's `copy_mem_files` sweeps several directories into the simulation directory, so an inconsistent copy will be picked up by position rather than intent. Change `GPNAE/src/TYTAN/Memory/taylor_coeffs.mem` and let the copy rules propagate it.
 
+## Milestone tags
+
+Every repo (SIENNA, SystolicMesh, GPNAE, ArithmeticLibrary) carries the same tag names: the name says what that version contains and the number counts the milestones (the next is `_v6`), and each submodule is tagged at the commit SIENNA pins under the same name. The tag message gives the date and a one-line description. GPNAE's `tytan_vdat2025` (the code as published) is separate.
+
+| Tag | Date | What it contains | Was |
+|---|---|---|---|
+| `handshake_tile_v1` | 2026-09-24 | the valid/ready handshake PE tile beside the synchronous one | `legacy_tile_v1` |
+| `serial_mesh_v2` | 2026-09-25 | synchronous tiles only; the mesh takes one set at a time | `serial_mesh_v1` |
+| `pipelined_mesh_v3` | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
+| `three_formats_v4` | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
+| `job_packing_v5` | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
+
 ## Conventions
 
 Ports are suffixed `_i` / `_o`; the reset is `rstn_i`, active low and asynchronous. Most new RTL uses `logic` with `always_ff` / `always_comb`; the older TYTAN and ProcessingElement code uses `reg`/`wire` with `always @`. Both styles are present and neither is being migrated — match the file you are in.

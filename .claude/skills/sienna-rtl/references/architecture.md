@@ -82,7 +82,7 @@ SystolicMesh            staging banks, broadcaster, reduce dispatcher, result ba
 
 `TILES_PER_DIM = MATRIX_SIZE / TILE_SIZE`. With `COLLAPSE_K=1` (default) each output tile has one `SystolicArray` of depth `K = MATRIX_SIZE`: N² PEs. With `COLLAPSE_K=0` the problem is `TILES_PER_DIM³` arrays of depth T: N³/T PEs. `U = min(K, 6)` partial sums per pixel (the adder latency plus one).
 
-Since 2026-09-25 the mesh is pipelined: sets flow through it back to back. The one-set-at-a-time mesh (a state machine per set, PEs combining their own partials, two result banks) is at git tag `serial_mesh_v1` in SystolicMesh and the parent; the older handshake tile (`PEMesh`, `MAC`, input queues, `OutputSram`) is at `legacy_tile_v1`.
+Since 2026-09-25 the mesh is pipelined: sets flow through it back to back. The one-set-at-a-time mesh (a state machine per set, PEs combining their own partials, two result banks) is at git tag `serial_mesh_v2` in SystolicMesh and the parent; the older handshake tile (`PEMesh`, `MAC`, input queues, `OutputSram`) is at `handshake_tile_v1`.
 
 ### SystolicArray
 

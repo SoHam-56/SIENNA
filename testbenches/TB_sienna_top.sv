@@ -971,15 +971,19 @@ module TB_sienna_top #(
   endtask
 
   // overrun: before set SETS_IN_FLIGHT the host waits until every admitted set is in flight and shows it gets no credit; close_fill: the last set closes the cache fill.
-  // hold (Review Focus 3): from the first words of set NUM_SETS/2, every L9 credit is withheld for 500 cycles; the outputs must equal the first plain pass's.
+  // hold (Review Focus 3): from the first words of set HOLD_SET, every L9 credit is withheld for 500 cycles; the outputs must equal the first plain pass's.
+  // HOLD_SET leaves SETS_IN_FLIGHT+4 sets to put after it where NUM_SETS allows (else set 0), so the buffers fill and the host is blocked.
+  localparam int HOLD_SET = (NUM_SETS / 2 < NUM_SETS - SETS_IN_FLIGHT - 4) ? NUM_SETS / 2
+                          : ((NUM_SETS - SETS_IN_FLIGHT - 4 > 0) ? NUM_SETS - SETS_IN_FLIGHT - 4 : 0);
+  // The host must end up blocked when the test has more sets than SETS_IN_FLIGHT: by staging credits once the banks are full, or by the entry first (fewer credits, or partial sums that hold no result bank).
   logic [DATA_WIDTH-1:0] ref_results[$];  // the first plain pass's words and set boundaries
   int ref_bounds[$];
   task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill, input bit hold = 0);
     automatic longint t0 = $time;
-    automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0;
+    automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s%s", NUM_SETS,
              overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "",
-             hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld 500 cycles from set %0d's first words", out_adv, NUM_SETS / 2)
+             hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld 500 cycles from set %0d's first words", out_adv, HOLD_SET)
                   : "");
     stream_results.delete();
     stream_bounds.delete();
@@ -1066,12 +1070,12 @@ module TB_sienna_top #(
               automatic bit started = 0;
               while (!started && stream_bounds.size() < NUM_SETS) begin
                 @(negedge clk_i);
-                if (stream_bounds.size() >= NUM_SETS / 2)
+                if (stream_bounds.size() >= HOLD_SET)
                   for (int l = 0; l < NUM_LANES; l++) if (lane_q[l].size() != 0) started = 1;
               end
               if (!started) begin
                 failed++;
-                $display("  [FAIL] Hold: set %0d never started its output", NUM_SETS / 2);
+                $display("  [FAIL] Hold: set %0d never started its output", HOLD_SET);
               end else begin
                 out_hold  = 1;
                 hold_puts = 0;
@@ -1080,11 +1084,19 @@ module TB_sienna_top #(
                   if (out_put == '0) hold_stalled++;
                   if (pipeline_complete_o) hold_done++;
                   if (host_cnt == 0 && dut.entry_full) hold_full++;
+                  if (host_cnt == 0 && !dut.entry_full && n_started < NUM_SETS) hold_blocked++;  // a set to put, no staging credit
+                  if (host_cnt == 0 && dut.entry_full && n_started < NUM_SETS) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
                   if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
                 end
                 out_hold = 0;
-                $display("  [Hold] every L9 credit withheld 500 cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full",
-                         NUM_SETS / 2, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full);
+                $display("  [Hold] every L9 credit withheld 500 cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put",
+                         HOLD_SET, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started);
+                if (NUM_SETS <= SETS_IN_FLIGHT)
+                  $display("  [Hold] host blocking not reachable: the test's %0d sets fit in SETS_IN_FLIGHT %0d", NUM_SETS, SETS_IN_FLIGHT);
+                else if (hold_blocked + hold_capped == 0) begin
+                  failed++;
+                  $display("  [FAIL] Hold: the host was never blocked with a set to put, so the stall never reached it");
+                end
                 if (hold_stalled < 400 || hold_puts > out_adv * NUM_LANES) begin
                   failed++;
                   $display("  [FAIL] Hold: the output did not stall (%0d of 500 cycles with no word, %0d words on %0d credits per lane)", hold_stalled,

@@ -24,7 +24,12 @@ stage event and wait, which is how to find the next limit. Three
 credits had capped the rate at latency / 3, about 50 cycles per set, once the stages were fast.
 Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 
-## Top-level interface after phase 3
+## Top-level interface after phase 3 (history: before the credit links)
+
+**Superseded on 2026-10-07 by the credit links; see "Module boundaries as built" below for the current interface.**
+`pipeline_ready_o`, `start_pipeline_i` and every port "sampled with the start" are gone: the host puts a set on the L0 link `host`, whose data is the set's sideband (`set_side_t` in `src/sienna_set_side.svh`, the same fields as the old ports).
+`pipeline_complete_o` and `done_set_id_o` are kept; outputs leave on the L9 links `out[NUM_LANES]` instead of `final_result_o` / `result_valid_o`.
+The table below is the interface as it was from phase 3 until then.
 
 | Port | Meaning |
 |---|---|
@@ -113,7 +118,11 @@ of N^3/T and no reduce. At N=16, T=4: 256 PEs instead of 1024, mesh stage 87 cyc
 same steady state (activation-bound). Mesh 68/68, SIENNA 11/11 and back-to-back 12 clean with it
 selected. It is the default since 2026-09-24 (sienna_top, sienna_multi and the mesh).
 
-## Mesh interface after phase 2
+## Mesh interface after phase 2 (history: before the credit links)
+
+**Superseded on 2026-10-07 by the credit links; see "Module boundaries as built" below.**
+`input_ready_o` / `start_matrix_mult_i` became the L1 staging link (a put per set, the pack shift and the other per-set bits in its data), `collection_complete_o` / `result_release_i` / the wide read became the L3 result push, and `wide_read_packed_i` is gone (the packed flag travels with each sum).
+The table below is the mesh interface as it was from phase 2 until then.
 
 | Port | Meaning |
 |---|---|
@@ -214,7 +223,8 @@ set, so results emerge in issue order by construction. No reorder buffer.
 
 ### Module boundaries as built (credit links, SIENNA branch `credits` at 3d66c57, 2026-10-07)
 
-Every module boundary is now one credit link (`credit_link_if`, from ArithmeticLibrary `Common/src`); there are no ready/valid pairs left.
+Every module boundary is now one credit link (`credit_link_if`, from ArithmeticLibrary `Common/src`); no boundary uses ready/valid or valid-only handshakes any more.
+What still travels without its own credit: the row, cache-write and bias buses and `sienna_layer`'s int8 epilogue words, which ride beside a put that holds the credit, and `requant_lanes`' fixed-latency valid pipe inside the activation stage, which cannot stall.
 The consumer owns the buffer and grants one credit per free slot (after reset its slot count, sent as ordinary credits); the producer puts only while it holds a credit.
 The full contract, the deviations from the design and the measured cost are in the `sienna-credits` skill, section "As built".
 Entry admission is still `SETS_IN_FLIGHT` (15), but it now lives inside L0: the host gets a staging credit only while fewer than SETS_IN_FLIGHT sets are in flight or granted.
@@ -315,7 +325,8 @@ being zero, which holds only because each regression test is a fresh simulation.
 
 Added 2026-09-23. Every build now compiles with `--assert`. Handshake assertions sit at the
 end of `SystolicMesh.sv` and `sienna_top.sv` under `ifndef SYNTHESIS`, and
-`-DASSERT_SELFTEST` adds one that always fails, to prove they are live. Directed tests:
+`-DASSERT_SELFTEST` adds one that always fails, to prove they are live. Directed tests (as written 2026-09-23; the
+bullet after them gives what changed with the credit links on 2026-10-07):
 
 - **Mesh staging overrun** (`staging_overrun_test`): no releases, so both result banks and
   both staging banks fill. Then 256 writes and a start with `input_ready_o` low must be
@@ -325,17 +336,22 @@ end of `SystolicMesh.sv` and `sienna_top.sv` under `ifndef SYNTHESIS`, and
   still be correct.
 - **Reset mid-stream** (`reset_mid_stream`): reset with two sets in flight. The pipeline must
   go idle with all credits free and no output for 2000 cycles, and a clean 4-set stream must pass.
-- **Output port**: both captures read `final_result_o` qualified by the new `result_valid_o`,
-  never the internal dropout signals.
+- **Output port** (history): both captures read `final_result_o` qualified by the new `result_valid_o`,
+  never the internal dropout signals. Since 2026-10-07 the TB reads the L9 links instead (next bullet).
 - Since the credit links (2026-10-07) the two overrun tests are no-credit tests: the mesh's became "producer waits" (the host stages
   until no credit returns, then everything drains intact) and the top's became "entry full" (the host holds no credit while the entry
   is full); the output is read from the L9 links, and a 500-cycle L9 hold checks that nothing is lost, duplicated or reordered.
 
-Back-pressure: the mesh stalls on full result banks only in the credit-overrun pass
-(159-217 cycles). **The activation stage never stalls on full activation banks, in any
-test.** Pooling takes far less time than activation and has no output back-pressure, so
-that path cannot be reached in this configuration. Its handshake is covered only by the
-`a_act_bank_free` and `a_act_bank_full` assertions.
+Back-pressure before the credit links (history, 2026-09-23): the mesh stalled on full result banks only in the
+credit-overrun pass (159-217 cycles), and the activation stage never stalled on full activation banks, because
+pooling was faster than activation and the output could not be stalled.
+
+Back-pressure since the credit links (2026-10-07): a downstream consumer stalls SIENNA through L9.
+- TB_sienna_top's consumer advertises `+out_slots` per lane (default 64) and withholds credit returns at `+out_stall_pct`.
+- After a second reset it advertises one L9 slot per lane and withholds every credit for 500 cycles mid-set: no word leaves in those cycles, and afterwards the words and set boundaries equal the plain pass and every link count is home (Task 5b, every test in all three formats).
+- In the credits-3 tests that hold reaches the host: the entry is full for 485 to 500 of the 500 cycles, so the stalled output backs sets up all the way to the entry.
+- With 2 slots and 50% stalls (`cr5bxg_o2s50_int8_T4`) the producer is starved of L9 credits in every pass and the words still equal main's.
+- `a_act_bank_free` and `a_act_bank_full` are still in `sienna_top`; the L6 credit link and its checker now carry the activation-to-pooling handshake.
 
 Since 2026-09-23 also covered: GPNAE's own assertions (fixed, known-issues #16), varied seeds
 (`SIENNA_SEED` shifts every stimulus seed in the mesh and SIENNA generators, `--seed` for GPNAE;

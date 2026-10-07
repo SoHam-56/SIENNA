@@ -54,6 +54,7 @@ module sienna_top #(
     input logic                     west_write_reset_i,
 
     credit_link_if.producer         out[NUM_LANES],  // L9: lane k's pooled, dropped-out results, one word per put, while the consumer's credit is held
+    // L9 lanes drift apart by up to FIFO2's 4 windows + maxpool's 2 windows ahead + the L9 slots: a consumer must not make one lane's credits wait on another lane's later windows.
 
     output logic pipeline_complete_o,  // with the put of a set's last word
     output logic [ID_W-1:0] done_set_id_o,  // id of the set pipeline_complete_o reports
@@ -71,6 +72,8 @@ module sienna_top #(
     $fatal(1, "sienna_top: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
   end else if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC
     $fatal(1, "sienna_top: ACC_W=%0d, but the format accumulates in %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end else if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
+    $fatal(1, "sienna_top: SRAM_DEPTH %0d must be N*N (%0d)", SRAM_DEPTH, N * N);
   end
 
   localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
@@ -257,14 +260,20 @@ module sienna_top #(
   if (BUS_STAGES == 0) begin : G_BUS_WIRE
     assign bus_out = bus_in;
   end else begin : G_BUS_REGS
-    logic [BUS_W-1:0] bus_q[BUS_STAGES];
+    localparam int CTL_W = 5;  // the enables and resets lead bus_in and are reset; the rest is datapath, not reset (D-8)
+    logic [CTL_W-1:0] ctl_q[BUS_STAGES];
+    logic [BUS_W-CTL_W-1:0] dat_q[BUS_STAGES];
     always_ff @(posedge clk_i or negedge rstn_i)
-      if (!rstn_i) for (int i = 0; i < BUS_STAGES; i++) bus_q[i] <= '0;
+      if (!rstn_i) for (int i = 0; i < BUS_STAGES; i++) ctl_q[i] <= '0;
       else begin
-        bus_q[0] <= bus_in;
-        for (int i = 1; i < BUS_STAGES; i++) bus_q[i] <= bus_q[i-1];
+        ctl_q[0] <= bus_in[BUS_W-1-:CTL_W];
+        for (int i = 1; i < BUS_STAGES; i++) ctl_q[i] <= ctl_q[i-1];
       end
-    assign bus_out = bus_q[BUS_STAGES-1];
+    always_ff @(posedge clk_i) begin
+      dat_q[0] <= bus_in[BUS_W-CTL_W-1:0];
+      for (int i = 1; i < BUS_STAGES; i++) dat_q[i] <= dat_q[i-1];
+    end
+    assign bus_out = {ctl_q[BUS_STAGES-1], dat_q[BUS_STAGES-1]};
   end
   assign {m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we, m_north, m_west, m_wc_addr, m_bias} = bus_out;
 

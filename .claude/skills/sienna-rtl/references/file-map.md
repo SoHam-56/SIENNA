@@ -62,7 +62,7 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | `src/engine/AccumulationUnit.sv` | 162 | Adder-tree reduce of the depth slices (a copy with collapse-k), global write address |
 | `src/mem/MeshOutputSram.sv` | 65 | Two-bank result memory, one write port per output tile, wide read port |
 
-The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue`, `OutputSram` and the old `SystolicArray`/`ProcessingElement`) is at git tag `legacy_tile_v1`.
+The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue`, `OutputSram` and the old `SystolicArray`/`ProcessingElement`) is at git tag `handshake_tile_v1`.
 
 ### Testbenches
 

@@ -47,6 +47,7 @@ module sienna_multi #(
     input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
 
+    input logic                     drained_i,  // checks only: the host has put its last set; no fill may be left reaching only some copies
     output logic [$clog2(COPIES+1)-1:0]          copy_sel_o,  // copy whose turn it is: the host loads its rows and puts it next
     credit_link_if.producer         out[COPIES*NUM_LANES],  // L9 per copy: copy c's lane l is out[c*NUM_LANES + l]
     output logic [COPIES-1:0]                                pipeline_complete_o,
@@ -232,6 +233,27 @@ module sienna_multi #(
   a_wc_fill_short: assert property (@(posedge clk_i) disable iff (!rstn_i) pq |-> !pq_short)
     else $error("sienna_multi: region %0d's fill reached only some copies with their marked sets when another set was put: the rest never close it",
                 pq_region);
+  // At drain, a fill with sets put must have reached every copy's marked set, else its region credit never returns.
+  logic dq, dq_short;
+  logic [COPIES-1:0] dq_marked;
+  logic dq_region;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {dq, dq_short, dq_marked, dq_region} <= '0;
+    else begin
+      dq <= drained_i;
+      dq_short <= 1'b0;
+      dq_marked <= '0;
+      dq_region <= 1'b0;
+      for (int r = 0; r < 2; r++)
+        if (f_open[r] && f_started[r]) begin
+          dq_short <= 1'b1;
+          dq_marked <= f_marked[r];
+          dq_region <= 1'(r);
+        end
+    end
+  a_wc_drained: assert property (@(posedge clk_i) disable iff (!rstn_i) dq |-> !dq_short)
+    else $error("sienna_multi: drained with region %0d's fill reaching only copies %b with their marked sets: its credit never returns",
+                dq_region, dq_marked);
 `endif
 
 endmodule

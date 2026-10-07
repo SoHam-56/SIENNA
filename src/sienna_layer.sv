@@ -32,7 +32,10 @@ module sienna_layer #(
     parameter int PADDING           = 0,
     parameter int DROPOUT_P_PERCENT = 50,
     parameter int DIM_W             = 16,  // width of the configured sizes
-    parameter int PACK_ENTRIES      = 8
+    parameter int PACK_ENTRIES      = 8,
+    parameter int LINK_STAGES       = 0,   // sienna_top's register stages on L0, L1, L3 and L9; L10 is not staged
+    parameter int OUT_MAX           = 64,  // the most L9 credits the consumer may grant per lane
+    parameter int OUT_CRW           = 1    // L9 credit width
 ) (
     input logic clk_i,
     input logic rstn_i,
@@ -71,7 +74,8 @@ module sienna_layer #(
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
-    credit_link_if.consumer          a_rows,  // L10: one row of N words per put; a set's N credits may come with the last row's put, so the producer counter needs MAX >= N+1 (a_no_overflow counts cnt + credit before the put)
+    // L10 puts must come from registered state: a put reaches a_rows.credit and w_rows.credit combinationally inside this module.
+    credit_link_if.consumer          a_rows,  // L10: one row of N words per put; a set's N credits may come with the last row's put (count 1 + N - 1 = N after it), so the producer counter needs MAX >= N
     credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
     input  logic [N-1:0][ACC_W-1:0]  w_bias_i,
@@ -223,7 +227,10 @@ module sienna_layer #(
       .PADDING          (PADDING),
       .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
       .LFSR_WIDTH       (LFSR_WIDTH),
-      .PACK_ENTRIES     (PACK_ENTRIES)
+      .PACK_ENTRIES     (PACK_ENTRIES),
+      .LINK_STAGES      (LINK_STAGES),
+      .OUT_MAX          (OUT_MAX),
+      .OUT_CRW          (OUT_CRW)
   ) pipe (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),

@@ -10,8 +10,9 @@ import test_config_pkg::*;
 // +out_slots=S (1..64) and +out_stall_pct=P on L9; +fault=1 a fill of one set, 2 a copy's first set of a fill marked, 3 a put to a copy whose turn it is not,
 // 4 the last set alone in a fill of one, then the host stops.
 module TB_sienna_multi #(
-    parameter int COPIES     = 2,
-    parameter int COLLAPSE_K = 1
+    parameter int COPIES      = 2,
+    parameter int COLLAPSE_K  = 1,
+    parameter int LINK_STAGES = 0  // each copy's register stages on L0, L1, L3 and L9
 );
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int TIMEOUT_CYCLES = 400_000;
@@ -105,7 +106,10 @@ module TB_sienna_multi #(
       .PADDING          (PADDING),
       .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
       .LFSR_WIDTH       (LFSR_WIDTH),
-      .FIFO_DEPTH       (FIFO_DEPTH)
+      .FIFO_DEPTH       (FIFO_DEPTH),
+      .LINK_STAGES      (LINK_STAGES),
+      .OUT_MAX          (OUT_CAP),
+      .OUT_CRW          (1)
   ) dut (
       .clk_i               (clk_i),
       .rstn_i              (rstn_i),

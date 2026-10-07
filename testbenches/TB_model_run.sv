@@ -12,7 +12,8 @@ import test_config_pkg::*;
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
 // FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many.
 module TB_model_run #(
-    parameter int FAULT = 0
+    parameter int FAULT       = 0,
+    parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
 );
 
   localparam int STALL_CYCLES = 50_000;  // this long with nothing moving is a hang
@@ -93,7 +94,10 @@ module TB_model_run #(
       .EXP_W         (EXP_W),
       .MAN_W         (MAN_W),
       .CONTROL_WIDTH (CONTROL_WIDTH),
-      .LFSR_WIDTH    (LFSR_WIDTH)
+      .LFSR_WIDTH    (LFSR_WIDTH),
+      .LINK_STAGES   (LINK_STAGES),
+      .OUT_MAX       (OUT_CAP),
+      .OUT_CRW       (1)
   ) dut (
       .clk_i           (clk_i),
       .rstn_i          (rstn_i),

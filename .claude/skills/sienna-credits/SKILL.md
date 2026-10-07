@@ -5,10 +5,11 @@ description: Use when designing, building or verifying credit-based interfaces a
 
 # SIENNA credit links
 
-**Status: design, 2026-10-07, awaiting Soham's review.** Approach A chosen in discussion: one credit link at every
-module boundary, today's buffers kept where they are, ports as SV interfaces. No branch or RTL change before the
-spec is approved. Today's protocols (what this replaces) are tabled in the `sienna-back-to-back` skill, "Module
-boundaries as built".
+**Status: built, 2026-10-07, on branch `credits` in all four repos (not merged, not pushed).** Approach A, approved by
+Soham 2026-10-07: one credit link at every module boundary, today's buffers kept where they are, ports as SV
+interfaces. The sections up to "As built" are the approved design; "As built" at the end records what was built,
+where it differs and what it costs. The links as built are also tabled in the `sienna-back-to-back` skill,
+"Module boundaries as built".
 
 ## Why
 
@@ -120,3 +121,72 @@ Notes per link:
 - **Back-pressure:** a new test that withholds L9 credits mid-set and checks nothing is lost, duplicated or
   reordered, and that the pipeline resumes.
 - N = 64 only after the change is checked in (one report sweep).
+
+## As built (2026-10-07)
+
+### Commits (branch `credits`, not pushed, not merged)
+
+- ArithmeticLibrary 5255999: `credit_link_if`, `credit_counter` (with `count_o`), `credit_reg`, `credit_link_checker`, `TB_credit_link` (`make credit`).
+- GPNAE 4896cd7 (AriL bump), bd4d919 (L4/L5 in `gpnae_poly` and `gpnae_poly_int8`), bbd96b4 (`lane_fifo`), 8334d4d (`lane_link`, the shared credit front end).
+- SystolicMesh 1e7f484 (AriL bump), 0f18888 (L1, L2, L3), 8076166 (review fixes).
+- SIENNA 8adf841 (L0, L1, L3, L6, L2 passed through; mesh bump), 2615bb2 (fix), 8824c31 (L4, L5, L7, L8, L9; GPNAE bump), a575057 (TB fix), b7dec1a (L10 in `sienna_layer`, L0/L9 per copy in `sienna_multi`), 3d66c57 (fix), dcf03fa (the unused `l9_sink.sv` removed).
+- `gpnae.sv` (the published Taylor lane) and the GPNAE math are unchanged; nothing existing in ArithmeticLibrary changed.
+
+### The links as built
+
+| # | Producer → consumer | Unit, data | Consumer's slots | CRW | Register stage with `LINK_STAGES` |
+|---|---|---|---|---|---|
+| L0 | host → `sienna_top` (`host`) | set; `data` = `set_side_t` (`src/sienna_set_side.svh`, 1488 bits at N 16) | 2 staging banks, withheld while `SETS_IN_FLIGHT` sets are in flight or granted | 1 | yes |
+| L1 | `sienna_top` → SystolicMesh (`staging`) | set; `{wc_last, weight_tile, weight_cached, pack_shift, bias_valid, accumulate}` | 2 staging banks, credit on `bcast_release` | 1 | yes |
+| L2 | `sienna_layer` / `sienna_multi`'s host → SystolicMesh (`wc_region[2]`) | region; a put opens a fill | 1 per region, back when the fill's last set is broadcast | 1 | no |
+| L3 | SystolicMesh → activation stage (`result`) | wide beat; `{packed, last, first, one word per lane}` | PER_LANE beats (8 at N 16, 32 lanes), granted at once | `$clog2(PER_LANE+1)` | yes |
+| L4 | activation stage → GPNAE lane (per lane) | word; `{last, word}` | 32 (`lane_fifo`) | 1 | no |
+| L5 | GPNAE lane → collector (per lane) | word | 16 (`LANE_OUT_SLOTS`) | 1 | no |
+| L6 | activation stage → pooling stage (inside `sienna_top`) | set; the bank | 2 activation banks, credit on `p_release` | 1 | no |
+| L7 | dispatcher → FIFO2 (`fwft`, per lane) | word | 16 | 1 | no |
+| L8 | FIFO2 → `Maxpool_2D` → `dropout` (per lane) | word | a window's 4 elements at once, only with an output credit reserved, up to 2 windows ahead | 3 into maxpool | no |
+| L9 | `sienna_top` → downstream (`out[NUM_LANES]`) | word | the downstream consumer's advertisement (`OUT_MAX` 64) | 1 (`OUT_CRW`) | yes |
+| L10 | host → `sienna_layer` (`a_rows`, `w_rows`) | row of N words | a set's N A rows (and N B rows if uncached) per L0 credit held, one set ahead; bias row 1, cache tile N | `$clog2(N+1)` | no |
+
+- `sienna_multi` exposes `host[COPIES]` (L0 per copy) and `out[COPIES*NUM_LANES]` (L9 per copy), and fans L2 out to every copy.
+- Every link has a `credit_link_checker` in its testbench or inside the consumer, with `a_all_back` judged at each drain.
+- Each new assertion and `$fatal` was shown firing once on purpose (task reports 1 to 6 name the runs); a few fired only on saved one-line mutants because Verilator 5.035 rejects `force` in a model that uses queue methods.
+
+### Rules the RTL relies on that the design did not state
+
+- A slot's credit returns no earlier than the cycle after the put that fills it (Ruling 18). `credit_counter.a_no_overflow` checks `cnt + credit <= MAX` before subtracting a same-cycle put, so a credit sent in the cycle of its own put fires the check whenever the producer is full. Every consumer here (L5 collector, the TB consumers, `tb_l9_sink`) credits from the next cycle on.
+- A producer whose consumer may grant N credits in the cycle of the last put of a set needs counter MAX >= N+1 (`sienna_layer`'s A rows); one that may get two cache tiles' grants needs MAX 2N (W rows). Stated on the ports, not checked inside.
+- `credit` is compared as `int` everywhere, never truncated to CRW: a `CRW'(2)` at `SETS_IN_FLIGHT` 1 read 0 and deadlocked (found in Task 5a review, fixed in 2615bb2).
+- No credit leaves during reset: a `live` flop (one cycle after reset) gates every advertisement in the mesh, `sienna_top`, `sienna_layer` and `sienna_multi`.
+
+### Where the build differs from the design above
+
+- **L2 needs a `wc_last` bit in the L0/L1 sideband (Ruling 5).** With one slot per region the mesh can return "region free" only when it knows the fill's last set has been broadcast. Producer contract: one L2 put per fill, the fill's sets, the last one marked; `wc_last` low on uncached sets (`a_wc_last_cached`).
+- **The L2 put only feeds checks in synthesis (Ruling 6).** The region's credit is driven by the marked set's broadcast.
+- **L2's producer is the cache writer (Ruling 10):** `sienna_layer`'s weight loader (one counter per region), and in `sienna_multi` the host, whose put goes to every copy; a region credit goes back only when every copy has returned its own.
+- **`sienna_multi`'s L2 contract is checked, not enforced:** a fill must reach at least COPIES sets, each copy's last one marked. `a_wc_fill_short`, `a_wc_after_last`, `a_put_on_turn` and, at drain, `a_wc_drained` name a host that breaks it.
+- **The poly lanes use a new circular `lane_fifo` (Ruling 3).** InputFIFO writes the lowest free slot, so a credit-legal put while the lane pops reordered words. `lane_fifo` keeps InputFIFO's 32 entries and read latency; `gpnae.sv` still uses InputFIFO.
+- **L3 carries no set id;** set ids stay in `sienna_top`. The activation stage grants a set's PER_LANE beats ahead of the result, from G_IDLE with an activation bank reserved, every lane holding PER_LANE L4 credits, and no partial set waiting.
+- **`LINK_STAGES` stages L0, L1, L3 and L9 only (Ruling 15),** the links that cross a module or repo boundary with a register stage. L4, L5, L7 and L8 sit inside a lane's tile, L6 inside `sienna_top`; L2 and L10 are not staged. The north/west row buses, the cache write bus and `bias_i` are delayed 2*LINK_STAGES with the put, so a set's rows never land after its put or in the previous bank. `pipeline_complete_o` and `done_set_id_o` are delayed by LINK_STAGES so they still arrive with the set's last word.
+- **dropout passes its output credits through** (`in.credit = out.credit`): every beat leaves after a fixed delay, and maxpool (or the dispatcher with a 1x1 pool) reserves the L9 credit before a beat enters.
+- **Entry admission stays inside L0:** a host credit is granted only while an undelegated staging credit exists and `sets_out + l0_out < SETS_IN_FLIGHT`.
+- **`src/l9_sink.sv`** (a never-stalling L9 consumer used between Tasks 5b and 6) lost its last user in Task 6 and was removed with Soham's approval (SIENNA dcf03fa, with its Makefile and `synth/sienna_rtl.f` lines).
+- **The int8 epilogue (bias, multiplier, shift) rides side buses beside the W bias row's put,** not the L10 data, so L10 is not latency-tolerant if it is ever staged.
+
+### Performance and correctness (`/proj/work/spramanik/sienna_report/credits_compare.log`)
+
+All at N 16, T 4, from the runs named in the comparison log; GFLOPS, GOPS and µs are derived at an assumed 950 MHz (no timing run exists).
+- Outputs are identical to main: `make regression` passes in fp32, bf16 and int8 (bf16 GPNAE accuracy is the known reported item); pipeline words, mesh results, GPNAE results, GEMM, pack, TFLite and ResNet-8 match.
+- At `LINK_STAGES` 0 every config is equal or better: first-output latency is 1 cycle lower without pooling and 5 lower with pooling; activation-bound streams run 1 cycle per set faster (fp32 tanh 263.0 → 262.0); pooled ReLU/linear streams run 21.0 → 19.0 cycles per set (+10.5%).
+- ResNet-8 bf16 on the layer engine runs 51959 → 51501 cycles (−0.88%, 54.69 → 54.21 µs).
+- Why better: the mesh pushes a result as soon as its bank is full (no collect, feed, read sequence), and FIFO2 → maxpool on credits takes 4 cycles per 2x2 window where the old feeder took 6.
+- At `LINK_STAGES` 1 the latency is 4 cycles above `LINK_STAGES` 0 (one per staged link) and activation-bound streams pay +2 cycles per set (the L3 round trip); host-bound streams are unchanged except the credits-3 ReLU stream (39.3 → 40.7).
+- `sienna_layer`'s grant-then-put round trip (Task 6) costs 1 cycle per GEMM and 3 per ResNet-8 layer against the design before Task 6, and is still below main.
+- Mesh latency (77 cycles at N 16, T 4, fp32) and GPNAE lane timing are unchanged; the GPNAE and mesh testbench cycle counts fell only because those testbenches now put and read faster.
+
+### Known limits
+
+- The mesh's push leaves one idle beat between two result banks (rate BEATS/(BEATS+1)); not exposed in SIENNA at N 16 T 4 because L3 is granted one set at a time.
+- With `LINK_STAGES` 1 every activation-bound set pays the L3 grant-to-first-beat round trip (2*LINK_STAGES). Removing it needs a grant a round trip before the lanes finish, with a second bank reserved.
+- A back-pressuring consumer desynchronises the lanes; consumers rebuild each set per lane in window order (TB_sienna_top, TB_model_run, TB_sienna_model, TB_sienna_multi).
+- Not covered: mid-stream reset of the L10, L9-out and multi state; `OUT_CRW` > 1; `LINK_STAGES` > 1; N = 64 (after check-in only).

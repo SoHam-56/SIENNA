@@ -61,13 +61,13 @@ testbenches/results/pipeline/<test>_data_flow.txt       # hardware, per stage pe
 
 Both print `value (0xhex)` in matrix layout, so the stage where they diverge tells you which block to look at: Stage 1 is the mesh, Stage 2 is GPNAE, Stage 3 is Maxpool. The hardware file warns when lane element counts are uneven, which is the usual symptom of a stalled lane.
 
-For FSM-level stalls use `testbenches/pipeline_lane_status.txt`. The testbench writes a per-lane snapshot on every outer-FSM transition, on every `mp_state` change, and every 5000 cycles. Each line carries `fill_count`, `done_count`, `load_finalized`, `lane_collected`, `mp_state`, `mp_window_fed`, `mp_windows_done`, `lane_windows_total` and `dropout_out_count`. A lane with `load_finalized=1` and `lane_collected=0` that never advances is a GPNAE that never asserted `done_o`.
+For FSM-level stalls use `testbenches/pipeline_lane_status.txt`. Since the credit links (2026-10-07) the `mp_state` fields are replaced by per-lane credit counts; a lane that holds words but no credits is the first thing to look for. The description below is the pre-credit layout. The testbench writes a per-lane snapshot on every outer-FSM transition, on every `mp_state` change, and every 5000 cycles. Each line carries `fill_count`, `done_count`, `load_finalized`, `lane_collected`, `mp_state`, `mp_window_fed`, `mp_windows_done`, `lane_windows_total` and `dropout_out_count`. A lane with `load_finalized=1` and `lane_collected=0` that never advances is a GPNAE that never asserted `done_o`.
 
 ### Testbench mechanics
 
-`TB_sienna_top.sv` (474 lines) loads the three `.mem` files into queues, resets, drives the west and north write ports in parallel `fork`/`join` threads, pulses `start_pipeline_i`, then waits on `pipeline_complete_o` with a 5000-cycle heartbeat and a 200,000-cycle timeout.
+`TB_sienna_top.sv` (474 lines) loads the three `.mem` files into queues, resets, drives the west and north write ports in parallel `fork`/`join` threads, pulses `start_pipeline_i`, then waits on `pipeline_complete_o` with a 5000-cycle heartbeat and a 200,000-cycle timeout. Since 2026-10-07 the TB is the L0 host producer instead (a `credit_counter` and a `credit_link_checker`; put and sideband driven on the falling edge, one put per set while it holds a staging credit) and the L9 consumer per lane (`+out_slots`, `+out_stall_pct`, a checker per lane, and a 500-cycle full hold after a second reset).
 
-Results are captured **on the fly** by an `always_ff` block that pushes `dut.dropout_data_out[lane]` into `actual_results` whenever `dut.dropout_valid_out[lane]` is high — not read back from a buffer at the end. Order across lanes within a cycle is lane-index order.
+Results are captured **on the fly** at the L9 output links, one queue per lane; at each `pipeline_complete_o` the set is rebuilt in window order (lane L's j-th word is window `j*NUM_LANES + L`), because under output stalls lanes no longer finish in lockstep. Before 2026-10-07 the TB pushed `dut.dropout_data_out[lane]` whenever `dut.dropout_valid_out[lane]` was high, in lane-index order.
 
 `check_tolerance()` converts with `$bitstoshortreal`, which is correct. Modes are `ABSOLUTE`, `RELATIVE` or `BOTH`; the configured mode is `RELATIVE` with `REL_TOL = 0.01`.
 

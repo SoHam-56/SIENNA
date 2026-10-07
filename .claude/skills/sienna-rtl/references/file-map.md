@@ -24,14 +24,15 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | File | Lines | Status | What it is |
 |---|---|---|---|
 | `sienna_top.sv` | 740 | live | Top level: outer FSM, fill FSM, window dispatcher, per-lane maxpool feeder |
-| `fwft.sv` | 75 | live | First-word-fall-through FIFO. Never backpressures; overwrites when full |
+| `fwft.sv` | — | live | First-word-fall-through FIFO on credit links (L7 in, L8 out) since 2026-10-07; no overwrite |
+| `sienna_set_side.svh` | — | live | `set_side_t`, the L0 host link's per-set sideband, included by sienna_top, sienna_layer, sienna_multi and their TBs |
 
 ### `Maxpool/`, `Dropout/`
 
 | File | Lines | Status | What it is |
 |---|---|---|---|
-| `Maxpool/Maxpool_2D.sv` | 197 | live | 2-D max pooling with FP32-aware comparison |
-| `Dropout/dropout.sv` | 85 | live | LFSR dropout. `training_mode` is tied low at the top level, so it is a pass-through |
+| `Maxpool/Maxpool_2D.sv` | — | live | 2-D max pooling with FP32-aware comparison, on credit links since 2026-10-07 |
+| `Dropout/dropout.sv` | — | live | LFSR dropout on credit links since 2026-10-07 (passes its output credits through). `training_mode` is tied low at the top level, so it is a pass-through |
 
 ### `testbenches/`
 

@@ -540,7 +540,9 @@ There is also a cluster of `[Synth 8-7137] ... has both Set and reset with same 
 
 ---
 
-## 14. `fwft` silently drops data when full
+## 14. `fwft` silently drops data when full — FIXED (credit links)
+
+**Fixed 2026-10-07** in SIENNA `credits` 8824c31: fwft is a credit-link consumer (it advertises 16, returns one credit per pop), overwrite-on-full is removed, and `a_fifo_room` fires on a put into a full FIFO (shown firing in cr5bx_ufault). The text below describes main before that.
 
 **Confirmed (inspection), by design.** `src/fwft.sv` ties `wr_ready_o` high and, on a write into a full FIFO, overwrites the oldest entry and advances `rd_ptr`. There is no overflow flag.
 

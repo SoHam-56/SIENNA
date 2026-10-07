@@ -186,15 +186,21 @@ Be aware the tolerance check does not measure what it claims: every testbench in
 
 ## Milestone tags
 
-Every repo (SIENNA, SystolicMesh, GPNAE, ArithmeticLibrary) carries the same tag names: the name says what that version contains and the number counts the milestones (the next is `_v6`), and each submodule is tagged at the commit SIENNA pins under the same name. The tag message gives the date and a one-line description. GPNAE's `tytan_vdat2025` (the code as published) is separate.
+Each repo tags its own milestones: the name says what that version contains, the number counts that repo's milestones, and the tag message gives the date and a one-line description. SIENNA and SystolicMesh share names because every SIENNA milestone so far was also a mesh change (SystolicMesh is tagged at the commit SIENNA pins); GPNAE and ArithmeticLibrary have their own. SIENNA's submodule pointers record which GPNAE and ArithmeticLibrary commit each SIENNA tag used.
 
-| Tag | Date | What it contains | Was |
-|---|---|---|---|
-| `handshake_tile_v1` | 2026-09-24 | the valid/ready handshake PE tile beside the synchronous one | `legacy_tile_v1` |
-| `serial_mesh_v2` | 2026-09-25 | synchronous tiles only; the mesh takes one set at a time | `serial_mesh_v1` |
-| `pipelined_mesh_v3` | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
-| `three_formats_v4` | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
-| `job_packing_v5` | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
+| Repo | Tag | Commit | Date | What it contains | Was |
+|---|---|---|---|---|---|
+| SIENNA, SystolicMesh | `handshake_tile_v1` | 5fdeaeb, 98b429b | 2026-09-24 | the valid/ready handshake PE tile beside the synchronous one | `legacy_tile_v1` |
+| SIENNA, SystolicMesh | `serial_mesh_v2` | bb998cb, a4cea39 | 2026-09-25 | synchronous tiles only; the mesh takes one set at a time | `serial_mesh_v1` |
+| SIENNA, SystolicMesh | `pipelined_mesh_v3` | 012b013, 407b2bc | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
+| SIENNA, SystolicMesh | `three_formats_v4` | 1a6b081, a32f237 | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
+| SIENNA, SystolicMesh | `job_packing_v5` | 3ff67e9, c569e1f | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
+| GPNAE | `tytan_vdat2025` | 59c0aa6 | 2025-10-29 | the Taylor-series lane as published (VDAT 2025) | same |
+| GPNAE | `poly_lane_v1` | f1482f4 | 2026-09-25 | the fitted-polynomial lane, exact past the fits, ReLU and linear; fp32 | `pre_synthesis_v1` |
+| GPNAE | `three_formats_v2` | 0d407a7 | 2026-10-01 | the polynomial lane in fp32 or bf16, and a separate int8 lane | `pre_packing_v1` |
+| ArithmeticLibrary | `fp32_units_v1` | ea2c09b | 2026-07-26 | fp32 multiplier and adder (Booth, Karatsuba, leading-zero count) | new |
+| ArithmeticLibrary | `bf16_units_v2` | d97e270 | 2026-09-28 | float multiplier and adder at any width, the format package | new |
+| ArithmeticLibrary | `int8_units_v3` | cb46ced | 2026-10-01 | int8 multiply and add, Q4.11 multiply-add, TFLite requantize | `pre_packing_v1` |
 
 ## Conventions
 

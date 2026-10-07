@@ -16,7 +16,7 @@ PYTHON ?= python3
 # model_runner.py has no default model directory, so make model needs one.
 MODEL_DIR ?=
 QUICK ?= 0
-# Register stages on sienna_top's host, staging and result links (L0, L1, L3), a TB_sienna_top parameter; 0 is wires.
+# Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna_top parameter; 0 is wires.
 LINK_STAGES ?= 0
 
 FORMATS = fp32 bf16 int8
@@ -64,6 +64,8 @@ PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 TOP_FILES = \
 	sienna_top.sv \
 	requant_lanes.sv \
+	fwft.sv \
+	l9_sink.sv \
 	sienna_multi.sv \
 	sienna_layer.sv
 
@@ -102,6 +104,8 @@ GPNAE_FILES = \
 	gpnae.sv \
 	gpnae_tail.sv \
 	gpnae_poly_int8.sv \
+	lane_fifo.sv \
+	lane_link.sv \
 	gpnae_poly.sv
 
 GPNAE_LIB_FILES = \

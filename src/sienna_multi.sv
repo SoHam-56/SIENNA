@@ -1,7 +1,7 @@
 `timescale 1ns / 100ps
 
 // COPIES independent SIENNA pipelines behind one host port: sets go to the copies in turn, one set per accepted start.
-// Each copy keeps its own output port and set ids, since sienna_top has no output back-pressure to merge them in order.
+// Each copy keeps its own output port and set ids; its L9 outputs end in sinks that never stall, so nothing merges them in order.
 module sienna_multi #(
     parameter int COPIES            = 2,
     parameter int NUM_LANES         = 32,
@@ -139,6 +139,12 @@ module sienna_multi #(
       assign wcc[r].data = wc_region[r].data;
       assign wc_cred[r][c] = wcc[r].credit;
     end
+    // L9: a sink per lane that never stalls, so each copy's outputs leave as before (Task 6 adds back-pressure).
+    credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) outl[NUM_LANES] ();
+    for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
+      l9_sink #(.DATA_W(DATA_WIDTH)) sink (.clk_i(clk_i), .rstn_i(rstn_i), .lnk(outl[l]), .valid_o(result_valid_o[c][l]),
+                                           .data_o(final_result_o[c][l]));
+    end
     sienna_top #(
         .NUM_LANES        (NUM_LANES),
         .N                (N),
@@ -180,8 +186,7 @@ module sienna_multi #(
         .west_write_enable_i        (west_write_enable_i && mine),
         .west_write_data_i          (west_write_data_i),
         .west_write_reset_i         (west_write_reset_i && mine),
-        .final_result_o             (final_result_o[c]),
-        .result_valid_o             (result_valid_o[c]),
+        .out                        (outl),
         .pipeline_complete_o        (pipeline_complete_o[c]),
         .done_set_id_o              (done_set_id_o[c]),
         .systolic_busy_o            (),

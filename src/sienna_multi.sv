@@ -1,7 +1,8 @@
 `timescale 1ns / 100ps
 
-// COPIES independent SIENNA pipelines behind one host port: sets go to the copies in turn, one set per accepted start.
-// Each copy keeps its own output port and set ids; its L9 outputs end in sinks that never stall, so nothing merges them in order.
+// COPIES independent SIENNA pipelines behind one host: sets go to the copies in turn, one set per put.
+// Each copy has its own host link (L0), output links (L9) and set ids; nothing merges the copies' outputs in order.
+// L2 contract: a fill goes to every copy, so its sets are put one after another, at least COPIES of them, and each copy's last one is marked wc_last.
 module sienna_multi #(
     parameter int COPIES            = 2,
     parameter int NUM_LANES         = 32,
@@ -34,116 +35,81 @@ module sienna_multi #(
     input logic clk_i,
     input logic rstn_i,
 
-    input logic                     start_pipeline_i,
-    input logic                     training_mode_i,
-    input logic                     accumulate_i,
-    input logic                     bias_valid_i,
-    input logic [N-1:0][ACC_W-1:0]  bias_i,
-    input logic [N-1:0][31:0]       req_mult_i,  // int8 (D-2): to the copy that takes the start, as sienna_top
-    input logic [N-1:0][7:0]        req_shift_i,
-    input logic [7:0]               req_zp_i,
-    input logic [7:0]               req_min_i,
-    input logic [7:0]               req_max_i,
-    input logic [15:0]              gp_mx_i,
-    input logic [4:0]               gp_shx_i,
-    input logic [31:0]              gp_mout_i,
-    input logic [7:0]               gp_shout_i,
-    input logic [7:0]               gp_zout_i,
-    input logic                     weight_cached_i,
-    input logic [$clog2(WC_TILES)-1:0] weight_tile_i,
-    input logic                     wc_last_i,  // with the start: the last set this copy takes from its cache region's fill (one per copy)
+    credit_link_if.consumer         host[COPIES],  // L0 per copy, as sienna_top's: put only the copy whose turn it is (copy_sel_o), its rows went there
+    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with a put, to the copy put
     credit_link_if.consumer         wc_region[2],  // L2: a put opens a fill of that region in every copy; its credit returns once every copy's has
     input logic                     wc_write_enable_i,  // written into every copy's cache
     input logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i,
-    input logic [   LFSR_WIDTH-1:0] dropout_seed_i,
-    input logic [CONTROL_WIDTH-1:0] activation_function_i,
-    input logic [     ADDR_LINES:0] num_terms_i,
-    input logic                     north_write_enable_i,
+    input logic                     north_write_enable_i,  // the row buses reach only the copy whose turn it is
     input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
     input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
 
-    output logic                                 pipeline_ready_o,  // the copy whose turn it is can take a set
-    output logic [$clog2(COPIES+1)-1:0]          copy_sel_o,        // copy the host is loading now
-    output logic [COPIES-1:0][NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o,
-    output logic [COPIES-1:0][NUM_LANES-1:0]                 result_valid_o,
+    output logic [$clog2(COPIES+1)-1:0]          copy_sel_o,  // copy whose turn it is: the host loads its rows and puts it next
+    credit_link_if.producer         out[COPIES*NUM_LANES],  // L9 per copy: copy c's lane l is out[c*NUM_LANES + l]
     output logic [COPIES-1:0]                                pipeline_complete_o,
     output logic [COPIES-1:0][$clog2(SETS_IN_FLIGHT+1)-1:0]  done_set_id_o
 );
   localparam int SW = $clog2(COPIES + 1);
   localparam int PACK_ENTRIES = 8;  // sienna_top's default; sienna_multi never packs
+  localparam int WCTW = $clog2(WC_TILES);
   `include "sienna_set_side.svh"
   logic [SW-1:0] sel;
-  logic [COPIES-1:0] ready;  // per copy: this side holds a staging credit of that copy
+  logic [COPIES-1:0] put;  // per copy: the host's put this cycle
   assign copy_sel_o = sel;
-  assign pipeline_ready_o = ready[sel];
 
-  // The host's start moves the turn on only when the selected copy accepts it.
+  // The turn moves on with each put to the copy whose turn it is.
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) sel <= '0;
-    else if (start_pipeline_i && ready[sel]) sel <= (sel == SW'(COPIES - 1)) ? '0 : sel + 1'b1;
+    else if (put[sel]) sel <= (sel == SW'(COPIES - 1)) ? '0 : sel + 1'b1;
   end
 
-  // The set's sideband from the start-time ports, put to the copy whose turn it is.
-  set_side_t side;
-  always_comb begin
-    side               = '0;
-    side.wc_last       = wc_last_i;
-    side.weight_tile   = weight_tile_i;
-    side.weight_cached = weight_cached_i;
-    side.accumulate    = accumulate_i;
-    side.bias_valid    = bias_valid_i;
-    side.train         = training_mode_i;
-    side.seed          = dropout_seed_i;
-    side.terms         = num_terms_i;
-    side.act[0]        = activation_function_i;
-    side.zp[0]         = req_zp_i;
-    side.amin[0]       = req_min_i;
-    side.amax[0]       = req_max_i;
-    side.mx[0]         = gp_mx_i;
-    side.shx[0]        = gp_shx_i;
-    side.mout[0]       = gp_mout_i;
-    side.shout[0]      = gp_shout_i;
-    side.zout[0]       = gp_zout_i;
-    side.mult          = req_mult_i;
-    side.shift         = req_shift_i;
-  end
+  logic live;  // out of reset for a cycle: no region credit before it
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) live <= 1'b0;
+    else live <= 1'b1;
 
   // L2: a fill goes to every copy at once; a region's credit goes up only when every copy has returned its own.
   logic [COPIES-1:0] wc_cred[2];  // this cycle's region credits from each copy
   logic [COPIES-1:0] wc_got[2];  // copies whose region credit came back and has not gone up yet
+  logic [1:0] wc_put;  // the host opens a fill of the region this cycle
   for (genvar r = 0; r < 2; r++) begin : G_WC
     logic all_back;
-    assign all_back = &(wc_got[r] | wc_cred[r]);
+    assign wc_put[r] = wc_region[r].put;
+    assign all_back = live && &(wc_got[r] | wc_cred[r]);
     assign wc_region[r].credit = all_back;
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) wc_got[r] <= '0;
       else wc_got[r] <= all_back ? '0 : (wc_got[r] | wc_cred[r]);
   end
 
+`ifndef SYNTHESIS
+  logic [COPIES-1:0] p_cached, p_last, p_region;  // per copy: the put set reads the cache, is marked its fill's last, and its region
+`endif
   for (genvar c = 0; c < COPIES; c++) begin : COPY
     logic mine;
-    logic [1:0] cnt;  // staging credits of this copy held here
     assign mine = (sel == SW'(c));
-    credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host ();
+    assign put[c] = host[c].put;
+`ifndef SYNTHESIS
+    set_side_t side;
+    assign side = host[c].data;
+    assign p_cached[c] = side.weight_cached;
+    assign p_last[c] = side.wc_last;
+    assign p_region[c] = side.weight_tile[WCTW-1];
+`endif
     credit_link_if #(.DATA_W(1), .CRW(1)) wcc[2] ();
-    credit_counter #(.MAX(2), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host.put), .credit_i(host.credit), .has_credit_o(),
-                                           .count_o(cnt));
-    assign ready[c] = (cnt != 0);
-    assign host.put = start_pipeline_i && mine && ready[c];  // a start the copy cannot take is ignored, as before
-    assign host.data = side;
     for (genvar r = 0; r < 2; r++) begin : G_WCC
       assign wcc[r].put = wc_region[r].put;
       assign wcc[r].data = wc_region[r].data;
       assign wc_cred[r][c] = wcc[r].credit;
     end
-    // L9: a sink per lane that never stalls, so each copy's outputs leave as before (Task 6 adds back-pressure).
     credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) outl[NUM_LANES] ();
     for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
-      l9_sink #(.DATA_W(DATA_WIDTH)) sink (.clk_i(clk_i), .rstn_i(rstn_i), .lnk(outl[l]), .valid_o(result_valid_o[c][l]),
-                                           .data_o(final_result_o[c][l]));
+      assign out[c*NUM_LANES+l].put = outl[l].put;
+      assign out[c*NUM_LANES+l].data = outl[l].data;
+      assign outl[l].credit = out[c*NUM_LANES+l].credit;
     end
     sienna_top #(
         .NUM_LANES        (NUM_LANES),
@@ -175,7 +141,7 @@ module sienna_multi #(
     ) pipe (
         .clk_i                      (clk_i),
         .rstn_i                     (rstn_i),
-        .host                       (host),
+        .host                       (host[c]),
         .bias_i                     (bias_i),
         .wc_region                  (wcc),
         .wc_write_enable_i          (wc_write_enable_i),
@@ -197,5 +163,75 @@ module sienna_multi #(
         .intermediate_buffer_empty_o()
     );
   end
+
+`ifndef SYNTHESIS
+  // The L2 contract, tracked per region: a fill is open from its put until every copy has taken its marked set.
+  logic [1:0] f_open, f_started;  // the fill is open; a set of it has been put
+  logic [COPIES-1:0] f_marked[2];  // copies that took their marked set of the open fill
+  logic any_put, set_cached, set_last, set_region;
+  logic [SW-1:0] set_copy;
+  always_comb begin
+    any_put = |put;
+    set_copy = sel;
+    set_cached = 1'b0;
+    set_last = 1'b0;
+    set_region = 1'b0;
+    for (int c = 0; c < COPIES; c++)
+      if (put[c]) begin
+        set_copy = SW'(c);
+        set_cached = p_cached[c];
+        set_last = p_last[c];
+        set_region = p_region[c];
+      end
+  end
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) begin
+      f_open <= '0;
+      f_started <= '0;
+      f_marked[0] <= '0;
+      f_marked[1] <= '0;
+    end else
+      for (int r = 0; r < 2; r++)
+        if (wc_put[r]) begin
+          f_open[r] <= 1'b1;
+          f_started[r] <= 1'b0;
+          f_marked[r] <= '0;
+        end else if (any_put && set_cached && set_region == 1'(r)) begin
+          f_started[r] <= 1'b1;
+          if (set_last) begin
+            f_marked[r] <= f_marked[r] | (COPIES'(1) << set_copy);
+            if ((f_marked[r] | (COPIES'(1) << set_copy)) == '1) f_open[r] <= 1'b0;
+          end
+        end
+  // A put and its terms, registered: a host may drive its puts at the edge.
+  logic pq, pq_turn, pq_after_last, pq_short;
+  logic [SW-1:0] pq_copy;
+  logic pq_region;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {pq, pq_turn, pq_after_last, pq_short, pq_copy, pq_region} <= '0;
+    else begin
+      pq            <= any_put;
+      pq_turn       <= (put == (COPIES'(1) << sel));
+      pq_after_last <= set_cached && (!f_open[set_region] || f_marked[set_region][set_copy]);
+      pq_short      <= 1'b0;
+      pq_copy       <= set_copy;
+      pq_region     <= set_region;
+      // Another kind of set while a fill has reached only some copies with their marked sets: those copies' regions never close.
+      for (int r = 0; r < 2; r++)
+        if (f_open[r] && f_started[r] && !(set_cached && set_region == 1'(r))) begin
+          pq_short  <= 1'b1;
+          pq_region <= 1'(r);
+        end
+    end
+  a_put_on_turn: assert property (@(posedge clk_i) disable iff (!rstn_i) pq |-> pq_turn)
+    else $error("sienna_multi: a put to a copy whose turn it is not (copy %0d put, turn %0d): its rows went to the copy whose turn it was",
+                pq_copy, $past(sel));
+  a_wc_after_last: assert property (@(posedge clk_i) disable iff (!rstn_i) pq |-> !pq_after_last)
+    else $error("sienna_multi: copy %0d took a cached set of region %0d after its marked one, or with no fill open: its region may be refilled under it",
+                pq_copy, pq_region);
+  a_wc_fill_short: assert property (@(posedge clk_i) disable iff (!rstn_i) pq |-> !pq_short)
+    else $error("sienna_multi: region %0d's fill reached only some copies with their marked sets when another set was put: the rest never close it",
+                pq_region);
+`endif
 
 endmodule

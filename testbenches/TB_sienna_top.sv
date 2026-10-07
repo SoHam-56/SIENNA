@@ -5,7 +5,7 @@ import test_config_pkg::*;
 // LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide; -DTB_FAULT4: forced L3 framing and completion faults.
 module TB_sienna_top #(
     parameter int LINK_STAGES = 0,
-    parameter int FAULT       = 0
+    parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider
 );
 
   // ── Localparams from generated SV package ─────────────────────────────
@@ -87,6 +87,12 @@ module TB_sienna_top #(
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
+  bit stream_on = 0;  // a streaming pass is running
+  logic [DATA_WIDTH-1:0] stream_results[$];
+  int stream_bounds[$];
+  int stream_ids[$];
+  logic [DATA_WIDTH-1:0] acc_results[$];
+  int acc_bounds[$];
   int acc_bound_passed = 0;  // bf16 accumulate-pass outputs inside its loose bound, counted apart from the tolerance passes
   // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
   int over_admit = 0;
@@ -97,8 +103,6 @@ module TB_sienna_top #(
   logic west_write_enable_i, west_write_reset_i;
   logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i;
 
-  logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
-  logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
   logic                        [ID_W-1:0] done_set_id_o;
   logic systolic_busy_tb, gpnae_busy_tb;
@@ -125,6 +129,10 @@ module TB_sienna_top #(
     forever #5 clk_i = ~clk_i;
   end
 
+  // ── L9: this TB is the downstream consumer of every lane's output link ──
+  localparam int OUT_CAP = 64;  // sienna_top's OUT_MAX: the most slots a lane's consumer may advertise
+  credit_link_if #(.DATA_W(DATA_WIDTH + ((FAULT == 7) ? 1 : 0)), .CRW(1)) out_lnk[NUM_LANES] ();
+
   // ── DUT ───────────────────────────────────────────────────────────────
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
@@ -149,7 +157,9 @@ module TB_sienna_top #(
       .FIFO_DEPTH       (FIFO_DEPTH),
       .WC_TILES         (WC_TILES),
       .PACK_ENTRIES     (PACK_ENTRIES),
-      .LINK_STAGES      (LINK_STAGES)
+      .LINK_STAGES      (LINK_STAGES),
+      .OUT_MAX          (OUT_CAP),
+      .LANE_OUT_SLOTS   ((FAULT == 6) ? 8 : 16)
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
@@ -164,8 +174,7 @@ module TB_sienna_top #(
       .west_write_enable_i        (west_write_enable_i),
       .west_write_data_i          (west_write_data_i),
       .west_write_reset_i         (west_write_reset_i),
-      .final_result_o             (final_result_o),
-      .result_valid_o             (result_valid_o),
+      .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),
       .systolic_busy_o            (systolic_busy_tb),
@@ -178,6 +187,118 @@ module TB_sienna_top #(
 
   wire [4:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
   wire res_ready = dut.systolic_array_inst.out_full[dut.systolic_array_inst.out_rd];  // the mesh holds a finished result
+
+  // ── L9 consumer: out_adv slots per lane after each reset; a word frees its slot at once, its credit returned unless stalled or held ──
+  int out_slots = OUT_CAP, out_stall_pct = 0;  // +out_slots=N (1..64) L9 slots per lane; +out_stall_pct=P of credit returns withheld at random
+  int out_adv = OUT_CAP;  // slots advertised after the next reset: out_slots, or 1 for the hold pass after the mid-stream reset
+  bit out_hold = 0;  // Review Focus 3: every L9 credit withheld
+  logic [NUM_LANES-1:0] out_put, out_cr;
+  logic [DATA_WIDTH-1:0] out_data[NUM_LANES];
+  int out_owed[NUM_LANES];  // freed slots not yet credited
+  int out_held[NUM_LANES];  // credits the DUT holds: returned minus words put
+  int hold_puts = 0;  // words put while every credit is withheld
+  logic [DATA_WIDTH-1:0] lane_q[NUM_LANES][$];  // each lane's words of the set being output
+  localparam bit TB_POOL_BYPASS = (POOL_H == 1) && (POOL_W == 1) && (STRIDE_ROWS == 1) && (STRIDE_COLS == 1) && (PADDING == 0);
+  localparam int TB_L5 = (FAULT == 6) ? 8 : 16;  // the collector's L5 slots per lane
+  initial begin
+    void'($value$plusargs("out_slots=%d", out_slots));
+    void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
+    if (out_slots < 1 || out_slots > OUT_CAP || out_stall_pct < 0 || out_stall_pct > 90) begin
+      $display("[ERROR] +out_slots=%0d must be 1..%0d and +out_stall_pct=%0d 0..90", out_slots, OUT_CAP, out_stall_pct);
+      $finish;
+    end
+    out_adv = out_slots;
+    $display(" Output links    : %0d L9 slots per lane, %0d%% of credit returns stalled", out_slots, out_stall_pct);
+  end
+  for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
+    assign out_put[l]  = out_lnk[l].put;
+    assign out_data[l] = DATA_WIDTH'(out_lnk[l].data);
+    assign out_lnk[l].credit = out_cr[l];
+    // Drained only once every slot is credited and no credit is still on the wire this cycle.
+    credit_link_checker #(.SLOTS(OUT_CAP)) chk (.clk_i(clk_i), .rstn_i(rstn_i),
+                                                .drained_i(drained && out_adv == OUT_CAP && out_owed[l] == 0 && !out_cr[l]), .lnk(out_lnk[l]));
+  end
+
+  // Lane L's j-th word of a set is window j*NUM_LANES + L, so popping the lanes in turn rebuilds window order whatever each lane's stalls.
+  task automatic take_set(output logic [DATA_WIDTH-1:0] w[$], output int src[$]);
+    bit any = 1;
+    w.delete();
+    src.delete();
+    while (any) begin
+      any = 0;
+      for (int l = 0; l < NUM_LANES; l++)
+        if (lane_q[l].size() != 0) begin
+          w.push_back(lane_q[l].pop_front());
+          src.push_back(l);
+          any = 1;
+        end
+    end
+  endtask
+
+  // Link signals change on the falling edge; the words of a set are taken in window order with its completion.
+  always @(negedge clk_i) begin
+    if (!rstn_i) begin
+      for (int l = 0; l < NUM_LANES; l++) begin
+        out_cr[l]   = 1'b0;
+        out_owed[l] = out_adv;
+        out_held[l] = 0;
+        lane_q[l].delete();
+      end
+    end else begin
+      // A word's slot is credited from the next cycle on: the producer's counter checks no credit comes with the put that frees it.
+      for (int l = 0; l < NUM_LANES; l++) begin
+        out_held[l] += int'(out_cr[l]);
+        out_cr[l] = 1'b0;
+        if (out_owed[l] > 0 && !out_hold && !(out_stall_pct > 0 && $urandom_range(99) < out_stall_pct)) begin
+          out_cr[l] = 1'b1;
+          out_owed[l]--;
+        end
+        if (out_put[l]) begin
+          lane_q[l].push_back(out_data[l]);
+          out_owed[l]++;
+          out_held[l]--;
+          if (out_hold) hold_puts++;
+        end
+      end
+      if (pipeline_complete_o) begin
+        logic [DATA_WIDTH-1:0] w[$];
+        int src[$];
+        take_set(w, src);
+        foreach (w[i]) begin
+          actual_results.push_back(w[i]);
+          if (stream_on) stream_results.push_back(w[i]);
+          if (acc_on) acc_results.push_back(w[i]);
+          // Data leaving dropout for the output, dec in the build's format (int8: the signed code); not for the accumulate pass, which main never ran
+          if (!acc_on) begin
+            if (EXP_W == 0)
+              $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%0d  hex=%08x", $time, src[i], $signed(w[i][7:0]), w[i]);
+            else
+              $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%.4f  hex=%08x", $time, src[i],
+                       f32((EXP_W == 8 && MAN_W == 7) ? {16'(w[i]), 16'h0} : 32'(w[i])), w[i]);
+          end
+        end
+        if (stream_on) begin
+          stream_bounds.push_back(stream_results.size());
+          stream_ids.push_back(int'(done_set_id_o));
+        end
+        if (acc_on) acc_bounds.push_back(acc_results.size());
+      end
+    end
+  end
+
+  // Every lane link holds all its slots: L4 32, L5 the collector's, the pooling input (FIFO2, or L9 with a 1x1 pool) and L9 out_adv.
+  function automatic bit lanes_home(output string why);
+    automatic int pin = TB_POOL_BYPASS ? out_adv : 16;
+    for (int l = 0; l < NUM_LANES; l++)
+      if (int'(dut.l4_cnt[l]) != 32 || int'(dut.l5_out[l]) != TB_L5 || int'(dut.pin_cnt[l]) != pin || out_held[l] != out_adv ||
+          out_owed[l] != 0) begin
+        why = $sformatf("lane %0d: L4 %0d (32), L5 %0d (%0d), pool input %0d (%0d), L9 %0d (%0d), L9 owed %0d (0)", l, dut.l4_cnt[l],
+                        dut.l5_out[l], TB_L5, dut.pin_cnt[l], pin, out_held[l], out_adv, out_owed[l]);
+        return 0;
+      end
+    why = $sformatf("lanes: L4 32, L5 %0d, pool input %0d, L9 %0d each", TB_L5, pin, out_adv);
+    return 1;
+  endfunction
 
   // The sideband of the set being put, from the per-set signals above; entry 0 of each table is the set's own.
   function automatic set_side_t side_now();
@@ -405,6 +526,14 @@ module TB_sienna_top #(
                  host_cnt, wc_cnt[0], wc_cnt[1], dut.l1_cnt, dut.l6_cnt, dut.sets_out, dut.l0_out, dut.systolic_array_inst.res_cnt,
                  host_lnk.credit, wc_lnk[0].credit, wc_lnk[1].credit, dut.l3_grant, dut.l6_credit, dut.systolic_array_inst.stg_credit);
       end
+      // The lane links too: no L4, L5, pooling-input or L9 count and no credit while reset is held.
+      for (int l = 0; l < NUM_LANES; l++)
+        if (dut.l4_cnt[l] != 0 || dut.l5_out[l] != 0 || dut.pin_cnt[l] != 0 || dut.l4_cr[l] || dut.l5_cr[l] || dut.pin_cr[l]) begin
+          failed++;
+          $display("  [FAIL] In reset: lane %0d L4 %0d, L5 %0d, pool input %0d; credits out %0b%0b%0b", l, dut.l4_cnt[l], dut.l5_out[l],
+                   dut.pin_cnt[l], dut.l4_cr[l], dut.l5_cr[l], dut.pin_cr[l]);
+          break;
+        end
     end
     @(posedge clk_i);
     rstn_i = 1;
@@ -432,18 +561,7 @@ module TB_sienna_top #(
     $display("  Load complete @ %0t  (%0d cycles)", $time, cycle_count);
   endtask
 
-  // =========================================================================
-  // ON-THE-FLY STREAMING CAPTURE
-  // =========================================================================
-  always_ff @(posedge clk_i) begin
-    if (rstn_i) begin  // from the output ports; the last beat shares the cycle with pipeline_complete_o
-      for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (result_valid_o[lane]) begin
-          actual_results.push_back(final_result_o[lane]);
-        end
-      end
-    end
-  end
+  // The output words reach actual_results from the L9 consumer, a set at a time in window order.
 
   // ── Collect outputs — with heartbeat ─────────────────────────────────
   task automatic collect_outputs();
@@ -545,18 +663,7 @@ module TB_sienna_top #(
                    real'($bitstoshortreal(dut.fifo2_wr_data[lane])), dut.fifo2_wr_data[lane]);
         end
       end
-      // Console Print: Data exiting Dropout to final Output, dec in the build's format (int8: the signed code); not for the accumulate pass, which main never ran
-      for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.dropout_valid_out[lane] && !acc_on) begin
-          if (EXP_W == 0)
-            $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%0d  hex=%08x", $time, lane,
-                     $signed(dut.dropout_data_out[lane][7:0]), dut.dropout_data_out[lane]);
-          else
-            $display("[DEBUG %0t] Dropout -> Output (Lane %0d)   : dec=%.4f  hex=%08x", $time, lane,
-                     f32((EXP_W == 8 && MAN_W == 7) ? {16'(dut.dropout_data_out[lane]), 16'h0} : 32'(dut.dropout_data_out[lane])),
-                     dut.dropout_data_out[lane]);
-        end
-      end
+      // Dropout -> Output lines are printed by the L9 consumer, a set at a time in window order, so stalls cannot reorder them.
     end
   end
 
@@ -585,7 +692,6 @@ module TB_sienna_top #(
   end
 
   integer       lane_fd;
-  logic   [1:0] prev_mp_state      [NUM_LANES];
   logic   [4:0] prev_current_state;
   logic         lane_log_init_done;
 
@@ -596,7 +702,7 @@ module TB_sienna_top #(
     end else begin
       $fdisplay(lane_fd, "==============================================");
       $fdisplay(lane_fd, " SIENNA Per-Lane Streaming Status");
-      $fdisplay(lane_fd, " mp_state key: 0=MP_IDLE 1=MP_FEED 2=MP_WAIT_DONE 3=MP_DONE");
+      $fdisplay(lane_fd, " credits held per lane: L4 into the GPNAE lane, L5 by the lane, pool input (FIFO2, or L9 with a 1x1 pool)");
       $fdisplay(lane_fd, "==============================================\n");
     end
     lane_log_init_done = 1'b0;
@@ -607,38 +713,27 @@ module TB_sienna_top #(
     $fdisplay(lane_fd,
               "---- %0t  (%s)  current_state=%0d  all_collected=%0b  streaming_complete=%0b ----",
               $time, reason, dut_stage, dut.all_collected, dut.streaming_complete);
-    // Note: mp_real_consumed explicitly removed to sync with current top-level architecture
     for (int lane = 0; lane < NUM_LANES; lane++) begin
       $fdisplay(
           lane_fd,
-          "  lane=%0d fill_count=%0d done_count=%0d load_finalized=%0b lane_collected=%0b | mp_state=%0d mp_window_fed=%0d mp_windows_done=%0d lane_windows_total=%0d | dropout_out_count=%0d",
+          "  lane=%0d fill_count=%0d done_count=%0d load_finalized=%0b lane_collected=%0b | L4 %0d L5 %0d pool-in %0d | maxpool out %0d of %0d | dropout_out_count=%0d",
           lane, dut.fill_count[lane], dut.done_count[lane], dut.load_finalized[lane],
-          dut.lane_collected[lane], dut.mp_state[lane], dut.mp_window_fed[lane],
-          dut.mp_windows_done[lane], dut.lane_windows_total[lane], dut.dropout_out_count[lane]);
+          dut.lane_collected[lane], dut.l4_cnt[lane], dut.l5_out[lane], dut.pin_cnt[lane],
+          dut.mp_out_count[lane], dut.lane_windows_total[lane], dut.dropout_out_count[lane]);
     end
   endtask
 
   always @(posedge clk_i) begin
     if (rstn_i && lane_fd) begin
       if (!lane_log_init_done) begin
-        for (int lane = 0; lane < NUM_LANES; lane++) prev_mp_state[lane] <= dut.mp_state[lane];
         prev_current_state <= dut_stage;
         lane_log_init_done <= 1'b1;
       end else begin
-        automatic logic any_mp_state_changed = 1'b0;
-        for (int lane = 0; lane < NUM_LANES; lane++) begin
-          if (dut.mp_state[lane] != prev_mp_state[lane]) any_mp_state_changed = 1'b1;
-          prev_mp_state[lane] <= dut.mp_state[lane];
-        end
-
         if (dut_stage != prev_current_state) begin
           print_lane_status("current_state changed");
-        end else if (any_mp_state_changed) begin
-          print_lane_status("mp_state changed");
         end else if (cycle_count % HEARTBEAT_CYCLES == 0) begin
           print_lane_status("heartbeat");
         end
-
         prev_current_state <= dut_stage;
       end
     end
@@ -762,29 +857,14 @@ module TB_sienna_top #(
 
   // ── Streaming: K distinct sets through overlapped stages ──────────────
   // The monitor reads registered state on the falling edge, never a combinational view of start.
-  bit stream_on = 0;
   int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
   int pool_with_result = 0;  // pooling busy while a mesh result waited, so activation could have overlapped it
-  logic [DATA_WIDTH-1:0] stream_results[$];
-  int stream_bounds[$];
-  int stream_ids[$];
   int stream_id_base;  // sets started before the stream, which consumed ids
   wire mesh_computing = dut.systolic_array_inst.mesh_busy;  // a set between staging and a written result
   // A finished set waits for a result bank: the mesh is held up by the consumer.
   wire mesh_blocked = dut.systolic_array_inst.arrays_final && dut.systolic_array_inst.reducers_ready &&
                       !dut.systolic_array_inst.reduce_start;
   int withheld = 0;  // cycles the full entry kept a free staging bank from the host
-
-  always_ff @(posedge clk_i) begin
-    if (stream_on) begin
-      for (int lane = 0; lane < NUM_LANES; lane++)
-        if (result_valid_o[lane]) stream_results.push_back(final_result_o[lane]);
-      if (pipeline_complete_o) begin
-        stream_bounds.push_back(stream_results.size());
-        stream_ids.push_back(int'(done_set_id_o));
-      end
-    end
-  end
 
   initial forever begin
     @(negedge clk_i);
@@ -887,10 +967,16 @@ module TB_sienna_top #(
   endtask
 
   // overrun: before set SETS_IN_FLIGHT the host waits until every admitted set is in flight and shows it gets no credit; close_fill: the last set closes the cache fill.
-  task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill);
+  // hold (Review Focus 3): from the first words of set NUM_SETS/2, every L9 credit is withheld for 500 cycles; the outputs must equal the first plain pass's.
+  logic [DATA_WIDTH-1:0] ref_results[$];  // the first plain pass's words and set boundaries
+  int ref_bounds[$];
+  task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill, input bit hold = 0);
     automatic longint t0 = $time;
-    $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s", NUM_SETS,
-             overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "");
+    automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0;
+    $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s%s", NUM_SETS,
+             overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "",
+             hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld 500 cycles from set %0d's first words", out_adv, NUM_SETS / 2)
+                  : "");
     stream_results.delete();
     stream_bounds.delete();
     stream_ids.delete();
@@ -969,6 +1055,38 @@ module TB_sienna_top #(
               verify_slice(k, exp_q);
             end
           end
+          begin : holder
+            if (hold) begin
+              automatic bit started = 0;
+              while (!started && stream_bounds.size() < NUM_SETS) begin
+                @(negedge clk_i);
+                if (stream_bounds.size() >= NUM_SETS / 2)
+                  for (int l = 0; l < NUM_LANES; l++) if (lane_q[l].size() != 0) started = 1;
+              end
+              if (!started) begin
+                failed++;
+                $display("  [FAIL] Hold: set %0d never started its output", NUM_SETS / 2);
+              end else begin
+                out_hold  = 1;
+                hold_puts = 0;
+                repeat (500) begin
+                  @(negedge clk_i);
+                  if (out_put == '0) hold_stalled++;
+                  if (pipeline_complete_o) hold_done++;
+                  if (host_cnt == 0 && dut.entry_full) hold_full++;
+                  if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
+                end
+                out_hold = 0;
+                $display("  [Hold] every L9 credit withheld 500 cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full",
+                         NUM_SETS / 2, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full);
+                if (hold_stalled < 400 || hold_puts > out_adv * NUM_LANES) begin
+                  failed++;
+                  $display("  [FAIL] Hold: the output did not stall (%0d of 500 cycles with no word, %0d words on %0d credits per lane)", hold_stalled,
+                           hold_puts, out_adv);
+                end
+              end
+            end
+          end
         join
       end
       begin : watchdog
@@ -980,20 +1098,48 @@ module TB_sienna_top #(
     join_any
     disable fork;
     stream_on = 0;
+    out_hold = 0;
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [Stream] %0d sets in %0d cycles", NUM_SETS, ($time - t0) / 10);
+    if (!overrun && !hold && ref_bounds.size() == 0) begin
+      ref_results = stream_results;
+      ref_bounds  = stream_bounds;
+    end
+    if (hold) begin  // Review Focus 3: nothing lost, duplicated or reordered, and every count back home once drained
+      automatic int first = -1, waited = 0;
+      string why;
+      for (int i = 0; i < ref_results.size() && i < stream_results.size(); i++)
+        if (first < 0 && stream_results[i] !== ref_results[i]) first = i;
+      if (stream_results.size() != ref_results.size() || stream_bounds != ref_bounds || first >= 0) begin
+        failed++;
+        $display("  [FAIL] Hold: %0d words in %0d sets against the plain pass's %0d in %0d, first difference at word %0d", stream_results.size(),
+                 stream_bounds.size(), ref_results.size(), ref_bounds.size(), first);
+      end else $display("  [Hold] outputs identical to the plain pass: %0d words, the same %0d set boundaries", stream_results.size(),
+                        stream_bounds.size());
+      while (!drained && waited < 2000) begin
+        @(posedge clk_i);
+        waited++;
+      end
+      repeat (40) @(posedge clk_i);
+      if (!drained || tb_inflight != 0 || host_cnt != HOST_SLOTS || dut.sets_out != 0 || dut.l0_out != HOST_SLOTS || !lanes_home(why)) begin
+        failed++;
+        $display("  [FAIL] Hold: not home after the drain: drained %0b, in flight %0d, host %0d (%0d), sets %0d, granted %0d; %s", drained,
+                 tb_inflight, host_cnt, HOST_SLOTS, dut.sets_out, dut.l0_out, why);
+      end else $display("  [Hold] drained: every completion counted (in flight 0), host credits %0d, %s", host_cnt, why);
+    end
     $display("  [Stream] mesh computing while activation busy: %0d cycles", ov_mesh_g);
     $display("  [Stream] activation and pooling busy together: %0d cycles", ov_g_p);
     $display("  [Stream] most sets in flight: %0d", max_in_flight);
     $display("  [Stream] mesh stalled on full result banks: %0d cycles", bp_mesh);
     $display("  [Stream] activation stalled on full activation banks: %0d cycles", bp_act);
-    if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1) begin
+    if (hold) $display("  [Stream] overlap requirements not applied: the hold pass's output stalls by design");
+    else if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1) begin
       failed++;
       $display("  [FAIL] Overlap: the mesh never computed while the activation stage held a set");
     end else if (ov_mesh_g == 0)
       $display("  [Stream] mesh/activation overlap not reachable: SETS_IN_FLIGHT 1 admits one set at a time");
     // Only a failure if a mesh result was waiting while pooling ran; with the mesh slowest there is nothing to overlap.
-    if (ov_g_p == 0 && pool_with_result > 0) begin
+    if (!hold && ov_g_p == 0 && pool_with_result > 0) begin
       failed++;
       $display("  [FAIL] Overlap: a mesh result waited %0d cycles while pooling ran, yet activation never overlapped it",
                pool_with_result);
@@ -1002,7 +1148,7 @@ module TB_sienna_top #(
     if (EXP_W == 0) begin
       $display("  [Stream] requantize pipeline held set k while set k+1 was in the activation stage: %0d cycles", ov_rq);
       $display("  [Stream] of those, a ReLU or linear set draining while a GPNAE lane set held the stage: %0d cycles", ov_lane);
-      if (rq_wait > 0 && ov_rq == 0) begin
+      if (!hold && rq_wait > 0 && ov_rq == 0) begin
         failed++;
         $display("  [FAIL] Overlap: a mesh result waited %0d cycles on a ReLU or linear set's requantize drain, yet no drain overlapped the next set",
                  rq_wait);
@@ -1010,7 +1156,7 @@ module TB_sienna_top #(
         $display("  [Stream] requantize drain overlap not reachable: no mesh result waited on a ReLU or linear set's drain");
       $display("  [Stream] stage held by a ReLU or linear set with every read in, the next result ready and a bank free: %0d cycles",
                rq_hold);
-      if (rq_hold > 0) begin
+      if (!hold && rq_hold > 0) begin
         failed++;
         $display("  [FAIL] Overlap: a ReLU or linear set held the activation stage for %0d cycles of its requantize drain", rq_hold);
       end
@@ -1035,6 +1181,7 @@ module TB_sienna_top #(
   task automatic reset_mid_stream();
     automatic int waited = 0;
     automatic int stray = 0;
+    string why;
     $display("\n[STAGE] RESET MID-STREAM");
     fork
       begin
@@ -1065,13 +1212,14 @@ module TB_sienna_top #(
     end
     disable fork;
     $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.sets_out, host_cnt, dut_stage);
+    out_adv = 1;  // after this reset each lane's consumer advertises one L9 slot, so the hold pass below stalls mid-set
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
     num_terms_i           = NUM_TERMS[ADDR_LINES:0];
     training_mode_i       = TRAINING_MODE[0];
     repeat (2000) begin
       @(posedge clk_i);
-      if (pipeline_complete_o || (|result_valid_o)) stray++;
+      if (pipeline_complete_o || (|out_put)) stray++;
     end
     if (stray != 0) begin
       failed++;
@@ -1084,21 +1232,20 @@ module TB_sienna_top #(
       $display("  [FAIL] Not idle after reset: host %0d (%0d), staging %0d (2), granted %0d (%0d), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
                host_cnt, HOST_SLOTS, dut.l1_cnt, dut.l0_out, HOST_SLOTS, dut.sets_out, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE,
                wc_cnt[0], wc_cnt[1], dut_stage);
-    end else $display("  [Reset] idle after reset: every link re-advertised (host %0d, staging 2, act banks 2, results %0d, regions 1 1), no stray output",
-                      HOST_SLOTS, PER_LANE);
+    end else if (!lanes_home(why)) begin
+      failed++;
+      $display("  [FAIL] Lane links not re-advertised after reset: %s", why);
+    end else $display("  [Reset] idle after reset: every link re-advertised (host %0d, staging 2, act banks 2, results %0d, regions 1 1; %s), no stray output",
+                      HOST_SLOTS, PER_LANE, why);
     write_cache();  // the reset closed the cache fill: open it again
-    stream_all_sets(0, 0, PACKED != 0);  // the accumulate pass closes the fill when it runs
+    stream_all_sets(0, 0, PACKED != 0, 1);  // with the 500-cycle hold; the accumulate pass closes the fill when it runs
   endtask
 
   // ── Review Focus 4: four partial sets of zeros, then set ACCUM_PASSES-1's own passes ─────
   // Only the last set has a result: one L3 set of beats and one L6 bank; the partial sets spend no L3 or L6 credit.
-  logic [DATA_WIDTH-1:0] acc_results[$];
-  int acc_bounds[$];
   int acc_beats = 0, acc_banks = 0;
   always_ff @(posedge clk_i) begin
-    if (acc_on) begin
-      for (int lane = 0; lane < NUM_LANES; lane++) if (result_valid_o[lane]) acc_results.push_back(final_result_o[lane]);
-      if (pipeline_complete_o) acc_bounds.push_back(acc_results.size());
+    if (acc_on) begin  // its words and boundaries come from the L9 consumer
       if (dut.wide_rd_valid) acc_beats <= acc_beats + 1;
       if (dut.bank_done) acc_banks <= acc_banks + 1;
     end

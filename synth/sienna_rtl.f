@@ -28,10 +28,13 @@ GPNAE/src/TYTAN/barrel_mac.sv
 GPNAE/src/fp32_down.sv
 GPNAE/src/gpnae_tail.sv
 GPNAE/src/gpnae_poly_int8.sv
+GPNAE/src/lane_fifo.sv
+GPNAE/src/lane_link.sv
 GPNAE/src/gpnae_poly.sv
 Maxpool/Maxpool_2D.sv
 Dropout/dropout.sv
 src/fwft.sv
+src/l9_sink.sv
 src/requant_lanes.sv
 src/sienna_top.sv
 src/sienna_layer.sv

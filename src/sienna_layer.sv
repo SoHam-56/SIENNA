@@ -187,6 +187,13 @@ module sienna_layer #(
     assign p_wc[r].data = 1'b0;
   end
 
+  // L9: a sink per lane that never stalls, so the outputs leave as they did before the output had credits (Task 6 adds back-pressure).
+  credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) p_out[NUM_LANES] ();
+  for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
+    l9_sink #(.DATA_W(DATA_WIDTH)) sink (.clk_i(clk_i), .rstn_i(rstn_i), .lnk(p_out[l]), .valid_o(result_valid_o[l]),
+                                         .data_o(final_result_o[l]));
+  end
+
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
       .N                (N),
@@ -226,8 +233,7 @@ module sienna_layer #(
       .west_write_enable_i        (p_west_we),
       .west_write_data_i          (p_west),
       .west_write_reset_i         (1'b0),
-      .final_result_o             (final_result_o),
-      .result_valid_o             (result_valid_o),
+      .out                        (p_out),
       .pipeline_complete_o        (p_complete),
       .done_set_id_o              (p_done_id),
       .systolic_busy_o            (),

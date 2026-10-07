@@ -13,16 +13,29 @@ module dropout #(
     input wire clk,
     input wire rst_n,
 
-    input wire                  in_valid,
+    credit_link_if.consumer in,   // one beat per put; its credits are out's, passed through, since every beat leaves after a fixed delay
+    credit_link_if.producer out,  // one beat per put
     input wire                  training_mode,
-    input wire [DATA_WIDTH-1:0] data_in,
     input wire                  reseed_i,  // load seed_i into the LFSR; only between sets
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
-    input wire [DATA_WIDTH-1:0] zero_point_i,  // int8 training: a dropped beat becomes this (D-5); other formats ignore it
-
-    output logic [DATA_WIDTH-1:0] data_out,
-    output logic                  valid_out
+    input wire [DATA_WIDTH-1:0] zero_point_i  // int8 training: a dropped beat becomes this (D-5); other formats ignore it
 );
+
+  // The downstream credit is the upstream's: a beat is put here only on a slot already reserved past this unit's pipeline.
+  wire                  in_valid = in.put;
+  wire [DATA_WIDTH-1:0] data_in  = in.data;
+  logic [DATA_WIDTH-1:0] data_out;
+  logic                  valid_out;
+  assign out.put   = valid_out;
+  assign out.data  = data_out;
+  assign in.credit = out.credit;
+`ifndef SYNTHESIS
+  // Interface widths are not elaboration constants in Verilator, so the link widths are checked at time 0.
+  initial
+    if ($bits(in.data) != DATA_WIDTH || $bits(out.data) != DATA_WIDTH || $bits(in.credit) != $bits(out.credit))
+      $fatal(1, "dropout: links need data %0d bits and equal credit widths, found %0d/%0d and %0d/%0d", DATA_WIDTH, $bits(in.data),
+             $bits(in.credit), $bits(out.data), $bits(out.credit));
+`endif
 
   localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: no multiplier, the 1/keep factor lives in the next layer's scale
   localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));

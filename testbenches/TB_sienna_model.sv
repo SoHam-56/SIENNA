@@ -90,6 +90,13 @@ module TB_sienna_model;
     forever #5 clk_i = ~clk_i;
   end
 
+  // L9: a sink per lane that never stalls, so the outputs arrive as they did before the output had credits.
+  credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) out_lnk[NUM_LANES] ();
+  for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
+    l9_sink #(.DATA_W(DATA_WIDTH)) sink (.clk_i(clk_i), .rstn_i(rstn_i), .lnk(out_lnk[l]), .valid_o(result_valid_o[l]),
+                                         .data_o(final_result_o[l]));
+  end
+
   sienna_top #(
       .NUM_LANES        (NUM_LANES),
       .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
@@ -125,8 +132,7 @@ module TB_sienna_model;
       .west_write_enable_i        (west_write_enable_i),
       .west_write_data_i          (west_write_data_i),
       .west_write_reset_i         (west_write_reset_i),
-      .final_result_o             (final_result_o),
-      .result_valid_o             (result_valid_o),
+      .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),
       .systolic_busy_o            (systolic_busy_tb),

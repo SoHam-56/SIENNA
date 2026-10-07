@@ -70,7 +70,8 @@ module TB_sienna_top #(
   localparam int QUIET_TB = 16 + 4 * LINK_STAGES;
   credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
                                               .has_credit_o(), .count_o(host_cnt));
-  credit_link_checker #(.SLOTS(2)) chk_host (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(host_lnk));
+  localparam int HOST_SLOTS = (SETS_IN_FLIGHT < 2) ? SETS_IN_FLIGHT : 2;  // the host holds both staging credits unless the entry admits fewer sets
+  credit_link_checker #(.SLOTS(HOST_SLOTS)) chk_host (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(host_lnk));
   for (genvar r = 0; r < 2; r++) begin : G_WC
     credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(wc_lnk[r].put), .credit_i(wc_lnk[r].credit),
                                            .has_credit_o(), .count_o(wc_cnt[r]));
@@ -86,6 +87,7 @@ module TB_sienna_top #(
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
+  int acc_bound_passed = 0;  // bf16 accumulate-pass outputs inside its loose bound, counted apart from the tolerance passes
   // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
   int over_admit = 0;
   always @(negedge clk_i) if (rstn_i && tb_inflight + int'(host_cnt) > SETS_IN_FLIGHT) over_admit++;
@@ -985,10 +987,11 @@ module TB_sienna_top #(
     $display("  [Stream] most sets in flight: %0d", max_in_flight);
     $display("  [Stream] mesh stalled on full result banks: %0d cycles", bp_mesh);
     $display("  [Stream] activation stalled on full activation banks: %0d cycles", bp_act);
-    if (ov_mesh_g == 0) begin
+    if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1) begin
       failed++;
       $display("  [FAIL] Overlap: the mesh never computed while the activation stage held a set");
-    end
+    end else if (ov_mesh_g == 0)
+      $display("  [Stream] mesh/activation overlap not reachable: SETS_IN_FLIGHT 1 admits one set at a time");
     // Only a failure if a mesh result was waiting while pooling ran; with the mesh slowest there is nothing to overlap.
     if (ov_g_p == 0 && pool_with_result > 0) begin
       failed++;
@@ -1052,11 +1055,11 @@ module TB_sienna_top #(
         end
       end
     join_none
-    while (!(gpnae_busy_tb && dut.sets_out >= 2) && waited < TIMEOUT_CYCLES) begin
+    while (!(gpnae_busy_tb && dut.sets_out >= HOST_SLOTS) && waited < TIMEOUT_CYCLES) begin
       @(posedge clk_i);
       waited++;
     end
-    if (!(gpnae_busy_tb && dut.sets_out >= 2)) begin
+    if (!(gpnae_busy_tb && dut.sets_out >= HOST_SLOTS)) begin
       failed++;
       $display("  [FAIL] Never reached two sets in flight before the reset");
     end
@@ -1075,14 +1078,14 @@ module TB_sienna_top #(
       $display("  [FAIL] %0d cycles of output after reset with nothing started", stray);
     end
     // Review Focus 1: every consumer advertised its slots again and every producer counted them from 0.
-    if (host_cnt != 2 || dut.l1_cnt != 2 || dut.l0_out != 2 || dut.sets_out != 0 || dut.l6_cnt != 2 || !dut.l3_armed ||
+    if (host_cnt != HOST_SLOTS || dut.l1_cnt != 2 || dut.l0_out != HOST_SLOTS || dut.sets_out != 0 || dut.l6_cnt != 2 || !dut.l3_armed ||
         int'(dut.systolic_array_inst.res_cnt) != PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage != 0) begin
       failed++;
-      $display("  [FAIL] Not idle after reset: host %0d (2), staging %0d (2), granted %0d (2), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
-               host_cnt, dut.l1_cnt, dut.l0_out, dut.sets_out, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE,
+      $display("  [FAIL] Not idle after reset: host %0d (%0d), staging %0d (2), granted %0d (%0d), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
+               host_cnt, HOST_SLOTS, dut.l1_cnt, dut.l0_out, HOST_SLOTS, dut.sets_out, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE,
                wc_cnt[0], wc_cnt[1], dut_stage);
-    end else $display("  [Reset] idle after reset: every link re-advertised (host 2, staging 2, act banks 2, results %0d, regions 1 1), no stray output",
-                      PER_LANE);
+    end else $display("  [Reset] idle after reset: every link re-advertised (host %0d, staging 2, act banks 2, results %0d, regions 1 1), no stray output",
+                      HOST_SLOTS, PER_LANE);
     write_cache();  // the reset closed the cache fill: open it again
     stream_all_sets(0, 0, PACKED != 0);  // the accumulate pass closes the fill when it runs
   endtask
@@ -1151,6 +1154,10 @@ module TB_sienna_top #(
       waited++;
     end
     acc_on = 0;
+    if ($test$plusargs("acc_fault") && acc_results.size() > 0) begin  // on purpose: the summed set's first output corrupted
+      acc_results[0] = acc_results[0] ^ DATA_WIDTH'(1 << (DATA_WIDTH - 2));
+      $display("  [FAULT acc] the accumulate pass's first output corrupted");
+    end
     read_mem_file($sformatf("expected_output_%0d.mem", G), exp_q);
     read_mem_file($sformatf("bound_output_%0d.mem", G), bnd_q);
     if (acc_bounds.size() != n || !drained) begin
@@ -1177,7 +1184,7 @@ module TB_sienna_top #(
         total_elements++;
         if (acc_results[i] === exp_q[i]) exact_passed++;
         else if (EXP_W == 8 && MAN_W == 7 && d <= acc_max_e / 16.0) begin
-          tol_passed++;
+          acc_bound_passed++;
           if (d > acc_max_d) acc_max_d = d;
         end
         else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
@@ -1190,10 +1197,10 @@ module TB_sienna_top #(
     end
     // Credits: one set of beats and one bank spent; drained, every link holds all its slots again.
     if (acc_beats != PER_LANE || acc_banks != 1 || dut.l6_cnt != 2 || !dut.l3_armed ||
-        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || dut.l1_cnt != 2 || host_cnt != 2) begin
+        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || dut.l1_cnt != 2 || host_cnt != HOST_SLOTS) begin
       failed++;
-      $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (2)",
-               acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt);
+      $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (%0d)",
+               acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt, HOST_SLOTS);
     end
     $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d mismatches, bf16 at most %g off, largest output %g); %0d result beats and %0d activation bank spent",
              acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), errs, acc_max_d, acc_max_e,
@@ -1380,6 +1387,7 @@ module TB_sienna_top #(
     $display(" Total    : %0d", total_elements);
     $display(" Exact    : %0d", exact_passed);
     $display(" Tol pass : %0d  (rel <= %.1f%%)", tol_passed, REL_TOL * 100.0);
+    $display(" Acc bound: %0d  (bf16 accumulate pass, within 1/16 of its set's largest output)", acc_bound_passed);
     $display(" Failed   : %0d", failed);
     $display("----------------------------------------------");
     if (failed == 0) $display(" RESULT: PASSED");

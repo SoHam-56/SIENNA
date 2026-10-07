@@ -228,7 +228,7 @@ module sienna_top #(
   credit_counter #(.MAX(2), .CRW(1)) l1_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(l1p.put), .credit_i(l1p.credit), .has_credit_o(),
                                             .count_o(l1_cnt));
   assign entry_full = (int'(sets_out) + int'(l0_out)) >= SETS_IN_FLIGHT;
-  assign l0_grant = live && (CRW'(l1_cnt) > l0_out) && !entry_full;
+  assign l0_grant = live && (int'(l1_cnt) > int'(l0_out)) && !entry_full;  // uncast: CRW is 1 bit when SETS_IN_FLIGHT is 1
   assign l0.credit = l0_grant;
 
   // Rows, cache writes and bias pass as many stages as the put (L0 then L1), so a set's rows reach its bank before its put.

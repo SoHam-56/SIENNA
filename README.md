@@ -49,11 +49,11 @@ GFLOPS (GOPS in int8), 24 sets per run, with the activation applied to every set
 | Activation | N = 16 | N = 32 | N = 64 |
 |---|---|---|---|
 | ReLU / linear, no pooling | 410 · 410 · 410 | 1 729 · 1 729 · 1 706 | 7 434 · 7 434 · 7 434 |
-| SELU | 36 · 50 · 80 | 111 · 128 · 190 | 745 · 942 · 1 519 |
-| sigmoid | 29 · 39 · 74 | 97 · 134 · 173 | not in the N = 64 sweep |
-| tanh | 30 · 41 · 72 | 100 · 118 · 170 | 470 · 668 · 1 361 |
+| SELU | 36 · 50 · 81 | 111 · 128 · 190 | 745 · 942 · 1 519 |
+| sigmoid | 29 · 39 · 75 | 97 · 134 · 173 | not in the N = 64 sweep |
+| tanh | 30 · 41 · 73 | 100 · 118 · 170 | 470 · 668 · 1 361 |
 
-N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
+N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. N = 16 is measured on the current design; N = 32 and 64 on the design just before the credit links (tag `job_packing_v5`), which at N = 16 differs by at most one cycle per set. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
 
 ### MLPerf Tiny models
 

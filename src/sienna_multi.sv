@@ -30,7 +30,10 @@ module sienna_multi #(
     parameter int STRIDE_COLS       = 2,
     parameter int PADDING           = 1,
     parameter int DROPOUT_P_PERCENT = 50,
-    parameter int LFSR_WIDTH        = 32
+    parameter int LFSR_WIDTH        = 32,
+    parameter int LINK_STAGES       = 0,   // each copy's register stages on L0, L1, L3 and L9, as sienna_top
+    parameter int OUT_MAX           = 64,  // the most L9 credits the consumer may grant per lane
+    parameter int OUT_CRW           = 1    // L9 credit width
 ) (
     input logic clk_i,
     input logic rstn_i,
@@ -106,7 +109,7 @@ module sienna_multi #(
       assign wcc[r].data = wc_region[r].data;
       assign wc_cred[r][c] = wcc[r].credit;
     end
-    credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) outl[NUM_LANES] ();
+    credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) outl[NUM_LANES] ();
     for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
       assign out[c*NUM_LANES+l].put = outl[l].put;
       assign out[c*NUM_LANES+l].data = outl[l].data;
@@ -138,7 +141,10 @@ module sienna_multi #(
         .STRIDE_COLS      (STRIDE_COLS),
         .PADDING          (PADDING),
         .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
-        .LFSR_WIDTH       (LFSR_WIDTH)
+        .LFSR_WIDTH       (LFSR_WIDTH),
+        .LINK_STAGES      (LINK_STAGES),
+        .OUT_MAX          (OUT_MAX),
+        .OUT_CRW          (OUT_CRW)
     ) pipe (
         .clk_i                      (clk_i),
         .rstn_i                     (rstn_i),

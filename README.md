@@ -24,7 +24,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 - **Matrix engine** ([SystolicMesh](https://github.com/SoHam-56/SystolicMesh)). The mesh is a grid of small systolic arrays, and each one computes its own block of the result from start to finish, so they all finish together and nothing has to be combined afterwards. Inputs, running sums and results each have spare buffers, so the next set loads while the current one multiplies and the previous result is read out. Weights that a layer reuses stay in an on-chip cache instead of being sent again.
 - **Activation** ([GPNAE](https://github.com/SoHam-56/GPNAE)). Sigmoid, tanh and SELU are usually computed from e^x, which takes a long series of terms and, for sigmoid and tanh, a slow division. SIENNA instead approximates each function directly with a short polynomial, which needs only multiplies and adds. A tanh takes about 21 cycles instead of 747 in the published design. Each lane's multiply-add unit works on many inputs in turn, so it starts a new operation every cycle, and 32 lanes run side by side.
-- **Pipeline.** Up to 15 sets are in flight at once, each stage working on a different one. The host interface is hardware (a DMA engine, or the layer engine's input streams): a credit counter at the entry tells it when a new set may start, and a credit returns as each set leaves. Between the stages, the mesh and the activation stage each pass a set on only when the next stage has a free buffer; pooling, dropout and the output take every result as it comes. Each set can use a different activation function.
+- **Pipeline.** Up to 15 sets are in flight at once, each stage working on a different one, and each set can use a different activation function. Every boundary, from the host interface to the output, is the same *credit link*: the receiving side grants one credit per free buffer slot, and the sending side sends only while it holds one. Nothing can overrun or be dropped, and a slow consumer at the output simply holds the pipeline back, stage by stage, until it is ready. The host interface is hardware (a DMA engine, or the layer engine's input streams).
 - **Layer engine.** `sienna_layer` runs a whole network layer on its own. It splits the layer into sets, reuses weights, and adds the bias and any skip connection. It handles depthwise convolution and, in int8, the rescaling of each output channel. The host only streams the data in.
 - **Packing.** A layer much smaller than the mesh would leave most of it idle. Several such layers are packed side by side into one matrix multiply, each in its own block, and run together. The hardware ignores everything outside each layer's block, so every result is identical to running the layers one at a time.
 - **Number format chosen at build time.** One build parameter makes the whole pipeline fp32, bf16 or int8 (int32 sums, TensorFlow Lite rescaling). It selects the multipliers, adders and activation lanes for that format, and each build runs that one format. bf16 and int8 builds match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
@@ -39,7 +39,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 | N = 16, fp32, bias + ReLU set | Cycles | Time |
 |---|---|---|
-| First result (latency) | 100 | 105 ns |
+| First result (latency) | 99 | 104 ns |
 | Each further set while streaming (throughput) | 19 | 20 ns |
 
 ### Throughput while streaming sets
@@ -121,7 +121,7 @@ Read them as an indication of where the architecture stands.
 - The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size (fp32 at 64 × 64 with one 64 × 64 array is still running). Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
 - The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.
-- Assertions on every handshake run in every simulation, and a firing assertion fails the run.
+- A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random and held for 500 cycles mid-stream.
 
 ---
 

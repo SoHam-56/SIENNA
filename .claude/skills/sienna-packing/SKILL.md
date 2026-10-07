@@ -7,7 +7,7 @@ description: Use when designing, building or verifying SIENNA's multi-job packin
 
 **Status: implemented and verified 2026-10-04 on the packing branch (gated tree SIENNA 8d7a4b2, SystolicMesh b1a2c31; the commit after it changes only this skill) at N = 8-32; N = 64 after check-in.**
 Spec approved 2026-10-04; "As built" at the end lists every deviation. The design before this work (2026-10-04) is tagged
-`three_formats_v4` in SIENNA and SystolicMesh, `three_formats_v2` in GPNAE and `int8_units_v3` in ArithmeticLibrary.
+`three_formats_v4` in SIENNA and SystolicMesh and `three_formats_v2` in GPNAE.
 
 ## The problem
 

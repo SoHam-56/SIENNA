@@ -1202,6 +1202,14 @@ def judge(name, desc, fmt, stats, r):
     return {"hw": hw, "bad_layers": sorted(bad), "task": task, "reported": reported, "task_line": line, "rep_key": (name, fmt) if rep else None}
 
 
+def verdict_word(g, kind: str) -> str:
+    """judge's word for one part ('hw' or 'task') of an inference: a reported failure reads FAIL (reported, not gated), never PASS."""
+    if g[kind]:
+        return "FAIL"
+    tag = "FAIL hardware" if kind == "hw" else "FAIL task"
+    return "FAIL (reported, not gated)" if any(m.startswith(tag) for m in g["reported"]) else "PASS"
+
+
 def gate_verdict(tally, models, fault=None) -> tuple:
     """(ok, extra failures, notes) of a whole run: no hardware or task failure, every requested model ran, a test-only fault was applied."""
     extra = [f"FAIL coverage: {m} ran no inference" for m in models if not tally["runs"].get(m)]
@@ -1434,8 +1442,7 @@ def model_main(argv=None):
             log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
                 f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
             g = r["gate"]
-            extra_rep = f"  reported, not gated: {len(g['reported'])} FAIL" if g["reported"] else ""
-            log(f"  gate: hardware {'FAIL' if g['hw'] else 'PASS'} ({len(stats)} layers, {how})  task {'FAIL' if g['task'] else 'PASS'} ({g['task_line']}){extra_rep}")
+            log(f"  gate: hardware {verdict_word(g, 'hw')} ({len(stats)} layers, {how})  task {verdict_word(g, 'task')} ({g['task_line']})")
             for m in g["hw"] + g["task"] + g["reported"]:
                 log(f"    {m}")
             tally["layers"] += len(stats)

@@ -77,13 +77,18 @@ module TB_sienna_top #(
                                            .has_credit_o(), .count_o(wc_cnt[r]));
     credit_link_checker #(.SLOTS(1)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained && !wc_open_tb[r]), .lnk(wc_lnk[r]));
   end
+  logic sum_open;  // the last set put was a partial sum: it completes before the mesh frees its staging bank, so no drain until the sum ends
+  set_side_t side_put;
+  assign side_put = set_side_t'(host_lnk.data[SIDE_W-1:0]);
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) begin
       tb_inflight <= 0;
       quiet_cyc   <= 0;
+      sum_open    <= 1'b0;
     end else begin
       tb_inflight <= tb_inflight + int'(host_lnk.put) - int'(pipeline_complete_o);
-      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put || sum_open) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+      if (host_lnk.put) sum_open <= side_put.accumulate;
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running

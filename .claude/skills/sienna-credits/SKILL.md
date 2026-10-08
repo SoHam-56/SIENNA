@@ -199,6 +199,13 @@ All at N 16, T 4, from the runs named in the comparison log; GFLOPS, GOPS and µ
 - Mid-stream reset (`+mid_reset=C`): TB_model_run on the fp32 cached residual layer (also with 2 L9 slots and 50% stalls, and at `LINK_STAGES` 1) and TB_sienna_multi int8 cached (a fill open at the reset) come home (row counts 0, staging and region credits back, the turn at copy 0, every L9 slot re-advertised, no stray output), then give outputs identical to a run without the reset (crf_layer, crf_layer_ls1, crf_multi_int8, crf_multi_ls1_int8); `-DTB_STALE_HOME` fires the home check (crf_layer_stale, crf_multi_stale).
 - `make regression FMT=int8` passes on the final SIENNA head (crf_gate2_int8); GPNAE's lane regression (crf_gp_int8b) and the SystolicMesh N 16 int8 regression (crf_sm16_int8b) pass on the AriL bump.
 
+### N = 64 fixes (2026-10-08, branch `n64_fixes`, SIENNA only)
+
+- **A partial set completes before the mesh frees its staging bank** (it passes the activation stage two cycles after its put; the broadcast takes T cycles plus any wait for an operand bank). Every drain judgement therefore waits for the sum to close: `sienna_top`'s internal `drained` on `last_accum`, TB_sienna_top's on `sum_open`. Without it `a_all_back` fired on a late, not lost, staging credit at T 32 and 64 (684b850, b9731f7).
+- **The accumulate pass's bf16 reference is bit-exact:** the mesh's accumulator slot (product count mod 6) runs on through the zero partials, so regression.py writes `expected_accum.mem` from `mesh_model` with those passes and the TB compares exactly (8a8181b); the max|exp|/16 bound is gone.
+- **The hold lasts `HOLD_CYC` = max(500, (SETS_IN_FLIGHT + 2) * (N*N/HOST_WORDS + 4))** (1156 at N 64), and the host must be blocked whenever it has more sets left at the hold's start than the entry admits after it (563c930).
+- Evidence and runs: `.superpowers/sdd/n64-fix-report.md`.
+
 ### Known limits
 
 - The mesh's push leaves one idle beat between two result banks (rate BEATS/(BEATS+1)); not exposed in SIENNA at N 16 T 4 because L3 is granted one set at a time.

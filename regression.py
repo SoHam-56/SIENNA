@@ -51,6 +51,7 @@ from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
+ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
 ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "all")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -399,6 +400,7 @@ def _check_mem_widths(fmt: str, num_sets: int) -> None:
     per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
     names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output")]
     names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
+    names += [] if fmt == "int8" else ["expected_accum.mem"]  # int8's accumulate pass reads its group's own golden
     for fn in names:
         want = 8 if fmt == "int8" and fn.startswith(("bias_", "requant_")) else d
         if os.path.exists(os.path.join(TB_DIR, fn)):
@@ -725,6 +727,10 @@ def generate_vectors(cfg: dict) -> None:
                 _golden_bits(grp, gbias, cfg, act_k, set_dropout_seed(drop_seed, k), fmt)[3]
             write_bits(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk, fmt)  # empty for a partial set
             write_bits(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(Fk), fmt)
+            if k == passes - 1:  # TB_sienna_top's accumulate pass: zero partials with set 0's B, then group 0; the mesh's slot rotation runs on through them
+                Z = np.zeros_like(grp[0][0])
+                write_bits(os.path.join(TB_DIR, "expected_accum.mem"), _golden_bits([(Z, grp[0][1])] * ACCUM_ZERO_PASSES + grp, gbias, cfg,
+                                                                                  act_k, set_dropout_seed(drop_seed, k), fmt)[3], fmt)
             Fk = bits_float(Fk, fmt)  # the dropout-mask check below reads values
         else:
             write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set

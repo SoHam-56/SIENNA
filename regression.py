@@ -339,6 +339,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
     assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
     credits = cfg.get("credits", SETS_IN_FLIGHT)
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+        raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     use_bias = bool(cfg.get("bias", False))
     req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
     reals = [(A0 * scale, B0 * scale)]
@@ -360,7 +362,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
         parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(len(ks))]
         acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
         rq = requant_params(acc, s_a, s_w, act_g, req_rng, zqs[g])
-        complete = len(ks) == passes  # a trailing short group has only partial passes, as in the float tests
+        complete = len(ks) == passes  # always, since num_sets is a whole number of groups
         if act_g == "selu" and complete:
             R = requantize(acc, rq)
             sat[0] += int(np.sum(selu_saturates(rq["mx"], rq["shx"], rq["zp"], R)))
@@ -689,6 +691,8 @@ def generate_vectors(cfg: dict) -> None:
     # Enough sets to use every credit, so the credit-overrun pass is reachable; whole accumulate groups only.
     credits = cfg.get("credits", SETS_IN_FLIGHT)  # a test may build the pipeline with fewer credits than the default
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+        raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     masks = []
     run = None
     run_s = None  # sum|a*b| behind the running partial sum

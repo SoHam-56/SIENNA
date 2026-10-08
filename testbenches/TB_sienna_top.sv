@@ -1318,7 +1318,7 @@ module TB_sienna_top #(
       read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
       read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
       if (j < 4) foreach (west_data_queue[i]) west_data_queue[i] = '0;
-      accumulate_i = (j < n - 1);
+      accumulate_i = (j < n - 1) || $test$plusargs("acc_open");  // on purpose with +acc_open: the sum never closes
       activation_function_i = act_of(G);
       num_terms_i = terms_of(G);
       dropout_seed_i = set_seed(G);
@@ -1557,6 +1557,12 @@ module TB_sienna_top #(
     end
     reset_mid_stream();
     accum_null_pass();
+    // sienna_top's own link checkers judge only when it is drained: it must drain after the last set.
+    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.drained; w++) @(posedge clk_i);
+    if (!dut.drained) begin
+      failed++;
+      $display("  [FAIL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.drain_n);
+    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
 
     $display("\n==============================================");
     $display(" RESULT SUMMARY");

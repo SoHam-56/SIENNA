@@ -39,7 +39,7 @@ from mesh_model import fpu  # noqa: E402
 import model_runner as mr  # noqa: E402  the numerics and the device build package, one owner each
 from model_runner import (  # noqa: E402
     FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _check_rounding, _config_items, activate_int8, activation_to_code,
-    apply_activation, bits_float, drop_zp, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
+    apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 
@@ -1291,33 +1291,6 @@ TRANSFORMER = [
     ("decode_proj_1tok", 1, 768, 768),
     ("decode_mlp_up_1tok", 1, 768, 3072),
 ]
-
-
-def exact_layer(A, B, bias, act, N, fmt, T=4):
-    """Bit-exact output of sienna_layer for one product in a narrow format: per output tile, the depth blocks as passes in
-    order (format_layer's order), the bias with the first, then the lane; T is the build's tile size."""
-    f = fpu.FORMATS[fmt]
-    M, K = A.shape
-    C = B.shape[1]
-    rt, ct, dt = -(-M // N), -(-C // N), -(-K // N)
-    Ap = np.zeros((rt * N, dt * N), np.float32)
-    Ap[:M, :K] = A
-    Bp = np.zeros((dt * N, ct * N), np.float32)
-    Bp[:K, :C] = B
-    bp = np.zeros(ct * N, np.float32)
-    if bias is not None:
-        bp[: bias.size] = bias
-    rom = gpnae_model.read_rom(os.path.join(mr.ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
-    lane = gpnae_model.Lane(f, rom)
-    Y = np.zeros((rt * N, ct * N), np.int64)
-    for c in range(ct):
-        for r in range(rt):
-            passes = [(mr.fmt_bits(Ap[r * N:(r + 1) * N, t * N:(t + 1) * N], fmt), mr.fmt_bits(Bp[t * N:(t + 1) * N, c * N:(c + 1) * N], fmt))
-                      for t in range(dt)]
-            b = mr.fmt_bits(bp[c * N:(c + 1) * N], fmt) if bias is not None else None
-            Ct = mesh_model.matmul(f, passes, N, T, 1, b)
-            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = lane.run(Ct, mr.activation_to_code(act))
-    return Y[:M, :C]
 
 
 def run_int8(a, sim, shapes) -> None:

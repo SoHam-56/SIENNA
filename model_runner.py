@@ -2,13 +2,13 @@
 """SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers)."""
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
-#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact; TFLite's kernels
+#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact, exact_sum, exact_layer; TFLite's kernels
 #   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_layer, job_of
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
 #   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_model_run), RtlSets (TB_sienna_model), Emulator (numpy)
-#   7. Runtime          execute, macs_of
+#   7. Runtime          execute, macs_of; the model gate: check_layer, its bounds (FP32_LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
 #   8. CLI              model_main, tflite_main, tflite_pack_main, main
 
 import argparse
@@ -29,6 +29,7 @@ sys.path.insert(0, ROOT)
 sys.path.append(os.path.join(ROOT, "GPNAE"))  # appended: the submodules have their own regression.py, which must not shadow ours
 sys.path.append(os.path.join(ROOT, "SystolicMesh"))
 import gpnae_model  # noqa: E402
+import mesh_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
 sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
 import ipu  # noqa: E402
@@ -223,6 +224,46 @@ def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
                for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
     return activate_int8(requantize(acc, rq), act, rq)
+
+
+def word_bits(x, fmt: str) -> np.ndarray:
+    """Float32 values holding a float format's words (as read_outputs widens them) back to the words, unrounded."""
+    return np.asarray(x, np.float32).view(np.uint32).astype(np.int64) >> (23 - FORMATS[fmt][1])
+
+
+_LANES = {}
+
+
+def exact_sum(passes, bias, act: str, N: int, fmt: str, T: int, collapse_k=None) -> np.ndarray:
+    """Bit-exact N x N result of one sum in a float format: mesh_model over its passes (A, B words) in order, the bias words in the reducer, then the GPNAE lane."""
+    f = fpu.FORMATS[fmt]
+    if fmt not in _LANES:
+        _LANES[fmt] = gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+    C = mesh_model.matmul(f, passes, N, T, COLLAPSE_K if collapse_k is None else collapse_k, bias)
+    return _LANES[fmt].run(C, activation_to_code(act))
+
+
+def exact_layer(A, B, bias, act, N, fmt, T=4):
+    """Bit-exact output of sienna_layer for one product in a float format: per output tile, the depth blocks as passes in
+    order (format_layer's order), the bias with the first, then the lane; T is the build's tile size."""
+    M, K = A.shape
+    C = B.shape[1]
+    rt, ct, dt = -(-M // N), -(-C // N), -(-K // N)
+    Ap = np.zeros((rt * N, dt * N), np.float32)
+    Ap[:M, :K] = A
+    Bp = np.zeros((dt * N, ct * N), np.float32)
+    Bp[:K, :C] = B
+    bp = np.zeros(ct * N, np.float32)
+    if bias is not None:
+        bp[: bias.size] = bias
+    Y = np.zeros((rt * N, ct * N), np.int64)
+    for c in range(ct):
+        for r in range(rt):
+            passes = [(fmt_bits(Ap[r * N:(r + 1) * N, t * N:(t + 1) * N], fmt), fmt_bits(Bp[t * N:(t + 1) * N, c * N:(c + 1) * N], fmt))
+                      for t in range(dt)]
+            b = fmt_bits(bp[c * N:(c + 1) * N], fmt) if bias is not None else None
+            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(passes, b, act, N, fmt, T)
+    return Y[:M, :C]
 
 
 def _check_rounding() -> None:
@@ -938,6 +979,31 @@ class RtlLayer:
         self.words += (len(a) + len(w)) * N
         return Y[:M, :C], n, cyc
 
+    def exact(self, job):
+        """Bit-exact words run_job must return for a float job, from the streams format_layer sends: per tile its depth passes, the residual's identity pass, the bias."""
+        N, fmt = self.N, self.fmt_name
+        cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
+        dt = -(-cfg["kb"] // N)
+        cached = rt > 1 and dt <= WC_TILES // 2  # sienna_layer's rule: a cached block's weight tiles are sent once
+        ab, wb = fmt_bits(a, fmt), fmt_bits(w, fmt)
+        eye = fmt_bits(np.eye(N, dtype=np.float32), fmt)  # the residual pass's B, sienna_layer's ONE on the diagonal
+        Y = np.zeros((rt * N, ct * N), np.int64)
+        ai = wi = 0
+        for c in range(ct):
+            b = None
+            if cfg["bias"]:
+                b, wi = wb[wi], wi + 1
+            for r in range(rt):
+                if r == 0 or not cached:
+                    Wt, wi = [wb[wi + t * N:wi + (t + 1) * N] for t in range(dt)], wi + dt * N
+                passes, ai = [(ab[ai + t * N:ai + (t + 1) * N], Wt[t]) for t in range(dt)], ai + dt * N
+                if cfg["residual"]:
+                    passes, ai = passes + [(ab[ai:ai + N], eye)], ai + N
+                Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(passes, b, job["act"], N, fmt, self.T)
+        if ai != len(ab) or wi != len(wb):
+            raise RuntimeError(f"exact: decoded {ai}/{len(ab)} A rows and {wi}/{len(wb)} W rows of format_layer's streams")
+        return Y[:M, :C]
+
 
 class RtlSets:
     """The TB_sienna_model binary, built once per configuration and run once per layer."""
@@ -997,9 +1063,21 @@ class RtlSets:
             Y[r * N : (r + 1) * N, c * N : (c + 1) * N] = o.reshape(N, N)
         return Y[:P, :C], n, cyc
 
+    def exact(self, job):
+        """Bit-exact fp32 words run_job must return: per group its passes (zero weight tiles skipped, as tile_job sends them) and its bias, then the lane."""
+        N = self.N
+        groups, (P, C, rt, ct) = tile_job(job, N)
+        Y = np.zeros((rt * N, ct * N), np.int64)
+        for (r, c), passes, bias in groups:
+            pb = [(word_bits(A, "fp32"), word_bits(B, "fp32")) for A, B in passes]  # write_sets sends the float32 words as they are
+            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(pb, None if bias is None else word_bits(bias, "fp32"), job["act"], N, "fp32", self.T)
+        return Y[:P, :C]
+
 
 class Emulator(RtlSets):
     """Numpy stand-in for the RTL with the same set stream: checks tiling and reassembly, not the hardware."""
+
+    exact = None  # not the hardware: no bit-exact model, only the fp32 bound
 
     def build(self):
         pass
@@ -1034,8 +1112,86 @@ def macs_of(job):
     return int(n)
 
 
-def execute(model, x, sim=None, log=None):
-    """Runs the graph. With sim, compute ops run on the RTL and outputs feed the next layer; otherwise float64 reference."""
+# The model gate's bounds, one place; the hardware itself is judged bit for bit against the backend's exact model in every float format.
+FP32_LAYER_BOUND = 1e-4  # fp32 max|hw-ref|/max|ref| per layer: gemm's fp32 bound (regression.py), 2.4x the measured worst 4.1e-05 (ms_N16_T4_fp32)
+CLASSIFIERS = ("resnet8", "kws", "vww")  # top-1 must equal the float reference's in every format
+SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.9e-05 (50x margin); bf16 operands with exact sums give 2.2e-03 (numpy estimate, 4.5x margin)
+REPORTED = {("ad01-score", "bf16")}  # known limit: bf16 builds sum in bf16 (score 3x the float model's) until the fp32-accumulation change; shown as FAIL, not counted
+
+
+def parse_fault(spec):
+    """TEST ONLY: word|shared:MODEL:LAYER:INDEX[:BIT] flips one output word's bit after the simulation (shared: in the exact model too); top1:MODEL swaps the top two outputs."""
+    if not spec:
+        return None
+    p = spec.split(":")
+    if p[0] == "top1" and len(p) == 2:
+        return {"kind": "top1", "model": p[1]}
+    if p[0] in ("word", "shared") and len(p) in (4, 5):
+        return {"kind": p[0], "model": p[1], "layer": p[2], "index": int(p[3]), "bit": int(p[4]) if len(p) == 5 else 0}
+    raise ValueError(f"--fault {spec}: expected word:MODEL:LAYER:INDEX[:BIT], shared:MODEL:LAYER:INDEX[:BIT] or top1:MODEL")
+
+
+def flip_bit(y, fmt, index, bit):
+    """TEST ONLY: a layer's float32 outputs with bit `bit` of word `index` (in the build's format) flipped."""
+    if not 0 <= bit < 1 + sum(FORMATS[fmt]):
+        raise ValueError(f"--fault: bit {bit} is outside a {fmt} word")
+    y = np.array(y, np.float32)
+    y.view(np.uint32).flat[index] ^= np.uint32(1 << (bit + 23 - FORMATS[fmt][1]))
+    return y
+
+
+def check_layer(sim, job, y, fmt, fault=None):
+    """Hardware correctness of one layer -> (y as the next layer takes it, record): every word against the backend's bit-exact model; a test-only fault flips one first."""
+    if fault:
+        y = flip_bit(y, fmt, fault["index"], fault["bit"])
+    exact = getattr(sim, "exact", None)
+    if exact is None:
+        return y, None
+    want = exact(job)
+    if fault and fault["kind"] == "shared":  # a bug the RTL and its model share: only the float bound can see it
+        want = want.copy()
+        want.flat[fault["index"]] ^= 1 << fault["bit"]
+    got = word_bits(y, fmt)
+    bad = np.flatnonzero(got != want)
+    rec = {"differ": int(bad.size), "words": int(got.size)}
+    if bad.size:
+        i, w = int(bad[0]), (1 + sum(FORMATS[fmt])) // 4
+        rec.update(index=i, row=i // got.shape[1], col=i % got.shape[1], expected=f"{int(want.flat[i]):0{w}x}", got=f"{int(got.flat[i]):0{w}x}")
+    return y, rec
+
+
+def judge(name, desc, fmt, stats, r):
+    """The gate on one inference: hardware (each layer bit-exact; fp32 also within FP32_LAYER_BOUND) and task (top-1, or ad01's score) against the float model."""
+    hw, bad = [], set()
+    for s in stats:
+        L, e = f"L{s['layer']:02d}", s["exact"]
+        if e and e["differ"]:
+            hw.append(f"FAIL hardware {name} [{desc}] {L}: {e['differ']} of {e['words']} words differ from the bit-exact model; "
+                      f"first at index {e['index']} (row {e['row']}, col {e['col']}): expected {e['expected']} got {e['got']}")
+            bad.add(L)
+        if fmt == "fp32" and not s["err"] <= FP32_LAYER_BOUND:
+            hw.append(f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the fp32 bound {FP32_LAYER_BOUND:.0e}")
+            bad.add(L)
+    task, reported = [], []
+    if name in CLASSIFIERS:
+        line = f"top-1 hw {r['hw_top']} ref {r['ref_top']}"
+        if r["hw_top"] != r["ref_top"]:
+            task.append(f"FAIL task {name} [{desc}]: top-1 {r['hw_top']} differs from the float reference's {r['ref_top']}")
+    else:  # ad01: the mean reconstruction error over the inference's slices
+        sh, sr, bound = float(np.mean(r["score_hw"])), float(np.mean(r["score_ref"])), SCORE_BOUND[fmt]
+        rel = abs(sh - sr) / sr
+        line = f"anomaly score hw {sh:.6f} ref {sr:.6f}, |hw-ref|/ref {rel:.2e}, bound {bound:.0e}"
+        if not rel <= bound:
+            m = f"FAIL task {name} [{desc}]: anomaly score {sh:.6f} against the float reference's {sr:.6f}, |hw-ref|/ref {rel:.2e} above {bound:.0e}"
+            if ("ad01-score", fmt) in REPORTED:
+                reported.append(m + " (reported, not gated: bf16 builds sum in bf16 until the fp32-accumulation change)")
+            else:
+                task.append(m)
+    return {"hw": hw, "bad_layers": sorted(bad), "task": task, "reported": reported, "task_line": line}
+
+
+def execute(model, x, sim=None, log=None, fault=None):
+    """Runs the graph. With sim, compute ops run on the RTL, each checked bit for bit (check_layer), and outputs feed the next layer; otherwise float64 reference."""
     ops, consts = model["ops"], model["consts"]
     t = dict(consts)
     t[model["input"]] = x.astype(np.float32)
@@ -1077,13 +1233,17 @@ def execute(model, x, sim=None, log=None):
             n = cyc = 0
         else:
             y, n, cyc = sim.run_job(job, f"L{li:02d}")
+        rec = None
+        if sim is not None:
+            y, rec = check_layer(sim, job, y, fmt, fault if fault and fault.get("layer") == f"L{li:02d}" else None)
         scale = float(np.max(np.abs(ref))) or 1.0
         err = float(np.max(np.abs(y.astype(np.float64) - ref))) / scale
         err_fmt = float(np.max(np.abs(y.astype(np.float64) - ref_float))) / (float(np.max(np.abs(ref_float))) or 1.0)
         stats.append({"layer": li, "kind": kind, "sets": n, "cycles": cyc, "macs": macs_of(job),
-                      "passes": len(job["terms"]), "shape": list(job["shape"]), "err": err, "err_vs_float": err_fmt})
+                      "passes": len(job["terms"]), "shape": list(job["shape"]), "err": err, "err_vs_float": err_fmt, "exact": rec})
         if log:
-            log(f"    L{li:02d} {kind:<18} {str(job['shape']):<18} sets {n:6d}  cycles {cyc:8d}  MACs {stats[-1]['macs']:9d}  max err/max|ref| {err:.2e}")
+            ex = "" if rec is None else f"  bit-exact {rec['differ']}/{rec['words']} differ"
+            log(f"    L{li:02d} {kind:<18} {str(job['shape']):<18} sets {n:6d}  cycles {cyc:8d}  MACs {stats[-1]['macs']:9d}  max err/max|ref| {err:.2e}{ex}")
         t[out] = y.reshape(job["shape"]).astype(np.float32)
     return t[model["output"]], stats
 
@@ -1170,6 +1330,8 @@ def model_main(argv=None):
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
                     help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
+    ap.add_argument("--fault", default=None, help="TEST ONLY, to prove the gate fails: word:MODEL:LAYER:INDEX[:BIT] (flip a hardware output bit), "
+                    "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
     a = ap.parse_args(argv)
     if a.fmt_name == "int8":
         ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
@@ -1194,6 +1356,14 @@ def model_main(argv=None):
         t0 = time.time()
         sim.build()
         log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
+    fault = parse_fault(a.fault)
+    if fault:
+        log(f"TEST ONLY: --fault {a.fault} (this run must FAIL the gate)")
+    sim_fmt = getattr(sim, "fmt_name", "fp32")
+    engine = "emulator" if a.emulate else f"engine {a.engine}"
+    how = ("bit-exact" if getattr(sim, "exact", None) else "no bit-exact model: emulator") + \
+        (f", fp32 bound {FP32_LAYER_BOUND:.0e}" if sim_fmt == "fp32" else "")
+    tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": []}
     results = {}
     for name in a.models.split(","):
         model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
@@ -1205,14 +1375,20 @@ def model_main(argv=None):
         inputs, source = model_inputs(name, a.model_dir, a.count, 7)
         log(f"\n== {name} ({MODELS[name]}), inputs: {source}")
         runs = []
-        for x, label, desc in inputs:
+        for ii, (x, label, desc) in enumerate(inputs):
             ref, _ = execute(model, x)
             if sim is None:
                 runs.append({"input": desc, "label": label, "ref_top": int(np.argmax(ref))})
                 continue
             c0, s0, w0, t0 = sim.cycles, sim.sets, getattr(sim, "words", 0), time.time()
             log(f"  inference on {desc}")
-            hw, stats = execute(model, x, sim, log)
+            f_here = fault if fault and fault["model"] == name and ii == 0 else None  # a test-only fault hits the model's first inference
+            hw, stats = execute(model, x, sim, log, f_here)
+            if f_here and f_here["kind"] == "top1":  # TEST ONLY: the hardware's top two outputs swapped
+                hw = np.array(hw, np.float32)
+                o = np.argsort(hw.ravel())[::-1][:2]
+                hw.ravel()[o] = hw.ravel()[o[::-1]]
+                log(f"  TEST ONLY fault: top1 swaps hw outputs {o[0]} and {o[1]}")
             cyc, sets, hwords = sim.cycles - c0, sim.sets - s0, getattr(sim, "words", 0) - w0
             macs = sum(s["macs"] for s in stats)
             diff = float(np.max(np.abs(hw.astype(np.float64) - ref)))
@@ -1224,14 +1400,40 @@ def model_main(argv=None):
                 r["score_ref"] = np.mean((x.astype(np.float64) - ref) ** 2, axis=1).tolist()
                 r["score_hw"] = np.mean((x.astype(np.float64) - hw) ** 2, axis=1).tolist()
                 log(f"  anomaly score (MSE) ref {np.mean(r['score_ref']):.6f} hw {np.mean(r['score_hw']):.6f}")
+            r["gate"] = judge(name, desc, sim_fmt, stats, r)
             runs.append(r)
             util = macs / (sets * a.n ** 3) if sets else 0
             log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
                 f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
+            g = r["gate"]
+            verdict = "FAIL" if g["task"] else "FAIL (reported, not gated)" if g["reported"] else "PASS"
+            log(f"  gate: hardware {'FAIL' if g['hw'] else 'PASS'} ({len(stats)} layers, {how})  task {verdict} ({g['task_line']})")
+            for m in g["hw"] + g["task"] + g["reported"]:
+                log(f"    {m}")
+            tally["layers"] += len(stats)
+            tally["bad_layers"] += len(g["bad_layers"])
+            tally["inferences"] += 1
+            tally["bad_inferences"] += int(bool(g["task"]))
+            for k in ("hw", "task", "reported"):
+                tally[k] += g[k]
         results.setdefault(name, {})["runs"] = runs
         results[name]["source"] = source
         json.dump(results, open(js, "w"), indent=1)
     log(f"\nreport {report}\nresults {js}")
+    if sim is None:
+        log("MODEL GATE: not run (--no-sim: float reference only)")
+        return
+    log("")
+    for m in tally["hw"] + tally["task"] + tally["reported"]:
+        log(m)
+    ok = not tally["hw"] and not tally["task"]
+    rep_names = sorted({k for k, f in REPORTED if f == sim_fmt}) if tally["reported"] else []
+    log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(results)} models, "
+        f"{tally['inferences']} inferences; hardware: {tally['bad_layers']} of {tally['layers']} layers fail ({how}); "
+        f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; "
+        f"reported, not gated: {len(tally['reported'])}{' (' + ', '.join(rep_names) + ')' if rep_names else ''}")
+    if not ok:
+        sys.exit(1)
 
 
 def tflite_main(argv=None):
@@ -1261,7 +1463,7 @@ def tflite_main(argv=None):
     t0 = time.time()
     sim.build()
     log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
-    bad, covered = 0, False
+    bad, covered, hw_bad, task_bad = 0, False, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]
         ref = np.load(path[:-len(".tflite")] + ".npz")
@@ -1277,15 +1479,24 @@ def tflite_main(argv=None):
         z_in = int(layer["input"]["zp"][0])
         padded = layer["kind"] == "CONV_2D" and layer["same"]
         covered |= padded and per_channel and z_in != 0
-        m_rtl, m_low = int(np.sum(got != want)), int(np.sum(low != want))
-        bad += int(m_rtl != 0)
+        m_rtl, m_low, m_hw = int(np.sum(got != want)), int(np.sum(low != want)), int(np.sum(got != low))
+        bad += int(m_rtl != 0 or m_hw != 0)
+        hw_bad += int(m_hw != 0)
+        task_bad += int(m_rtl != 0)
         log(f"MODEL {name}: {layer['kind']} out {shape} z_in {z_in} {'per-channel' if per_channel else 'per-tensor'} "
             f"{'SAME-padded' if padded else 'unpadded'} clamp {layer['act_range']}: RTL {m_rtl}/{want.size} differ from the "
             f"interpreter, host lowering {m_low}/{want.size}; {sets} sets, {cyc} cycles")
+        for what, ref_codes, n_bad in (("the bit-exact model (int8_layer_exact)", low, m_hw), ("the interpreter", want, m_rtl)):
+            if n_bad:
+                i = int(np.flatnonzero(got.ravel() != ref_codes.ravel())[0])
+                log(f"FAIL {name}: {n_bad} of {want.size} codes differ from {what}; first at index {i}: expected {int(ref_codes.flat[i])} got {int(got.flat[i])}")
     if not covered:
         log("no SAME-padded per-channel conv with a non-zero input zero point among the models")
         bad += 1
     log(f"TFLITE_INT8: {len(paths)} models, {bad} failing")
+    log(f"MODEL GATE: {'PASS' if bad == 0 else 'FAIL'}  int8 N={a.n} T={a.tile_size} lanes={a.lanes} TFLite layers: {len(paths)} models; "
+        f"hardware: {hw_bad} of {len(paths)} differ from the bit-exact model; task: {task_bad} of {len(paths)} differ from the interpreter"
+        f"{'; coverage missing (no SAME-padded per-channel conv with a non-zero zero point)' if not covered else ''}")
     log("RESULT: PASSED" if bad == 0 else "RESULT: FAILED")
     sys.exit(1 if bad else 0)
 

@@ -1775,7 +1775,7 @@ def one_config(name: str, args) -> tuple:
     else:
         raw = run(name, args.sets, args.build_dir)
     mdl = model(cfg, not args.slices)
-    if "RESULT: PASSED" not in raw or "Assertion failed" in raw:
+    if "RESULT: PASSED" not in raw or re.search(r"Assertion failed|%Error|%Fatal", raw):
         return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
     a = analyse(events(raw), args.sets, cfg.get("accum_passes", 1))
     s = a["sets"]
@@ -1881,6 +1881,10 @@ def perf_main(argv=None) -> None:
     open(args.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
     print(f"\nReport: {args.report}")
+    failed = [r[0] for r in (rows if not args.merge else [r for p in parts for r in p["rows"]]) if r[-1] == "FAIL"]
+    if failed:  # a config that did not pass fails the action, so sweeps see it
+        print(f"[ERROR] perf: {len(failed)} config(s) did not pass: {', '.join(failed)}")
+        sys.exit(1)
 
 
 # ── oracle (was tflite_oracle.py) ────────────────────────────────────────────

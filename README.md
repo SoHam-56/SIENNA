@@ -44,14 +44,14 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 ### Throughput while streaming sets
 
-GFLOPS (GOPS in int8), 24 sets per run, with the activation applied to every set. Each cell gives fp32 · bf16 · int8:
+24 sets per run, with the activation applied to every set. Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
 
-| Activation | N = 16 | N = 32 | N = 64 |
+| Activation | N = 16 (GFLOPS) | N = 32 (TFLOPS) | N = 64 (TFLOPS) |
 |---|---|---|---|
-| ReLU / linear, no pooling | 410 · 410 · 410 | 1 729 · 1 729 · 1 706 | 7 434 · 7 434 · 7 434 |
-| SELU | 36 · 50 · 81 | 111 · 128 · 190 | 745 · 942 · 1 519 |
-| sigmoid | 29 · 39 · 75 | 97 · 134 · 173 | not in the N = 64 sweep |
-| tanh | 30 · 41 · 73 | 100 · 118 · 170 | 470 · 668 · 1 361 |
+| ReLU / linear, no pooling | 410 · 410 · 410 | 1.73 · 1.73 · 1.71 | 7.43 · 7.43 · 7.43 |
+| SELU | 36 · 50 · 81 | 0.11 · 0.13 · 0.19 | 0.75 · 0.94 · 1.52 |
+| sigmoid | 29 · 39 · 75 | 0.10 · 0.13 · 0.17 | not in the N = 64 sweep |
+| tanh | 30 · 41 · 73 | 0.10 · 0.12 · 0.17 | 0.47 · 0.67 · 1.36 |
 
 N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. N = 16 is measured on the current design; N = 32 and 64 on the design just before the credit links (tag `job_packing_v5`), which at N = 16 differs from it by at most one cycle per set in every row of this table. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
 

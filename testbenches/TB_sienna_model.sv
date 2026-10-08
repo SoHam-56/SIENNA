@@ -72,7 +72,7 @@ module TB_sienna_model;
   longint cycle = 0;
   assign host_lnk.put = start_pipeline_i;
   assign host_lnk.data = side;
-  credit_link_checker #(.SLOTS(2)) host_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk && host_cnt == 2'd2), .lnk(host_lnk));
+  credit_link_checker #(.SLOTS(2)) host_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk), .lnk(host_lnk));
   always @(negedge clk_i)  // just before the edge that samples the put, so it reports ahead of the DUT's own checks
     #4 if (rstn_i && start_pipeline_i && host_cnt == 0) begin
       $display("[FATAL] a host put with no staging credit held at cycle %0d", cycle);
@@ -405,6 +405,11 @@ module TB_sienna_model;
     osp = out_stall_pct;
     out_stall_pct = 0;
     repeat (OUT_CAP + 4) @(posedge clk_i);
+    @(negedge clk_i);
+    drain_chk = 1'b1;  // the link checkers judge before the count check below can stop the run
+    @(negedge clk_i);
+    drain_chk = 1'b0;
+    repeat (2) @(posedge clk_i);
     if (lane_home != '1 || host_cnt != 2'd2) begin
       $display("[FATAL] credits not all back after the last set: host %0d of 2, lanes home %b", host_cnt, lane_home);
       $finish;
@@ -416,10 +421,6 @@ module TB_sienna_model;
       $finish;
     end
     $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
-    @(negedge clk_i);
-    drain_chk = 1'b1;
-    @(negedge clk_i);
-    drain_chk = 1'b0;
 
     // Sets complete in issue order, so set k's id is k mod 2^ID_W.
     bad_ids = 0;

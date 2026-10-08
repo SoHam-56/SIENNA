@@ -64,7 +64,7 @@ module TB_sienna_multi #(
     credit_counter #(.MAX(2), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host[c].put), .credit_i(host[c].credit),
                                            .has_credit_o(), .count_o(hcnt[c]));
 `endif
-    credit_link_checker #(.SLOTS(2)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk && hcnt[c] == 2'd2), .lnk(host[c]));
+    credit_link_checker #(.SLOTS(2)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk), .lnk(host[c]));
   end
 
   // ── L2: this host opens each fill of a region with one put while it holds that region's credit ──
@@ -76,7 +76,7 @@ module TB_sienna_multi #(
     assign wc_region[r].data = 1'b0;
     credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(wc_region[r].put), .credit_i(wc_region[r].credit),
                                            .has_credit_o(), .count_o(wcnt[r]));
-    credit_link_checker #(.SLOTS(1)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk && wcnt[r]), .lnk(wc_region[r]));
+    credit_link_checker #(.SLOTS(1)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk), .lnk(wc_region[r]));
   end
 
   // ── L9 per copy and lane: copy c's lane l is out_lnk[c*NUM_LANES + l] ──

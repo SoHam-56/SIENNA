@@ -2,8 +2,11 @@
 
 import test_config_pkg::*;
 
+`include "tb_l9_sink.svh"
+
 // Streams one network layer's sets from +sets=<file> through sienna_top back to back and writes every set's outputs to +out=<file>.
 // int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
+// +out_slots=S (1..64) L9 slots per lane and +out_stall_pct=P random output stalls (-DTB_OUT_STALL_PCT sets the default); +fault_put puts with no credit once.
 module TB_sienna_model;
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
@@ -29,10 +32,56 @@ module TB_sienna_model;
   logic weight_cached_i, wc_write_enable_i;
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
-  logic [1:0] wc_region_busy_o;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic [     ADDR_LINES:0] num_terms_i;
+
+  // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
+  localparam int PACK_ENTRIES = 8;
+  `include "sienna_set_side.svh"
+  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk ();
+  credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
+  logic [1:0] host_cnt;
+  set_side_t side;
+  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
+                                              .has_credit_o(), .count_o(host_cnt));
+  always_comb begin
+    side               = '0;
+    side.weight_tile   = weight_tile_i;
+    side.weight_cached = weight_cached_i;
+    side.accumulate    = accumulate_i;
+    side.bias_valid    = bias_valid_i;
+    side.train         = training_mode_i;
+    side.seed          = dropout_seed_i;
+    side.terms         = num_terms_i;
+    side.act[0]        = activation_function_i;
+    side.zp[0]         = req_zp_i;
+    side.amin[0]       = req_min_i;
+    side.amax[0]       = req_max_i;
+    side.mx[0]         = gp_mx_i;
+    side.shx[0]        = gp_shx_i;
+    side.mout[0]       = gp_mout_i;
+    side.shout[0]      = gp_shout_i;
+    side.zout[0]       = gp_zout_i;
+    side.mult          = req_mult_i;
+    side.shift         = req_shift_i;
+  end
+  // The host drives its rows, sideband and put on the falling edge, so the counter, checker and DUT sample them alike; it starts a set only with a credit held.
+  logic drain_chk = 1'b0;
+  bit fault_put = 0;
+  longint cycle = 0;
+  assign host_lnk.put = start_pipeline_i;
+  assign host_lnk.data = side;
+  credit_link_checker #(.SLOTS(2)) host_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk && host_cnt == 2'd2), .lnk(host_lnk));
+  always @(negedge clk_i)  // just before the edge that samples the put, so it reports ahead of the DUT's own checks
+    #4 if (rstn_i && start_pipeline_i && host_cnt == 0) begin
+      $display("[FATAL] a host put with no staging credit held at cycle %0d", cycle);
+      $finish;
+    end
+  assign wc_lnk[0].put = 1'b0;
+  assign wc_lnk[0].data = 1'b0;
+  assign wc_lnk[1].put = 1'b0;
+  assign wc_lnk[1].data = 1'b0;
 
   logic north_write_enable_i, north_write_reset_i;
   logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i;  // operands in the package's format
@@ -42,14 +91,32 @@ module TB_sienna_model;
   logic [ NUM_LANES-1:0][DATA_WIDTH-1:0] final_result_o;
   logic [ NUM_LANES-1:0]                 result_valid_o;
   logic                                  pipeline_complete_o;
-  logic                                  pipeline_ready_o;
+  logic                                  pipeline_ready_o;  // this host holds a staging credit
   logic                        [ID_W-1:0] done_set_id_o;
+  assign pipeline_ready_o = (host_cnt != 0);
   logic systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb;
   logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
 
   initial begin
     clk_i = 0;
     forever #5 clk_i = ~clk_i;
+  end
+
+  // L9: a consumer per lane, out_slots slots each, out_stall_pct of its credit returns withheld at random.
+  localparam int OUT_CAP = 64;  // sienna_top's OUT_MAX
+  credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) out_lnk[NUM_LANES] ();
+`ifdef TB_OUT_STALL_PCT
+  int out_stall_pct = `TB_OUT_STALL_PCT;
+`else
+  int out_stall_pct = 0;
+`endif
+  int out_slots = OUT_CAP;
+  logic [NUM_LANES-1:0] lane_home;
+  for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
+    tb_l9_sink #(.DATA_W(DATA_WIDTH), .MAX_SLOTS(OUT_CAP)) snk (.clk_i(clk_i), .rstn_i(rstn_i), .slots_i(out_slots),
+                                                                .stall_pct_i(out_stall_pct), .hold_i(1'b0), .drain_i(drain_chk),
+                                                                .lnk(out_lnk[l]), .valid_o(result_valid_o[l]), .data_o(final_result_o[l]),
+                                                                .held_o(), .home_o(lane_home[l]));
   end
 
   sienna_top #(
@@ -76,50 +143,19 @@ module TB_sienna_model;
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
-      .start_pipeline_i           (start_pipeline_i),
-      .training_mode_i            (training_mode_i),
-      .accumulate_i               (accumulate_i),
-      .bias_valid_i               (bias_valid_i),
+      .host                       (host_lnk),  // unpacked sets: the sideband's pack fields and entries 1.. stay zero
       .bias_i                     (bias_i),
-      .req_mult_i                 (req_mult_i),
-      .req_shift_i                (req_shift_i),
-      .req_zp_i                   (req_zp_i),
-      .req_min_i                  (req_min_i),
-      .req_max_i                  (req_max_i),
-      .gp_mx_i                    (gp_mx_i),
-      .gp_shx_i                   (gp_shx_i),
-      .gp_mout_i                  (gp_mout_i),
-      .gp_shout_i                 (gp_shout_i),
-      .gp_zout_i                  (gp_zout_i),
-      .pack_shift_i               ('0),  // packing: the model TB streams unpacked sets
-      .pack_map_i                 ('0),
-      .pack_act_i                 ('0),
-      .pack_zp_i                  ('0),
-      .pack_min_i                 ('0),
-      .pack_max_i                 ('0),
-      .pack_mx_i                  ('0),
-      .pack_shx_i                 ('0),
-      .pack_mout_i                ('0),
-      .pack_shout_i               ('0),
-      .pack_zout_i                ('0),
-      .weight_cached_i            (weight_cached_i),
-      .weight_tile_i              (weight_tile_i),
+      .wc_region                  (wc_lnk),
       .wc_write_enable_i          (wc_write_enable_i),
       .wc_write_addr_i            (wc_write_addr_i),
-      .wc_region_busy_o           (wc_region_busy_o),
-      .dropout_seed_i             (dropout_seed_i),
-      .activation_function_i      (activation_function_i),
-      .num_terms_i                (num_terms_i),
       .north_write_enable_i       (north_write_enable_i),
       .north_write_data_i         (north_write_data_i),
       .north_write_reset_i        (north_write_reset_i),
       .west_write_enable_i        (west_write_enable_i),
       .west_write_data_i          (west_write_data_i),
       .west_write_reset_i         (west_write_reset_i),
-      .final_result_o             (final_result_o),
-      .result_valid_o             (result_valid_o),
+      .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
-      .pipeline_ready_o           (pipeline_ready_o),
       .done_set_id_o              (done_set_id_o),
       .systolic_busy_o            (systolic_busy_tb),
       .gpnae_busy_o               (gpnae_busy_tb),
@@ -129,10 +165,10 @@ module TB_sienna_model;
       .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
   );
 
-  longint cycle = 0;
   always_ff @(posedge clk_i) cycle <= cycle + 1;
 
-  // ── Output capture: every beat from the output port, one boundary per completed set ──
+  // ── Output capture: per lane, then a set at a time in window order (lane L's j-th word is window j*NUM_LANES + L) ──
+  logic [DATA_WIDTH-1:0] lane_q[NUM_LANES][$];
   logic [DATA_WIDTH-1:0] res_q[$];
   int bounds[$];
   int done_ids[$];
@@ -141,8 +177,18 @@ module TB_sienna_model;
 
   always_ff @(posedge clk_i) begin
     if (rstn_i) begin
-      for (int lane = 0; lane < NUM_LANES; lane++) if (result_valid_o[lane]) res_q.push_back(final_result_o[lane]);
+      for (int lane = 0; lane < NUM_LANES; lane++) if (result_valid_o[lane]) lane_q[lane].push_back(final_result_o[lane]);
       if (pipeline_complete_o) begin
+        automatic bit any;
+        any = 1;
+        while (any) begin
+          any = 0;
+          for (int lane = 0; lane < NUM_LANES; lane++)
+            if (lane_q[lane].size() != 0) begin
+              res_q.push_back(lane_q[lane].pop_front());
+              any = 1;
+            end
+        end
         bounds.push_back(res_q.size());
         done_ids.push_back(int'(done_set_id_o));
         last_done <= cycle;
@@ -166,7 +212,7 @@ module TB_sienna_model;
       if (dut.g_accept) $display("EV %0d act", cycle);
       if (dut.p_accept || dut.p_null) $display("EV %0d pool", cycle);
       if (pipeline_complete_o) $display("EV %0d done", cycle);
-      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, dut.credits, dut.mesh_input_ready);
+      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, !dut.entry_full, dut.l1_cnt > dut.l0_out);
       if (dut.systolic_array_inst.arrays_final && !dut.systolic_array_inst.reduce_start)
         $display("EV %0d blocked red%0d bank%0d", cycle, dut.systolic_array_inst.reducers_ready,
                  dut.systolic_array_inst.out_state[dut.systolic_array_inst.out_wr]);
@@ -188,7 +234,7 @@ module TB_sienna_model;
         north_write_data_i[c] = (i + c < north_q.size()) ? north_q[i+c] : '0;
       end
       start_pipeline_i = (i + HOST_WORDS >= west_q.size());
-      @(posedge clk_i);
+      @(negedge clk_i);
     end
     west_write_enable_i  = 0;
     north_write_enable_i = 0;
@@ -202,19 +248,19 @@ module TB_sienna_model;
         for (int i = 0; i < west_q.size(); i += HOST_WORDS) begin
           west_write_enable_i = 1;
           for (int c = 0; c < HOST_WORDS; c++) west_write_data_i[c] = (i + c < west_q.size()) ? west_q[i+c] : '0;
-          @(posedge clk_i);
+          @(negedge clk_i);
         end
         west_write_enable_i = 0;
-        @(posedge clk_i);
+        @(negedge clk_i);
       end
       begin
         for (int i = 0; i < north_q.size(); i += HOST_WORDS) begin
           north_write_enable_i = 1;
           for (int c = 0; c < HOST_WORDS; c++) north_write_data_i[c] = (i + c < north_q.size()) ? north_q[i+c] : '0;
-          @(posedge clk_i);
+          @(negedge clk_i);
         end
         north_write_enable_i = 0;
-        @(posedge clk_i);
+        @(negedge clk_i);
       end
     join
   endtask
@@ -222,7 +268,7 @@ module TB_sienna_model;
   initial begin
     string sets_f, out_f;
     integer fin, fout, rc;
-    int n_sets, acc, act, terms, has_bias, bad_ids;
+    int n_sets, acc, act, terms, has_bias, bad_ids, osp;
     bit host_gaps;
     logic [DATA_WIDTH-1:0] w;
     logic [31:0] w32;
@@ -269,12 +315,26 @@ module TB_sienna_model;
     end
     rc = $fscanf(fin, "%d", n_sets);
     host_gaps = $test$plusargs("host_gaps");
+    fault_put = $test$plusargs("fault_put");
+    void'($value$plusargs("out_slots=%d", out_slots));
+    void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
+    if (out_slots < 1 || out_slots > OUT_CAP || out_stall_pct < 0 || out_stall_pct > 90) begin
+      $display("[FATAL] +out_slots=%0d must be 1..%0d and +out_stall_pct=%0d 0..90", out_slots, OUT_CAP, out_stall_pct);
+      $finish;
+    end
 
     repeat (10) @(posedge clk_i);
     rstn_i = 1;
     north_write_reset_i = 0;
     west_write_reset_i = 0;
-    repeat (5) @(posedge clk_i);
+    @(negedge clk_i);
+    if (fault_put) begin  // before the staging credits are advertised
+      $display("  [FAULT put] a host put with %0d credits held", host_cnt);
+      start_pipeline_i = 1;
+      @(negedge clk_i);
+      start_pipeline_i = 0;
+    end
+    repeat (5) @(negedge clk_i);
 
     t0 = cycle;
     for (int k = 0; k < n_sets; k++) begin
@@ -310,7 +370,7 @@ module TB_sienna_model;
       end
       waited = 0;
       while (!pipeline_ready_o) begin
-        @(posedge clk_i);
+        @(negedge clk_i);
         waited++;
         if (waited > STALL_CYCLES) begin
           $display("[FATAL] pipeline_ready_o low for %0d cycles at set %0d, %0d sets done", waited, k, bounds.size());
@@ -324,9 +384,9 @@ module TB_sienna_model;
       if (host_gaps) begin
         load_set();
         start_pipeline_i = 1;
-        @(posedge clk_i);
+        @(negedge clk_i);
         start_pipeline_i = 0;
-        @(posedge clk_i);  // let the credit land before sampling ready again
+        @(negedge clk_i);  // let the credit land before sampling ready again
       end else load_and_start();
     end
     $fclose(fin);
@@ -341,6 +401,18 @@ module TB_sienna_model;
       end
     end
     @(posedge clk_i);
+    // Every L0 and L9 slot comes home once the output stalls stop.
+    osp = out_stall_pct;
+    out_stall_pct = 0;
+    repeat (OUT_CAP + 4) @(posedge clk_i);
+    if (lane_home != '1 || host_cnt != 2'd2) begin
+      $display("[FATAL] credits not all back after the last set: host %0d of 2, lanes home %b", host_cnt, lane_home);
+      $finish;
+    end
+    @(negedge clk_i);
+    drain_chk = 1'b1;
+    @(negedge clk_i);
+    drain_chk = 1'b0;
 
     // Sets complete in issue order, so set k's id is k mod 2^ID_W.
     bad_ids = 0;
@@ -353,8 +425,8 @@ module TB_sienna_model;
       for (int i = lo; i < bounds[k]; i++) $fwrite(fout, "%h\n", res_q[i]);
     end
     $fclose(fout);
-    $display("[MODEL] sets=%0d outputs=%0d cycles=%0d mesh_busy=%0d act_busy=%0d order_errors=%0d", n_sets,
-             res_q.size(), last_done - t0 + 1, busy_mesh, busy_act, bad_ids);
+    $display("[MODEL] sets=%0d outputs=%0d cycles=%0d mesh_busy=%0d act_busy=%0d order_errors=%0d out_stall=%0d", n_sets,
+             res_q.size(), last_done - t0 + 1, busy_mesh, busy_act, bad_ids, osp);
     $finish;
   end
 

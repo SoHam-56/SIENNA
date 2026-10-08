@@ -11,18 +11,17 @@ module Maxpool_2D #(
     parameter     PADDING     = 1,
     parameter bit IS_FP32     = 1,   // float sign-magnitude compare given EXP_W > 0; EXP_W = 0 (int8) always compares signed integers
     parameter int EXP_W       = 8,
-    parameter int MAN_W       = 23
+    parameter int MAN_W       = 23,
+    parameter int AHEAD       = 2,   // streaming: windows whose input credits are granted before their results are out
+    parameter int OUT_MAX     = 64,  // the most output credits the downstream consumer may grant
+    parameter int OUT_CRW     = 1,   // out.credit width
+    parameter int IN_CRW      = $clog2(IN_ROWS * IN_COLS + 1)  // in.credit width: a whole input granted in one cycle
 ) (
     input  logic clk,
     input  logic rst_n,
-    input  logic start,
-    output logic done,
 
-    input logic [DATA_WIDTH-1:0] data_in,
-    input logic valid_in,
-
-    output logic [DATA_WIDTH-1:0] out_data,
-    output logic out_valid
+    credit_link_if.consumer in,   // IN_ROWS*IN_COLS elements per input, granted at once only when output credits for its results are reserved
+    credit_link_if.producer out   // one result per put
 );
 
   localparam int OUT_ROWS = (PADDING == 1) ? ((IN_ROWS + 2*PADDING - SEG_ROWS) / STRIDE_ROWS) + 1 :
@@ -72,19 +71,65 @@ module Maxpool_2D #(
     end
   endfunction
 
+  // Links: elements arrive on in, results leave on out; an input is granted only with output credits reserved for all its results.
+  localparam bit SINGLE_SEG = (OUT_SIZE == 1);
+  logic [DATA_WIDTH-1:0] data_in;
+  logic valid_in;
+  logic [DATA_WIDTH-1:0] out_data;
+  logic out_valid;
+  assign data_in  = in.data;
+  assign valid_in = in.put;
+  assign out.put  = out_valid;
+  assign out.data = out_data;
+
+  if (OUT_MAX < OUT_SIZE || AHEAD < 1) begin : G_BAD_OUT_MAX
+    $fatal(1, "Maxpool_2D: OUT_MAX %0d is below the %0d results of one input (or AHEAD %0d < 1), so no input could be granted", OUT_MAX,
+           OUT_SIZE, AHEAD);
+  end
+`ifndef SYNTHESIS
+  // Interface widths are not elaboration constants in Verilator, so the link widths are checked at time 0.
+  initial
+    if ($bits(in.data) != DATA_WIDTH || $bits(in.credit) != IN_CRW || $bits(out.data) != DATA_WIDTH || $bits(out.credit) != OUT_CRW)
+      $fatal(1, "Maxpool_2D: links need data %0d bits, in.credit %0d and out.credit %0d, found %0d/%0d and %0d/%0d", DATA_WIDTH, IN_CRW,
+             OUT_CRW, $bits(in.data), $bits(in.credit), $bits(out.data), $bits(out.credit));
+`endif
+
+  logic live;  // out of reset for a cycle: no input is granted before it
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n) live <= 1'b0;
+    else live <= 1'b1;
+
+  localparam int OCW = $clog2(OUT_MAX + 1);
+  logic [OCW-1:0] out_cnt;  // output credits held, reserved or not
+  credit_counter #(.MAX(OUT_MAX), .CRW(OUT_CRW)) out_cc (.clk_i(clk), .rstn_i(rst_n), .put_i(out.put), .credit_i(out.credit),
+                                                        .has_credit_o(), .count_o(out_cnt));
+  logic grant;  // the IN_SIZE input credits of one more input go out this cycle
+  assign in.credit = grant ? IN_CRW'(IN_SIZE) : '0;
+
+`ifndef SYNTHESIS
+  // Every element arrives on a credit this module granted: credits granted minus elements received.
+  int in_open;
+  always_ff @(posedge clk or negedge rst_n)
+    if (!rst_n) in_open <= 0;
+    else in_open <= in_open + (grant ? IN_SIZE : 0) - int'(in.put);
+  a_mp_in_credit: assert property (@(posedge clk) disable iff (!rst_n) in.put |-> in_open > 0)
+    else $error("Maxpool_2D: a_mp_in_credit: an element arrived with no input credit granted");
+`endif
+
   // SIENNA instantiates this with SEG == IN and PADDING == 0, so the whole input is one segment
   // and OUT_SIZE is 1: the window dispatcher already does the tiling and padding. That case is a
   // running max, which accepts an element every cycle, whereas the batch FSM below collects,
   // then processes, then emits, and cannot overlap consecutive windows.
-  localparam bit SINGLE_SEG = (OUT_SIZE == 1);
-
   generate
     if (SINGLE_SEG) begin : gen_stream
       localparam logic [DATA_WIDTH-1:0] NEG_FLOOR = FLOOR;
 
       logic [DATA_WIDTH-1:0]        run_max;
       logic [$clog2(IN_SIZE+1)-1:0] in_cnt;
-      logic                         busy;
+      logic [$clog2(AHEAD+1)-1:0]   rsv;  // windows granted whose result is not out yet, each holding one output credit
+
+      // A window is granted when it can reserve an output credit no other granted window holds; the result never waits.
+      assign grant = live && (int'(rsv) < AHEAD) && (int'(out_cnt) > int'(rsv));
 
       // Folding the incoming element in combinationally lets the last one be emitted on the
       // cycle it arrives rather than one later.
@@ -94,32 +139,21 @@ module Maxpool_2D #(
         if (!rst_n) begin
           run_max   <= NEG_FLOOR;
           in_cnt    <= '0;
-          busy      <= 1'b0;
+          rsv       <= '0;
           out_data  <= '0;
           out_valid <= 1'b0;
-          done      <= 1'b0;
         end else begin
           out_valid <= 1'b0;
-
-          if (!start) begin
-            busy    <= 1'b0;
-            done    <= 1'b0;
-            in_cnt  <= '0;
-            run_max <= NEG_FLOOR;
-          end else if (!busy && !done) begin
-            busy    <= 1'b1;
-            in_cnt  <= '0;
-            run_max <= NEG_FLOOR;
-          end
-
-          if (busy && valid_in) begin
-            run_max <= nxt_max;
-            in_cnt  <= in_cnt + 1'b1;
+          rsv <= rsv + ($clog2(AHEAD+1))'(grant) - ($clog2(AHEAD+1))'(out_valid);
+          if (valid_in) begin
             if ((in_cnt + 1'b1) == IN_SIZE[$clog2(IN_SIZE+1)-1:0]) begin
               out_data  <= nxt_max;
               out_valid <= 1'b1;
-              done      <= 1'b1;
-              busy      <= 1'b0;
+              in_cnt    <= '0;
+              run_max   <= NEG_FLOOR;
+            end else begin
+              run_max <= nxt_max;
+              in_cnt  <= in_cnt + 1'b1;
             end
           end
         end
@@ -132,14 +166,17 @@ module Maxpool_2D #(
     else state <= next_state;
   end
 
+  // One input at a time: granted from IDLE once the output credits of all its results are held.
+  assign grant = live && (state == IDLE) && (int'(out_cnt) >= OUT_SIZE);
+
   always_comb begin
     next_state = state;
     case (state)
-      IDLE:           if (start) next_state = COLLECT_INPUT;
+      IDLE:           if (grant) next_state = COLLECT_INPUT;
       COLLECT_INPUT:  if (input_collection_done) next_state = PROCESS;
       PROCESS:        if (processing_done) next_state = OUTPUT_RESULTS;
       OUTPUT_RESULTS: if (output_count >= OUT_SIZE) next_state = FINISH;
-      FINISH:         if (!start) next_state = IDLE;
+      FINISH:         next_state = IDLE;
       default:        next_state = IDLE;
     endcase
   end
@@ -250,7 +287,6 @@ module Maxpool_2D #(
     end
   end
 
-  assign done = (state == FINISH);
 
     end
   endgenerate

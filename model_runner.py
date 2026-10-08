@@ -954,9 +954,9 @@ class RtlLayer:
         of = os.path.join(self.work, f"{tag}.out")
         write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None)
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
-        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
+        if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
-            raise RuntimeError(f"{tag}: an assertion fired in the layer simulation")
+            raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
         e = re.search(r"epilogues=(\d+)/(\d+)", r.stdout)
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):
@@ -1032,9 +1032,9 @@ class RtlSets:
         r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
-        if re.search(r"Assertion failed|%Error", r.stdout + r.stderr):  # assertion firings do not change the exit code
+        if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
-            raise RuntimeError(f"{tag}: an assertion fired in the model simulation")
+            raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the model simulation")
         m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
         if not m or int(m.group(6)) != 0:
             sys.stdout.write(r.stdout[-3000:])

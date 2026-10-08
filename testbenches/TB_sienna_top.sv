@@ -98,7 +98,6 @@ module TB_sienna_top #(
   int stream_ids[$];
   logic [DATA_WIDTH-1:0] acc_results[$];
   int acc_bounds[$];
-  int acc_bound_passed = 0;  // bf16 accumulate-pass outputs inside its loose bound, counted apart from the tolerance passes
   // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
   int over_admit = 0;
   always @(negedge clk_i) if (rstn_i && tb_inflight + int'(host_cnt) > SETS_IN_FLIGHT) over_admit++;
@@ -1290,8 +1289,7 @@ module TB_sienna_top #(
 
   task automatic accum_null_pass();
     automatic int G = ACCUM_PASSES - 1;  // the first set the stream activates; its golden is the sum of sets 0..G
-    automatic int n = 4 + ACCUM_PASSES, waited = 0, errs = 0;
-    automatic real acc_max_d = 0.0, acc_max_e = 0.0;
+    automatic int n = 4 + ACCUM_PASSES, waited = 0, errs = 0, n_exact = 0;
     automatic logic [DATA_WIDTH-1:0] exp_q[$], bnd_q[$];
     string info;
     $display("\n[STAGE] ACCUMULATE: 4 partial sets of zeros, then sets 0..%0d as one sum; checkers bound", G);
@@ -1342,7 +1340,8 @@ module TB_sienna_top #(
       acc_results[0] = acc_results[0] ^ DATA_WIDTH'(1 << (DATA_WIDTH - 2));
       $display("  [FAULT acc] the accumulate pass's first output corrupted");
     end
-    read_mem_file($sformatf("expected_output_%0d.mem", G), exp_q);
+    // Narrow floats: regression.py's bit-exact golden of this pass (the zero partials move the mesh's accumulator slots); int8 and fp32: set G's own.
+    read_mem_file((EXACT_GOLDEN != 0 && IS_INT == 0) ? "expected_accum.mem" : $sformatf("expected_output_%0d.mem", G), exp_q);
     read_mem_file($sformatf("bound_output_%0d.mem", G), bnd_q);
     if (acc_bounds.size() != n || !drained) begin
       failed++;
@@ -1357,21 +1356,13 @@ module TB_sienna_top #(
         failed++;
         $display("  [FAIL] Accumulate pass: %0d outputs, expected %0d", acc_results.size(), exp_q.size());
       end
-      // int8 bit-exact; bf16 within 1/16 of the set's largest output (a wrong set misses by about the largest output): the zero passes change the order the mesh sums in, which moves cancelling sums by many ulp.
-      for (int i = 0; i < exp_q.size(); i++) begin
-        automatic real e = (EXP_W == 8 && MAN_W == 7) ? f32({16'(exp_q[i]), 16'h0}) : 0.0;
-        if (e > acc_max_e || -e > acc_max_e) acc_max_e = (e > 0.0) ? e : -e;
-      end
+      // int8 and narrow floats bit-exact (check_tolerance takes only identical bits there); fp32 within its tolerance and bound.
       for (int i = 0; i < exp_q.size() && i < acc_results.size(); i++) begin
-        automatic real d = f32({16'(exp_q[i]), 16'h0}) - f32({16'(acc_results[i]), 16'h0});
-        if (d < 0.0) d = -d;
         total_elements++;
-        if (acc_results[i] === exp_q[i]) exact_passed++;
-        else if (EXP_W == 8 && MAN_W == 7 && d <= acc_max_e / 16.0) begin
-          acc_bound_passed++;
-          if (d > acc_max_d) acc_max_d = d;
-        end
-        else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
+        if (acc_results[i] === exp_q[i]) begin
+          exact_passed++;
+          n_exact++;
+        end else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
         else begin
           failed++;
           errs++;
@@ -1386,9 +1377,9 @@ module TB_sienna_top #(
       $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (%0d)",
                acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt, HOST_SLOTS);
     end
-    $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d mismatches, bf16 at most %g off, largest output %g); %0d result beats and %0d activation bank spent",
-             acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), errs, acc_max_d, acc_max_e,
-             acc_beats, acc_banks);
+    $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d exact, %0d mismatches); %0d result beats and %0d activation bank spent",
+             acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), n_exact, errs, acc_beats,
+             acc_banks);
   endtask
 
   // ── PERF trace: stage transitions per cycle, read by regression.py --action perf ──
@@ -1563,7 +1554,6 @@ module TB_sienna_top #(
     $display(" Total    : %0d", total_elements);
     $display(" Exact    : %0d", exact_passed);
     $display(" Tol pass : %0d  (rel <= %.1f%%)", tol_passed, REL_TOL * 100.0);
-    $display(" Acc bound: %0d  (bf16 accumulate pass, within 1/16 of its set's largest output)", acc_bound_passed);
     $display(" Failed   : %0d", failed);
     $display("----------------------------------------------");
     if (failed == 0) $display(" RESULT: PASSED");

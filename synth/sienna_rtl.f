@@ -1,4 +1,7 @@
 SystolicMesh/ArithmeticLibrary/Common/src/sienna_fmt_pkg.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_link_if.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_counter.sv
+SystolicMesh/ArithmeticLibrary/Common/src/credit_reg.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Radix4Booth/src/R4Booth.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Karatsuba/src/karatsubaUnsigned.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/FP32/src/fp32Multiplier.sv
@@ -25,6 +28,8 @@ GPNAE/src/TYTAN/barrel_mac.sv
 GPNAE/src/fp32_down.sv
 GPNAE/src/gpnae_tail.sv
 GPNAE/src/gpnae_poly_int8.sv
+GPNAE/src/lane_fifo.sv
+GPNAE/src/lane_link.sv
 GPNAE/src/gpnae_poly.sv
 Maxpool/Maxpool_2D.sv
 Dropout/dropout.sv

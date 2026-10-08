@@ -1,26 +1,29 @@
 `timescale 1ns / 1ps
 
+// First-word-fall-through FIFO on credit links: the writer holds one credit per free slot, the oldest word is put while the reader's credit is held.
 module fwft #(
     parameter DATA_WIDTH = 32,
     parameter FIFO_DEPTH = 32,
-    parameter ADDR_WIDTH = (FIFO_DEPTH > 1) ? $clog2(FIFO_DEPTH) : 1
+    parameter ADDR_WIDTH = (FIFO_DEPTH > 1) ? $clog2(FIFO_DEPTH) : 1,
+    parameter int OUT_MAX = 8,  // the most credits the reader may grant
+    parameter int OUT_CRW = 1   // out.credit width
 ) (
     input wire clk_i,
     input wire rstn_i,
 
-    // Write Interface: Never backpressures. Will overwrite if full.
-    input  wire                  wr_valid_i,
-    input  wire [DATA_WIDTH-1:0] wr_data_i,
-    output wire                  wr_ready_o,
+    credit_link_if.consumer in,   // advertises FIFO_DEPTH after reset, one per cycle, then one credit per pop
+    credit_link_if.producer out,  // the oldest word, one per put; a put is a pop
 
-    // Read Interface -- FWFT
-    output wire                  rd_valid_o,
-    output wire [DATA_WIDTH-1:0] rd_data_o,
-    input  wire                  rd_ready_i,
-
-    // Status
     output wire [ADDR_WIDTH:0] count_o
 );
+
+`ifndef SYNTHESIS
+  // Interface widths are not elaboration constants in Verilator, so the link widths are checked at time 0.
+  initial
+    if ($bits(in.data) != DATA_WIDTH || $bits(in.credit) != 1 || $bits(out.data) != DATA_WIDTH || $bits(out.credit) != OUT_CRW)
+      $fatal(1, "fwft: links need data %0d bits, in.credit 1 and out.credit %0d, found %0d/%0d and %0d/%0d", DATA_WIDTH, OUT_CRW,
+             $bits(in.data), $bits(in.credit), $bits(out.data), $bits(out.credit));
+`endif
 
   logic [DATA_WIDTH-1:0] mem[0:FIFO_DEPTH-1];
 
@@ -28,48 +31,51 @@ module fwft #(
   logic [ADDR_WIDTH-1:0] rd_ptr;
   logic [ADDR_WIDTH:0] count;
 
-  // The FIFO is always ready to accept data, because it can overwrite
-  assign wr_ready_o = 1'b1;
+  localparam int OCW = $clog2(OUT_MAX + 1);
+  logic [OCW-1:0] out_cnt;
+  credit_counter #(.MAX(OUT_MAX), .CRW(OUT_CRW)) out_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(out.put), .credit_i(out.credit),
+                                                        .has_credit_o(), .count_o(out_cnt));
 
-  wire wr_fire = wr_valid_i && wr_ready_o;  // Effectively just wr_valid_i
-  wire rd_fire = rd_ready_i && rd_valid_o;
+  wire wr_fire = in.put;
+  wire rd_fire = (count != 0) && (out_cnt != 0);
 
-  assign rd_valid_o = (count > 0);
-  assign count_o    = count;
-  assign rd_data_o  = mem[rd_ptr];
+  assign out.put  = rd_fire;
+  assign out.data = mem[rd_ptr];
+  assign count_o  = count;
+
+  // Input credits: one per free slot, FIFO_DEPTH after reset, then one per pop, at most one a cycle.
+  logic [ADDR_WIDTH:0] in_owed;
+  logic in_cr;
+  assign in.credit = in_cr;
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
-      wr_ptr <= '0;
-      rd_ptr <= '0;
-      count  <= '0;
+      wr_ptr  <= '0;
+      rd_ptr  <= '0;
+      count   <= '0;
+      in_owed <= (ADDR_WIDTH + 1)'(FIFO_DEPTH);
+      in_cr   <= 1'b0;
     end else begin
-
-      // Write Pointer & Data Logic
-      if (wr_fire) begin
-        mem[wr_ptr] <= wr_data_i;
+      in_owed <= in_owed + (ADDR_WIDTH + 1)'(rd_fire) - (ADDR_WIDTH + 1)'(in_owed != '0);
+      in_cr   <= in_owed != '0;
+      if (wr_fire && (count < FIFO_DEPTH || rd_fire)) begin
+        mem[wr_ptr] <= in.data;
         if (wr_ptr == FIFO_DEPTH - 1) wr_ptr <= '0;
         else wr_ptr <= wr_ptr + 1'b1;
       end
-
-      // Read Pointer Logic
-      // The read pointer advances if the consumer reads (rd_fire), OR 
-      // if a write tramples the oldest data in a full FIFO without a simultaneous read.
-      if (rd_fire || (wr_fire && (count == FIFO_DEPTH))) begin
+      if (rd_fire) begin
         if (rd_ptr == FIFO_DEPTH - 1) rd_ptr <= '0;
         else rd_ptr <= rd_ptr + 1'b1;
       end
-
-      // Count Update Logic
-      if (wr_fire && !rd_fire) begin
-        // Cap the count at FIFO_DEPTH. If it's full, it stays full.
-        if (count < FIFO_DEPTH) count <= count + 1'b1;
-      end else if (rd_fire && !wr_fire) begin
-        // Only decrement if we read without a new write coming in
-        count <= count - 1'b1;
-      end
-      // If both fire (or neither fire), count remains unchanged
+      if (wr_fire && !rd_fire && count < FIFO_DEPTH) count <= count + 1'b1;
+      else if (rd_fire && !wr_fire) count <= count - 1'b1;
     end
   end
+
+`ifndef SYNTHESIS
+  // A put needs a free slot: with FIFO_DEPTH words held no credit can be outstanding; nothing is overwritten any more.
+  a_fifo_room: assert property (@(posedge clk_i) disable iff (!rstn_i) in.put |-> int'(count) < FIFO_DEPTH)
+    else $error("fwft: a_fifo_room: put into a full FIFO (%0d words)", count);
+`endif
 
 endmodule

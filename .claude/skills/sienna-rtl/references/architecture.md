@@ -4,6 +4,9 @@
 > design has separate activation and pooling stages, 32 lanes (default since 2026-09-24) filled in parallel from a wide
 > mesh read, banked buffers and credits; see `SKILL.md` and the `sienna-back-to-back` skill before trusting any FSM
 > detail here. The SystolicMesh section is current as of 2026-09-24 (after the module renames).
+> **Handshakes changed 2026-10-07 (branch `credits`):** every module boundary is a credit link (`credit_link_if`); the
+> `sienna-back-to-back` skill tables them as built and the `sienna-credits` skill ("As built") has the contract. Ports named
+> below such as `start_pipeline_i`, `last_i`, `done_o` on the poly lanes, `wc_region_busy_o` and fwft's `wr_ready_o` are gone.
 
 Module-by-module reference. Line numbers are from the working tree at the time of writing; treat them as pointers, not guarantees.
 
@@ -94,7 +97,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 
 ### Output path
 
-`AccumulationUnit` reads one pixel per cycle from its arrays, sums the `RP × U` partials in a log2 `fp32Adder` tree and writes one result per cycle to `MeshOutputSram`; the pixel index and result bank travel beside the data, so a new set can be read while the previous one is still in the tree. `MeshOutputSram` has `RESULT_BANKS` banks, one write port per output tile and a wide read port of `WIDE_READ` words for the activation stage. The reducer reads T² pixels per set, so the mesh needs K ≥ T² to run at K cycles per set (true for T=4 at N ≥ 16).
+`AccumulationUnit` reads one pixel per cycle from its arrays, sums the `RP × U` partials in a log2 `fp32Adder` tree and writes one result per cycle to `MeshOutputSram`; the pixel index and result bank travel beside the data, so a new set can be read while the previous one is still in the tree. `MeshOutputSram` has `RESULT_BANKS` banks, one write port per output tile and a wide port of `WIDE_READ` words; since the credit links the mesh reads it itself and pushes each result as `PER_LANE` beats on the L3 link, while it holds the consumer's credits, freeing the bank on the last beat. The reducer reads T² pixels per set, so the mesh needs K ≥ T² to run at K cycles per set (true for T=4 at N ≥ 16).
 
 ### sienna_layer: a layer scheduled in hardware
 
@@ -103,7 +106,8 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 - Weight stream, per column block: the bias row, then the block's weight tiles, once if cached (more than one row tile and at most `WC_TILES/2` tiles), else once per row tile.
 - Activation stream, per block, per row tile: the depth tiles of A, then the residual tile.
 - Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
-- The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache and waits for `wc_region_busy_o` before overwriting a half.
+- The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache only while it holds that region's L2 credit (one put opens the fill; the credit returns when the fill's last set, marked `wc_last`, is broadcast).
+- Since 2026-10-07 the two streams are credit links (`a_rows`, `w_rows`, L10): a set's N A rows (and N B rows if uncached) are granted at once per staging credit held, one set ahead; results leave on the L9 links `out[NUM_LANES]`.
 - Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default, backend `RtlLayer`) and `regression.py --action gemm` format the streams with `format_layer()`, which only rearranges data.
 
 ---
@@ -188,7 +192,7 @@ The adder and multiplier handle NaN, infinity and signaling-NaN explicitly and e
 
 ## Maxpool and dropout
 
-`Maxpool/Maxpool_2D.sv` — five states (`IDLE → COLLECT_INPUT → PROCESS → OUTPUT_RESULTS → FINISH`). Collects `IN_ROWS × IN_COLS` values into a 2-D buffer, computes one output pixel per cycle in `PROCESS`, then streams the buffer out. The `is_greater()` function does sign-magnitude comparison when `IS_FP32` is set, because a raw `$signed` compare is wrong for FP32 negatives; `−infinity` (`32'hFF800000`) is the identity element.
+`Maxpool/Maxpool_2D.sv` — since 2026-10-07 on credit links (`in`, `out`; `start`/`done` and the valid ports are gone): the streaming path SIENNA uses grants a 2x2 window's 4 element credits at once, only with an output credit reserved, up to 2 windows ahead. The batch path (padded multi-output windows, `TB_maxpool_int8` only) keeps the five states (`IDLE → COLLECT_INPUT → PROCESS → OUTPUT_RESULTS → FINISH`). Collects `IN_ROWS × IN_COLS` values into a 2-D buffer, computes one output pixel per cycle in `PROCESS`, then streams the buffer out. The `is_greater()` function does sign-magnitude comparison when `IS_FP32` is set, because a raw `$signed` compare is wrong for FP32 negatives; `−infinity` (`32'hFF800000`) is the identity element.
 
 `Dropout/dropout.sv` — a 32-bit LFSR (taps 31/21/1/0) compared against a threshold derived from `DROPOUT_P_PERCENT`. Three paths: inference (`training_mode` low) passes data straight through combinationally; drop emits zero; keep routes through an `fp32Multiplier` by the scale constant. **The top level hardwires `training_mode` to `1'b0`**, so in the assembled pipeline dropout is always a pass-through and the multiplier is never exercised.
 
@@ -196,7 +200,7 @@ The adder and multiplier handle NaN, infinity and signaling-NaN explicitly and e
 
 ## fwft FIFO
 
-`src/fwft.sv` — first-word-fall-through, `rd_data_o` is combinational from `mem[rd_ptr]`. It **never backpressures**: `wr_ready_o` is tied high and a write into a full FIFO overwrites the oldest entry, advancing the read pointer to match. Producers must be rate-limited externally. FIFO1 is sized `SRAM_DEPTH` (256) so this does not trigger at the default configuration; FIFO2 is only 16 deep and relies on the dispatcher's explicit `<= FIFO2_DEPTH - 4` check.
+`src/fwft.sv` — first-word-fall-through FIFO on credit links since 2026-10-07: `credit_link_if.consumer in` advertises `FIFO_DEPTH` (16 for FIFO2) after reset and returns one credit per pop; `credit_link_if.producer out` puts the oldest word while it holds the consumer's credit. Overwrite-on-full is removed and `a_fifo_room` fires on a put into a full FIFO. The dispatcher's almost-full threshold is replaced by one credit counter per lane (L7). Before 2026-10-07 it never back-pressured: a write into a full FIFO overwrote the oldest entry (known-issues #14).
 
 ---
 

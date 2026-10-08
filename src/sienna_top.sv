@@ -1225,6 +1225,16 @@ module sienna_top #(
       quiet_n <= 0;
     else if (quiet_n < QUIET) quiet_n <= quiet_n + 1;
   assign drained = (quiet_n == QUIET);
+  int drain_n;  // drain rises since reset; testbenches print it and require drained after their last set
+  logic drained_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) begin
+      drain_n   <= 0;
+      drained_q <= 1'b0;
+    end else begin
+      drained_q <= drained;
+      if (drained && !drained_q) drain_n <= drain_n + 1;
+    end
   credit_link_checker #(.SLOTS(2)) l1_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l1m));
   credit_link_checker #(.SLOTS(PER_LANE)) l3_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l3m));
   credit_link_checker #(.SLOTS(2)) l6_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l6));

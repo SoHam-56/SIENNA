@@ -444,6 +444,13 @@ module TB_model_run #(
       failed++;
       $display("[FAIL] L9 slots not all credited back after the layer: lanes home %b", lane_home);
     end
+    // sienna_top's own link checkers judge only when it is drained: it must drain after the layer's last set.
+    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.pipe.drained; w++) @(posedge clk_i);
+    if (!dut.pipe.drained) begin
+      failed++;
+      $display("[FAIL] sienna_top never drained after the layer's last set (%0d drains in the run): its link checkers never judged it",
+               dut.pipe.drain_n);
+    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.pipe.drain_n);
     @(negedge clk_i);
     drain_chk = 1'b1;
     @(negedge clk_i);

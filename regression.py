@@ -51,6 +51,7 @@ from matmul_tests import _f2h as float_to_hex
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
+ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
 ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "all")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -338,6 +339,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
     assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
     credits = cfg.get("credits", SETS_IN_FLIGHT)
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+        raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     use_bias = bool(cfg.get("bias", False))
     req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
     reals = [(A0 * scale, B0 * scale)]
@@ -359,7 +362,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
         parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(len(ks))]
         acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
         rq = requant_params(acc, s_a, s_w, act_g, req_rng, zqs[g])
-        complete = len(ks) == passes  # a trailing short group has only partial passes, as in the float tests
+        complete = len(ks) == passes  # always, since num_sets is a whole number of groups
         if act_g == "selu" and complete:
             R = requantize(acc, rq)
             sat[0] += int(np.sum(selu_saturates(rq["mx"], rq["shx"], rq["zp"], R)))
@@ -399,6 +402,7 @@ def _check_mem_widths(fmt: str, num_sets: int) -> None:
     per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
     names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output")]
     names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
+    names += [] if fmt == "int8" else ["expected_accum.mem"]  # int8's accumulate pass reads its group's own golden
     for fn in names:
         want = 8 if fmt == "int8" and fn.startswith(("bias_", "requant_")) else d
         if os.path.exists(os.path.join(TB_DIR, fn)):
@@ -687,6 +691,8 @@ def generate_vectors(cfg: dict) -> None:
     # Enough sets to use every credit, so the credit-overrun pass is reachable; whole accumulate groups only.
     credits = cfg.get("credits", SETS_IN_FLIGHT)  # a test may build the pipeline with fewer credits than the default
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+        raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     masks = []
     run = None
     run_s = None  # sum|a*b| behind the running partial sum
@@ -725,6 +731,10 @@ def generate_vectors(cfg: dict) -> None:
                 _golden_bits(grp, gbias, cfg, act_k, set_dropout_seed(drop_seed, k), fmt)[3]
             write_bits(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk, fmt)  # empty for a partial set
             write_bits(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(Fk), fmt)
+            if k == passes - 1:  # TB_sienna_top's accumulate pass: zero partials with set 0's B, then group 0; the mesh's slot rotation runs on through them
+                Z = np.zeros_like(grp[0][0])
+                write_bits(os.path.join(TB_DIR, "expected_accum.mem"), _golden_bits([(Z, grp[0][1])] * ACCUM_ZERO_PASSES + grp, gbias, cfg,
+                                                                                  act_k, set_dropout_seed(drop_seed, k), fmt)[3], fmt)
             Fk = bits_float(Fk, fmt)  # the dropout-mask check below reads values
         else:
             write_mem(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk)  # empty for a partial set
@@ -1769,7 +1779,7 @@ def one_config(name: str, args) -> tuple:
     else:
         raw = run(name, args.sets, args.build_dir)
     mdl = model(cfg, not args.slices)
-    if "RESULT: PASSED" not in raw or "Assertion failed" in raw:
+    if "RESULT: PASSED" not in raw or re.search(r"Assertion failed|%Error|%Fatal", raw):
         return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
     a = analyse(events(raw), args.sets, cfg.get("accum_passes", 1))
     s = a["sets"]
@@ -1875,6 +1885,10 @@ def perf_main(argv=None) -> None:
     open(args.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
     print(f"\nReport: {args.report}")
+    failed = [r[0] for r in (rows if not args.merge else [r for p in parts for r in p["rows"]]) if r[-1] == "FAIL"]
+    if failed:  # a config that did not pass fails the action, so sweeps see it
+        print(f"[ERROR] perf: {len(failed)} config(s) did not pass: {', '.join(failed)}")
+        sys.exit(1)
 
 
 # ── oracle (was tflite_oracle.py) ────────────────────────────────────────────

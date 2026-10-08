@@ -77,13 +77,18 @@ module TB_sienna_top #(
                                            .has_credit_o(), .count_o(wc_cnt[r]));
     credit_link_checker #(.SLOTS(1)) chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained && !wc_open_tb[r]), .lnk(wc_lnk[r]));
   end
+  logic sum_open;  // the last set put was a partial sum: it completes before the mesh frees its staging bank, so no drain until the sum ends
+  set_side_t side_put;
+  assign side_put = set_side_t'(host_lnk.data[SIDE_W-1:0]);
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) begin
       tb_inflight <= 0;
       quiet_cyc   <= 0;
+      sum_open    <= 1'b0;
     end else begin
       tb_inflight <= tb_inflight + int'(host_lnk.put) - int'(pipeline_complete_o);
-      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put || sum_open) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+      if (host_lnk.put) sum_open <= side_put.accumulate;
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
@@ -93,7 +98,6 @@ module TB_sienna_top #(
   int stream_ids[$];
   logic [DATA_WIDTH-1:0] acc_results[$];
   int acc_bounds[$];
-  int acc_bound_passed = 0;  // bf16 accumulate-pass outputs inside its loose bound, counted apart from the tolerance passes
   // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
   int over_admit = 0;
   always @(negedge clk_i) if (rstn_i && tb_inflight + int'(host_cnt) > SETS_IN_FLIGHT) over_admit++;
@@ -971,19 +975,25 @@ module TB_sienna_top #(
   endtask
 
   // overrun: before set SETS_IN_FLIGHT the host waits until every admitted set is in flight and shows it gets no credit; close_fill: the last set closes the cache fill.
-  // hold (Review Focus 3): from the first words of set HOLD_SET, every L9 credit is withheld for 500 cycles; the outputs must equal the first plain pass's.
+  // hold (Review Focus 3): from the first words of set HOLD_SET, every L9 credit is withheld for HOLD_CYC cycles; the outputs must equal the first plain pass's.
   // HOLD_SET leaves SETS_IN_FLIGHT+4 sets to put after it where NUM_SETS allows (else set 0), so the buffers fill and the host is blocked.
   localparam int HOLD_SET = (NUM_SETS / 2 < NUM_SETS - SETS_IN_FLIGHT - 4) ? NUM_SETS / 2
                           : ((NUM_SETS - SETS_IN_FLIGHT - 4 > 0) ? NUM_SETS - SETS_IN_FLIGHT - 4 : 0);
-  // The host must end up blocked when the test has more sets than SETS_IN_FLIGHT: by staging credits once the banks are full, or by the entry first (fewer credits, or partial sums that hold no result bank).
+  // The host must end up blocked when it has more sets left than the entry admits: by staging credits once the banks are full, or by the entry first (fewer credits, or partial sums that hold no result bank).
+  // HOLD_CYC: at least 500, and long enough for the host to put SETS_IN_FLIGHT + 2 sets of N*N/HOST_WORDS row cycles and a put each (N = 64: 1156).
+  localparam int HOST_SET_CYC = (N * N + HOST_WORDS - 1) / HOST_WORDS + 4;
+  localparam int HOLD_CYC = ((SETS_IN_FLIGHT + 2) * HOST_SET_CYC > 500) ? (SETS_IN_FLIGHT + 2) * HOST_SET_CYC : 500;
   logic [DATA_WIDTH-1:0] ref_results[$];  // the first plain pass's words and set boundaries
   int ref_bounds[$];
   task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill, input bit hold = 0);
     automatic longint t0 = $time;
     automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
+    automatic int hold_put0 = 0, hold_in0 = 0, hold_room = 0;  // sets put and in flight at the hold's start; sets the entry admits after it
+    automatic int hold_extra = 0;  // cycles the hold ran on past HOLD_CYC until the host was blocked
+    automatic bit hold_end_blocked = 0;  // the host was blocked with a set to put as the hold ended
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s%s", NUM_SETS,
              overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "",
-             hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld 500 cycles from set %0d's first words", out_adv, HOLD_SET)
+             hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld %0d cycles from set %0d's first words", out_adv, HOLD_CYC, HOLD_SET)
                   : "");
     stream_results.delete();
     stream_bounds.delete();
@@ -1079,7 +1089,9 @@ module TB_sienna_top #(
               end else begin
                 out_hold  = 1;
                 hold_puts = 0;
-                repeat (500) begin
+                hold_put0 = n_started;
+                hold_in0  = tb_inflight;
+                repeat (HOLD_CYC) begin
                   @(negedge clk_i);
                   if (out_put == '0) hold_stalled++;
                   if (pipeline_complete_o) hold_done++;
@@ -1088,19 +1100,34 @@ module TB_sienna_top #(
                   if (host_cnt == 0 && dut.entry_full && n_started < NUM_SETS) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
                   if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
                 end
+                // With the output frozen no real set completes, so the entry admits SETS_IN_FLIGHT less those in flight at the start (plus any completion): more sets left must block the host.
+                hold_room = SETS_IN_FLIGHT - hold_in0 + hold_done;
+                // Required, the host must still be blocked as the hold ends; one between a staging credit and its put gets one set's load to block again.
+                while (NUM_SETS - hold_put0 > hold_room && !(host_cnt == 0 && n_started < NUM_SETS) && hold_extra < HOST_SET_CYC + 8) begin
+                  @(negedge clk_i);
+                  if (pipeline_complete_o) hold_done++;
+                  hold_extra++;
+                end
+                hold_end_blocked = (host_cnt == 0 && n_started < NUM_SETS);
                 out_hold = 0;
-                $display("  [Hold] every L9 credit withheld 500 cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put",
-                         HOLD_SET, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started);
-                if (NUM_SETS <= SETS_IN_FLIGHT)
-                  $display("  [Hold] host blocking not reachable: the test's %0d sets fit in SETS_IN_FLIGHT %0d", NUM_SETS, SETS_IN_FLIGHT);
+                $display("  [Hold] every L9 credit withheld %0d cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put (%0d at the start, %0d in flight); %0d cycles more to the end, blocked at the end %0b",
+                         HOLD_CYC, HOLD_SET, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started,
+                         hold_put0, hold_in0, hold_extra, hold_end_blocked);
+                if (NUM_SETS - hold_put0 <= hold_room)
+                  $display("  [Hold] host blocking not reachable: %0d sets left to put at the hold's start, the entry admits %0d more (SETS_IN_FLIGHT %0d, %0d in flight, %0d completions)",
+                           NUM_SETS - hold_put0, hold_room, SETS_IN_FLIGHT, hold_in0, hold_done);
                 else if (hold_blocked + hold_capped == 0) begin
                   failed++;
                   $display("  [FAIL] Hold: the host was never blocked with a set to put, so the stall never reached it");
-                end
-                if (hold_stalled < 400 || hold_puts > out_adv * NUM_LANES) begin
+                end else if (!hold_end_blocked) begin
                   failed++;
-                  $display("  [FAIL] Hold: the output did not stall (%0d of 500 cycles with no word, %0d words on %0d credits per lane)", hold_stalled,
-                           hold_puts, out_adv);
+                  $display("  [FAIL] Hold: the host was not blocked when the hold ended (%0d cycles blocked in all), so the stall did not hold it back",
+                           hold_blocked + hold_capped);
+                end
+                if (hold_stalled < HOLD_CYC * 4 / 5 || hold_puts > out_adv * NUM_LANES) begin
+                  failed++;
+                  $display("  [FAIL] Hold: the output did not stall (%0d of %0d cycles with no word, %0d words on %0d credits per lane)", hold_stalled,
+                           HOLD_CYC, hold_puts, out_adv);
                 end
               end
             end
@@ -1270,7 +1297,7 @@ module TB_sienna_top #(
       $display("  [FAIL] Lane links not re-advertised after the second reset: %s", why);
     end else $display("  [Reset] idle after the second reset: %s", why);
     write_cache();
-    stream_all_sets(0, 0, PACKED != 0, 1);  // with the 500-cycle hold; the accumulate pass closes the fill when it runs
+    stream_all_sets(0, 0, PACKED != 0, 1);  // with the HOLD_CYC hold; the accumulate pass closes the fill when it runs
   endtask
 
   // ── Review Focus 4: four partial sets of zeros, then set ACCUM_PASSES-1's own passes ─────
@@ -1285,8 +1312,7 @@ module TB_sienna_top #(
 
   task automatic accum_null_pass();
     automatic int G = ACCUM_PASSES - 1;  // the first set the stream activates; its golden is the sum of sets 0..G
-    automatic int n = 4 + ACCUM_PASSES, waited = 0, errs = 0;
-    automatic real acc_max_d = 0.0, acc_max_e = 0.0;
+    automatic int n = 4 + ACCUM_PASSES, waited = 0, errs = 0, n_exact = 0;
     automatic logic [DATA_WIDTH-1:0] exp_q[$], bnd_q[$];
     string info;
     $display("\n[STAGE] ACCUMULATE: 4 partial sets of zeros, then sets 0..%0d as one sum; checkers bound", G);
@@ -1305,7 +1331,7 @@ module TB_sienna_top #(
       read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
       read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
       if (j < 4) foreach (west_data_queue[i]) west_data_queue[i] = '0;
-      accumulate_i = (j < n - 1);
+      accumulate_i = (j < n - 1) || $test$plusargs("acc_open");  // on purpose with +acc_open: the sum never closes
       activation_function_i = act_of(G);
       num_terms_i = terms_of(G);
       dropout_seed_i = set_seed(G);
@@ -1337,7 +1363,8 @@ module TB_sienna_top #(
       acc_results[0] = acc_results[0] ^ DATA_WIDTH'(1 << (DATA_WIDTH - 2));
       $display("  [FAULT acc] the accumulate pass's first output corrupted");
     end
-    read_mem_file($sformatf("expected_output_%0d.mem", G), exp_q);
+    // Narrow floats: regression.py's bit-exact golden of this pass (the zero partials move the mesh's accumulator slots); int8 and fp32: set G's own.
+    read_mem_file((EXACT_GOLDEN != 0 && IS_INT == 0) ? "expected_accum.mem" : $sformatf("expected_output_%0d.mem", G), exp_q);
     read_mem_file($sformatf("bound_output_%0d.mem", G), bnd_q);
     if (acc_bounds.size() != n || !drained) begin
       failed++;
@@ -1352,21 +1379,13 @@ module TB_sienna_top #(
         failed++;
         $display("  [FAIL] Accumulate pass: %0d outputs, expected %0d", acc_results.size(), exp_q.size());
       end
-      // int8 bit-exact; bf16 within 1/16 of the set's largest output (a wrong set misses by about the largest output): the zero passes change the order the mesh sums in, which moves cancelling sums by many ulp.
-      for (int i = 0; i < exp_q.size(); i++) begin
-        automatic real e = (EXP_W == 8 && MAN_W == 7) ? f32({16'(exp_q[i]), 16'h0}) : 0.0;
-        if (e > acc_max_e || -e > acc_max_e) acc_max_e = (e > 0.0) ? e : -e;
-      end
+      // int8 and narrow floats bit-exact (check_tolerance takes only identical bits there); fp32 within its tolerance and bound.
       for (int i = 0; i < exp_q.size() && i < acc_results.size(); i++) begin
-        automatic real d = f32({16'(exp_q[i]), 16'h0}) - f32({16'(acc_results[i]), 16'h0});
-        if (d < 0.0) d = -d;
         total_elements++;
-        if (acc_results[i] === exp_q[i]) exact_passed++;
-        else if (EXP_W == 8 && MAN_W == 7 && d <= acc_max_e / 16.0) begin
-          acc_bound_passed++;
-          if (d > acc_max_d) acc_max_d = d;
-        end
-        else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
+        if (acc_results[i] === exp_q[i]) begin
+          exact_passed++;
+          n_exact++;
+        end else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
         else begin
           failed++;
           errs++;
@@ -1381,9 +1400,9 @@ module TB_sienna_top #(
       $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (%0d)",
                acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt, HOST_SLOTS);
     end
-    $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d mismatches, bf16 at most %g off, largest output %g); %0d result beats and %0d activation bank spent",
-             acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), errs, acc_max_d, acc_max_e,
-             acc_beats, acc_banks);
+    $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d exact, %0d mismatches); %0d result beats and %0d activation bank spent",
+             acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), n_exact, errs, acc_beats,
+             acc_banks);
   endtask
 
   // ── PERF trace: stage transitions per cycle, read by regression.py --action perf ──
@@ -1551,6 +1570,12 @@ module TB_sienna_top #(
     end
     reset_mid_stream();
     accum_null_pass();
+    // sienna_top's own link checkers judge only when it is drained: it must drain after the last set.
+    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.drained; w++) @(posedge clk_i);
+    if (!dut.drained) begin
+      failed++;
+      $display("  [FAIL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.drain_n);
+    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
 
     $display("\n==============================================");
     $display(" RESULT SUMMARY");
@@ -1558,7 +1583,6 @@ module TB_sienna_top #(
     $display(" Total    : %0d", total_elements);
     $display(" Exact    : %0d", exact_passed);
     $display(" Tol pass : %0d  (rel <= %.1f%%)", tol_passed, REL_TOL * 100.0);
-    $display(" Acc bound: %0d  (bf16 accumulate pass, within 1/16 of its set's largest output)", acc_bound_passed);
     $display(" Failed   : %0d", failed);
     $display("----------------------------------------------");
     if (failed == 0) $display(" RESULT: PASSED");

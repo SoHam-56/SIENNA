@@ -2815,8 +2815,14 @@ def test_gate_judge():
     assert mr.judge("ad01", "x", "fp32", [_layer()], ad(10.02))["task"], "fp32 score above 1e-3 must fail"
     g = mr.judge("ad01", "x", "bf16", [_layer(1.8)], ad(27.0))
     assert not g["hw"] and not g["task"] and len(g["reported"]) == 2 and g["rep_key"] == ("ad01", "bf16"), g
+    assert mr.verdict_word(g, "hw") == mr.verdict_word(g, "task") == "FAIL (reported, not gated)", "a reported failure must not read PASS"
+    g = mr.judge("ad01", "x", "bf16", [_layer(0.1)], ad(27.0))
+    assert (mr.verdict_word(g, "hw"), mr.verdict_word(g, "task")) == ("PASS", "FAIL (reported, not gated)"), g
     g = mr.judge("ad01", "x", "bf16", [_layer(1.8, differ=1)], ad(27.0))
     assert len(g["hw"]) == 1 and g["bad_layers"] == ["L03"], "REPORTED must never suppress a bit-exact failure"
+    assert mr.verdict_word(g, "hw") == "FAIL"
+    assert mr.verdict_word(mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 1, "ref_top": 0}), "task") == "FAIL"
+    assert mr.verdict_word(mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 0, "ref_top": 0}), "task") == "PASS"
 
 
 @selftest

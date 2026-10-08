@@ -989,6 +989,8 @@ module TB_sienna_top #(
     automatic longint t0 = $time;
     automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
     automatic int hold_put0 = 0, hold_in0 = 0, hold_room = 0;  // sets put and in flight at the hold's start; sets the entry admits after it
+    automatic int hold_extra = 0;  // cycles the hold ran on past HOLD_CYC until the host was blocked
+    automatic bit hold_end_blocked = 0;  // the host was blocked with a set to put as the hold ended
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s%s", NUM_SETS,
              overrun ? $sformatf(", the host waiting for a credit on set %0d with every admitted set in flight", SETS_IN_FLIGHT) : "",
              hold ? $sformatf(", %0d L9 slot per lane and every L9 credit withheld %0d cycles from set %0d's first words", out_adv, HOLD_CYC, HOLD_SET)
@@ -1098,18 +1100,29 @@ module TB_sienna_top #(
                   if (host_cnt == 0 && dut.entry_full && n_started < NUM_SETS) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
                   if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
                 end
-                out_hold = 0;
-                $display("  [Hold] every L9 credit withheld %0d cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put (%0d at the start, %0d in flight)",
-                         HOLD_CYC, HOLD_SET, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started,
-                         hold_put0, hold_in0);
                 // With the output frozen no real set completes, so the entry admits SETS_IN_FLIGHT less those in flight at the start (plus any completion): more sets left must block the host.
                 hold_room = SETS_IN_FLIGHT - hold_in0 + hold_done;
+                // Required, the host must still be blocked as the hold ends; one between a staging credit and its put gets one set's load to block again.
+                while (NUM_SETS - hold_put0 > hold_room && !(host_cnt == 0 && n_started < NUM_SETS) && hold_extra < HOST_SET_CYC + 8) begin
+                  @(negedge clk_i);
+                  if (pipeline_complete_o) hold_done++;
+                  hold_extra++;
+                end
+                hold_end_blocked = (host_cnt == 0 && n_started < NUM_SETS);
+                out_hold = 0;
+                $display("  [Hold] every L9 credit withheld %0d cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put (%0d at the start, %0d in flight); %0d cycles more to the end, blocked at the end %0b",
+                         HOLD_CYC, HOLD_SET, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started,
+                         hold_put0, hold_in0, hold_extra, hold_end_blocked);
                 if (NUM_SETS - hold_put0 <= hold_room)
                   $display("  [Hold] host blocking not reachable: %0d sets left to put at the hold's start, the entry admits %0d more (SETS_IN_FLIGHT %0d, %0d in flight, %0d completions)",
                            NUM_SETS - hold_put0, hold_room, SETS_IN_FLIGHT, hold_in0, hold_done);
                 else if (hold_blocked + hold_capped == 0) begin
                   failed++;
                   $display("  [FAIL] Hold: the host was never blocked with a set to put, so the stall never reached it");
+                end else if (!hold_end_blocked) begin
+                  failed++;
+                  $display("  [FAIL] Hold: the host was not blocked when the hold ended (%0d cycles blocked in all), so the stall did not hold it back",
+                           hold_blocked + hold_capped);
                 end
                 if (hold_stalled < HOLD_CYC * 4 / 5 || hold_puts > out_adv * NUM_LANES) begin
                   failed++;

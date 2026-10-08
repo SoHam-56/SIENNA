@@ -8,7 +8,7 @@
 #   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_model_run), RtlSets (TB_sienna_model), Emulator (numpy)
-#   7. Runtime          execute, macs_of; the model gate: check_layer, its bounds (FP32_LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
+#   7. Runtime          execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
 #   8. CLI              model_main, tflite_main, tflite_pack_main, main
 
 import argparse
@@ -1113,10 +1113,13 @@ def macs_of(job):
 
 
 # The model gate's bounds, one place; the hardware itself is judged bit for bit against the backend's exact model in every float format.
-FP32_LAYER_BOUND = 1e-4  # fp32 max|hw-ref|/max|ref| per layer: gemm's fp32 bound (regression.py), 2.4x the measured worst 4.1e-05 (ms_N16_T4_fp32)
+LAYER_BOUND = {  # max|hw-ref|/max|ref| per layer against float64 on the same operands: the check a bug shared by the RTL and its exact model must pass
+    "fp32": 1e-4,  # also regression.py's gemm bound; measured worst 3.29e-05 over 187 layers (mg_fp32c), 3x margin
+    "bf16": 0.25,  # bf16 sums in bf16: measured worst 7.41e-02 (resnet8 L11 ADD, mg_bf16c) without ad01, 3.4x margin; catches gross shared bugs only
+}
 CLASSIFIERS = ("resnet8", "kws", "vww")  # top-1 must equal the float reference's in every format
-SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.9e-05 (50x margin); bf16 operands with exact sums give 2.2e-03 (numpy estimate, 4.5x margin)
-REPORTED = {("ad01-score", "bf16")}  # known limit: bf16 builds sum in bf16 (score 3x the float model's) until the fp32-accumulation change; shown as FAIL, not counted
+SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 operands with exact sums give 2.24e-03 (numpy estimate, 4.5x margin)
+REPORTED = {("ad01", "bf16")}  # known limit: bf16 builds sum in bf16 (ad01 layers up to 183% off, score 2.7-2.8x the float model's) until the fp32-accumulation change; float checks shown as FAIL, not counted; bit-exact still gates
 
 
 def parse_fault(spec):
@@ -1125,9 +1128,9 @@ def parse_fault(spec):
         return None
     p = spec.split(":")
     if p[0] == "top1" and len(p) == 2:
-        return {"kind": "top1", "model": p[1]}
+        return {"kind": "top1", "model": p[1], "spec": spec, "applied": False}
     if p[0] in ("word", "shared") and len(p) in (4, 5):
-        return {"kind": p[0], "model": p[1], "layer": p[2], "index": int(p[3]), "bit": int(p[4]) if len(p) == 5 else 0}
+        return {"kind": p[0], "model": p[1], "layer": p[2], "index": int(p[3]), "bit": int(p[4]) if len(p) == 5 else 0, "spec": spec, "applied": False}
     raise ValueError(f"--fault {spec}: expected word:MODEL:LAYER:INDEX[:BIT], shared:MODEL:LAYER:INDEX[:BIT] or top1:MODEL")
 
 
@@ -1142,11 +1145,16 @@ def flip_bit(y, fmt, index, bit):
 
 def check_layer(sim, job, y, fmt, fault=None):
     """Hardware correctness of one layer -> (y as the next layer takes it, record): every word against the backend's bit-exact model; a test-only fault flips one first."""
-    if fault:
+    if fault and 0 <= fault["index"] < np.size(y):  # an index outside the layer leaves the fault unapplied, which gate_verdict fails
         y = flip_bit(y, fmt, fault["index"], fault["bit"])
+        fault["applied"] = True
+    else:
+        fault = None
     exact = getattr(sim, "exact", None)
     if exact is None:
-        return y, None
+        if isinstance(sim, Emulator):
+            return y, None  # the numpy stand-in is not hardware; only its float bound applies
+        raise RuntimeError(f"{type(sim).__name__} has no bit-exact model (exact): the model gate cannot judge it")
     want = exact(job)
     if fault and fault["kind"] == "shared":  # a bug the RTL and its model share: only the float bound can see it
         want = want.copy()
@@ -1161,33 +1169,49 @@ def check_layer(sim, job, y, fmt, fault=None):
 
 
 def judge(name, desc, fmt, stats, r):
-    """The gate on one inference: hardware (each layer bit-exact; fp32 also within FP32_LAYER_BOUND) and task (top-1, or ad01's score) against the float model."""
-    hw, bad = [], set()
+    """The gate on one inference: hardware (each layer bit-exact, and within LAYER_BOUND of float64) and task (top-1, or ad01's score) against the float model.
+    A REPORTED (model, format) moves only its float checks (bound, task) to reported; a bit-exact failure always gates."""
+    rep = (name, fmt) in REPORTED
+    why = " (reported, not gated: bf16 builds sum in bf16 until the fp32-accumulation change)"
+    hw, bad, task, reported = [], set(), [], []
     for s in stats:
         L, e = f"L{s['layer']:02d}", s["exact"]
         if e and e["differ"]:
             hw.append(f"FAIL hardware {name} [{desc}] {L}: {e['differ']} of {e['words']} words differ from the bit-exact model; "
                       f"first at index {e['index']} (row {e['row']}, col {e['col']}): expected {e['expected']} got {e['got']}")
             bad.add(L)
-        if fmt == "fp32" and not s["err"] <= FP32_LAYER_BOUND:
-            hw.append(f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the fp32 bound {FP32_LAYER_BOUND:.0e}")
-            bad.add(L)
-    task, reported = [], []
+        if not s["err"] <= LAYER_BOUND[fmt]:  # NaN fails too
+            m = f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the {fmt} bound {LAYER_BOUND[fmt]:g}"
+            if rep:
+                reported.append(m + why)
+            else:
+                hw.append(m)
+                bad.add(L)
     if name in CLASSIFIERS:
         line = f"top-1 hw {r['hw_top']} ref {r['ref_top']}"
         if r["hw_top"] != r["ref_top"]:
-            task.append(f"FAIL task {name} [{desc}]: top-1 {r['hw_top']} differs from the float reference's {r['ref_top']}")
+            m = f"FAIL task {name} [{desc}]: top-1 {r['hw_top']} differs from the float reference's {r['ref_top']}"
+            (reported if rep else task).append(m + why if rep else m)
     else:  # ad01: the mean reconstruction error over the inference's slices
         sh, sr, bound = float(np.mean(r["score_hw"])), float(np.mean(r["score_ref"])), SCORE_BOUND[fmt]
         rel = abs(sh - sr) / sr
-        line = f"anomaly score hw {sh:.6f} ref {sr:.6f}, |hw-ref|/ref {rel:.2e}, bound {bound:.0e}"
+        line = f"anomaly score hw {sh:.6f} ref {sr:.6f}, |hw-ref|/ref {rel:.2e}, bound {bound:g}"
         if not rel <= bound:
-            m = f"FAIL task {name} [{desc}]: anomaly score {sh:.6f} against the float reference's {sr:.6f}, |hw-ref|/ref {rel:.2e} above {bound:.0e}"
-            if ("ad01-score", fmt) in REPORTED:
-                reported.append(m + " (reported, not gated: bf16 builds sum in bf16 until the fp32-accumulation change)")
-            else:
-                task.append(m)
-    return {"hw": hw, "bad_layers": sorted(bad), "task": task, "reported": reported, "task_line": line}
+            m = f"FAIL task {name} [{desc}]: anomaly score {sh:.6f} against the float reference's {sr:.6f}, |hw-ref|/ref {rel:.2e} above {bound:g}"
+            (reported if rep else task).append(m + why if rep else m)
+    return {"hw": hw, "bad_layers": sorted(bad), "task": task, "reported": reported, "task_line": line, "rep_key": (name, fmt) if rep else None}
+
+
+def gate_verdict(tally, models, fault=None) -> tuple:
+    """(ok, extra failures, notes) of a whole run: no hardware or task failure, every requested model ran, a test-only fault was applied."""
+    extra = [f"FAIL coverage: {m} ran no inference" for m in models if not tally["runs"].get(m)]
+    if not tally["layers"]:
+        extra.append("FAIL coverage: no layer was checked")
+    if fault and not fault.get("applied"):
+        extra.append(f"FAIL fault: --fault {fault['spec']} was never applied (no such model, layer or index in its first inference, or a conv fused into its ADD)")
+    notes = [f"NOTE: REPORTED entry {k} passed every check it covers; it can be dropped from REPORTED"
+             for k in sorted(tally["rep_seen"]) if k not in tally["rep_failed"]]
+    return not tally["hw"] and not tally["task"] and not extra, extra, notes
 
 
 def execute(model, x, sim=None, log=None, fault=None):
@@ -1335,6 +1359,8 @@ def model_main(argv=None):
     a = ap.parse_args(argv)
     if a.fmt_name == "int8":
         ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
+    if a.fmt_name != "fp32" and (a.emulate or a.engine == "sets"):
+        ap.error(f"--format {a.fmt_name}: --engine sets and --emulate build and judge fp32 only; use --engine layer")
     os.makedirs(a.work, exist_ok=True)
     report = os.path.join(a.work, f"model_report_N{a.n}.log")
     js = os.path.join(a.work, f"model_results_N{a.n}.json")
@@ -1358,14 +1384,15 @@ def model_main(argv=None):
         log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
     fault = parse_fault(a.fault)
     if fault:
-        log(f"TEST ONLY: --fault {a.fault} (this run must FAIL the gate)")
+        log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
     sim_fmt = getattr(sim, "fmt_name", "fp32")
     engine = "emulator" if a.emulate else f"engine {a.engine}"
-    how = ("bit-exact" if getattr(sim, "exact", None) else "no bit-exact model: emulator") + \
-        (f", fp32 bound {FP32_LAYER_BOUND:.0e}" if sim_fmt == "fp32" else "")
-    tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": []}
+    how = ("no bit-exact model: emulator" if isinstance(sim, Emulator) else "bit-exact") + f", {sim_fmt} bound {LAYER_BOUND[sim_fmt]:g}"
+    tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": [],
+             "runs": {}, "rep_seen": set(), "rep_failed": set()}
     results = {}
-    for name in a.models.split(","):
+    models = a.models.split(",")
+    for name in models:
         model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
         if name == "resnet8" and a.ref_accuracy:
             x, y = cifar_test(os.path.join(a.model_dir, "data"))
@@ -1388,6 +1415,7 @@ def model_main(argv=None):
                 hw = np.array(hw, np.float32)
                 o = np.argsort(hw.ravel())[::-1][:2]
                 hw.ravel()[o] = hw.ravel()[o[::-1]]
+                f_here["applied"] = True
                 log(f"  TEST ONLY fault: top1 swaps hw outputs {o[0]} and {o[1]}")
             cyc, sets, hwords = sim.cycles - c0, sim.sets - s0, getattr(sim, "words", 0) - w0
             macs = sum(s["macs"] for s in stats)
@@ -1406,32 +1434,37 @@ def model_main(argv=None):
             log(f"  result: hw top {r['hw_top']} ref top {r['ref_top']} label {label}  max |hw-ref| on outputs {diff:.2e}  "
                 f"{cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {sets} sets  {hwords} host words  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {r['wall_s']:.0f} s")
             g = r["gate"]
-            verdict = "FAIL" if g["task"] else "FAIL (reported, not gated)" if g["reported"] else "PASS"
-            log(f"  gate: hardware {'FAIL' if g['hw'] else 'PASS'} ({len(stats)} layers, {how})  task {verdict} ({g['task_line']})")
+            extra_rep = f"  reported, not gated: {len(g['reported'])} FAIL" if g["reported"] else ""
+            log(f"  gate: hardware {'FAIL' if g['hw'] else 'PASS'} ({len(stats)} layers, {how})  task {'FAIL' if g['task'] else 'PASS'} ({g['task_line']}){extra_rep}")
             for m in g["hw"] + g["task"] + g["reported"]:
                 log(f"    {m}")
             tally["layers"] += len(stats)
             tally["bad_layers"] += len(g["bad_layers"])
             tally["inferences"] += 1
             tally["bad_inferences"] += int(bool(g["task"]))
+            tally["runs"][name] = tally["runs"].get(name, 0) + 1
+            if g["rep_key"]:
+                tally["rep_seen"].add(g["rep_key"])
+                if g["reported"]:
+                    tally["rep_failed"].add(g["rep_key"])
             for k in ("hw", "task", "reported"):
                 tally[k] += g[k]
         results.setdefault(name, {})["runs"] = runs
         results[name]["source"] = source
-        json.dump(results, open(js, "w"), indent=1)
+        json.dump(results, open(js, "w"), indent=1, default=list)
     log(f"\nreport {report}\nresults {js}")
     if sim is None:
         log("MODEL GATE: not run (--no-sim: float reference only)")
         return
+    ok, extra, notes = gate_verdict(tally, models, fault)
     log("")
-    for m in tally["hw"] + tally["task"] + tally["reported"]:
+    for m in tally["hw"] + tally["task"] + extra + tally["reported"] + notes:
         log(m)
-    ok = not tally["hw"] and not tally["task"]
-    rep_names = sorted({k for k, f in REPORTED if f == sim_fmt}) if tally["reported"] else []
-    log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(results)} models, "
+    rep_names = ", ".join(f"{m} {f}" for m, f in sorted(tally["rep_failed"]))
+    log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(tally['runs'])} of {len(models)} models ran, "
         f"{tally['inferences']} inferences; hardware: {tally['bad_layers']} of {tally['layers']} layers fail ({how}); "
-        f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; "
-        f"reported, not gated: {len(tally['reported'])}{' (' + ', '.join(rep_names) + ')' if rep_names else ''}")
+        f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; other failures: {len(extra)}; "
+        f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}")
     if not ok:
         sys.exit(1)
 

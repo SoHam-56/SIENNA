@@ -1415,8 +1415,8 @@ def gemm_main(argv=None):
         rep.write(line + "\n")
         rep.flush()
         json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
-        if a.fmt_name == "fp32" and err > 1e-4:
-            print(f"FAIL {name}: error {err:.2e} above 1e-4", flush=True)
+        if a.fmt_name == "fp32" and not err <= mr.LAYER_BOUND["fp32"]:  # the model gate's fp32 layer bound, one constant; NaN fails
+            print(f"FAIL {name}: error {err:.2e} above {mr.LAYER_BOUND['fp32']:g}", flush=True)
             sys.exit(1)
         if a.fmt_name != "fp32" and mism:
             print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
@@ -2714,6 +2714,128 @@ def test_precheck_table():
         job = _packed(16)
         edit(job["pack"])
         _refused(job, 16, 32, why)
+
+
+# ── tool: the model gate (model_runner's parse_fault, flip_bit, check_layer, judge, gate_verdict) ──
+
+class _ExactSim:
+    """A backend stand-in whose bit-exact model returns the given words."""
+
+    def __init__(self, want):
+        self.want = np.asarray(want, np.int64)
+
+    def exact(self, job):
+        return self.want
+
+
+def _layer(err=0.0, differ=0, layer=3):
+    """One layer's stats as execute records them; differ > 0 adds a first mismatch."""
+    e = {"differ": differ, "words": 16}
+    if differ:
+        e.update(index=5, row=0, col=5, expected="3de8", got="3de9")
+    return {"layer": layer, "err": err, "exact": e}
+
+
+def _tally(runs=None, layers=9, hw=(), task=(), rep_seen=(), rep_failed=()):
+    return {"layers": layers, "hw": list(hw), "task": list(task), "runs": dict(runs or {"resnet8": 1}),
+            "rep_seen": set(rep_seen), "rep_failed": set(rep_failed)}
+
+
+@selftest
+def test_gate_parse_fault():
+    assert mr.parse_fault(None) is None and mr.parse_fault("") is None
+    f = mr.parse_fault("word:resnet8:L00:17")
+    assert (f["kind"], f["model"], f["layer"], f["index"], f["bit"], f["applied"]) == ("word", "resnet8", "L00", 17, 0, False)
+    assert mr.parse_fault("shared:ad01:L09:0:20")["bit"] == 20 and mr.parse_fault("top1:kws")["kind"] == "top1"
+    for bad in ("word:resnet8:L00", "top1", "flip:resnet8:L00:1", "word:resnet8:L00:x"):
+        try:
+            mr.parse_fault(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"parse_fault accepted {bad!r}")
+
+
+@selftest
+def test_gate_flip_bit():
+    y = mr.bits_float(np.array([0x3DE8, 0x0000]), "bf16")
+    assert mr.word_bits(mr.flip_bit(y, "bf16", 0, 0), "bf16").tolist() == [0x3DE9, 0]
+    assert mr.word_bits(y, "bf16").tolist() == [0x3DE8, 0], "flip_bit must not change its input"
+    assert mr.word_bits(mr.flip_bit(np.float32([0.0]), "fp32", 0, 30), "fp32").tolist() == [0x40000000]
+    for fmt, bit in (("bf16", 16), ("fp32", 32), ("bf16", -1)):
+        try:
+            mr.flip_bit(y, fmt, 0, bit)
+        except ValueError:
+            continue
+        raise AssertionError(f"flip_bit took bit {bit} of a {fmt} word")
+
+
+@selftest
+def test_gate_check_layer():
+    want = np.array([[0x3F80, 0x4000], [0x0000, 0xBF80]])
+    y = mr.bits_float(want, "bf16")
+    _, rec = mr.check_layer(_ExactSim(want), None, y, "bf16")
+    assert rec["differ"] == 0 and rec["words"] == 4, rec
+    bad = want.copy()
+    bad[1, 0] = 0x0001
+    _, rec = mr.check_layer(_ExactSim(bad), None, y, "bf16")
+    assert (rec["differ"], rec["index"], rec["row"], rec["col"], rec["expected"], rec["got"]) == (1, 2, 1, 0, "0001", "0000"), rec
+    f = mr.parse_fault("word:m:L00:3:0")
+    y2, rec = mr.check_layer(_ExactSim(want), None, y, "bf16", f)
+    assert f["applied"] and rec["differ"] == 1 and rec["got"] == "bf81" and mr.word_bits(y2, "bf16")[1, 1] == 0xBF81, rec
+    f = mr.parse_fault("shared:m:L00:3:0")
+    _, rec = mr.check_layer(_ExactSim(want), None, y, "bf16", f)
+    assert f["applied"] and rec["differ"] == 0, "a shared fault must pass the bit-exact check"
+    f = mr.parse_fault("word:m:L00:4:0")  # one past the last word
+    _, rec = mr.check_layer(_ExactSim(want), None, y, "bf16", f)
+    assert not f["applied"] and rec["differ"] == 0
+    with tempfile.TemporaryDirectory() as d:
+        assert mr.check_layer(mr.Emulator(16, 32, d), None, y, "fp32")[1] is None
+    try:
+        mr.check_layer(object(), None, y, "bf16")
+    except RuntimeError:
+        return
+    raise AssertionError("check_layer judged a backend without a bit-exact model")
+
+
+@selftest
+def test_gate_judge():
+    top = {"hw_top": 3, "ref_top": 3}
+    g = mr.judge("resnet8", "x", "fp32", [_layer(), _layer(3e-5)], top)
+    assert not g["hw"] and not g["task"] and not g["reported"], g
+    g = mr.judge("resnet8", "x", "bf16", [_layer(differ=1)], top)
+    assert g["bad_layers"] == ["L03"] and "expected 3de8 got 3de9" in g["hw"][0], g
+    assert mr.judge("resnet8", "x", "fp32", [_layer(float("nan"))], top)["hw"], "NaN error must fail"
+    assert mr.judge("resnet8", "x", "fp32", [_layer(2e-4)], top)["hw"], "fp32 error above 1e-4 must fail"
+    assert mr.judge("kws", "x", "bf16", [_layer(0.3)], top)["hw"], "bf16 error above 0.25 must fail"
+    assert not mr.judge("kws", "x", "bf16", [_layer(0.07)], top)["hw"]
+    g = mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 1, "ref_top": 0})
+    assert g["task"] and "top-1 1 differs" in g["task"][0], g
+    ad = lambda hw: {"hw_top": 0, "ref_top": 0, "score_hw": [hw], "score_ref": [10.0]}
+    assert not mr.judge("ad01", "x", "fp32", [_layer()], ad(10.005))["task"]
+    assert mr.judge("ad01", "x", "fp32", [_layer()], ad(10.02))["task"], "fp32 score above 1e-3 must fail"
+    g = mr.judge("ad01", "x", "bf16", [_layer(1.8)], ad(27.0))
+    assert not g["hw"] and not g["task"] and len(g["reported"]) == 2 and g["rep_key"] == ("ad01", "bf16"), g
+    g = mr.judge("ad01", "x", "bf16", [_layer(1.8, differ=1)], ad(27.0))
+    assert len(g["hw"]) == 1 and g["bad_layers"] == ["L03"], "REPORTED must never suppress a bit-exact failure"
+
+
+@selftest
+def test_gate_verdict():
+    assert mr.gate_verdict(_tally(), ["resnet8"])[0]
+    ok, extra, _ = mr.gate_verdict(_tally(runs={"resnet8": 1}), ["resnet8", "kws"])
+    assert not ok and "kws ran no inference" in extra[0], extra
+    assert not mr.gate_verdict(_tally(runs={}, layers=0), ["resnet8"])[0], "zero inferences must fail"
+    assert not mr.gate_verdict(_tally(hw=["FAIL hardware"]), ["resnet8"])[0]
+    assert not mr.gate_verdict(_tally(task=["FAIL task"]), ["resnet8"])[0]
+    f = mr.parse_fault("word:resnet8:L01:0")
+    ok, extra, _ = mr.gate_verdict(_tally(), ["resnet8"], f)
+    assert not ok and "never applied" in extra[0], extra
+    f["applied"] = True
+    assert mr.gate_verdict(_tally(), ["resnet8"], f)[0]
+    ok, _, notes = mr.gate_verdict(_tally(rep_seen=[("ad01", "bf16")], rep_failed=[("ad01", "bf16")]), ["resnet8"])
+    assert ok and not notes
+    ok, _, notes = mr.gate_verdict(_tally(rep_seen=[("ad01", "bf16")]), ["resnet8"])
+    assert ok and "can be dropped" in notes[0], notes
 
 
 # ── tool: perf section (was test_perf_analysis.py) ──

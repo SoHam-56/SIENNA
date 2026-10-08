@@ -1218,9 +1218,11 @@ module sienna_top #(
   // Protocol checkers on the mesh side of L1 and L3, and on L6, checked whenever the pipeline has been empty a while.
   localparam int QUIET = GPNAE_FIFO_DEPTH + 8 + 4 * LINK_STAGES;  // past the lanes' 32-cycle advertisement after reset
   int quiet_n;
+  // last_accum: a partial set completes as it passes the stage, before the mesh broadcasts its staging bank, so an open sum is never drained.
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) quiet_n <= 0;
-    else if (host_accept || sets_out != 0 || mesh_sets != 0 || gp_sets != 0 || g_state != G_IDLE || p_state != P_IDLE) quiet_n <= 0;
+    else if (host_accept || sets_out != 0 || mesh_sets != 0 || gp_sets != 0 || g_state != G_IDLE || p_state != P_IDLE || last_accum)
+      quiet_n <= 0;
     else if (quiet_n < QUIET) quiet_n <= quiet_n + 1;
   assign drained = (quiet_n == QUIET);
   credit_link_checker #(.SLOTS(2)) l1_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l1m));

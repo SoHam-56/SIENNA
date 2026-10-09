@@ -360,22 +360,30 @@ module TB_sienna_top #(
     if (wc_last_i) wc_open_tb[weight_tile_i[$clog2(WC_TILES)-1]] = 1'b0;
   endtask
 
-  // The mesh's bias input, in the cycle its staging put arrives (L0 and L1 stages later), must be want: a zero-extended bf16 row reads wrong here even where the sums cannot show it.
+  // The bias the mesh captures (bias_push into its bias queue, L0 and L1 stages after the host put) must be want: a zero-extended or flushed bf16 row reads wrong here even where the sums cannot show it.
   task automatic check_mesh_bias(input logic [N-1:0][ACC_W-1:0] want);
     fork
       begin
+        automatic int q;
         repeat (2 * LINK_STAGES) @(negedge clk_i);
         #1;  // after the put's combinational paths settle
-        if (!dut.l1m.put) begin
+        if (!dut.systolic_array_inst.bias_push) begin
           failed++;
-          $display("  [FAIL] Bias check: no staging put reached the mesh %0d cycles after the host put", 2 * LINK_STAGES);
+          $display("  [FAIL] Bias check: the mesh captured no bias %0d cycles after the host put", 2 * LINK_STAGES);
         end else begin
+          q = int'(dut.systolic_array_inst.bq_wr);  // the queue entry this capture writes
+          @(posedge clk_i);
+          #1;  // the registered entry
           bias_checked++;
+          if (!dut.systolic_array_inst.bias_qv[q]) begin
+            failed++;
+            $display("  [FAIL] Bias check: bias queue entry %0d was captured without its bias_valid", q);
+          end
           for (int c = 0; c < N; c++)
-            if (dut.systolic_array_inst.bias_i[c] !== want[c]) begin
+            if (dut.systolic_array_inst.bias_q[q][c] !== want[c]) begin
               failed++;
-              $display("  [FAIL] Bias check: the mesh's bias input column %0d is %h, the bias row widened is %h", c,
-                       dut.systolic_array_inst.bias_i[c], want[c]);
+              $display("  [FAIL] Bias check: the mesh's bias queue entry %0d column %0d is %h, the bias row widened is %h", q, c,
+                       dut.systolic_array_inst.bias_q[q][c], want[c]);
             end
         end
       end

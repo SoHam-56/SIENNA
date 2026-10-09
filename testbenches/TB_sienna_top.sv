@@ -59,7 +59,6 @@ module TB_sienna_top #(
   logic                     wc_last_i;  // this set is the last of its cache region's fill
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
-  logic [     ADDR_LINES:0] num_terms_i;
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;  // result beats per set
 
   // ── Links: this TB is the host (L0) and the weight-cache writer (L2), each with a counter and a checker ──
@@ -320,7 +319,6 @@ module TB_sienna_top #(
     s.bias_valid    = bias_valid_i;
     s.train         = training_mode_i;
     s.seed          = dropout_seed_i;
-    s.terms         = num_terms_i;
     s.pack_shift    = pack_shift_i;
     s.pack_map      = pack_map_i;
     s.act           = {pack_act_i, activation_function_i};
@@ -560,7 +558,6 @@ module TB_sienna_top #(
     north_write_data_i = '0;
     west_write_data_i = '0;
     activation_function_i = '0;
-    num_terms_i = '0;
     repeat (10) begin
       @(negedge clk_i);
       // Review Focus 1: while reset is held every producer count is 0 and no consumer advertises a credit.
@@ -793,17 +790,6 @@ module TB_sienna_top #(
   // Set k's activation: with MIXED_LEN > 0 the codes cycle through MIXED_ACTS, 4 bits per set.
   function automatic logic [CONTROL_WIDTH-1:0] act_of(input int k);
     return (MIXED_LEN > 0) ? CONTROL_WIDTH'((MIXED_ACTS >> (4 * (k % MIXED_LEN))) & 15) : CONTROL_WIDTH'(ACTIVATION_CODE);
-  endfunction
-
-  // Polynomial terms for set k's code, the same table as model_runner.py's ACTIVATION_TERMS.
-  function automatic logic [ADDR_LINES:0] terms_of(input int k);
-    if (MIXED_LEN == 0) return NUM_TERMS[ADDR_LINES:0];
-    case (act_of(k))
-      1: return 14;
-      2: return 15;
-      3: return 30;
-      default: return 0;
-    endcase
   endfunction
 
   // Set k's bias: with HAS_BIAS, the first pass of each group reads bias_<k>.mem.
@@ -1069,7 +1055,6 @@ module TB_sienna_top #(
               dropout_seed_i = set_seed(k);
               accumulate_i = is_partial(k);
               activation_function_i = act_of(k);
-              num_terms_i = terms_of(k);
               apply_bias(k);
               apply_requant(k);
               apply_pack(k);
@@ -1276,7 +1261,6 @@ module TB_sienna_top #(
           read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
           accumulate_i = is_partial(k);
           activation_function_i = act_of(k);
-          num_terms_i = terms_of(k);
           apply_bias(k);
           apply_requant(k);
           apply_pack(k);
@@ -1300,7 +1284,6 @@ module TB_sienna_top #(
     $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.sets_out, host_cnt, dut_stage);
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
-    num_terms_i           = NUM_TERMS[ADDR_LINES:0];
     training_mode_i       = TRAINING_MODE[0];
     repeat (2000) begin
       @(posedge clk_i);
@@ -1328,7 +1311,6 @@ module TB_sienna_top #(
     out_adv = 1;
     reset();
     activation_function_i = ACTIVATION_CODE[CONTROL_WIDTH-1:0];
-    num_terms_i           = NUM_TERMS[ADDR_LINES:0];
     training_mode_i       = TRAINING_MODE[0];
     repeat (100) @(posedge clk_i);
     if (!lanes_home(why)) begin
@@ -1372,7 +1354,6 @@ module TB_sienna_top #(
       if (j < 4) foreach (west_data_queue[i]) west_data_queue[i] = '0;
       accumulate_i = (j < n - 1) || $test$plusargs("acc_open");  // on purpose with +acc_open: the sum never closes
       activation_function_i = act_of(G);
-      num_terms_i = terms_of(G);
       dropout_seed_i = set_seed(G);
       apply_bias(0);  // the sum's bias rides its first pass only
       if (j != 0) begin
@@ -1498,7 +1479,7 @@ module TB_sienna_top #(
     $display(" SIENNA PIPELINE VERIFICATION");
     $display("==============================================");
     $display(" N=%-0d  TILE_SIZE=%-0d  FIFO_DEPTH=%-0d", N, TILE_SIZE, FIFO_DEPTH);
-    $display(" Activation code : %0b  Num terms : %0d", ACTIVATION_CODE, NUM_TERMS);
+    $display(" Activation code : %0b", ACTIVATION_CODE);
     $display(" Dropout         : %s  seed 0x%08h", TRAINING_MODE ? "training" : "inference", DROPOUT_SEED);
     $display(" Tolerance       : %s  rel<=%.1f%%  abs<=%.4f", TOLERANCE_MODE, REL_TOL * 100.0,
              ABS_TOL);
@@ -1528,7 +1509,6 @@ module TB_sienna_top #(
 
     $display("\n[STAGE] Starting pipeline");
     activation_function_i = act_of(0);
-    num_terms_i           = terms_of(0);
     apply_bias(0);
     apply_requant(0);
     apply_pack(0);
@@ -1560,7 +1540,6 @@ module TB_sienna_top #(
       read_mem_file("bound_output_1.mem", bound_results);
       dropout_seed_i = set_seed(1);
       activation_function_i = act_of(1);
-      num_terms_i = terms_of(1);
       apply_bias(1);
       apply_requant(1);
       apply_pack(1);

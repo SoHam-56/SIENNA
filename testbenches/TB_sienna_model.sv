@@ -37,7 +37,6 @@ module TB_sienna_model;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
-  logic [     ADDR_LINES:0] num_terms_i;
 
   // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
   localparam int PACK_ENTRIES = 8;
@@ -56,7 +55,6 @@ module TB_sienna_model;
     side.bias_valid    = bias_valid_i;
     side.train         = training_mode_i;
     side.seed          = dropout_seed_i;
-    side.terms         = num_terms_i;
     side.act[0]        = activation_function_i;
     side.zp[0]         = req_zp_i;
     side.amin[0]       = req_min_i;
@@ -268,7 +266,7 @@ module TB_sienna_model;
   initial begin
     string sets_f, out_f;
     integer fin, fout, rc;
-    int n_sets, acc, act, terms, has_bias, bad_ids, osp;
+    int n_sets, acc, act, has_bias, bad_ids, osp;
     bit host_gaps;
     logic [DATA_WIDTH-1:0] w;
     logic [31:0] w32;
@@ -296,7 +294,6 @@ module TB_sienna_model;
     wc_write_addr_i = '0;
     dropout_seed_i = '1;
     activation_function_i = '0;
-    num_terms_i = '0;
     north_write_reset_i = 1;
     west_write_reset_i = 1;
     north_write_enable_i = 0;
@@ -338,8 +335,8 @@ module TB_sienna_model;
 
     t0 = cycle;
     for (int k = 0; k < n_sets; k++) begin
-      rc = $fscanf(fin, "%d %d %d %d", acc, act, terms, has_bias);
-      if (rc != 4) begin
+      rc = $fscanf(fin, "%d %d %d", acc, act, has_bias);
+      if (rc != 3) begin
         $display("[FATAL] set %0d header unreadable in %s", k, sets_f);
         $finish;
       end
@@ -380,7 +377,6 @@ module TB_sienna_model;
       accumulate_i = acc[0];
       bias_valid_i = (has_bias != 0);
       activation_function_i = CONTROL_WIDTH'(act);
-      num_terms_i = terms[ADDR_LINES:0];
       if (host_gaps) begin
         load_set();
         start_pipeline_i = 1;

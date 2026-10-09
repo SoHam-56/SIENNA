@@ -122,7 +122,7 @@ The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue
 
 ## `ArithmeticLibrary/` (vendored twice)
 
-Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`. **Both copies are compiled into the top-level build**, so every module below is defined twice — see issue 9. The only differences between the copies are `logic` vs `wire`/`reg` port declarations in `fp32Adder.sv` and `fp32Multiplier.sv`.
+Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`, the same commit in both. The top-level build compiles only `SystolicMesh/ArithmeticLibrary` (issue 9, fixed); GPNAE's own `Makefile` uses its checkout.
 
 | File | Lines | Status | What it is |
 |---|---|---|---|

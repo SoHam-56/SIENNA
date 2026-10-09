@@ -47,7 +47,6 @@ TB_DIR      = $(PRJ_DIR)/testbenches
 SM_DIR      = $(PRJ_DIR)/SystolicMesh/src
 SM_LIB_DIR  = $(PRJ_DIR)/SystolicMesh/ArithmeticLibrary
 GPNAE_DIR   = $(PRJ_DIR)/GPNAE/src
-GPNAE_LIB_DIR = $(PRJ_DIR)/GPNAE/ArithmeticLibrary
 MAXPOOL_DIR = $(PRJ_DIR)/Maxpool
 DROPOUT_DIR = $(PRJ_DIR)/Dropout
 
@@ -90,33 +89,18 @@ SM_LIB_FILES = \
 	Multipliers/Fx/src/fxMac.sv \
 	Requant/src/tfliteRequant.sv
 
+# gpnae_poly's lane only: the published gpnae.sv and its InputFIFO / SeLu / sigtan build in GPNAE's own Makefile.
 GPNAE_FILES = \
 	TYTAN/Memory/CoeffROM.v \
-	TYTAN/Memory/InputFIFO.v \
-	TYTAN/Memory/PE5B.v \
-	TYTAN/Memory/RAM.v \
 	TYTAN/Memory/ROM.v \
 	TYTAN/LZC.v \
 	TYTAN/barrel_mac.sv \
 	fp32_down.sv \
-	fp32_up_down.sv \
-	SeLu.sv \
-	sigtan.sv \
-	gpnae.sv \
 	gpnae_tail.sv \
 	gpnae_poly_int8.sv \
 	lane_fifo.sv \
 	lane_link.sv \
 	gpnae_poly.sv
-
-GPNAE_LIB_FILES = \
-	Adders/FP32/src/fp32Adder.sv \
-	Adders/FP32/src/LZC.sv \
-	Multipliers/Radix4Booth/src/R4Booth.sv \
-	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
-	Multipliers/FP32/src/fp32Multiplier.sv \
-	Divider/FP32/src/fp32Divider.sv \
-	Divider/FP32/src/divu.sv
 
 MAXPOOL_FILES = \
 	Maxpool_2D.sv
@@ -137,7 +121,6 @@ DESIGN_FILES = \
 	$(addprefix $(SM_DIR)/,$(SM_FILES)) \
 	$(addprefix $(SM_LIB_DIR)/,$(SM_LIB_FILES)) \
 	$(addprefix $(GPNAE_DIR)/,$(GPNAE_FILES)) \
-	$(addprefix $(GPNAE_LIB_DIR)/,$(GPNAE_LIB_FILES)) \
 	$(addprefix $(MAXPOOL_DIR)/,$(MAXPOOL_FILES)) \
 	$(addprefix $(DROPOUT_DIR)/,$(DROPOUT_FILES))
 
@@ -220,7 +203,6 @@ VERILATOR_FLAGS = \
 	-I$(SM_DIR) \
 	-I$(SM_LIB_DIR) \
 	-I$(GPNAE_DIR) \
-	-I$(GPNAE_LIB_DIR) \
 	-I$(MAXPOOL_DIR) \
 	-I$(DROPOUT_DIR) \
 	--Mdir $(VERILATOR_DIR) \
@@ -228,7 +210,6 @@ VERILATOR_FLAGS = \
 	--Wno-WIDTHEXPAND \
 	--Wno-WIDTHCONCAT \
 	--Wno-CASEINCOMPLETE \
-	--Wno-MODDUP \
 	--Wno-SELRANGE \
 	--Wno-LATCH \
 	--Wno-REALCVT \
@@ -259,7 +240,6 @@ VCS_FLAGS = \
 	+incdir+$(SM_DIR) \
 	+incdir+$(SM_LIB_DIR) \
 	+incdir+$(GPNAE_DIR) \
-	+incdir+$(GPNAE_LIB_DIR) \
 	+incdir+$(MAXPOOL_DIR) \
 	+incdir+$(DROPOUT_DIR) \
 	+define+VCS
@@ -334,7 +314,7 @@ help:
 	@echo ""
 	@echo "Design Files:"
 	@echo "  Systolic Mesh : $(words $(SM_FILES)) files  |  SM Lib: $(words $(SM_LIB_FILES)) files"
-	@echo "  GPNAE         : $(words $(GPNAE_FILES)) files  |  GPNAE Lib: $(words $(GPNAE_LIB_FILES)) files"
+	@echo "  GPNAE         : $(words $(GPNAE_FILES)) files"
 	@echo "  Maxpool       : $(words $(MAXPOOL_FILES)) files"
 	@echo "  Dropout       : $(words $(DROPOUT_FILES)) files"
 	@echo "  Total         : $(words $(DESIGN_FILES)) files"
@@ -513,8 +493,6 @@ list-files:
 	for f in $(SM_LIB_FILES); do echo "  - $$f"; done
 	@echo "GPNAE ($(GPNAE_DIR)):"; \
 	for f in $(GPNAE_FILES); do echo "  - $$f"; done
-	@echo "GPNAE ArithmeticLibrary ($(GPNAE_LIB_DIR)):"; \
-	for f in $(GPNAE_LIB_FILES); do echo "  - $$f"; done
 	@echo "Maxpool ($(MAXPOOL_DIR)):"; \
 	for f in $(MAXPOOL_FILES); do echo "  - $$f"; done
 	@echo "Dropout ($(DROPOUT_DIR)):"; \

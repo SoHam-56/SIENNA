@@ -27,7 +27,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
 
 import numpy as np
 
@@ -46,8 +45,7 @@ import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 # Ensure we can import the mesh helpers
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
 
-from conv_tests import _basic_pair, _general_pair, _im2col_patches, _kernel_size
-from matmul_tests import _f2h as float_to_hex
+from conv_tests import _basic_pair, _general_pair, _kernel_size
 from matmul_tests import _ref_matmul, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")

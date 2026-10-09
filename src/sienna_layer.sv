@@ -568,6 +568,23 @@ module sienna_layer #(
     a_int_no_residual: assert property (@(posedge clk_i) disable iff (!rstn_i) !(cfg_load_i && !active && cfg_residual_i))
       else $error("sienna_layer: int8 residual is not supported until 2b");
   end
+  // A float bias row word must land in bias_buf as the word followed by zeros, -0 and subnormals included.
+  logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias), float builds
+  logic chk_bias_h;
+  logic [N-1:0][DATA_WIDTH-1:0] chk_bias_row;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) chk_bias_v <= 1'b0;
+    else chk_bias_v <= active && wl_take_bias && !IS_INT;
+  always_ff @(posedge clk_i) begin  // no reset: read only with chk_bias_v
+    chk_bias_h <= wl_blk[0];
+    chk_bias_row <= w_data_i;
+  end
+  for (genvar c = 0; c < N; c++) begin : G_A_BIAS
+    a_bias_widened: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                     chk_bias_v |-> bias_buf[chk_bias_h][c] == (ACC_W'(chk_bias_row[c]) << (ACC_W - DATA_WIDTH)))
+      else $error("sienna_layer: bias column %0d holds %h, the row word %h widened is %h", c, bias_buf[chk_bias_h][c], chk_bias_row[c],
+                  ACC_W'(chk_bias_row[c]) << (ACC_W - DATA_WIDTH));
+  end
 `endif
 
 endmodule

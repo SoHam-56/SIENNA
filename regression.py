@@ -1444,8 +1444,8 @@ def gemm_main(argv=None):
         rep.write(line + "\n")
         rep.flush()
         json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
-        if a.fmt_name == "fp32" and not err <= mr.LAYER_BOUND["fp32"]:  # the model gate's fp32 layer bound, one constant; NaN fails
-            print(f"FAIL {name}: error {err:.2e} above {mr.LAYER_BOUND['fp32']:g}", flush=True)
+        if not err <= mr.LAYER_BOUND[a.fmt_name]:  # the model gate's layer bound in this format, one constant; NaN fails
+            print(f"FAIL {name}: error {err:.2e} above {mr.LAYER_BOUND[a.fmt_name]:g}", flush=True)
             sys.exit(1)
         if a.fmt_name != "fp32" and mism:
             print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
@@ -2851,8 +2851,8 @@ def test_gate_judge():
     assert g["bad_layers"] == ["L03"] and "expected 3de8 got 3de9" in g["hw"][0], g
     assert mr.judge("resnet8", "x", "fp32", [_layer(float("nan"))], top)["hw"], "NaN error must fail"
     assert mr.judge("resnet8", "x", "fp32", [_layer(2e-4)], top)["hw"], "fp32 error above 1e-4 must fail"
-    assert mr.judge("kws", "x", "bf16", [_layer(0.3)], top)["hw"], "bf16 error above 0.25 must fail"
-    assert not mr.judge("kws", "x", "bf16", [_layer(0.07)], top)["hw"]
+    assert mr.judge("kws", "x", "bf16", [_layer(0.03)], top)["hw"], "bf16 error above 0.02 must fail"
+    assert not mr.judge("kws", "x", "bf16", [_layer(0.01)], top)["hw"]
     g = mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 1, "ref_top": 0})
     assert g["task"] and "top-1 1 differs" in g["task"][0], g
     ad = lambda hw: {"hw_top": 0, "ref_top": 0, "score_hw": [hw], "score_ref": [10.0]}
@@ -2867,7 +2867,7 @@ def test_gate_judge():
         g = mr.judge("ad01", "x", "bf16", [_layer(1.8)], ad(27.0))
         assert not g["hw"] and not g["task"] and len(g["reported"]) == 2 and g["rep_key"] == ("ad01", "bf16"), g
         assert mr.verdict_word(g, "hw") == mr.verdict_word(g, "task") == "FAIL (reported, not gated)", "a reported failure must not read PASS"
-        g = mr.judge("ad01", "x", "bf16", [_layer(0.1)], ad(27.0))
+        g = mr.judge("ad01", "x", "bf16", [_layer(0.01)], ad(27.0))
         assert (mr.verdict_word(g, "hw"), mr.verdict_word(g, "task")) == ("PASS", "FAIL (reported, not gated)"), g
         g = mr.judge("ad01", "x", "bf16", [_layer(1.8, differ=1)], ad(27.0))
         assert len(g["hw"]) == 1 and g["bad_layers"] == ["L03"], "REPORTED must never suppress a bit-exact failure"

@@ -1472,6 +1472,27 @@ def gemm_main(argv=None):
                 rep.write(f"  layer_{act}: {mism} outputs differ from the bit-exact model\n")
                 if mism:
                     sys.exit(1)
+        if a.fmt_name == "bf16" and not layer_bias_special(a, sim, rep):
+            sys.exit(1)
+
+
+def layer_bias_special(a, sim, rep) -> bool:
+    """One bf16 layer whose bias row holds +0, -0 and subnormals (_special_bias): bit-exact, and sienna_layer's a_bias_widened, the only check that sees them, must not fire."""
+    rng = np.random.RandomState(4711)
+    A = mr.op_round(rng.uniform(-1, 1, (32, 40)), a.fmt_name)
+    B = mr.op_round(rng.uniform(-1, 1, (40, 24)), a.fmt_name)
+    words = _special_bias(mr.fmt_bits(mr.op_round(rng.uniform(-0.5, 0.5, 24), a.fmt_name), a.fmt_name), a.fmt_name)
+    job = {"terms": [(A, B)], "bias": mr.bits_float(words, a.fmt_name), "act": "linear", "shape": (32, 24), "bias_words": words}
+    try:
+        y, sets, cyc = sim.run_job(job, "bias_special")
+    except RuntimeError as e:  # a firing assertion or a TB check
+        line, good = f"FAIL layer_bias_special: {e}", False
+    else:
+        mism = int(np.sum(mr.word_bits(y, a.fmt_name) != sim.exact(job)))
+        line, good = f"layer_bias_special{'':<4} {32:>5} {40:>5} {24:>5} {sets:>7} {cyc:>10}  {mism} outputs differ from the bit-exact model", mism == 0
+    print(line, flush=True)
+    rep.write(line + "\n")
+    return good
 
 
 # ── perf (was perf_analysis.py) ──────────────────────────────────────────────

@@ -162,7 +162,6 @@ module sienna_top #(
   logic                  set_train[NUM_IDS];
   logic [LFSR_WIDTH-1:0] set_seed [NUM_IDS];
   logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
-  logic [   ADDR_LINES:0] set_terms[NUM_IDS];  // polynomial terms that go with each set's activation
   logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = the set's own)
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
@@ -305,7 +304,6 @@ module sienna_top #(
   logic [      DATA_WIDTH-1:0] gpnae_signal_i     [NUM_LANES];  // L4: the word put to lane k
   logic                        gpnae_wr_en        [NUM_LANES];  // L4 put
   logic                        gpnae_last         [NUM_LANES];  // L4: the set's last word for the lane
-  logic [GPNAE_ADDR_LINES-1:0] gpnae_terms        [NUM_LANES];
   logic [GPNAE_CTRL_WIDTH-1:0] gpnae_ctrl         [NUM_LANES];
   logic [      DATA_WIDTH-1:0] gpnae_result       [NUM_LANES];  // L5 data
   logic                        gpnae_done         [NUM_LANES];  // L5 put
@@ -468,7 +466,6 @@ module sienna_top #(
           .rstn_i        (rstn_i),
           .in            (l4),
           .out           (l5),
-          .terms_i       (gpnae_terms[g]),
           .control_word_i(gpnae_ctrl[g]),
           .gp_mx_i       (g_mx[g]),
           .gp_shx_i      (g_shx[g]),
@@ -601,7 +598,6 @@ module sienna_top #(
 
   always_comb begin
     for (int i = 0; i < NUM_LANES; i++) begin
-      gpnae_terms[i] = set_terms[g_set_id][GPNAE_ADDR_LINES-1:0];
       gpnae_ctrl[i] = (IS_INT && lane_act[i] == CONTROL_WIDTH'(3'b100) && !act_bypass) ? CONTROL_WIDTH'(3'b101) : lane_act[i];  // int8 ReLU is the clamp's
     end
   end
@@ -781,7 +777,6 @@ module sienna_top #(
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
         set_accum[k] <= 1'b0;
-        set_terms[k] <= '0;
         set_pack[k]  <= '0;
         set_map[k]   <= '0;
         set_ents[k]  <= '0;
@@ -794,7 +789,6 @@ module sienna_top #(
       complete_q <= set_complete;
       if (host_accept) begin
         set_accum[host_next_id] <= side.accumulate;
-        set_terms[host_next_id] <= side.terms;
         set_pack[host_next_id] <= side.pack_shift;
         set_map[host_next_id]  <= side.pack_map;
         set_ents[host_next_id] <= side.act;

@@ -15,7 +15,6 @@ package test_config_pkg;
   localparam int SRAM_DEPTH = 256;
   localparam int FIFO_DEPTH = 256;
   localparam int ACTIVATION_CODE = 4;
-  localparam int NUM_TERMS = 0;
   localparam int IN_ROWS = 16;
   localparam int IN_COLS = 16;
   localparam int POOL_H = 1;

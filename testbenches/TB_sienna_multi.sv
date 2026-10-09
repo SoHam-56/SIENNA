@@ -293,7 +293,6 @@ module TB_sienna_multi #(
     side.bias_valid    = (HAS_BIAS != 0);
     side.train         = TRAINING_MODE;
     side.seed          = set_seed(k);
-    side.terms         = NUM_TERMS;
     side.act[0]        = ACTIVATION_CODE;
     side.zp[0]         = req_zp_i;
     side.amin[0]       = req_min_i;

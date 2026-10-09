@@ -72,7 +72,7 @@ def op_hex(data, fmt: str) -> list:
     return [f"{int(b):04x}" for b in bits]
 
 
-# Polynomial terms per activation, as passed to the TYTAN controller.
+# Polynomial terms per activation; no SIENNA RTL reads them (gpnae_poly's degree is in its table), kept for the untracked run_real_model.py.
 ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
 
 
@@ -843,7 +843,7 @@ def read_outputs(path, fmt="fp32"):
 
 
 def write_sets(path, groups, act):
-    """TB_sienna_model's set file: the set count, then per set "partial code 0 bias" and its A, B (and bias) words as fp32 hex; returns the count."""
+    """TB_sienna_model's set file: the set count, then per set "partial code bias" and its A, B (and bias) words as fp32 hex; returns the count."""
     code = ACT_CODE[act]
     lines = []
     n = 0
@@ -851,7 +851,7 @@ def write_sets(path, groups, act):
         for k, (A, B) in enumerate(passes):
             partial = int(k < len(passes) - 1)
             with_bias = int(bias is not None and k == 0)  # the first pass carries the group's bias
-            lines.append(f"{partial} {code} 0 {with_bias}")
+            lines.append(f"{partial} {code} {with_bias}")
             parts = [A.ravel(), B.ravel()] + ([bias] if with_bias else [])
             words = np.concatenate(parts).astype(np.float32).view(np.uint32)
             lines.append("\n".join(f"{v:08x}" for v in words.tolist()))
@@ -897,7 +897,6 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("SRAM_DEPTH", sram_depth, "int"),
         ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
         ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
-        ("NUM_TERMS", get_polynomial_terms(act_type), "int"),
         ("IN_ROWS", N, "int"),
         ("IN_COLS", N, "int"),
         ("POOL_H", cfg.get("pool_h", 2), "int"),

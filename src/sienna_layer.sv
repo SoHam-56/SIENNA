@@ -135,16 +135,6 @@ module sienna_layer #(
     return (x + DIM_W'(N - 1)) / DIM_W'(N);
   endfunction
 
-  // Polynomial terms per activation, the same table as model_runner.py's ACTIVATION_TERMS.
-  function automatic logic [ADDR_LINES:0] terms(input logic [CONTROL_WIDTH-1:0] a);
-    case (a)
-      3'b001:  return 14;
-      3'b010:  return 15;
-      3'b011:  return 30;
-      default: return 0;
-    endcase
-  endfunction
-
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
   logic [N-1:0][ACC_W-1:0]       p_bias;
@@ -175,7 +165,6 @@ module sienna_layer #(
     p_side.bias_valid    = p_bias_v;
     p_side.train         = train_q;
     p_side.seed          = p_seed;
-    p_side.terms         = terms(act_q);
     p_side.pack_shift    = pk_shift_q;
     p_side.pack_map      = pk_map_q;
     p_side.act           = {pk_act_q, act_q};

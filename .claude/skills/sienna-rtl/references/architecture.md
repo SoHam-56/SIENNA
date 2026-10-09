@@ -106,7 +106,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 - Weight stream, per column block: the bias row, then the block's weight tiles, once if cached (more than one row tile and at most `WC_TILES/2` tiles), else once per row tile.
 - Activation stream, per block, per row tile: the depth tiles of A, then the residual tile.
 - Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
-- The set issuer derives the loops, the accumulate flags, the bias pass, the activation terms, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache only while it holds that region's L2 credit (one put opens the fill; the credit returns when the fill's last set, marked `wc_last`, is broadcast).
+- The set issuer derives the loops, the accumulate flags, the bias pass, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache only while it holds that region's L2 credit (one put opens the fill; the credit returns when the fill's last set, marked `wc_last`, is broadcast).
 - Since 2026-10-07 the two streams are credit links (`a_rows`, `w_rows`, L10): a set's N A rows (and N B rows if uncached) are granted at once per staging credit held, one set ahead; results leave on the L9 links `out[NUM_LANES]`.
 - Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default, backend `RtlLayer`) and `regression.py --action gemm` format the streams with `format_layer()`, which only rearranges data.
 
@@ -129,13 +129,13 @@ These encodings match `activation_to_code()` and `get_polynomial_terms()` in `mo
 
 The pipeline instantiates `gpnae_poly`, not `gpnae.sv`. Its control word is 3 bits and adds two modes that bypass the polynomial:
 
-| `control_word_i` | Activation | `NUM_TERMS` |
-|---|---|---|
-| `3'b001` / `3'b010` / `3'b011` | SELU / sigmoid / tanh, as above | 14 / 15 / 30 |
-| `3'b100` | ReLU, exact | 0 |
-| `3'b101` | linear, exact | 0 |
+| `control_word_i` | Activation |
+|---|---|
+| `3'b001` / `3'b010` / `3'b011` | SELU / sigmoid / tanh, as above |
+| `3'b100` | ReLU, exact |
+| `3'b101` | linear, exact |
 
-`sienna_top` stores the code and the term count per set (`set_act`, `set_terms`), so consecutive sets can use different activations.
+`gpnae_poly` takes no term count: each activation's polynomial degree comes from its coefficient table. `sienna_top` stores the code per set (`set_act`), so consecutive sets can use different activations.
 
 ### Structure
 

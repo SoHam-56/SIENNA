@@ -294,7 +294,7 @@ help:
 	@echo "  make vcs       TRACE=fst - VCS has no native FST dump; still writes VCD"
 	@echo ""
 	@echo "Individual Module Targets:"
-	@echo "  make sm-verilator      - Systolic Mesh only: its regression in FMT at N, TILE, COLLAPSE_K"
+	@echo "  make sm-verilator      - Systolic Mesh only: its model checks, then its regression in FMT at N, TILE, COLLAPSE_K (SM_CHECKS=0 skips the checks)"
 	@echo "  make gpnae-verilator   - GPNAE only: its regression in FMT on gpnae_poly, the lane sienna_top uses"
 	@echo "  make gpnae-verilator GPNAE_MODEL=hw - the same, bit-exact against the lane model instead of accuracy (int8 ignores it)"
 	@echo ""
@@ -310,7 +310,7 @@ help:
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make regression FMT=int8          - One verdict: self-tests, sm-verilator, gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
+	@echo "  make regression FMT=int8          - One verdict: self-tests, model checks, sm-verilator, gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
 	@echo "                                      bf16: gpnae-verilator is bit-exact and gpnae-accuracy is reported, not gated"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
@@ -430,10 +430,12 @@ endif
 # Sub-module targets
 # ─────────────────────────────────────────────────────────────────────────────
 # The mesh TB takes its format only from SystolicMesh's regression, which patches EXP_W/MAN_W/COLLAPSE_K into it.
+# SM_CHECKS=0: without the model checks (aril-fpu, aril-narrow, model-tests), which make regression runs as steps of their own.
+SM_CHECKS ?= 1
 sm-verilator:
 	@echo "=== Systolic Mesh only: FMT=$(FMT) N=$(N) TILE=$(TILE) COLLAPSE_K=$(COLLAPSE_K) ==="
 	$(MAKE) -C SystolicMesh regression MATRIX_SIZE=$(N) \
-		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)"
+		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)$(if $(filter 0,$(SM_CHECKS)), --no-checks)"
 
 # GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
 # GPNAE_MODEL: exact (accuracy against the functions) or hw (bit-exact against gpnae_poly's model); int8 ignores it and runs both.
@@ -582,7 +584,7 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# One verdict: the tool self-tests, then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), pipeline, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
+# One verdict: the tool self-tests, the model checks (aril-fpu, aril-narrow, sm-model-tests), then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), pipeline, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
 regression:
 	$(PYTHON) regression.py --action all --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 

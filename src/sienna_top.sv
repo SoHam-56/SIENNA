@@ -60,9 +60,7 @@ module sienna_top #(
     output logic systolic_busy_o,
     output logic gpnae_busy_o,
     output logic maxpool_busy_o,
-    output logic dropout_busy_o,
-    output logic intermediate_buffer_full_o,
-    output logic intermediate_buffer_empty_o
+    output logic dropout_busy_o
 );
 
   localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: int32 sums, requantized at the lane feed
@@ -1158,8 +1156,6 @@ module sienna_top #(
     assign pipeline_complete_o = done_q[LINK_STAGES-1];
     assign done_set_id_o       = id_q[LINK_STAGES-1];
   end
-  assign intermediate_buffer_full_o = 1'b0;  // no buffer between the mesh and the lanes since parallel fill
-  assign intermediate_buffer_empty_o = 1'b1;
 
   assign systolic_busy_o = (mesh_sets != 0) || ((g_state != G_IDLE) && !g_fed);  // a set not yet pushed to the activation stage
   assign gpnae_busy_o = (g_state != G_IDLE) && g_fed;  // the stage takes its set before the result: busy once a beat is in

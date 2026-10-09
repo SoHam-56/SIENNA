@@ -98,7 +98,6 @@ module TB_sienna_model;
   logic                        [ID_W-1:0] done_set_id_o;
   assign pipeline_ready_o = (host_cnt != 0);
   logic systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb;
-  logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
 
   initial begin
     clk_i = 0;
@@ -163,9 +162,7 @@ module TB_sienna_model;
       .systolic_busy_o            (systolic_busy_tb),
       .gpnae_busy_o               (gpnae_busy_tb),
       .maxpool_busy_o             (maxpool_busy_tb),
-      .dropout_busy_o             (dropout_busy_tb),
-      .intermediate_buffer_full_o (intermediate_buffer_full_tb),
-      .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
+      .dropout_busy_o             (dropout_busy_tb)
   );
 
   always_ff @(posedge clk_i) cycle <= cycle + 1;

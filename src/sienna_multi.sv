@@ -167,9 +167,7 @@ module sienna_multi #(
         .systolic_busy_o            (),
         .gpnae_busy_o               (),
         .maxpool_busy_o             (),
-        .dropout_busy_o             (),
-        .intermediate_buffer_full_o (),
-        .intermediate_buffer_empty_o()
+        .dropout_busy_o             ()
     );
   end
 

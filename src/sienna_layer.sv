@@ -251,9 +251,7 @@ module sienna_layer #(
       .systolic_busy_o            (),
       .gpnae_busy_o               (),
       .maxpool_busy_o             (),
-      .dropout_busy_o             (),
-      .intermediate_buffer_full_o (),
-      .intermediate_buffer_empty_o()
+      .dropout_busy_o             ()
   );
   assign set_done_o = p_complete;
 

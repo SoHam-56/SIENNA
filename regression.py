@@ -2491,6 +2491,10 @@ def test_check_reported_steps():
         assert "gpnae-accuracy" not in steps[f] and "GPNAE_MODEL=exact" in steps[f]["gpnae-verilator"][0] and steps[f]["gpnae-verilator"][1]
     assert all(g for f in ("fp32", "int8") for _, g in steps[f].values())
     assert [n for n, (_, g) in steps["bf16"].items() if not g] == ["gpnae-accuracy"]
+    for f in steps:  # the model checks: gated in every format, before sm-verilator, which skips them
+        names = list(steps[f])
+        assert names[1:5] == ["aril-fpu", "aril-narrow", "sm-model-tests", "sm-verilator"] and all(steps[f][n][1] for n in names[1:4]), names
+        assert "SM_CHECKS=0" in steps[f]["sm-verilator"][0] and steps[f]["aril-narrow"][0][1:4] == ["-C", "SystolicMesh", "aril-narrow"], steps[f]
     with tempfile.TemporaryDirectory() as d:
         leak = os.path.join(d, "env.log")
         os.environ["GPNAE_MODEL"], saved_mf = "hw", os.environ.get("MAKEFLAGS")
@@ -3057,12 +3061,14 @@ REPORTED = {("gpnae-accuracy", "bf16")}  # open accuracy items (sienna-uniform-f
 
 
 def check_steps(a) -> list:
-    """The gate's steps as (name, argv, gated): the self-tests, then make targets in the build's format, N, TILE and LANES."""
+    """The gate's steps as (name, argv, gated): the self-tests, the model checks, then make targets in the build's format, N, TILE and LANES."""
     mk = lambda target, *extra: ["make", target, f"FMT={a.fmt}", f"N={a.n}", f"TILE={a.tile}", f"LANES={a.lanes}", f"PYTHON={sys.executable}", *extra]
     gpnae = [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator", "GPNAE_MODEL=exact"))] \
         if a.fmt == "bf16" else [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=exact"))]  # bf16: bit-exact gated, accuracy reported
-    steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]), ("sm-verilator", mk("sm-verilator")),
-             *gpnae, ("pipeline", mk("pipeline")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
+    sm = lambda target: ["make", "-C", "SystolicMesh", target, f"PYTHON={sys.executable}"]  # checks against their own references, any format
+    steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]),
+             ("aril-fpu", sm("aril-fpu")), ("aril-narrow", sm("aril-narrow")), ("sm-model-tests", sm("model-tests")),
+             ("sm-verilator", mk("sm-verilator", "SM_CHECKS=0")), *gpnae, ("pipeline", mk("pipeline")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
     steps += [("tflite", mk("tflite"))] if a.fmt == "int8" else []
     return [(name, argv, (name, a.fmt) not in REPORTED) for name, argv in steps]
 
@@ -3088,7 +3094,7 @@ def run_step(argv: list, log_path: str) -> str:
 
 
 def all_main(argv=None, steps=check_steps) -> None:
-    """Self-tests, then the SystolicMesh and GPNAE regressions, the SIENNA pipeline, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
+    """Self-tests, the model checks, then the SystolicMesh and GPNAE regressions, the SIENNA pipeline, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
     ap = argparse.ArgumentParser(description=all_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="all")
     ap.add_argument("--format", dest="fmt", default="fp32", choices=sorted(mr.FORMATS))

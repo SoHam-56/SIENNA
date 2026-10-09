@@ -324,7 +324,6 @@ module sienna_top #(
 
   logic                        dropout_in_valid   [NUM_LANES];
   logic [      DATA_WIDTH-1:0] dropout_data_in    [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] dropout_data_out   [NUM_LANES];
   logic                        dropout_valid_out  [NUM_LANES];
 
   logic [          FCNT_W-1:0] fill_count         [NUM_LANES];
@@ -576,7 +575,6 @@ module sienna_top #(
           .zero_point_i (p_zp[g])
       );
       assign dropout_valid_out[g] = l9p.put;
-      assign dropout_data_out[g]  = l9p.data;
 
       // The output register, as final_result_o was; L9's credits pass it unregistered, which only spends them earlier.
       logic                  oq_put;

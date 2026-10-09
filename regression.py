@@ -1416,7 +1416,7 @@ def gemm_main(argv=None):
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and sums; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and results, fp32 sums; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
@@ -2858,14 +2858,22 @@ def test_gate_judge():
     ad = lambda hw: {"hw_top": 0, "ref_top": 0, "score_hw": [hw], "score_ref": [10.0]}
     assert not mr.judge("ad01", "x", "fp32", [_layer()], ad(10.005))["task"]
     assert mr.judge("ad01", "x", "fp32", [_layer()], ad(10.02))["task"], "fp32 score above 1e-3 must fail"
+    assert ("ad01", "bf16") not in mr.REPORTED, "bf16 sums in fp32: ad01 bf16 is gated"
     g = mr.judge("ad01", "x", "bf16", [_layer(1.8)], ad(27.0))
-    assert not g["hw"] and not g["task"] and len(g["reported"]) == 2 and g["rep_key"] == ("ad01", "bf16"), g
-    assert mr.verdict_word(g, "hw") == mr.verdict_word(g, "task") == "FAIL (reported, not gated)", "a reported failure must not read PASS"
-    g = mr.judge("ad01", "x", "bf16", [_layer(0.1)], ad(27.0))
-    assert (mr.verdict_word(g, "hw"), mr.verdict_word(g, "task")) == ("PASS", "FAIL (reported, not gated)"), g
-    g = mr.judge("ad01", "x", "bf16", [_layer(1.8, differ=1)], ad(27.0))
-    assert len(g["hw"]) == 1 and g["bad_layers"] == ["L03"], "REPORTED must never suppress a bit-exact failure"
-    assert mr.verdict_word(g, "hw") == "FAIL"
+    assert g["hw"] and g["task"] and not g["reported"] and g["rep_key"] is None, "a bf16-sum ad01 (layer 1.8, score 2.7x) must fail"
+    assert not mr.judge("ad01", "x", "bf16", [_layer(3e-3)], ad(10.0224))["task"], "ad01 bf16 at 2.24e-03 passes"
+    shipped, mr.REPORTED = mr.REPORTED, {("ad01", "bf16")}  # the REPORTED mechanism on a stand-in entry
+    try:
+        g = mr.judge("ad01", "x", "bf16", [_layer(1.8)], ad(27.0))
+        assert not g["hw"] and not g["task"] and len(g["reported"]) == 2 and g["rep_key"] == ("ad01", "bf16"), g
+        assert mr.verdict_word(g, "hw") == mr.verdict_word(g, "task") == "FAIL (reported, not gated)", "a reported failure must not read PASS"
+        g = mr.judge("ad01", "x", "bf16", [_layer(0.1)], ad(27.0))
+        assert (mr.verdict_word(g, "hw"), mr.verdict_word(g, "task")) == ("PASS", "FAIL (reported, not gated)"), g
+        g = mr.judge("ad01", "x", "bf16", [_layer(1.8, differ=1)], ad(27.0))
+        assert len(g["hw"]) == 1 and g["bad_layers"] == ["L03"], "REPORTED must never suppress a bit-exact failure"
+        assert mr.verdict_word(g, "hw") == "FAIL"
+    finally:
+        mr.REPORTED = shipped
     assert mr.verdict_word(mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 1, "ref_top": 0}), "task") == "FAIL"
     assert mr.verdict_word(mr.judge("vww", "x", "fp32", [_layer()], {"hw_top": 0, "ref_top": 0}), "task") == "PASS"
 

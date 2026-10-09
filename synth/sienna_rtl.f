@@ -20,10 +20,7 @@ SystolicMesh/src/engine/AccumulationUnit.sv
 SystolicMesh/src/mem/MeshOutputSram.sv
 SystolicMesh/src/top/SystolicArray.sv
 SystolicMesh/src/top/SystolicMesh.sv
-GPNAE/src/TYTAN/Memory/RAM.v
 GPNAE/src/TYTAN/Memory/ROM.v
-GPNAE/src/TYTAN/Memory/PE5B.v
-GPNAE/src/TYTAN/Memory/InputFIFO.v
 GPNAE/src/TYTAN/Memory/CoeffROM.v
 GPNAE/src/TYTAN/LZC.v
 GPNAE/src/TYTAN/barrel_mac.sv

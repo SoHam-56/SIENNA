@@ -116,7 +116,7 @@ The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue
 | `testbenches/TB_gpnae.sv` | 342 | live | No golden checking. Never uses `signal_tanh` — see issue 8 |
 | `testbenches/TB_gpnae_activations.sv` | ~185 | live | Numerical check of all three activations against goldens. Caught issues 5b and 5c |
 | `testbenches/TB_gpnae_selu_check.sv` | ~175 | live | Focused SELU reproducer written while isolating issue 3 |
-| `tb_gpnae.vcd` | — | tracked artifact | ~586k lines of waveform dump committed to git |
+| `tb_gpnae.vcd` | — | untracked artifact | Waveform written under `+dump`; git-ignored (`*.vcd`), as are `noStart.ron` and `TB_gpnae_behav.wcfg` |
 
 ---
 

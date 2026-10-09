@@ -470,10 +470,6 @@ def dump_golden_trace(
         write_matrix("Stage 3: Maxpool Output (Input to Dropout)", C_pooled)
 
 
-def _golden(A: np.ndarray, B: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) -> tuple:
-    return _golden_from_c(_ref_matmul(A, B), cfg, act_type, drop_seed)
-
-
 def _golden_from_c(C: np.ndarray, cfg: dict, act_type: str, drop_seed: int = 1) -> tuple:
     """Activation, pooling and dropout of an already formed product (one matmul or a sum of partials)."""
     C_act = apply_activation(C, act_type)

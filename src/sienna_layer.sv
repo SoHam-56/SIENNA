@@ -22,7 +22,7 @@ module sienna_layer #(
     parameter int EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
     parameter int MAN_W             = 23,
     parameter int DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, bias, results
-    parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // bias and sums: int32 in int8, DATA_WIDTH otherwise
+    parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // bias and sums: int32 in int8, fp32 in every float format (the bias row widened exactly)
     parameter int CONTROL_WIDTH     = 3,
     parameter int LFSR_WIDTH        = 32,
     parameter int POOL_H            = 1,
@@ -259,6 +259,9 @@ module sienna_layer #(
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
   logic [N-1:0][ACC_W-1:0] bias_buf[2];
+  if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
+    $fatal(1, "sienna_layer: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end
   logic [N-1:0][31:0] mult_buf[2];  // int8: the requantize words of the block each half holds
   logic [N-1:0][7:0] shift_buf[2];
   logic [DIM_W-1:0] wl_blk;  // block the loader works on
@@ -468,7 +471,7 @@ module sienna_layer #(
           automatic logic last_row = wl_take_tile && (wl_row == RW'(N - 1));
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
-            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= IS_INT ? w_bias_i[c] : ACC_W'(w_data_i[c]);
+            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= IS_INT ? w_bias_i[c] : sienna_fmt_pkg::widen(32'(w_data_i[c]), MAN_W);
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;

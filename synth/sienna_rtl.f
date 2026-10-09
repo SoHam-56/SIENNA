@@ -6,11 +6,13 @@ SystolicMesh/ArithmeticLibrary/Multipliers/Radix4Booth/src/R4Booth.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Karatsuba/src/karatsubaUnsigned.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/FP32/src/fp32Multiplier.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/FP/src/fpMultiplier.sv
+SystolicMesh/ArithmeticLibrary/Multipliers/FPWiden/src/fpMulWiden.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Int/src/intMultiplier.sv
 SystolicMesh/ArithmeticLibrary/Adders/FP32/src/LZC.sv
 SystolicMesh/ArithmeticLibrary/Adders/FP32/src/fp32Adder.sv
 SystolicMesh/ArithmeticLibrary/Adders/FP/src/fpAdder.sv
 SystolicMesh/ArithmeticLibrary/Adders/Int/src/intAdder.sv
+SystolicMesh/ArithmeticLibrary/Converters/FPNarrow/src/fpNarrow.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Fx/src/fxMac.sv
 SystolicMesh/ArithmeticLibrary/Requant/src/tfliteRequant.sv
 SystolicMesh/src/engine/ProcessingElement.sv

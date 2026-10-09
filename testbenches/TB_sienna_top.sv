@@ -30,7 +30,12 @@ module TB_sienna_top #(
   logic                     training_mode_i;
   logic                     accumulate_i;  // this set is a partial sum
   logic                     bias_valid_i;  // this set carries a bias row
-  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point
+  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
+  logic [N-1:0][ACC_W-1:0] bias_want;  // the bias the mesh must see with this set's put: the file's row, widened exactly
+  int bias_checked = 0;  // puts whose bias reached the mesh's input and was compared
+  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
+    $fatal(1, "TB_sienna_top: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
   logic [N-1:0][31:0] req_mult_i;
   logic [N-1:0][7:0]  req_shift_i;
@@ -349,9 +354,32 @@ module TB_sienna_top #(
     end
     host_lnk.data = side_now();
     host_lnk.put  = 1'b1;
+    if (bias_valid_i) check_mesh_bias(bias_want);
     @(negedge clk_i);
     host_lnk.put  = 1'b0;
     if (wc_last_i) wc_open_tb[weight_tile_i[$clog2(WC_TILES)-1]] = 1'b0;
+  endtask
+
+  // The mesh's bias input, in the cycle its staging put arrives (L0 and L1 stages later), must be want: a zero-extended bf16 row reads wrong here even where the sums cannot show it.
+  task automatic check_mesh_bias(input logic [N-1:0][ACC_W-1:0] want);
+    fork
+      begin
+        repeat (2 * LINK_STAGES) @(negedge clk_i);
+        #1;  // after the put's combinational paths settle
+        if (!dut.l1m.put) begin
+          failed++;
+          $display("  [FAIL] Bias check: no staging put reached the mesh %0d cycles after the host put", 2 * LINK_STAGES);
+        end else begin
+          bias_checked++;
+          for (int c = 0; c < N; c++)
+            if (dut.systolic_array_inst.bias_i[c] !== want[c]) begin
+              failed++;
+              $display("  [FAIL] Bias check: the mesh's bias input column %0d is %h, the bias row widened is %h", c,
+                       dut.systolic_array_inst.bias_i[c], want[c]);
+            end
+        end
+      end
+    join_none
   endtask
 
   // Opens a fill of cache region r: waits for its credit and puts; the rows follow.
@@ -369,6 +397,12 @@ module TB_sienna_top #(
     wc_open_tb[r] = 1'b1;
     @(posedge clk_i);
   endtask
+
+  // A w-bit word's value for debug prints: int8 codes and int32 sums as signed integers, floats widened to fp32 and decoded by f32.
+  function automatic real word_val(input logic [31:0] b, input int w);
+    if (IS_INT) return real'($signed(b << (32 - w)) >>> (32 - w));
+    return f32(b << (32 - w));
+  endfunction
 
   // Manual binary32 decode; $bitstoshortreal leaves the bit pattern as an integer under Verilator.
   function automatic real f32(input logic [31:0] b);
@@ -668,7 +702,7 @@ module TB_sienna_top #(
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.fifo2_wr_valid[lane]) begin
           $display("[DEBUG %0t] Dispatcher -> Maxpool (Lane %0d) : dec=%.4f  hex=%08x", $time, lane,
-                   real'($bitstoshortreal(dut.fifo2_wr_data[lane])), dut.fifo2_wr_data[lane]);
+                   word_val(32'(dut.fifo2_wr_data[lane]), DATA_WIDTH), dut.fifo2_wr_data[lane]);
         end
       end
       // Dropout -> Output lines are printed by the L9 consumer, a set at a time in window order, so stalls cannot reorder them.
@@ -680,19 +714,19 @@ module TB_sienna_top #(
       if (dut.wide_rd_valid) begin
         for (int lane = 0; lane < NUM_LANES; lane++)
           $fdisplay(trace_fd, "[%0t] Systolic -> GPNAE   : dec=%.6f  hex=%08x", $time,
-                    real'($bitstoshortreal(dut.wide_rd_data[lane])), dut.wide_rd_data[lane]);
+                    word_val(32'(dut.wide_rd_data[lane]), OUT_W), dut.wide_rd_data[lane]);
       end
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.fifo2_rd_ready[lane] && dut.fifo2_rd_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] GPNAE -> Maxpool    lane=%0d : dec=%.6f  hex=%08x", $time,
-                    lane, real'($bitstoshortreal(dut.fifo2_rd_data[lane])),
+                    lane, word_val(32'(dut.fifo2_rd_data[lane]), DATA_WIDTH),
                     dut.fifo2_rd_data[lane]);
         end
       end
       for (int lane = 0; lane < NUM_LANES; lane++) begin
         if (dut.dropout_in_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] Maxpool -> Dropout  lane=%0d : dec=%.6f  hex=%08x", $time,
-                    lane, real'($bitstoshortreal(dut.dropout_data_in[lane])),
+                    lane, word_val(32'(dut.dropout_data_in[lane]), DATA_WIDTH),
                     dut.dropout_data_in[lane]);
         end
       end
@@ -775,7 +809,8 @@ module TB_sienna_top #(
     bias_i = '0;
     if (bias_valid_i) begin
       read_word_file($sformatf("bias_%0d.mem", k), q);
-      for (int c = 0; c < N; c++) bias_i[c] = ACC_W'(q[c]);
+      for (int c = 0; c < N; c++) bias_i[c] = IS_INT ? ACC_W'(q[c]) : sienna_fmt_pkg::widen(q[c], MAN_W);
+      for (int c = 0; c < N; c++) bias_want[c] = IS_INT ? q[c] : ACC_W'(q[c][DATA_WIDTH-1:0]) << (ACC_W - DATA_WIDTH);
     end
   endtask
 
@@ -1576,6 +1611,11 @@ module TB_sienna_top #(
       failed++;
       $display("  [FAIL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.drain_n);
     end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
+
+    if (HAS_BIAS != 0 && bias_checked == 0) begin
+      failed++;
+      $display("  [FAIL] Bias check: a bias test compared no set's bias at the mesh's input");
+    end else $display("  [Bias] %0d puts: the mesh's bias input was compared with the bias row widened", bias_checked);
 
     $display("\n==============================================");
     $display(" RESULT SUMMARY");

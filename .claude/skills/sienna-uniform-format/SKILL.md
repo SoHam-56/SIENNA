@@ -80,7 +80,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   and operand/accumulator split go; residual identity rows keep 1.0 in the format (exists).
 - **Maxpool_2D**: sign-magnitude compare for any float width (today only width 32 with IS_FP32);
   the padding value -infinity in the format (sienna_top's `32'hFF800000`).
-- **dropout**: its multiplier becomes fpMultiplier; `CONST_ONE`/`CONST_SCALE` passed in the format.
+- **dropout**: its multiplier becomes fpMultiplier; `CONST_SCALE` passed in the format.
 - **GPNAE gpnae_poly**: barrel MAC multiplier/adder, square and post multipliers, and `fp32_down`
   (an fpAdder with a constant input) use the new units; `gpnae_tail` rewritten with `EXP_W`/`MAN_W`
   and per-format constants; range thresholds encoded per format; `poly_coeffs_bf16.mem`, chosen by

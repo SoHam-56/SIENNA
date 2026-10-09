@@ -6,8 +6,6 @@ module dropout #(
     parameter int                    DATA_WIDTH        = 1 + EXP_W + MAN_W,
     parameter int                    DROPOUT_P_PERCENT = 50,
     parameter int                    LFSR_WIDTH        = 32,
-    parameter logic [DATA_WIDTH-1:0] CONST_ZERO        = '0,
-    parameter logic [DATA_WIDTH-1:0] CONST_ONE         = DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h3F800000, MAN_W)),
     parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W))
 ) (
     input wire clk,

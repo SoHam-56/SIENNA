@@ -393,7 +393,6 @@ module sienna_top #(
       .north_queue_empty_o   (north_queue_empty),
       .west_queue_empty_o    (west_queue_empty),
       .matrix_mult_complete_o(systolic_mult_complete),
-      .collection_active_o   (),
       .result                (l3m)
   );
 

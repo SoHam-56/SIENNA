@@ -72,10 +72,6 @@ The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue
 |---|---|---|---|
 | `TB_SystolicMesh.sv` | 421 | live | Main IP testbench. Patched in place by `regression.py`. Tolerance math is wrong — see issue 7 |
 | `TB_SystolicArray.sv` | 146 | live | Unit test of the synchronous array over tile sizes and depths (`-GN=`, `-GK=`), against a real-valued model |
-| `TB_Mesh_2x2.sv` | 382 | **dead** | Targets nonexistent module `Mesh` |
-| `TB_Mesh_3x3.sv` | 391 | **dead** | Same, N=3 |
-| `TB_Mesh_5x5.sv` | 508 | **dead** | Same, N=5 |
-| `TB_Mesh_8x8.sv` | 626 | **dead** | Same, N=8 |
 
 ### Tooling
 
@@ -152,9 +148,8 @@ Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`
 | `Adders/FP32/testbenches/TB_fp32AdderVIVADO.sv` | live | Same plan, reads `vectors.mem` instead of DPI-C |
 | `Multipliers/FP32/testbenches/TB_fp32MultiplierVIVADO.sv` | live | Same |
 | `Multipliers/Karatsuba/testbenches/TB_karatsuba.sv` | live | Signed and unsigned against native `*` |
-| `Divider/FP32/testbenches/TB_Divider_FP32.sv` | **dead** | Targets nonexistent `divide_32`; declares itself `TB_Multi_FP32`; no checking |
 | `*/testbenches/generate_vectors.sh` | live | Builds SoftFloat, compiles `gen_vectors.cpp`, emits `vectors.mem` |
-| `*/testbenches/berkeley-softfloat-3/` | third party | ~1,800 `.c` and ~940 `.cpp` files. The IEEE-754 reference model, not design source |
+| `Adders/FP32/testbenches/berkeley-softfloat-3/` | third party | The IEEE-754 reference model, not design source; the one copy, used by Adders/FP32, Multipliers/FP32, Adders/FP, Multipliers/FP and Common's `generate_vectors.sh` |
 
 `ArithmeticLibrary/README.md` is not about the library — it documents the Vivado DPI linker workaround (symlinking Vivado's bundled `ld` to the system one).
 

@@ -1096,8 +1096,11 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     if target_test:
         tests_to_run = [t for t in tests_to_run if target_test in t["name"]]
         if not tests_to_run:
-            print(f"  {_R}[ERROR] No tests found containing '{target_test}'{_X}")
-            return
+            print(f"  {_R}[ERROR] No tests found containing '{target_test}' in {fmt_name}{_X}")
+            sys.exit(1)
+    if not tests_to_run:  # a run that simulates nothing is not a pass
+        print(f"  {_R}[ERROR] No tests found for {fmt_name}{_X}")
+        sys.exit(1)
 
     print(
         f"  Matrix size : {N}×{N}\n  Tile size   : {T}×{T}\n  Format      : {fmt_name}\n  Total tests : {len(tests_to_run)}\n"
@@ -2549,6 +2552,26 @@ def test_pkg_action_refusals():
     r = run("--format", "fp32", "--test", only8)
     assert r.returncode != 0 and f"test '{only8}' runs only in int8, not fp32" in r.stderr, r.stderr
     assert "formats" not in next(t for t in reg.PIPELINE_TESTS if t["name"] == reg.PKG_DEFAULT_TEST)  # the default runs everywhere
+
+
+@selftest
+def test_regression_selects_nothing_fails():
+    r = subprocess.run([sys.executable, "regression.py", "--format", "fp32", "--test", "no_such_test"], cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode != 0 and "No tests found containing 'no_such_test'" in r.stdout + r.stderr, (r.returncode, r.stdout[-400:])
+    only8 = next(t["name"] for t in reg.PIPELINE_TESTS if t.get("formats") == ("int8",))
+    r = subprocess.run([sys.executable, "regression.py", "--format", "fp32", "--test", only8], cwd=ROOT, capture_output=True, text=True)
+    assert r.returncode != 0 and "No tests found" in r.stdout + r.stderr and "Sanity Clean" not in r.stdout, (r.returncode, r.stdout[-400:])
+    saved, reg.PIPELINE_TESTS = reg.PIPELINE_TESTS, []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                reg.run_regression(16, 4)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+    finally:
+        reg.PIPELINE_TESTS = saved
+    assert code == 1 and "No tests found for fp32" in out.getvalue(), (code, out.getvalue()[-300:])
 
 
 @selftest

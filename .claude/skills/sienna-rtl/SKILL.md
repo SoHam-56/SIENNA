@@ -119,9 +119,9 @@ make model FMT=bf16 MODEL_DIR=<dir>             # model_runner.py has no default
 make perf-analysis FMT=bf16                     # regression.py --action perf; make perf is still the profiling build
 make tflite FMT=int8 PYTHON=<venv>/bin/python   # model_runner.py --action tflite; refuses any FMT but int8
 make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on sienna_layer (regression.py --action pack)
-make sm-verilator FMT=int8                      # SystolicMesh's regression at N, TILE, COLLAPSE_K
+make sm-verilator FMT=int8                      # SystolicMesh's model checks (aril-fpu, aril-narrow, model-tests), then its regression at N, TILE, COLLAPSE_K; SM_CHECKS=0 skips the checks
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses; GPNAE_MODEL=hw for bit-exact (floats)
-make regression FMT=int8 PYTHON=<venv>/bin/python  # one verdict (regression.py --action all): selftest, sm-verilator, gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (int8); bf16 adds gpnae-accuracy, reported, not gated; farm
+make regression FMT=int8 PYTHON=<venv>/bin/python  # one verdict (regression.py --action all): selftest, aril-fpu, aril-narrow, sm-model-tests, sm-verilator (SM_CHECKS=0), gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (int8); bf16 adds gpnae-accuracy, reported, not gated; farm
 ```
 
 SIENNA's Python is two scripts: `regression.py` (hardware sanity, every check above behind `--action`) and `model_runner.py` (the host stack: numerics, lowering, tiling, packing, the layer file, backends `RtlLayer` / `RtlSets` / `Emulator`). The `sienna-tooling` skill has their actions and the map from the deleted scripts (`pack_regression.py`, `gemm_sweep.py`, `perf_analysis.py`, `tflite_*.py`, `test_*.py`).

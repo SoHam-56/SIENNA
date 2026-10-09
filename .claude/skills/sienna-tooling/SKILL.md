@@ -78,7 +78,7 @@ never the other way round.
 - `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite` (was gpnae_int8_tflite.py)
 - `--action rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
-- `--action all` — one verdict: selftest, the SystolicMesh and GPNAE regressions (via make), the SIENNA regression, pack, gemm quick, and tflite (int8); prints a table and exits non-zero on any failure (farm launching stays in sienna_jobs, outside git)
+- `--action all` — one verdict: selftest, the model checks with their own references (aril-fpu, aril-narrow, sm-model-tests: `make -C SystolicMesh <target>`), the SystolicMesh (with SM_CHECKS=0, since those ran) and GPNAE regressions (via make), the SIENNA regression, pack, gemm quick, and tflite (int8); prints a table and exits non-zero on any failure (farm launching stays in sienna_jobs, outside git)
 
 ### Makefile
 

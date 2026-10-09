@@ -786,8 +786,24 @@ ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
 ACT_CODES = {"linear": 5, "relu": 4, "selu": 1, "sigmoid": 2, "tanh": 3}
 
 
-def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None):
+def bias_word_index(cfg, a, w) -> list:
+    """TEST ONLY: the layer file word of each bias column; format_layer starts every column block's W rows with its bias row."""
+    N = w.shape[1]
+    ct = -(-cfg["n"] // N)
+    if not cfg["bias"] or w.shape[0] % ct:
+        raise ValueError(f"bias words: the layer has no bias row per column block ({w.shape[0]} W rows, {ct} blocks)")
+    per = w.shape[0] // ct
+    return [a.size + (c // N) * per * N + c % N for c in range(cfg["n"])]
+
+
+def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_words=None):
     """TB_model_run's layer file: L (configuration), int8's Q (requantize), a packed layer's P (shift, block map) and E (entries 1-7), rows of N words, int8's epilogue words."""
+    words = op_hex(np.concatenate([a.ravel(), w.ravel()]), fmt)
+    if bias_words is not None:  # TEST ONLY: raw bias words, such as bf16 subnormals, which op_hex flushes to a signed zero
+        for i, b in zip(bias_word_index(cfg, a, w), bias_words):
+            if words[i] != op_hex(bits_float([b], fmt), fmt)[0]:  # the job's bias values must already be at these words
+                raise ValueError(f"bias words: layer word {i} is {words[i]}, not the bias column's {int(b):x} flushed")
+            words[i] = f"{int(b):0{len(words[i])}x}"
     with open(path, "w") as f:
         f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pack))}\n")
         if fmt == "int8":
@@ -798,7 +814,7 @@ def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None):
                 q = rq_e or {}
                 f.write(f"E {ACT_CODES[act]} " + " ".join(str(int(q.get(x, 0))) for x in
                                                         ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) + "\n")
-        f.write("\n".join(op_hex(np.concatenate([a.ravel(), w.ravel()]), fmt)))
+        f.write("\n".join(words))
         f.write("\n")
         if fmt == "int8":
             f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in epilogue.ravel()))
@@ -953,7 +969,7 @@ class RtlLayer:
             pack_precheck(pk, cfg, (M, C, rt), N, self.lanes, tag)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
-        write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None)
+        write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None, job.get("bias_words"))
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
@@ -994,6 +1010,9 @@ class RtlLayer:
             b = None
             if cfg["bias"]:
                 b, wi = wb[wi], wi + 1
+                if job.get("bias_words") is not None:  # TEST ONLY: the raw words write_layer sent
+                    seg = np.asarray(job["bias_words"], np.int64)[c * N:(c + 1) * N]
+                    b = np.concatenate([seg, b[seg.size:]])
             for r in range(rt):
                 if r == 0 or not cached:
                     Wt, wi = [wb[wi + t * N:wi + (t + 1) * N] for t in range(dt)], wi + dt * N

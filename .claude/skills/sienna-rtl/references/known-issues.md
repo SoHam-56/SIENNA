@@ -9,7 +9,7 @@ Defects found by reading the full source tree and cross-checking against simulat
 Entries 3, 4, 5, 5b, 5c and 5d have been **fixed** and are kept here because the
 reasoning is worth having. Entries 1 and 2 are **corrections** — claims that
 turned out to be wrong, kept so the same wrong conclusion is not reached twice.
-Entry 9 is partly fixed. Everything from 6 onward is otherwise still open.
+Entry 9 is partly fixed; 10 and 11 are fixed, as is every entry marked FIXED from 14 on. The rest from 6 onward are still open.
 
 Read the relevant entry before spending time on a diagnosis.
 
@@ -461,29 +461,22 @@ Either drop one copy from the Makefile lists, or promote `ArithmeticLibrary` to 
 
 ---
 
-## 10. Dead testbenches referencing modules that no longer exist
+## 10. Dead testbenches referencing modules that no longer exist — FIXED (removed)
 
-**Confirmed (inspection).** These compile against nothing and will fail if anyone adds them to a build:
+**Confirmed (inspection), then removed.** These compiled against nothing and would have failed if anyone added them to a build:
 
-| File | Instantiates | Status |
+| File | Instantiated | Status |
 |---|---|---|
-| `SystolicMesh/testbenches/TB_Mesh_2x2.sv` | `Mesh` | no such module |
-| `SystolicMesh/testbenches/TB_Mesh_3x3.sv` | `Mesh` | no such module |
-| `SystolicMesh/testbenches/TB_Mesh_5x5.sv` | `Mesh` | no such module |
-| `SystolicMesh/testbenches/TB_Mesh_8x8.sv` | `Mesh` | no such module |
-| `ArithmeticLibrary/Divider/FP32/testbenches/TB_Divider_FP32.sv` | `divide_32` | no such module; still present — it lives in the shared submodule with two checkouts |
+| `SystolicMesh/testbenches/TB_Mesh_2x2.sv`, `TB_Mesh_3x3.sv`, `TB_Mesh_5x5.sv`, `TB_Mesh_8x8.sv` | `Mesh` | no such module; deleted (SystolicMesh c260ef0) |
+| `ArithmeticLibrary/Divider/FP32/testbenches/TB_Divider_FP32.sv` | `divide_32` | no such module; deleted (ArithmeticLibrary dd14986) |
 
-The four `TB_Mesh_*` files are the same 380–630 line testbench regenerated per size, differing only in `N`, the hardcoded FP32 constant tables and the `wait_for_pe_idle` case arms. They target an older mesh interface that had a `select_accumulator_i` input; the current `PEMesh` drives accumulator draining internally.
-
-`TB_Divider_FP32.sv` also declares itself as `module TB_Multi_FP32` and performs no checking — it just drives 13 vector pairs.
-
-The old names `divide_32`, `multiply_32` and `Adder_32` also survive in a commented-out block in `SystolicMesh/src/engine/MAC.sv`. The equivalent block in `GPNAE/src/SeLu.sv` has been removed.
+The four `TB_Mesh_*` files were one testbench regenerated per size for an older mesh interface with a `select_accumulator_i` input. `TB_Divider_FP32.sv` declared itself `module TB_Multi_FP32` and checked nothing. `fp32Divider.sv` and `divu.sv` stay: `sigtan` in the published `gpnae.sv` uses them.
 
 ---
 
-## 11. `R4Booth` contains a dead adder tree
+## 11. `R4Booth` contains a dead adder tree — FIXED (removed)
 
-**Confirmed (reproduced by synthesis).** `R4Booth.sv` has two summation blocks. The sequential one is dead:
+**Confirmed (reproduced by synthesis), then removed** (ArithmeticLibrary f5b09d8). `R4Booth.sv` had two summation blocks. The sequential one was dead:
 
 ```systemverilog
 sum_final <= '0;
@@ -500,7 +493,7 @@ WARNING: [Synth 8-6014] Unused sequential element sum_final_reg was removed.
 WARNING: [Synth 8-6014] Unused sequential element valid_s2_reg was removed.
 ```
 
-Harmless, but it reads as the primary datapath and will mislead the next person. Delete it.
+Harmless, but it read as the primary datapath. The block, `sum_final` and `valid_s2` are gone; the product still comes from `adder_tree_comb`, registered with `valid_s1`.
 
 ---
 

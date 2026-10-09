@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - fp32 and int8 builds: outputs identical to main `c05c332` (words compared with `$J/cr_msgs/task5a/t5_cmp.py` against the merged-tree runs `mc_gate_{fp32,int8}`; mesh results against `crb_sm16_*`, `crb_sm8g_*`), and cycle counts identical.
-- bf16 builds: cycle counts identical to main (fpMulWiden 3 = today's `mul_lat(8,7)`, fp32 adder 5 = `add_lat`, U = 6); outputs change and are checked bit-exactly against the updated models.
+- bf16 builds: mesh, host, pack, GEMM and model-layer cycle counts identical to main (fpMulWiden 3 = today's `mul_lat(8,7)`, fp32 adder 5 = `add_lat`, U = 6); activation-limited polynomial-lane streams (tanh, SELU, sigmoid) may move, because `gpnae_tail`'s cycles depend on the values the mesh gives (reworded by Ruling 3, 2026-10-09); outputs change and are checked bit-exactly against the updated models.
 - GPNAE (lanes, `gpnae.sv`, GPNAE math) unchanged; the lanes keep taking `DATA_WIDTH` (bf16) words.
 - Narrowing: round to nearest even; NaN -> the format's canonical qNaN (`fpu.Fmt.qnan`, 7FC0 in bf16); infinity kept; an fp32 input with exponent field 0 (zero or subnormal) -> signed zero; rounding up past the largest finite gives infinity.
 - Bias: the weight stream's bias row stays in the operand format; it is widened exactly (`x << (23 - MAN_W)`) before the mesh's `bias_i`, which is `acc_w` = 32 bits wide in every format.
@@ -185,7 +185,7 @@ endmodule
 
 **Files:** `sienna_report/bf16_accum_compare.log` (outside git); `.claude/skills/sienna-bf16-fp32-accum/SKILL.md` (As built), `.claude/skills/sienna-uniform-format/SKILL.md` (bf16 accumulation now fp32: a second exception to the uniform rule; the GEMM error-vs-K numbers replaced), `.claude/skills/sienna-int8/SKILL.md` (ACC_W table row), `README.md` (~:30 pipeline format bullet: "fp32 sums for bf16"; the bf16 accuracy per model, task #45), `SystolicMesh/README.md` (~:29), comments the survey listed.
 
-- [ ] `bf16_accum_compare.log`: per model (ResNet-8, DS-CNN, MobileNet, ad01) bf16 vs float reference before (`ba0_*`) and after: top-1 agreement, worst layer error, ad01 anomaly score; GEMM bf16 error vs K before/after; cycles before/after (expected equal) for the pipeline perf configs (`make perf-analysis FMT=bf16 N=16` before and after); area estimate delta (from `$J/area_estimate.py`, updated to the new widths; labelled an estimate, no synthesis). Every number from a named run.
+- [ ] `bf16_accum_compare.log`: per model (ResNet-8, DS-CNN, MobileNet, ad01) bf16 vs float reference before (`ba0_*`) and after: top-1 agreement, worst layer error, ad01 anomaly score; GEMM bf16 error vs K before/after; cycles before/after for the pipeline perf configs (mesh equal; any polynomial-lane-bound config that moves listed with the reason, Ruling 3) (`make perf-analysis FMT=bf16 N=16` before and after); area estimate delta (from `$J/area_estimate.py`, updated to the new widths; labelled an estimate, no synthesis). Every number from a named run.
 - [ ] Docs as listed; the README states bf16 accuracy per model from gated runs (task #45).
 - [ ] Commit docs on SIENNA `bf16_accum` (and SystolicMesh README in its repo).
 - [ ] Final whole-branch review across the three changed repos; one fix pass; merge only on Soham's go-ahead; then one N = 64 bf16 sweep (regression, perf, models) with the gate.

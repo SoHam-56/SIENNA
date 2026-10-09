@@ -27,7 +27,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 - **Pipeline.** Up to 15 sets are in flight at once, each stage working on a different one, and each set can use a different activation function. Every boundary, from the host interface to the output, is the same *credit link*: the receiving side grants one credit per free buffer slot, and the sending side sends only while it holds one. Nothing can overrun or be dropped, and a slow consumer at the output simply holds the pipeline back, stage by stage, until it is ready. The host interface is hardware (a DMA engine, or the layer engine's input streams).
 - **Layer engine.** `sienna_layer` runs a whole network layer on its own. It splits the layer into sets, reuses weights, and adds the bias and any skip connection. It handles depthwise convolution and, in int8, the rescaling of each output channel. The host only streams the data in.
 - **Packing.** A layer much smaller than the mesh would leave most of it idle. Several such layers are packed side by side into one matrix multiply, each in its own block, and run together. The hardware ignores everything outside each layer's block, so every result is identical to running the layers one at a time.
-- **Number format chosen at build time.** One build parameter makes the whole pipeline fp32, bf16 or int8 (int32 sums, TensorFlow Lite rescaling). It selects the multipliers, adders and activation lanes for that format, and each build runs that one format. bf16 and int8 builds match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
+- **Number format chosen at build time.** One build parameter makes the whole pipeline fp32, bf16 or int8 (int32 sums, TensorFlow Lite rescaling). It selects the multipliers, adders and activation lanes for that format, and each build runs that one format. bf16 multiplies bf16 numbers but adds them up in fp32 and rounds each finished result to bf16 once, because summing in bf16 lets rounding errors pile up over long dot products. bf16 and int8 builds match bit-exact Python models of the hardware, and int8 matches the TensorFlow Lite interpreter.
 
 ---
 
@@ -67,6 +67,17 @@ fp32, every multiply-accumulate on the RTL; the host only reshapes tensors and a
 | Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs | 6.5 µs (0.16 µs per slice) | 3.25 TFLOPS |
 
 In fp32 the hardware picks the same class as the floating-point model on every classifier and reproduces the anomaly score to four decimal places, at both sizes. bf16 builds run within 1.1% of these times.
+
+**bf16 accuracy.** The same models in bf16 on 16 × 16 and 32 × 32 meshes, against the floating-point model (the two sizes give identical results). The layer error is the largest difference from an exact float64 calculation on the same bf16 inputs, as a share of that layer's largest output; rounding a single number to bf16 can be off by up to 0.39%:
+
+| Model | Agreement with the float model | Largest layer error |
+|---|---|---|
+| ResNet-8 | same class on 3 of 3 CIFAR-10 images | 0.34% |
+| DS-CNN | same class on 3 of 3 inputs | 0.33% |
+| MobileNet | same class on 3 of 3 inputs | 0.38% |
+| Autoencoder | anomaly score within 0.22% on 4 inputs | 0.33% |
+
+Summing in bf16 instead, the autoencoder's anomaly score came out 2.7 to 2.8 times too high.
 
 ### Packing small layers
 

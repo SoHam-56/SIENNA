@@ -17,7 +17,6 @@ import json
 import math
 import os
 import re
-import struct
 import subprocess
 import sys
 import time

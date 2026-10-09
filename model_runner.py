@@ -1135,7 +1135,7 @@ def macs_of(job):
 # The model gate's bounds, one place; the hardware itself is judged bit for bit against the backend's exact model in every float format.
 LAYER_BOUND = {  # max|hw-ref|/max|ref| per layer against float64 on the same operands: the check a bug shared by the RTL and its exact model must pass
     "fp32": 1e-4,  # also regression.py's gemm bound; measured worst 3.29e-05 over 187 layers (mg_fp32c), 3x margin
-    "bf16": 0.02,  # fp32 sums: measured worst 3.77e-03 (vww L04, ba3_models_N16_bf16, about 1 bf16 ulp), 5x margin; bf16 sums were 3.35e-02 to 1.83 in every model, so they fail it
+    "bf16": 0.02,  # fp32 sums: measured worst 3.77e-03 (vww L04, ba3_models_N16_bf16), about half a bf16 ulp of the largest output (2^-8 = 3.9e-03 is the RNE limit), 5x margin; bf16 sums were 3.35e-02 to 1.83 in every model, so they fail it
 }
 CLASSIFIERS = ("resnet8", "kws", "vww")  # top-1 must equal the float reference's in every format
 SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 with fp32 sums measured 2.24e-03 (ba3_models_N16_bf16, 4.5x margin)

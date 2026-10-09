@@ -14,6 +14,10 @@ branch of all four repos; it replaced the earlier mixed bf16. Plan and task reco
 - G3 SystolicMesh and G4 SIENNA: section 2 and 4 of the SIENNA report (`sienna-report` skill); farm runs `g3*`, `g4p_*`
 - fp32 before the work: `2026-09-28_baseline_fp32.txt`; bf16 coefficient fit: `2026-09-28_poly_coeffs_fit.txt`
 
+**Since 2026-10-09 bf16 builds sum in fp32** (skill `sienna-bf16-fp32-accum`, branch `bf16_accum` in all four repos, merge
+pending Soham's go-ahead): bf16 x bf16 products widened exactly, fp32 partial sums, reducer and bias, each result rounded to
+bf16 (nearest even) as the reducer writes it. The rest of this skill still holds; it says where that change applies.
+
 **REQUIRED BACKGROUND:** the `sienna-rtl` skill.
 
 ## The principle (agreed with Soham)
@@ -22,9 +26,13 @@ Every module works in the same format, chosen per build by parameters, by swappi
 units: storage, mesh multipliers and adders, reducer, GPNAE, pooling, dropout. This is how the
 published GPNAE was meant to work ("swap the multipliers and adders, change top-level parameters").
 
-The one inherent exception is accumulation width where a format cannot hold a sum of products:
-int8 accumulates in int32 and requantizes back. That is a property of dot products, not a
-mixed-precision choice. bf16 accumulates in bf16 (uniform), accepting the accuracy cost.
+Two exceptions, both the accumulation width, where a format cannot hold a sum of products:
+1. int8 accumulates in int32 and requantizes back. That is a property of dot products, not a
+   mixed-precision choice.
+2. bf16 accumulates in fp32 (Soham, 2026-10-08; built 2026-10-09, `sienna-bf16-fp32-accum`): products,
+   partial sums, the reducer and the bias are fp32; operands, storage, the result banks, the lanes, pooling
+   and dropout stay bf16. Until then bf16 summed in bf16 (uniform), and the cost was not small: ad01's anomaly
+   score 2.8x the float model's, GEMM error 50% of the largest output at K = 3072 (Verification, below).
 
 Two sub-projects, in order:
 1. **Uniform bf16** (this design). Also builds the per-format plumbing int8 reuses.
@@ -39,7 +47,7 @@ Two sub-projects, in order:
 | Unit latencies | from a shared package `sienna_fmt_pkg`, per format | PE, reducer, barrel MAC stop hard-coding 8 and 5 |
 | PE partial-sum slots | U = min(K, adder latency + 1) (from the package); 6 in both formats | the slot interleave exists to cover the adder loop |
 | fp32 builds | keep fp32Multiplier/fp32Adder unchanged | published units; fp32 must stay bit- and cycle-identical |
-| fpMulWiden (exists, bf16 branch) | stays in ArithmeticLibrary, tested; SIENNA stops using it | uniform replaces mixed |
+| fpMulWiden (exists, bf16 branch) | stays in ArithmeticLibrary, tested; SIENNA stopped using it, then took it back as the bf16 PE multiplier (fp32 sums, 2026-10-09) | uniform replaced mixed; fp32 sums need an exact product |
 | GPNAE lane | only `gpnae_poly` (what SIENNA instantiates) | the published `gpnae.sv` lane is out of scope |
 | GPNAE coefficients | refit for bf16 into a new `poly_coeffs_bf16.mem`, fp32 table layout, degrees 3 (SELU), 5 (sigmoid), 4 (tanh) with zero leading coefficients | fp32 files never change (published work); the fp32 degrees (8/6/8) gave bf16 worst errors of 5.3% / 21.7% / 331% |
 | Golden model for narrow formats | **bit-exact** emulation, not a tolerance | a worst-case bound on a truncated 144-term bf16 sum exceeds the answer, so tolerances catch nothing |
@@ -66,7 +74,8 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   `G_FP32` generate branch; any other unsupported format fails elaboration with `$fatal`), bf16
   partial sums, U from the package; reducer tree
   uses fpAdder; bias, result memory and wide read in the format. The `OP_W`/`DATA_WIDTH` split of the
-  mixed version collapses back to one width.
+  mixed version collapses back to one width. Since 2026-10-09 the bf16 PE is fpMulWiden + fp32Adder, the
+  reducer fp32Adder with fpNarrow at its write, the bias fp32 (`ACC_W` 32); result memory and wide read stay bf16 (`OUT_W` 16).
 - **sienna_top / sienna_layer / sienna_multi**: one `DATA_WIDTH` = format width; the bias widening
   and operand/accumulator split go; residual identity rows keep 1.0 in the format (exists).
 - **Maxpool_2D**: sign-magnitude compare for any float width (today only width 32 with IS_FP32);
@@ -97,9 +106,22 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   per activation against the TensorFlow-style reference, as for TYTAN.
 - **System**: the regression in bf16 (bit-exact golden; 29 tests after adding a zero-rows test
   and a signed-zero test that keeps -0), the four models in bf16 with accuracy against float, the
-  GEMM sweep (bf16 checked bit-exact against the mesh model; error against float64 is reported,
-  not gated, and grows with K: 6% at 256, 23% at 1024, 50% at 3072), the random power-up regression
-  and the lint. fp32: identical cycle counts; SIENNA-level checks unchanged (tolerance with the fp32 error bound).
+  GEMM sweep (bf16 checked bit-exact against the mesh model; error against float64 is reported), the random power-up
+  regression and the lint.
+  GEMM bf16 error, max |hw - ref| / max |ref| against float64 on the same bf16 operands, worst shape per depth K
+  (N 16 T 4, 67 shapes; sets and cycles identical in all 67):
+
+  | K | bf16 sums (`ba0_gemm_bf16`, main c05c332) | fp32 sums (`ba3f_gemm_bf16`, bf16_accum 0341b75) |
+  |---|---|---|
+  | 16 | 1.6e-02 | 3.2e-03 |
+  | 64 | 2.7e-02 | 3.1e-03 |
+  | 256 | 7.9e-02 | 3.2e-03 |
+  | 1024 | 3.0e-01 | 3.6e-03 |
+  | 768 (qkv, mlp_up, decode shapes) | 1.6e-01 to 1.9e-01 | 2.0e-03 to 2.9e-03 |
+  | 3072 (mlp_down_128tok) | 5.0e-01 | 3.1e-03 |
+
+  With fp32 sums the error no longer grows with K: it stays at bf16's output rounding, at most 2^-8 = 3.9e-03 of a value (round to nearest even). Since then the
+  sweep also gates bf16 on the model gate's bf16 layer bound, 0.02. fp32: identical cycle counts; SIENNA-level checks unchanged (tolerance with the fp32 error bound).
   The mesh checks fp32 bit-exact too (Soham, 2026-09-28): a 1% relative limit failed correct N=64 cancellations.
 
 ## Open decisions (Soham)

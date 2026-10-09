@@ -72,7 +72,7 @@ Work is spread round-robin, so `lane_windows_total[i] = MAXPOOL_OUT_COUNT/NUM_LA
 
 ## SystolicMesh
 
-`SystolicMesh/src/`, brought in as a git submodule. Computes `C = A × B` over FP32.
+`SystolicMesh/src/`, brought in as a git submodule. Computes `C = A × B + bias` in the build's format: fp32, bf16 (products and sums in fp32, results rounded to bf16) or int8 (int32 sums).
 
 ### Hierarchy
 
@@ -80,7 +80,7 @@ Work is spread round-robin, so `lane_windows_total[i] = MAXPOOL_OUT_COUNT/NUM_LA
 SystolicMesh            staging banks, broadcaster, reduce dispatcher, result bank states, MeshOutputSram
  ├─ AccumulationUnit    one per (i,j) output tile: sums every pixel's partials (U per array, per depth slice)
  └─ SystolicArray       one per (i,j) with collapse-k, one per (i,j,k) without: a pipelined TILE_SIZE² array
-     └─ ProcessingElement ─ fp32Multiplier, fp32Adder, ACC_BANKS (4) banks of U partial sums
+     └─ ProcessingElement ─ multiplier + adder by format (fp32: fp32Multiplier + fp32Adder; bf16: fpMulWiden + fp32Adder; int8: intMultiplier + intAdder), ACC_BANKS (4) banks of U partial sums of ACC_W (32) bits
 ```
 
 `TILES_PER_DIM = MATRIX_SIZE / TILE_SIZE`. With `COLLAPSE_K=1` (default) each output tile has one `SystolicArray` of depth `K = MATRIX_SIZE`: N² PEs. With `COLLAPSE_K=0` the problem is `TILES_PER_DIM³` arrays of depth T: N³/T PEs. `U = min(K, 6)` partial sums per pixel (the adder latency plus one).
@@ -97,7 +97,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 
 ### Output path
 
-`AccumulationUnit` reads one pixel per cycle from its arrays, sums the `RP × U` partials in a log2 `fp32Adder` tree and writes one result per cycle to `MeshOutputSram`; the pixel index and result bank travel beside the data, so a new set can be read while the previous one is still in the tree. `MeshOutputSram` has `RESULT_BANKS` banks, one write port per output tile and a wide port of `WIDE_READ` words; since the credit links the mesh reads it itself and pushes each result as `PER_LANE` beats on the L3 link, while it holds the consumer's credits, freeing the bank on the last beat. The reducer reads T² pixels per set, so the mesh needs K ≥ T² to run at K cycles per set (true for T=4 at N ≥ 16).
+`AccumulationUnit` reads one pixel per cycle from its arrays, sums the `RP × U` partials and the bias in a log2 tree (`fp32Adder` in every float format, `intAdder` in int8; ACC_W = 32 bits) and writes one result per cycle of `OUT_W` bits to `MeshOutputSram` (bf16: `fpNarrow` rounds each fp32 sum to bf16, nearest even, at this write; the bias arrives widened to fp32 by the caller, `sienna_fmt_pkg::widen`); the pixel index and result bank travel beside the data, so a new set can be read while the previous one is still in the tree. `MeshOutputSram` has `RESULT_BANKS` banks, one write port per output tile and a wide port of `WIDE_READ` words; since the credit links the mesh reads it itself and pushes each result as `PER_LANE` beats on the L3 link, while it holds the consumer's credits, freeing the bank on the last beat. The reducer reads T² pixels per set, so the mesh needs K ≥ T² to run at K cycles per set (true for T=4 at N ≥ 16).
 
 ### sienna_layer: a layer scheduled in hardware
 

@@ -111,7 +111,6 @@ module sienna_top #(
   localparam int MP_AHEAD = 2;  // windows maxpool grants ahead, so FIFO2 streams one element a cycle
   localparam int LANE_K = 16;  // gpnae_poly's K: a lane starts a group only with this many L5 credits
 
-  localparam int MAXPOOL_IN_COUNT = IN_ROWS * IN_COLS;
   localparam int POOL_OUT_ROWS = (IN_ROWS + 2 * PADDING - POOL_H) / STRIDE_ROWS + 1;
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
   localparam int MAXPOOL_OUT_COUNT = POOL_OUT_ROWS * POOL_OUT_COLS;

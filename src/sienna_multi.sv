@@ -18,6 +18,7 @@ module sienna_multi #(
     parameter int MAN_W             = 23,
     parameter int DATA_WIDTH        = 1 + EXP_W + MAN_W,
     parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),
+    parameter int OUT_W             = sienna_fmt_pkg::out_w(EXP_W, MAN_W),  // each copy's mesh result words, as sienna_top
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
     parameter int ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -39,7 +40,7 @@ module sienna_multi #(
     input logic rstn_i,
 
     credit_link_if.consumer         host[COPIES],  // L0 per copy, as sienna_top's: put only the copy whose turn it is (copy_sel_o), its rows went there
-    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with a put, to the copy put
+    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with a put, to the copy put; float builds: fp32 bits, as sienna_top
     credit_link_if.consumer         wc_region[2],  // L2: a put opens a fill of that region in every copy; its credit returns once every copy's has
     input logic                     wc_write_enable_i,  // written into every copy's cache
     input logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i,
@@ -129,6 +130,7 @@ module sienna_multi #(
         .MAN_W            (MAN_W),
         .DATA_WIDTH       (DATA_WIDTH),
         .ACC_W            (ACC_W),
+        .OUT_W            (OUT_W),
         .SRAM_DEPTH       (SRAM_DEPTH),
         .FIFO_DEPTH       (FIFO_DEPTH),
         .ADDR_LINES       (ADDR_LINES),

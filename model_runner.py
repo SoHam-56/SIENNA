@@ -877,7 +877,8 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
         ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
         ("IS_INT", int(fmt == "int8"), "int"),
-        ("ACC_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),
+        ("ACC_W", 32, "int"),  # sums and bias: int32 in int8, fp32 in every float format (sienna_fmt_pkg::acc_w)
+        ("OUT_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),  # mesh result words (sienna_fmt_pkg::out_w)
         ("SRAM_DEPTH", sram_depth, "int"),
         ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
         ("ACTIVATION_CODE", activation_to_code(act_type), "int"),
@@ -1352,7 +1353,7 @@ def model_main(argv=None):
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
     ap.add_argument("--n", type=int, default=16)
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS),
-                    help="the layer engine's build format for inputs, weights, sums and results (bf16 sums in bf16, so error grows with depth); --engine sets is fp32")
+                    help="the layer engine's build format for inputs, weights and results (bf16 sums in fp32, each result rounded to bf16); --engine sets is fp32")
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--tile-size", type=int, default=4, help="mesh tile size T the RTL is built with")
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))

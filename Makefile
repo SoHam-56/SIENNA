@@ -35,10 +35,10 @@ $(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a 
 endif
 endif
 
-# EXP_W MAN_W IS_INT of each FMT, as model_runner.py's FORMATS writes them into test_config_pkg.sv.
-FMT_FIELDS_fp32 = 8 23 0
-FMT_FIELDS_bf16 = 8 7 0
-FMT_FIELDS_int8 = 0 7 1
+# EXP_W MAN_W IS_INT ACC_W OUT_W of each FMT, as model_runner.py's _config_items writes them into test_config_pkg.sv.
+FMT_FIELDS_fp32 = 8 23 0 32 32
+FMT_FIELDS_bf16 = 8 7 0 32 16
+FMT_FIELDS_int8 = 0 7 1 32 32
 
 # Project Structure
 PRJ_DIR     = $(shell pwd)
@@ -80,11 +80,13 @@ SM_LIB_FILES = \
 	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
 	Multipliers/FP32/src/fp32Multiplier.sv \
 	Multipliers/FP/src/fpMultiplier.sv \
+	Multipliers/FPWiden/src/fpMulWiden.sv \
 	Multipliers/Int/src/intMultiplier.sv \
 	Adders/FP32/src/LZC.sv \
 	Adders/FP32/src/fp32Adder.sv \
 	Adders/FP/src/fpAdder.sv \
 	Adders/Int/src/intAdder.sv \
+	Converters/FPNarrow/src/fpNarrow.sv \
 	Multipliers/Fx/src/fxMac.sv \
 	Requant/src/tfliteRequant.sv
 
@@ -378,7 +380,7 @@ pkg:
 		--collapse-k $(COLLAPSE_K) \
 		--test $(PKG_TEST)
 
-# Fails the build unless the package's EXP_W, MAN_W, IS_INT (when present), N, TILE_SIZE and NUM_LANES are FMT's, N, TILE and LANES.
+# Fails the build unless the package's EXP_W, MAN_W, IS_INT (when present), ACC_W, OUT_W, N, TILE_SIZE and NUM_LANES are FMT's, N, TILE and LANES.
 pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 	@[ -r $(PKG_FILE) ] || { echo "ERROR: $(PKG_FILE) is missing or unreadable: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; exit 1; }
 	@set -- $(FMT_FIELDS_$(FMT)); \
@@ -389,12 +391,18 @@ pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 		echo "       The package is stale or for another format: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
 		exit 1; \
 	fi; \
+	a=$$(field ACC_W); o=$$(field OUT_W); \
+	if [ "$$a" != "$$4" ] || [ "$$o" != "$$5" ]; then \
+		echo "ERROR: $(PKG_FILE) has ACC_W=$${a:-missing} OUT_W=$${o:-missing}, but FMT=$(FMT) sums in $$4 bits and gives $$5-bit results (ACC_W=$$4 OUT_W=$$5)."; \
+		echo "       The package predates fp32 sums for bf16 or is stale: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
+		exit 1; \
+	fi; \
 	if [ "$$n" != "$(N)" ] || [ "$$t" != "$(TILE)" ] || [ "$$l" != "$(LANES)" ]; then \
 		echo "ERROR: $(PKG_FILE) has N=$${n:-missing} TILE_SIZE=$${t:-missing} NUM_LANES=$${l:-missing}, but the build asks for N=$(N) TILE=$(TILE) LANES=$(LANES)."; \
 		echo "       The package was written for another geometry: run make pkg with these N, TILE, LANES, or pass the package's."; \
 		exit 1; \
 	fi; \
-	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent}"
+	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent} ACC_W=$$a OUT_W=$$o"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top

@@ -19,7 +19,10 @@ module TB_sienna_model;
   logic                     training_mode_i;
   logic                     accumulate_i;
   logic                     bias_valid_i;
-  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point
+  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
+  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
+    $fatal(1, "TB_sienna_model: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
   logic [N-1:0][31:0] req_mult_i;
   logic [N-1:0][7:0]  req_shift_i;
@@ -357,7 +360,7 @@ module TB_sienna_model;
       if (has_bias != 0)
         for (int c = 0; c < N; c++) begin
           rc = $fscanf(fin, "%h", w32);
-          bias_i[c] = ACC_W'(w32);
+          bias_i[c] = IS_INT ? ACC_W'(w32) : sienna_fmt_pkg::widen(w32, MAN_W);
         end
       if (IS_INT) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
         logic [31:0] q[$];

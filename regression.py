@@ -232,6 +232,17 @@ def _golden_bits(passes, bias, cfg: dict, act: str, drop_seed: int, fmt: str) ->
     return C, A, P, _dropout_bits(P, cfg, drop_seed, f)
 
 
+def _special_bias(b, fmt: str) -> np.ndarray:
+    """A bias row's bits with +0, -0 and the smallest and largest subnormals of each sign in 3 of every 4 columns (Review Focus 5)."""
+    f = fpu.FORMATS[fmt]
+    sg = 1 << (f.w - 1)
+    special = [0, sg, 1, f.mmask, sg | 1, sg | f.mmask]
+    b = np.array(b, np.int64)
+    for i, c in enumerate(c for c in range(b.size) if c % 4 != 3):
+        b[c] = special[i % len(special)]
+    return b
+
+
 def _dropout_bits(P, cfg: dict, drop_seed: int, f) -> np.ndarray:
     """Dropout of a set's pooled bits as the lanes apply it: scaled by 1/(1-p) where kept, a zero with the input's sign where dropped."""
     if not cfg.get("training", False):
@@ -665,6 +676,10 @@ def generate_vectors(cfg: dict) -> None:
     use_bias = bool(cfg.get("bias", False))
     bias_raw = lambda k: (np.random.RandomState(seed + 5000 + k).uniform(-1.0, 1.0, N) * scale).astype(np.float32)
     bias_of = (lambda k: op_round(bias_raw(k), fmt)) if exact else bias_raw  # the bias in the format the hardware reads
+    special = bool(cfg.get("bias_special", False))  # bias words +0, -0 and subnormals of each sign in 3 of every 4 columns
+    if special and not (exact and use_bias):
+        raise ValueError(f"{test_name}: bias_special needs a bias and a bit-exact format, not {fmt}")
+    bias_bits = lambda k: _special_bias(fmt_bits(bias_of(k), fmt), fmt) if special else fmt_bits(bias_of(k), fmt)
     C0 = _ref_matmul(A, B) + (bias_of(0) if use_bias else np.float32(0.0))
     C, C_act, C_pooled, C_final = _golden_from_c(C0.astype(np.float32), cfg, act_type, drop_seed)
 
@@ -672,7 +687,7 @@ def generate_vectors(cfg: dict) -> None:
     write_op_mem(os.path.join(TB_DIR, "matrix_west.mem"), A, fmt)
     write_op_mem(os.path.join(TB_DIR, "matrix_north.mem"), B, fmt)
     if exact:
-        F0 = _golden_bits([(fmt_bits(A, fmt), fmt_bits(B, fmt))], fmt_bits(bias_of(0), fmt) if use_bias else None,
+        F0 = _golden_bits([(fmt_bits(A, fmt), fmt_bits(B, fmt))], bias_bits(0) if use_bias else None,
                           cfg, act_type, drop_seed, fmt)[3]
         write_bits(os.path.join(TB_DIR, "expected_output.mem"), F0, fmt)
     else:
@@ -707,9 +722,10 @@ def generate_vectors(cfg: dict) -> None:
             Bk = op_round(rng.uniform(-1.0, 1.0, (N, N)) * scale, fmt)
         bk = bias_of(k) if use_bias and k % passes == 0 else np.zeros(N, dtype=np.float32)
         if exact:
-            write_op_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), bk, fmt)
+            bbk = bias_bits(k) if use_bias and k % passes == 0 else fmt_bits(bk, fmt)
+            write_bits(os.path.join(TB_DIR, f"bias_{k}.mem"), bbk, fmt)  # the operand format's words; the TB widens them
             if k % passes == 0:
-                grp, gbias = [], (fmt_bits(bk, fmt) if use_bias else None)
+                grp, gbias = [], (bbk if use_bias else None)
             grp.append((fmt_bits(Ak, fmt), fmt_bits(Bk, fmt)))
         else:
             write_mem(os.path.join(TB_DIR, f"bias_{k}.mem"), bk)
@@ -950,6 +966,9 @@ PIPELINE_TESTS = [
     {"name": "matmul_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "bias": True},
     {"name": "matmul_accum3_bias_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
      "bias": True, "accum_passes": 3, "pool_h": 1, "pool_w": 1, "padding": 0},
+    # bf16 only: -0 and subnormal bias words beside zero-product rows; TB_sienna_top compares the mesh's bias input with the row widened.
+    {"name": "bf16_bias_special_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "bias": True,
+     "bias_special": True, "zero_rows": True, "pool_h": 1, "pool_w": 1, "padding": 0, "formats": ("bf16",)},
     # B from the mesh's weight cache: every set's B is written to its own tile once, then only A is sent.
     {"name": "matmul_cached_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "cached": True,
      "pool_h": 1, "pool_w": 1, "padding": 0},
@@ -1643,7 +1662,7 @@ def lane_inputs(k: int, P: dict, collapse: bool) -> list:
     n, f = P["N"], fpu.FORMATS[FMT]
     A, B = (rd(f"matrix_{s}_{k}.mem").reshape(n, n) for s in ("west", "north"))
     C = mesh_model.matmul(f, [(A, B)], n, P["TILE_SIZE"], int(collapse), rd(f"bias_{k}.mem") if P["HAS_BIAS"] else None)
-    return mr.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16 rounds every sum: tails shift
+    return mr.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16: each fp32 sum rounded once, as the lanes see it
 
 
 def in_tail(x: float, act: str) -> bool:
@@ -2321,11 +2340,11 @@ def make_n(*args) -> subprocess.CompletedProcess:
     return subprocess.run(["make", "-s", "-n", *args], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
 
 
-def fixture_pkg(d: str, fmt: str, n: int = 16, tile: int = 4, lanes: int = 32, drop: tuple = ()) -> str:
-    """A fixture test_config_pkg.sv in d, written by regression.py's own writer, minus the localparams in drop."""
-    path = os.path.join(d, f"pkg_{fmt}_{n}_{tile}_{lanes}{'_old' if drop else ''}.sv")
+def fixture_pkg(d: str, fmt: str, n: int = 16, tile: int = 4, lanes: int = 32, drop: tuple = (), edit: dict = None) -> str:
+    """A fixture test_config_pkg.sv in d, written by regression.py's own writer, minus the localparams in drop, with edit's values."""
+    path = os.path.join(d, f"pkg_{fmt}_{n}_{tile}_{lanes}{'_old' if drop or edit else ''}.sv")
     items = reg._config_items({"n": n, "tile_size": tile, "lanes": lanes}, fmt, "relu", 4, 15, 1, [], False, 1)
-    reg.write_sv_package(path, [x for x in items if x[0] not in drop])
+    reg.write_sv_package(path, [(k, (edit or {}).get(k, v), t) for k, v, t in items if k not in drop])
     return path
 
 
@@ -2360,6 +2379,16 @@ def test_guard_rejects_pre_format_package():
     with tempfile.TemporaryDirectory() as d:
         rc, out = pkg_guard(fixture_pkg(d, "fp32", drop=("EXP_W", "MAN_W", "IS_INT")), "FMT=fp32")
         assert rc != 0 and "EXP_W=missing" in out, out
+
+
+@selftest
+def test_guard_rejects_bf16_sum_package():
+    with tempfile.TemporaryDirectory() as d:  # a bf16 package from before fp32 sums: ACC_W 16 and no OUT_W
+        rc, out = pkg_guard(fixture_pkg(d, "bf16", drop=("OUT_W",), edit={"ACC_W": 16}), "FMT=bf16")
+        assert rc != 0 and "ACC_W=16 OUT_W=missing, but FMT=bf16 sums in 32 bits and gives 16-bit results" in out, out
+        for f, o in (("fp32", 32), ("bf16", 16), ("int8", 32)):
+            rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={f}")
+            assert rc == 0 and f"ACC_W=32 OUT_W={o}" in out, (f, out)
 
 
 @selftest
@@ -2508,7 +2537,9 @@ def test_fmt_fields_match_formats():
     mk = open(os.path.join(ROOT, "Makefile")).read()
     fields = {f: tuple(int(x) for x in v.split()) for f, v in re.findall(r"^FMT_FIELDS_(\w+) = ([\d ]+)$", mk, re.M)}
     assert re.search(r"^FORMATS = (.*)$", mk, re.M).group(1).split() == list(reg.FORMATS)
-    assert fields == {f: (*reg.FORMATS[f], int(f == "int8")) for f in reg.FORMATS}, fields
+    pkg_of = lambda f: {k: v for k, v, _ in reg._config_items({}, f, "relu", 1, 15, 1, [], False, 1)}  # what the package writes
+    assert fields == {f: tuple(pkg_of(f)[k] for k in ("EXP_W", "MAN_W", "IS_INT", "ACC_W", "OUT_W")) for f in reg.FORMATS}, fields
+    assert fields == {f: (*reg.FORMATS[f], int(f == "int8"), 32, 32 if f == "int8" else 1 + sum(reg.FORMATS[f])) for f in reg.FORMATS}, fields
 
 
 # ── tool: _parse_log (was test_regression_parse.py) ──

@@ -33,7 +33,10 @@ module TB_sienna_multi #(
   always #5 clk_i = ~clk_i;
   logic por_n = 0;  // the power-on reset only: TB_STALE_HOME's copy 0 staging counter ignores the mid-stream reset
 
-  logic [N-1:0][ACC_W-1:0] bias_i = '0;
+  logic [N-1:0][ACC_W-1:0] bias_i = '0;  // int32 in int8; fp32 bits in floats, the bias row widened exactly
+  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
+    $fatal(1, "TB_sienna_multi: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  end
   logic [N-1:0][31:0] req_mult_i = '0;  // int8 (D-2)
   logic [N-1:0][7:0] req_shift_i = '0;
   logic [7:0] req_zp_i = '0, req_min_i = '0, req_max_i = '0, gp_shout_i = '0, gp_zout_i = '0;
@@ -280,7 +283,7 @@ module TB_sienna_multi #(
     if (HAS_BIAS != 0) begin  // this TB streams no accumulate groups: every set carries its own bias
       logic [31:0] bw[$];
       read_word_file($sformatf("bias_%0d.mem", k), bw);
-      for (int j = 0; j < N; j++) bias_i[j] = ACC_W'(bw[j]);
+      for (int j = 0; j < N; j++) bias_i[j] = IS_INT ? ACC_W'(bw[j]) : sienna_fmt_pkg::widen(bw[j], MAN_W);
     end
     apply_requant(k);
     side               = '0;

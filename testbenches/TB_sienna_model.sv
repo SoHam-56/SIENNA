@@ -116,9 +116,9 @@ module TB_sienna_model;
   logic [NUM_LANES-1:0] lane_home;
   for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
     tb_l9_sink #(.DATA_W(DATA_WIDTH), .MAX_SLOTS(OUT_CAP)) snk (.clk_i(clk_i), .rstn_i(rstn_i), .slots_i(out_slots),
-                                                                .stall_pct_i(out_stall_pct), .hold_i(1'b0), .drain_i(drain_chk),
+                                                                .stall_pct_i(out_stall_pct), .drain_i(drain_chk),
                                                                 .lnk(out_lnk[l]), .valid_o(result_valid_o[l]), .data_o(final_result_o[l]),
-                                                                .held_o(), .home_o(lane_home[l]));
+                                                                .home_o(lane_home[l]));
   end
 
   sienna_top #(

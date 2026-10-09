@@ -88,8 +88,8 @@ module TB_model_run #(
   logic [DATA_WIDTH-1:0] res_d[NUM_LANES];
   for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
     tb_l9_sink #(.DATA_W(DATA_WIDTH), .MAX_SLOTS(OUT_CAP)) snk (.clk_i(clk_i), .rstn_i(rstn_i), .slots_i(out_slots),
-                                                                .stall_pct_i(out_stall_pct), .hold_i(1'b0), .drain_i(drain_chk),
-                                                                .lnk(out_lnk[l]), .valid_o(res_v[l]), .data_o(res_d[l]), .held_o(),
+                                                                .stall_pct_i(out_stall_pct), .drain_i(drain_chk),
+                                                                .lnk(out_lnk[l]), .valid_o(res_v[l]), .data_o(res_d[l]),
                                                                 .home_o(lane_home[l]));
   end
 

@@ -90,8 +90,8 @@ module TB_sienna_multi #(
   logic [DATA_WIDTH-1:0] od[NL];
   for (genvar i = 0; i < NL; i++) begin : G_OUT
     tb_l9_sink #(.DATA_W(DATA_WIDTH), .MAX_SLOTS(OUT_CAP)) snk (.clk_i(clk_i), .rstn_i(rstn_i), .slots_i(out_slots),
-                                                                .stall_pct_i(out_stall_pct), .hold_i(1'b0), .drain_i(drain_chk),
-                                                                .lnk(out_lnk[i]), .valid_o(ov[i]), .data_o(od[i]), .held_o(),
+                                                                .stall_pct_i(out_stall_pct), .drain_i(drain_chk),
+                                                                .lnk(out_lnk[i]), .valid_o(ov[i]), .data_o(od[i]),
                                                                 .home_o(lane_home[i]));
   end
 

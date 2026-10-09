@@ -10,12 +10,10 @@ module tb_l9_sink #(
     input  logic              rstn_i,
     input  int                slots_i,      // slots advertised after reset (1..MAX_SLOTS)
     input  int                stall_pct_i,  // percent of credit returns withheld at random
-    input  logic              hold_i,       // withhold every credit
     input  logic              drain_i,      // the test is quiet: every slot must be credited back
     credit_link_if            lnk,  // this side is the consumer; the checker watches it
     output logic              valid_o,
     output logic [DATA_W-1:0] data_o,
-    output int                held_o,       // credits the producer holds, as this side counts them
     output logic              home_o        // every slot credited back and no credit on the wire
 );
   logic cr = 1'b0;
@@ -26,7 +24,6 @@ module tb_l9_sink #(
   assign lnk.credit = cr;
   assign valid_o = lnk.put;
   assign data_o  = lnk.data;
-  assign held_o  = held;
   assign home_o  = (owed == 0) && !cr && (held == slots_i);
   always @(negedge clk_i) begin
     if (!rstn_i) begin
@@ -36,7 +33,7 @@ module tb_l9_sink #(
     end else begin
       held += int'(cr);
       cr = 1'b0;
-      if (owed > 0 && !hold_i && !(stall_pct_i > 0 && $urandom_range(99) < stall_pct_i)) begin
+      if (owed > 0 && !(stall_pct_i > 0 && $urandom_range(99) < stall_pct_i)) begin
         cr = 1'b1;
         owed--;
       end

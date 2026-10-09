@@ -9,7 +9,7 @@ Defects found by reading the full source tree and cross-checking against simulat
 Entries 3, 4, 5, 5b, 5c and 5d have been **fixed** and are kept here because the
 reasoning is worth having. Entries 1 and 2 are **corrections** — claims that
 turned out to be wrong, kept so the same wrong conclusion is not reached twice.
-Entry 9 is partly fixed; 10 and 11 are fixed, as is every entry marked FIXED from 14 on. The rest from 6 onward are still open.
+Entries 9, 10 and 11 are fixed, as is every entry marked FIXED from 14 on. The rest from 6 onward are still open.
 
 Read the relevant entry before spending time on a diagnosis.
 
@@ -440,24 +440,11 @@ of the project. `TB_gpnae.sv` itself is unchanged and still has the dead
 
 ---
 
-## 9. Duplicate module definitions across the build
+## 9. Duplicate module definitions across the build — FIXED (one ArithmeticLibrary in the top build)
 
-**Latent**, and flagged by Vivado.
+**Was latent, and flagged by Vivado.** The root `Makefile` listed both `ArithmeticLibrary` checkouts (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `LZC`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` were each compiled twice, and Verilator was silenced with `--Wno-MODDUP`. The `cntlz8` copy in `GPNAE/src/TYTAN/LZC.v` had already been removed.
 
-Both `ArithmeticLibrary` copies are listed in the root `Makefile` (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` are each compiled twice.
-
-**Partly fixed.** The `cntlz8` copy in `GPNAE/src/TYTAN/LZC.v` has been removed, so a GPNAE-only build now has exactly one definition. Two remain at SIENNA top level, because the two `ArithmeticLibrary` checkouts each carry one — that needs the submodules consolidating, not an RTL edit.
-
-Verilator is silenced with `--Wno-MODDUP`. Vivado is not:
-
-```
-CRITICAL WARNING: [Synth 8-9873] overwriting previous definition of module 'cntlz8'
-  [GPNAE/src/TYTAN/LZC.v:20]
-```
-
-The two `ArithmeticLibrary` copies currently differ only in port declaration style (`logic` versus `wire`/`reg`) and are functionally identical, so nothing is wrong today. The hazard is that an edit to one copy appears to have no effect, and the two can silently drift apart.
-
-Either drop one copy from the Makefile lists, or promote `ArithmeticLibrary` to a single shared submodule at the top level.
+**Fixed.** The root `Makefile` now compiles only `SystolicMesh/ArithmeticLibrary` and only the GPNAE files the `gpnae_poly` lanes use (the published `gpnae.sv` with `InputFIFO`, `SeLu` and `sigtan` builds in GPNAE's own `Makefile`), and `--Wno-MODDUP` is gone; `synth/sienna_rtl.f` lists the same set. The two checkouts remain because each submodule must build standalone; keep them on the same commit by fast-forwarding `GPNAE/ArithmeticLibrary` from `SystolicMesh/ArithmeticLibrary` and bumping both pointers together.
 
 ---
 

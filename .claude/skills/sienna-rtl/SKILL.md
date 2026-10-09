@@ -160,9 +160,9 @@ in the module to compensate. Both were reverted to HEAD on 2026-09-19 as an unju
 workaround rather than a fix. If they were commented out to dodge a real problem, it will
 come back — find out what it was.
 
-Everything is committed and pushed across all three remotes. `GPNAE/tb_gpnae.vcd` is still a
-tracked 5 MB generated waveform that `make clean` deletes; `.gitignore` covers `*.vcd` but
-that does not apply to an already-tracked file, so it wants `git rm --cached` — ask first.
+Everything is committed and pushed across all four remotes. `GPNAE/tb_gpnae.vcd` (a 5 MB `+dump`
+waveform), `noStart.ron` and `TB_gpnae_behav.wcfg` are no longer tracked; they stay on disk and
+GPNAE's `.gitignore` covers them.
 
 ## Things that will bite you
 

@@ -75,7 +75,7 @@ In fp32 the hardware picks the same class as the floating-point model on every c
 | ResNet-8 | same class on 3 of 3 CIFAR-10 images | 0.34% |
 | DS-CNN | same class on 3 of 3 inputs | 0.33% |
 | MobileNet | same class on 3 of 3 inputs | 0.38% |
-| Autoencoder | anomaly score within 0.22% on 4 inputs | 0.33% |
+| Autoencoder | anomaly score within 0.23% on 4 inputs | 0.33% |
 
 Summing in bf16 instead, the autoencoder's anomaly score came out 2.7 to 2.8 times too high.
 
@@ -131,6 +131,7 @@ Read them as an indication of where the architecture stands.
 - `make regression` runs every check below and gives one verdict. It passes in fp32, bf16 and int8.
 - The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
+- The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails the regression.
 - The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random and held for 500 cycles mid-stream.
 

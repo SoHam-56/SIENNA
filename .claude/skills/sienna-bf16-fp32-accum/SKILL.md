@@ -66,9 +66,9 @@ Measurements, each with its run: `sienna_report/bf16_accum_compare.log` (outside
 | Repo | Commits (on `bf16_accum`) |
 |---|---|
 | ArithmeticLibrary (both clones) | f6a443b `acc_w` 32, `out_w`, `acc_exp_w`/`acc_man_w`, `widen`, `fpNarrow` + TB + `fpu.narrow`, `fpMulWiden` to D-8, `fpu.widen`/`mul_widen`; cce9105 review fixes (two more fpNarrow mutants, `fpu.narrow` masks to 32 bits, fpNarrow lint 0 warnings); a03aa29 `supported()` comment |
-| SystolicMesh | 5503185 TB_PE_pack made non-vacuous (on main's RTL); 9f01605 PE `fpMulWiden` + `fp32Adder`, reducer `fp32Adder` with `fpNarrow` at its write, `OUT_W`, fp32 `bias_i`, `mesh_model`, `stim_format`, new tests, AriL bump; a1bc0de review fixes (`mm_range_edge`, `mm_bias_special` wording, expect guard message, file list, `fp32_of` guard); 473285f AriL bump; 3903e03 README |
+| SystolicMesh | 5503185 TB_PE_pack made non-vacuous (on main's RTL); 9f01605 PE `fpMulWiden` + `fp32Adder`, reducer `fp32Adder` with `fpNarrow` at its write, `OUT_W`, fp32 `bias_i`, `mesh_model`, `stim_format`, new tests, AriL bump; a1bc0de review fixes (`mm_range_edge`, `mm_bias_special` wording, expect guard message, file list, `fp32_of` guard); 473285f AriL bump; 3903e03 README; fd0cc98 the regression runs the model checks first |
 | GPNAE | ddd8429, a812858: ArithmeticLibrary bumps only; lanes unchanged |
-| SIENNA | 9327b61 bias widened in `sienna_layer` and the TBs, `OUT_W` result link in `sienna_top`, width checks, goldens, `bf16_bias_special_linear_nopool`, tooling, bumps; 9e7df01 ad01 bf16 gated (`REPORTED` empty); 0341b75 bf16 layer bound 0.02, bf16 GEMM gated, bias check on the registered capture, `a_bias_widened`; 87d564e bumps (AriL a03aa29 everywhere); 88ef427 TB bias-check strings; then the docs commit |
+| SIENNA | 9327b61 bias widened in `sienna_layer` and the TBs, `OUT_W` result link in `sienna_top`, width checks, goldens, `bf16_bias_special_linear_nopool`, tooling, bumps; 9e7df01 ad01 bf16 gated (`REPORTED` empty); 0341b75 bf16 layer bound 0.02, bf16 GEMM gated, bias check on the registered capture, `a_bias_widened`; 87d564e bumps (AriL a03aa29 everywhere); 88ef427 TB bias-check strings; 563c9af docs; final-review fixes 3803fec (model-check gate steps, SystolicMesh fd0cc98), d426a95 (`layer_bias_special`), e610ebd (LAYER_BOUND comment), then their docs commit |
 
 ### What was built
 
@@ -110,6 +110,12 @@ As designed, with the three approved decisions: narrow in the mesh at the reduce
 
 Runs: models mc_models_bf16, ba0_models_N32_bf16 -> ba3f_models_N16_bf16, ba3f_models_N32_bf16 (N 16 and N 32 identical after); GEMM ba0_gemm_bf16 -> ba3f_gemm_bf16; area `sienna_jobs/area_estimate.py` (now with separate sum, result and lane widths). fp32 and int8: words and cycles identical to main in every run compared.
 
+### Final-review fixes (2026-10-09)
+
+- **The checks with their own references gate `make regression`.** Every other bf16 check compares the RTL with its bit-exact model, and the 0.02 layer bound cannot see a 1-ulp rounding bug, so a bug shared by `fpNarrow` and `fpu.narrow` (the same add-and-shift trick) passed the gate. New gated steps in every format: `aril-fpu` (`test_fpu.py`: corner table, integer divmod RNE), `aril-narrow` (FPNarrow `all`: TB corners, RTL against `fpu.narrow` on 1,196,635 values, lint, G_BAD_FORMAT), `sm-model-tests` (`test_mesh_model_packed.py` with K = 640 against float64, `test_stim_format.py`). SystolicMesh's own regression runs the same three first (`--no-checks` skips them; the gate's sm-verilator passes `SM_CHECKS=0`). A mutant that rounds ties away in both `fpNarrow` and `fpu.narrow` (`bff_mut_narrow_tieaway.patch`) passes sm-verilator, pipeline, pack and gemm, and fails the gate through `aril-fpu` (rne_ref: 32,512 tie classes wrong) and `aril-narrow` (corners 3F808000, BF808000).
+- **`layer_bias_special`** in `make gemm FMT=bf16` (so in the gate, QUICK too): one bf16 layer on sienna_layer whose bias row holds +0, -0 and subnormals; bit-exact, and `a_bias_widened` must not fire. `model_runner` takes a test-only job key `bias_words` (the layer file would otherwise flush subnormal words). The layer flush mutant fails only this case.
+- Collapse-k 0 in bf16, bit-exact at N 16 (84/84, bff_sm16ck0_bf16).
+
 ### Deferred minors
 
 - `gen_mm_range_edge` needs N >= 8 (N 4 is weaker, N 2 crashes the generator); no flow runs the mesh below N 8.
@@ -121,4 +127,4 @@ Runs: models mc_models_bf16, ba0_models_N32_bf16 -> ba3f_models_N16_bf16, ba3f_m
 - Tail elements were not counted on the perf stimulus (the perf moves are explained per set above, not predicted per config).
 - `Common/models/__pycache__/` is untracked in both ArithmeticLibrary clones (left in place).
 
-Open at close (the controller's): the final whole-branch review, the merge on Soham's go-ahead, the N = 64 bf16 sweep (regression, perf, models) with the gate, Ruling 2's tags, the README throughput and latency tables after that sweep, and the push (innermost first; ArithmeticLibrary by its SSH URL).
+Open at close (the controller's): the merge on Soham's go-ahead, the N = 64 bf16 sweep (regression, perf, models) with the gate, Ruling 2's tags, the README throughput and latency tables after that sweep, and the push (innermost first; ArithmeticLibrary by its SSH URL).

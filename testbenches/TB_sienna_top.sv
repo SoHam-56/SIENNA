@@ -116,7 +116,6 @@ module TB_sienna_top #(
   logic                        [ID_W-1:0] done_set_id_o;
   logic systolic_busy_tb, gpnae_busy_tb;
   logic maxpool_busy_tb, dropout_busy_tb;
-  logic intermediate_buffer_full_tb, intermediate_buffer_empty_tb;
 
   // ── Data queues ───────────────────────────────────────────────────────
   logic [DATA_WIDTH-1:0] north_data_queue[$];
@@ -189,9 +188,7 @@ module TB_sienna_top #(
       .systolic_busy_o            (systolic_busy_tb),
       .gpnae_busy_o               (gpnae_busy_tb),
       .maxpool_busy_o             (maxpool_busy_tb),
-      .dropout_busy_o             (dropout_busy_tb),
-      .intermediate_buffer_full_o (intermediate_buffer_full_tb),
-      .intermediate_buffer_empty_o(intermediate_buffer_empty_tb)
+      .dropout_busy_o             (dropout_busy_tb)
   );
 
   wire [4:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
@@ -519,9 +516,8 @@ module TB_sienna_top #(
 
   task automatic print_status(input string stage_label);
     $display(
-        "[STATUS @ %0t] sys_busy=%0b gpnae_busy=%0b max_busy=%0b drop_busy=%0b | full=%0b empty=%0b",
-        $time, systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb,
-        intermediate_buffer_full_tb, intermediate_buffer_empty_tb);
+        "[STATUS @ %0t] sys_busy=%0b gpnae_busy=%0b max_busy=%0b drop_busy=%0b",
+        $time, systolic_busy_tb, gpnae_busy_tb, maxpool_busy_tb, dropout_busy_tb);
   endtask
 
   // ── Reset ─────────────────────────────────────────────────────────────

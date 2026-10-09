@@ -966,7 +966,7 @@ PIPELINE_TESTS = [
     {"name": "matmul_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "bias": True},
     {"name": "matmul_accum3_bias_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
      "bias": True, "accum_passes": 3, "pool_h": 1, "pool_w": 1, "padding": 0},
-    # bf16 only: -0 and subnormal bias words beside zero-product rows; TB_sienna_top compares the mesh's bias input with the row widened.
+    # bf16 only: -0 and subnormal bias words beside zero-product rows; TB_sienna_top compares the mesh's bias queue entry with the row widened.
     {"name": "bf16_bias_special_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "bias": True,
      "bias_special": True, "zero_rows": True, "pool_h": 1, "pool_w": 1, "padding": 0, "formats": ("bf16",)},
     # B from the mesh's weight cache: every set's B is written to its own tile once, then only A is sent.

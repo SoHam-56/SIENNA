@@ -32,7 +32,7 @@ module TB_sienna_top #(
   logic                     bias_valid_i;  // this set carries a bias row
   logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
   logic [N-1:0][ACC_W-1:0] bias_want;  // the bias the mesh must see with this set's put: the file's row, widened exactly
-  int bias_checked = 0;  // puts whose bias reached the mesh's input and was compared
+  int bias_checked = 0;  // puts whose bias reached the mesh's bias queue and was compared
   if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
     $fatal(1, "TB_sienna_top: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
   end
@@ -1622,8 +1622,8 @@ module TB_sienna_top #(
 
     if (HAS_BIAS != 0 && bias_checked == 0) begin
       failed++;
-      $display("  [FAIL] Bias check: a bias test compared no set's bias at the mesh's input");
-    end else $display("  [Bias] %0d puts: the mesh's bias input was compared with the bias row widened", bias_checked);
+      $display("  [FAIL] Bias check: a bias test compared no set's bias in the mesh's bias queue");
+    end else $display("  [Bias] %0d puts: the mesh's bias queue entry was compared with the bias row widened", bias_checked);
 
     $display("\n==============================================");
     $display(" RESULT SUMMARY");

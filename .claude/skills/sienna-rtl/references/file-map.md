@@ -42,7 +42,7 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 | `test_config_pkg.sv` | **generated** | Written by `regression.py` and `model_runner.py` (`write_sv_package()`). Edits are lost on the next run |
 | `TB_model_run.sv` | live | Layer-file testbench of `sienna_layer` (was `TB_sienna_layer`); `model_runner.RtlLayer` builds it once and runs one layer per invocation |
 | `TB_sienna_model.sv` | live | Host-driven set engine on `sienna_top`; `model_runner.RtlSets` (`--engine sets`) |
-| `tb_l9_sink.svh` | live | One lane's L9 consumer for the testbenches (slots, random stalls, hold, a checker and `a_l9_slots`), included by TB_model_run, TB_sienna_model and TB_sienna_multi |
+| `tb_l9_sink.svh` | live | One lane's L9 consumer for the testbenches (slots, random stalls, a checker and `a_l9_slots`), included by TB_model_run, TB_sienna_model and TB_sienna_multi |
 | `matrix_west.mem`, `matrix_north.mem`, `expected_output.mem` | generated | Stimulus and golden output, hex |
 | `hardware_trace.txt` | output | Stage-by-stage hardware values, parsed by `regression.py` |
 | `pipeline_lane_status.txt` | output | Per-lane FSM snapshots. The first place to look for a stall |

@@ -156,7 +156,6 @@ module sienna_layer #(
   logic                          p_wc_last;  // the set is its block's last cached pass: the region's fill closes with it
   logic                          p_west_we, p_north_we;
   logic [LFSR_WIDTH-1:0]         p_seed;
-  logic [ID_W-1:0]               p_done_id;
 
   // The pipeline's host link (L0): this layer holds up to two staging credits and puts each set with its last row.
   `include "sienna_set_side.svh"
@@ -247,7 +246,7 @@ module sienna_layer #(
       .west_write_reset_i         (1'b0),
       .out                        (out),
       .pipeline_complete_o        (p_complete),
-      .done_set_id_o              (p_done_id),
+      .done_set_id_o              (),
       .systolic_busy_o            (),
       .gpnae_busy_o               (),
       .maxpool_busy_o             (),

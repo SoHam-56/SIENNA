@@ -1116,11 +1116,11 @@ def macs_of(job):
 # The model gate's bounds, one place; the hardware itself is judged bit for bit against the backend's exact model in every float format.
 LAYER_BOUND = {  # max|hw-ref|/max|ref| per layer against float64 on the same operands: the check a bug shared by the RTL and its exact model must pass
     "fp32": 1e-4,  # also regression.py's gemm bound; measured worst 3.29e-05 over 187 layers (mg_fp32c), 3x margin
-    "bf16": 0.25,  # bf16 sums in bf16: measured worst 7.41e-02 (resnet8 L11 ADD, mg_bf16c) without ad01, 3.4x margin; catches gross shared bugs only
+    "bf16": 0.25,  # set with bf16 sums (worst 7.41e-02 without ad01, mg_bf16c); fp32 sums measure worst 3.77e-03 (vww L04, ba3_models_N16_bf16); catches gross shared bugs only
 }
 CLASSIFIERS = ("resnet8", "kws", "vww")  # top-1 must equal the float reference's in every format
-SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 operands with exact sums give 2.24e-03 (numpy estimate, 4.5x margin)
-REPORTED = {("ad01", "bf16")}  # known limit: bf16 builds sum in bf16 (ad01 layers up to 183% off, score 2.7-2.8x the float model's) until the fp32-accumulation change; float checks shown as FAIL, not counted; bit-exact still gates
+SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 with fp32 sums measured 2.24e-03 (ba3_models_N16_bf16, 4.5x margin)
+REPORTED = set()  # (model, format) known limits: float checks shown as FAIL, not counted; bit-exact still gates; ad01 bf16 left it once bf16 summed in fp32
 
 
 def parse_fault(spec):
@@ -1173,7 +1173,7 @@ def judge(name, desc, fmt, stats, r):
     """The gate on one inference: hardware (each layer bit-exact, and within LAYER_BOUND of float64) and task (top-1, or ad01's score) against the float model.
     A REPORTED (model, format) moves only its float checks (bound, task) to reported; a bit-exact failure always gates."""
     rep = (name, fmt) in REPORTED
-    why = " (reported, not gated: bf16 builds sum in bf16 until the fp32-accumulation change)"
+    why = " (reported, not gated: a known limit in model_runner.REPORTED)"
     hw, bad, task, reported = [], set(), [], []
     for s in stats:
         L, e = f"L{s['layer']:02d}", s["exact"]

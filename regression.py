@@ -768,8 +768,11 @@ def generate_vectors(cfg: dict) -> None:
                 fp32_error_bound(run_s if passes > 1 else Sk, N * passes, cfg, act_k,
                                  run if passes > 1 else (_ref_matmul(Ak, Bk) + bk).astype(np.float32))
             write_mem(os.path.join(TB_DIR, f"bound_output_{k}.mem"), Bnd)
-        if cfg.get("training", False) and not partial:
-            masks.append(tuple((Fk.flatten() != 0).tolist()))
+        if cfg.get("training", False) and not partial:  # the set's keep decisions, not Fk != 0: an output already zero is not a drop
+            keep = dropout_keep(Fk.size, cfg.get("dropout_p", 0.5), set_dropout_seed(drop_seed, k), cfg.get("lanes", 32))
+            if (Fk.flatten()[~keep] != 0).any():
+                raise RuntimeError(f"{test_name}: set {k}'s golden keeps a window its dropout mask drops")
+            masks.append(tuple(keep.tolist()))
     check_masks_differ(test_name, masks)
 
     # Dump the intermediate Golden Trace for debug comparisons

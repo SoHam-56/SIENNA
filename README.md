@@ -159,7 +159,7 @@ make perf-analysis FMT=bf16            # cycle-level throughput per stage
 How `make regression` works:
 - It is a list of *points*. A point is one check at one configuration, e.g. `bf16/N8_T2/pipeline` (the pipeline tests in bf16 at N = 8, tile size 2); the checks are `pipeline`, `model`, `pack`, `gemm` and `tflite`. `python3 regression.py --action points` lists them.
 - Each point is its own make target, so `make -j4 regression SMALL=1` runs four at a time, each simulating on a quarter of the cores; `make regression/bf16/N8_T2/pipeline` runs one alone.
-- Each point builds in a private copy of the tree and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`.
+- Each point builds in a private copy of the tree and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`. The pipeline point builds its testbench once for each group of tests that share a hardware configuration and runs the others on that build.
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
 - `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
 - The model points (the four MLPerf Tiny models, in fp32 and bf16) need `MODEL_DIR`. Without it they show NOT RUN and the regression fails.

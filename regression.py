@@ -437,8 +437,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
     _write_s8(os.path.join(TB_DIR, "expected_output.mem"), F0)
     _write_s8(os.path.join(TB_DIR, "bound_output.mem"), np.zeros_like(F0))
     dump_golden_trace(test_name, C0.astype(np.float32), A0q.astype(np.float32), P0.astype(np.float32))
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
-                     _config_items(cfg, "int8", act_type, num_sets, credits, passes, mixed, True, drop_seed))
+    mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                         _config_items(cfg, "int8", act_type, num_sets, credits, passes, mixed, True, drop_seed))
     _check_mem_widths("int8", num_sets)
 
 
@@ -655,8 +655,8 @@ def _generate_vectors_packed(cfg: dict) -> None:
         _write_pack(os.path.join(TB_DIR, f"pack_{k}.mem"), sh, mp, ents)
     for name in ("matrix_west", "matrix_north", "expected_output", "bound_output"):  # the single-set pass runs set 0
         shutil.copy(os.path.join(TB_DIR, f"{name}_0.mem"), os.path.join(TB_DIR, f"{name}.mem"))
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),  # int8 always sends bias_<k>: it carries the folded input zero point
-                     _config_items(cfg, fmt, act_type, num_sets, credits, 1, [], use_bias or fmt == "int8", drop_seed))
+    mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),  # int8 always sends bias_<k>: it carries the folded input zero point
+                         _config_items(cfg, fmt, act_type, num_sets, credits, 1, [], use_bias or fmt == "int8", drop_seed))
     if fmt != "fp32":
         _check_mem_widths(fmt, num_sets)
 
@@ -800,8 +800,8 @@ def generate_vectors(cfg: dict) -> None:
     dump_golden_trace(test_name, C, C_act, C_pooled)
 
     # Dump SV Config Package
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
-                     _config_items(cfg, fmt, act_type, num_sets, credits, passes, mixed, use_bias, drop_seed))
+    mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                         _config_items(cfg, fmt, act_type, num_sets, credits, passes, mixed, use_bias, drop_seed))
     if exact:
         _check_mem_widths(fmt, num_sets)
 
@@ -1042,10 +1042,31 @@ PIPELINE_TESTS = [
 ]
 
 
-def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 4, lanes: int = 32) -> tuple:
+def build_key(pkg_text: str) -> str:
+    """What a TB_sienna_top build depends on in a package: every line but the run-time knobs' (make's guard adds the inputs and flags)."""
+    knob = re.compile(r"^\s*localparam\s+\w+\s+(?:" + "|".join(mr.TB_KNOBS) + r")\s*=")
+    return "".join(x for x in pkg_text.splitlines(True) if not knob.match(x))
+
+
+def predicted_key(t: dict, N: int, T: int, lanes: int, fmt: str) -> str:
+    """A test's build key from its configuration alone, to order the tests; the build decision reads the package the test wrote."""
+    cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "fmt_name": fmt, **t}
+    items = _config_items(cfg, fmt, "relu", 1, cfg.get("credits", SETS_IN_FLIGHT), 1, [], False, 0)
+    return build_key("".join(f"localparam int {k} = {v};\n" for k, v, _ in items))
+
+
+def build_order(tests: list, N: int, T: int, lanes: int, fmt: str) -> list:
+    """The tests with each build group together, groups in order of first appearance, tests in order within a group."""
+    keys = {}
+    for t in tests:
+        keys.setdefault(predicted_key(t, N, T, lanes, fmt), []).append(t)
+    return [t for g in keys.values() for t in g]
+
+
+def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 4, lanes: int = 32, build: bool = True) -> tuple:
     t0 = time.time()
     process = subprocess.Popen(
-        ["make", "verilator", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}",
+        ["make", "verilator" if build else "sim", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}",
          "GEN_PKG=0"],  # GEN_PKG=0: build the package this test just wrote, in its format and geometry
         cwd=ROOT,
         stdout=subprocess.PIPE,
@@ -1145,6 +1166,8 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     results = []
+    tests_to_run = build_order(tests_to_run, N, T, lanes, fmt_name)
+    built = None  # the build key of the TB_sienna_top binary on disk, None until this run builds one
 
     for idx, t in enumerate(tests_to_run):
         print(
@@ -1155,9 +1178,12 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, "fmt_name": fmt_name, **t}
         generate_vectors(cfg)
 
-        # 2. Run Verilator (Streams live status)
+        # 2. Build TB_sienna_top when the package this test wrote needs another build, then run it (streams live status)
+        key = build_key(open(os.path.join(TB_DIR, "test_config_pkg.sv")).read())
         log_path = os.path.join(RESULTS_DIR, f"{t['name']}.log")
-        raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes)
+        print(f"      {_D}{'build' if key != built else 'the build of the test before'}{_X}")
+        raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes, build=key != built)
+        built = key if "-- Done" in raw_log or "-- Running simulation" in raw_log else None  # a failed build leaves no binary to reuse
 
         # 3. Parse Log
         r = {
@@ -2565,6 +2591,71 @@ def test_model_points_need_model_dir():
         for m in mr.MODELS.values():
             open(os.path.join(d, m), "w").write("")
         assert SPEC.not_run("fp32/N8_T2/model", o(d)) is None
+
+
+@selftest
+def test_tb_knobs_are_run_time():
+    # TB_sienna_top reads the TB-only settings from test_knobs.mem, so no knob value can reach its elaboration or the DUT's
+    src = open(os.path.join(TB_DIR, "TB_sienna_top.sv")).read()
+    assert not [k for k in mr.TB_KNOBS if re.search(rf"\b{k}\b", src)], [k for k in mr.TB_KNOBS if re.search(rf"\b{k}\b", src)]
+    labels = set(re.findall(r'^\s*"(\w+)"\s*:', src[src.index("task automatic read_knobs"):], re.M))
+    assert labels >= {k.lower() for k in mr.TB_KNOBS} and len(labels & {k.lower() for k in mr.TB_KNOBS}) == len(mr.TB_KNOBS), labels
+    mk = re.search(r"^TB_KNOBS\s*=\s*(.*)$", open(os.path.join(ROOT, "Makefile")).read(), re.M)
+    assert mk and mk.group(1).split() == list(mr.TB_KNOBS), mk and mk.group(1)
+    items = reg._config_items({"n": 16}, "fp32", "tanh", 9, 15, 3, ["tanh", "relu"], True, 77)
+    with tempfile.TemporaryDirectory() as d:
+        mr.write_test_config(os.path.join(d, "test_config_pkg.sv"), items)
+        knobs = dict(x.split() for x in open(os.path.join(d, "test_knobs.mem")).read().splitlines())
+        pkg = open(os.path.join(d, "test_config_pkg.sv")).read()
+    want = {k: v for k, v, _ in items if k in mr.TB_KNOBS}
+    assert knobs == {k.lower(): str(v) for k, v in want.items()} and len(knobs) == len(mr.TB_KNOBS), knobs
+    assert all(f"localparam int {k} = {v};" in pkg for k, v, _ in items)  # the package keeps every item (TB_sienna_multi reads them)
+
+
+@selftest
+def test_build_groups():
+    # two tests share a build exactly when their packages agree on everything but the run-time knobs
+    base = reg._config_items({"n": 16, "tile_size": 4, "pool_h": 2, "pool_w": 2, "padding": 1}, "bf16", "tanh", 17, 15, 1, [], False, 5)
+    text = lambda items: "".join(f"  localparam int {k} = {v};\n" for k, v, _ in items)
+    knob_only = [(k, (v + 1) if k in mr.TB_KNOBS else v, t) for k, v, t in base]
+    assert build_key(text(base)) == build_key(text(knob_only))
+    for k in [k for k, _, _ in base if k not in mr.TB_KNOBS]:  # any other item, POOL_H, SETS_IN_FLIGHT or DROPOUT_P_PERCENT among them, needs its own build
+        other = [(n, (v + 1) if n == k else v, t) for n, v, t in base]
+        assert build_key(text(base)) != build_key(text(other)), k
+    for N, T in ((8, 2), (16, 4), (32, 8)):
+        for f in ("fp32", "bf16", "int8"):
+            tests = [t for t in PIPELINE_TESTS if f in t.get("formats", tuple(FORMATS))]
+            order = build_order(tests, N, T, 128 if N >= 64 else 32, f)
+            assert sorted(t["name"] for t in order) == sorted(t["name"] for t in tests), (N, T, f)  # every test once
+            keys = [predicted_key(t, N, T, 32, f) for t in order]
+            assert all(keys.index(k) == i or keys[i - 1] == k for i, k in enumerate(keys)), (N, T, f)  # each group contiguous
+
+
+@selftest
+def test_sim_reuses_only_its_own_build():
+    r = make_n("sim", "GEN_PKG=0", "FMT=fp32")
+    assert r.returncode == 0 and "build_key.txt" in r.stdout and "cmp" in r.stdout and "verilator --binary" not in r.stdout, r.stdout[-400:]
+    mk = open(os.path.join(ROOT, "Makefile")).read()
+    rec = mk[mk.index("\nverilator: pkg-check"):mk.index("\n\n", mk.index("\nverilator: pkg-check") + 2)]  # make verilator: the key goes only after a whole build
+    assert rec.index("rm -f $(VERILATOR_DIR)/build_key.txt") < rec.index("$(VERILATOR) --binary") < rec.index("-f V$(TOP_MODULE).mk") < rec.index("> $(VERILATOR_DIR)/build_key.txt"), rec
+    with tempfile.TemporaryDirectory() as d:  # the key itself: knob values leave it unchanged; any other item, an input file or a flag changes it
+        pkg, vdir = fixture_pkg(d, "fp32"), os.path.join(d, "V")
+        os.makedirs(vdir)
+        rtl = os.path.join(d, "unit.sv")
+        open(rtl, "w").write("module unit; endmodule\n")
+        open(os.path.join(vdir, "VTB_sienna_top__ver.d"), "w").write(f"{vdir}/x.cpp : {pkg} {rtl}\n")
+        key = lambda *a: subprocess.run(["make", "-s", "build-key", f"PKG_FILE={pkg}", f"VERILATOR_DIR={vdir}", *a], cwd=ROOT, env=MAKE_ENV,
+                                        capture_output=True, text=True).stdout
+        k0, body = key(), open(pkg).read()
+        assert k0 and "unit.sv" in k0 and "NUM_SETS" not in k0 and "POOL_H" in k0, k0
+        open(pkg, "w").write(re.sub(r"NUM_SETS = \d+", "NUM_SETS = 99", re.sub(r"ACTIVATION_CODE = \d+", "ACTIVATION_CODE = 3", body)))
+        assert key() == k0
+        open(pkg, "w").write(re.sub(r"POOL_H = \d+", "POOL_H = 3", body))
+        assert key() != k0
+        open(pkg, "w").write(body)
+        assert key() == k0 and key("LINK_STAGES=1") != k0
+        open(rtl, "w").write("module unit; wire w; endmodule\n")
+        assert key() != k0
 
 
 @selftest

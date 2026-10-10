@@ -176,6 +176,22 @@ def apply_dropout(x: np.ndarray, p=0.5, training=False, seed=1, num_lanes=16) ->
     return out.reshape(x.shape)
 
 
+MASK_PAIR_P = 1e-5  # chance that two independent half-rate masks agree as often as a failing pair
+
+
+def check_masks_differ(test_name: str, masks: list) -> None:
+    """Sets' dropout masks must differ: no two agree on more than 75% of their windows, where independent masks would with chance below MASK_PAIR_P (from 70 windows, just the 75%)."""
+    for i in range(len(masks)):
+        for j in range(i + 1, len(masks)):
+            n = len(masks[i])
+            same = sum(a == b for a, b in zip(masks[i], masks[j]))
+            if same / n <= 0.75:
+                continue
+            tail = sum(math.comb(n, m) for m in range(same, n + 1)) / 2**n  # independent masks agree about half the time
+            if tail < MASK_PAIR_P:
+                raise RuntimeError(f"{test_name}: sets {i} and {j} dropout masks agree on {same / n:.0%} ({same} of {n}, chance {tail:.1e} if independent)")
+
+
 def write_bits(path: str, bits, fmt: str) -> None:
     d = (fpu.FORMATS[fmt].w + 3) // 4
     with open(path, "w") as fh:
@@ -754,11 +770,7 @@ def generate_vectors(cfg: dict) -> None:
             write_mem(os.path.join(TB_DIR, f"bound_output_{k}.mem"), Bnd)
         if cfg.get("training", False) and not partial:
             masks.append(tuple((Fk.flatten() != 0).tolist()))
-    for i in range(len(masks)):
-        for j in range(i + 1, len(masks)):
-            agree = sum(a == b for a, b in zip(masks[i], masks[j])) / len(masks[i])
-            if agree > 0.75:  # independent masks agree about half the time
-                raise RuntimeError(f"{test_name}: sets {i} and {j} dropout masks agree on {agree:.0%}")
+    check_masks_differ(test_name, masks)
 
     # Dump the intermediate Golden Trace for debug comparisons
     dump_golden_trace(test_name, C, C_act, C_pooled)
@@ -2573,6 +2585,19 @@ def test_regression_selects_nothing_fails():
         reg.PIPELINE_TESTS = saved
     assert code == 1 and "No tests found for fp32" in out.getvalue(), (code, out.getvalue()[-300:])
 
+
+@selftest
+def test_dropout_mask_check():
+    # N = 8: 17 sets of 25 pooled windows with independent masks pass; equal seeds, and at N >= 16 (81 windows) more than 75% agreement, still fail
+    ms = [tuple(reg.dropout_keep(25, 0.5, reg.set_dropout_seed(0x2ACE0000 + 42, k), 32)) for k in range(17)]
+    reg.check_masks_differ("n8_independent", ms)
+    for bad in ([ms[0]] * 3, [(True,) * 81, (True,) * 61 + (False,) * 20]):
+        try:
+            reg.check_masks_differ("dependent", bad)
+            raise AssertionError(f"masks agreeing on {sum(a == b for a, b in zip(bad[0], bad[1]))} of {len(bad[0])} passed")
+        except RuntimeError as e:
+            assert "dropout masks agree" in str(e), e
+    reg.check_masks_differ("n16_60_of_81", [(True,) * 81, (True,) * 60 + (False,) * 21])
 
 @selftest
 def test_fmt_fields_match_formats():

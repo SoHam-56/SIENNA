@@ -426,7 +426,7 @@ def build_conv_matrices(N: int, conv_type: str, seed: int, stride=None) -> tuple
     if math.isqrt(N) ** 2 == N:
         K = _kernel_size(N)
         return _basic_pair(img_size=K * K, K=K, seed=seed)
-    return _general_pair(N, seed)[0]  # 3x3 kernel, depth zero-padded to N
+    return _general_pair(N, seed)[0]  # 3x3 kernel (2x2 below N = 9), depth zero-padded to N
 
 
 def float_to_hex_str(f: float) -> str:

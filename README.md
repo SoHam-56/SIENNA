@@ -44,16 +44,16 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 ### Throughput while streaming sets
 
-24 sets per run, with the activation applied to every set. Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
+Measured in Verilator simulation, 24 sets per run, with the activation applied to every set. Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
 
 | Activation | N = 16 (GFLOPS) | N = 32 (TFLOPS) | N = 64 (TFLOPS) |
 |---|---|---|---|
-| ReLU / linear, no pooling | 410 · 410 · 410 | 1.73 · 1.73 · 1.71 | 7.43 · 7.43 · 7.43 |
-| SELU | 36 · 50 · 81 | 0.11 · 0.13 · 0.19 | 0.75 · 0.94 · 1.52 |
-| sigmoid | 29 · 39 · 75 | 0.10 · 0.13 · 0.17 | not in the N = 64 sweep |
-| tanh | 30 · 41 · 73 | 0.10 · 0.12 · 0.17 | 0.47 · 0.67 · 1.36 |
+| ReLU / linear, no pooling | 410 · 410 · 410 | 1.78 · 1.78 · 1.73 | 7.43 · 7.43 · 7.43 |
+| SELU | 36 · 50 · 81 | 0.11 · 0.13 · 0.19 | 0.74 · 0.92 · 1.51 |
+| sigmoid | 29 · 39 · 75 | not in the N = 32 sweep | not in the N = 64 sweep |
+| tanh | 30 · 41 · 73 | 0.10 · 0.12 · 0.17 | 0.47 · 0.66 · 1.36 |
 
-N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. N = 16 is measured on the current design; N = 32 and 64 on the design just before the credit links (tag `job_packing_v5`), which at N = 16 differs from it by at most one cycle per set in every row of this table. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
+N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. Every size runs with the credit links, and bf16 sums in fp32. Times and FLOPS assume the 950 MHz clock. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes, which are fastest in int8.
 
 ### MLPerf Tiny models
 
@@ -62,20 +62,20 @@ fp32, every multiply-accumulate on the RTL; the host only reshapes tensors and a
 | Model | Task | MACs | Latency, N = 16 | Latency, N = 64 | Throughput, N = 64 |
 |---|---|---|---|---|---|
 | ResNet-8 | image classification (CIFAR-10) | 12.5 M | 54.1 µs | 14.0 µs | 1.79 TFLOPS |
-| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 8.5 µs | 617 GFLOPS |
-| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 39.3 µs | 381 GFLOPS |
+| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 8.4 µs | 623 GFLOPS |
+| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 39.2 µs | 382 GFLOPS |
 | Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs | 6.5 µs (0.16 µs per slice) | 3.25 TFLOPS |
 
-In fp32 the hardware picks the same class as the floating-point model on every classifier and reproduces the anomaly score to four decimal places, at both sizes. bf16 builds run within 1.1% of these times.
+In fp32 the hardware picks the same class as the floating-point model on every classifier and reproduces the anomaly score to four decimal places, at both sizes. At N = 64, bf16 builds take up to 0.8% fewer cycles than these.
 
-**bf16 accuracy.** The same models in bf16 on 16 × 16 and 32 × 32 meshes, against the floating-point model (the two sizes give identical results). The layer error is the largest difference from an exact float64 calculation on the same bf16 inputs, as a share of that layer's largest output; rounding a single number to bf16 can be off by up to 0.39%:
+**bf16 accuracy.** The same models in bf16 on 32 × 32 and 64 × 64 meshes at every tile size, against the floating-point model (measured in Verilator simulation; the largest errors are the same at both sizes). The layer error is the largest difference from an exact float64 calculation on the same bf16 inputs, as a share of that layer's largest output; rounding a single number to bf16 can be off by up to 0.39%:
 
 | Model | Agreement with the float model | Largest layer error |
 |---|---|---|
-| ResNet-8 | same class on 3 of 3 CIFAR-10 images | 0.34% |
-| DS-CNN | same class on 3 of 3 inputs | 0.33% |
-| MobileNet | same class on 3 of 3 inputs | 0.38% |
-| Autoencoder | anomaly score within 0.23% on 4 inputs | 0.33% |
+| ResNet-8 | same class on every CIFAR-10 image (3 per run) | 0.34% |
+| DS-CNN | same class on every input (3 per run) | 0.33% |
+| MobileNet | same class on every input (3 per run) | 0.38% |
+| Autoencoder | anomaly score within 0.23% on every input (4 per run) | 0.33% |
 
 Summing in bf16 instead, the autoencoder's anomaly score came out 2.7 to 2.8 times too high.
 
@@ -112,8 +112,8 @@ The same small jobs, run one at a time and packed into shared sets (N = 32), wit
 | Benchmark | SIENNA, N = 64 | SIENNA, N = 16 | Qualcomm Sensing Hub | Renesas RA8P1 + Arm Ethos-U55 | Asygn NNPA_16x | STM32 Cortex-M7, 280 MHz |
 |---|---|---|---|---|---|---|
 | Image classification (ResNet-8) | 14.0 µs | 54.1 µs | 98.5 µs | 340 µs | 2.69 ms | 41.7 ms |
-| Keyword spotting (DS-CNN) | 8.5 µs | 31.4 µs | 66.5 µs | 108 µs | 567 µs | 11.5 ms |
-| Visual wake words (MobileNet) | 39.3 µs | 102.7 µs | 118 µs | 362 µs | 1.63 ms | 24.4 ms |
+| Keyword spotting (DS-CNN) | 8.4 µs | 31.4 µs | 66.5 µs | 108 µs | 567 µs | 11.5 ms |
+| Visual wake words (MobileNet) | 39.2 µs | 102.7 µs | 118 µs | 362 µs | 1.63 ms | 24.4 ms |
 | Anomaly detection (autoencoder) | 6.5 µs | 18.6 µs | 69.0 µs | 132 µs | 57.6 µs | 1.17 ms |
 
 These are not like-for-like:
@@ -129,7 +129,7 @@ Read them as an indication of where the architecture stands.
 ## Verification
 
 - `make regression` runs every check below and gives one verdict. It passes in fp32, bf16 and int8.
-- The pipeline regression runs 32 tests in fp32 and bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
+- The pipeline regression runs 32 tests in fp32, 33 in bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails the regression.
 - The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.

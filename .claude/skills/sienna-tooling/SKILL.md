@@ -125,6 +125,27 @@ unit bench and model check once) have their own, on the same engine.
 - Self-tests: `test_regression_points`, `test_point_commands`, `test_point_verdicts`, `test_model_points_need_model_dir`,
   `test_regression_target` (make -n).
 
+### One build per hardware group (2026-10-10)
+
+The pipeline regression builds TB_sienna_top once per group of tests whose packages agree on everything but the
+TB-only knobs (`TB_KNOBS` in model_runner.py and the Makefile: ACTIVATION_CODE, NUM_SETS, HAS_BIAS, WEIGHT_CACHE,
+ACCUM_PASSES, MIXED_LEN, MIXED_ACTS, PACKED, TRAINING_MODE, DROPOUT_SEED), and runs the other tests of the group on
+that build with `make sim`. Measured: a build is 70 s at N = 16 against 1-2 s of simulation, and about 8.6 min at
+N = 64 fp32.
+- Every generator writes `test_config_pkg.sv` with every item (TB_sienna_multi still reads the knobs from it) and, beside
+  it, `test_knobs.mem` (`write_test_config`: lowercase name and value per line). TB_sienna_top reads the knobs from that
+  file at time 0 (`read_knobs`: each exactly once, any other name or a missing one is `$fatal`) and names none of them
+  as package items, so no knob value can reach its elaboration or the DUT's.
+- `run_regression` orders the tests by group (`build_order`, from each test's configuration) and builds when the
+  package the test just wrote differs, outside the knobs, from the build on disk (`build_key`); a failed build is never
+  reused. `make sim` runs the binary only when `BUILD_KEY` (every Verilator input but the package by checksum, the
+  package without the knobs, and the Verilator flags) equals the one `make verilator` stored after a whole build, so a
+  stale or mismatched binary stops the run instead of answering for another configuration.
+- Self-tests: `test_tb_knobs_are_run_time` (TB_sienna_top names no knob; read_knobs covers each; the Makefile's list is
+  model_runner's; the knobs file), `test_build_groups` (knob-only differences share a build, any other package item
+  does not; every test once, each group contiguous), `test_sim_reuses_only_its_own_build` (the key ignores knob values
+  and changes with any other item, an input file or a flag).
+
 ## Rules
 
 - Behaviour-preserving: every flow must produce the same files and results as before the move (regression words and

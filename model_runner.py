@@ -868,6 +868,17 @@ COLLAPSE_K = 1  # the mesh's COLLAPSE_K the build uses; --collapse-k sets it for
 TB_DIR = os.path.join(ROOT, "testbenches")
 
 
+TB_KNOBS = ("ACTIVATION_CODE", "NUM_SETS", "HAS_BIAS", "WEIGHT_CACHE", "ACCUM_PASSES", "MIXED_LEN", "MIXED_ACTS", "PACKED", "TRAINING_MODE",
+            "DROPOUT_SEED")  # TB_sienna_top reads these at run time (test_knobs.mem), so one build runs every test that agrees on the rest
+
+
+def write_test_config(path: str, items: list) -> None:
+    """test_config_pkg.sv with every item, and beside it test_knobs.mem: the TB_KNOBS items, lowercase name and value, one per line."""
+    write_sv_package(path, items)
+    with open(os.path.join(os.path.dirname(path), "test_knobs.mem"), "w") as f:
+        f.writelines(f"{k.lower()} {v}\n" for k, v, _ in items if k in TB_KNOBS)
+
+
 def write_sv_package(path: str, items: list) -> None:
     with open(path, "w") as f:
         f.write("// Auto-Generated Configuration Package\npackage test_config_pkg;\n\n")
@@ -928,8 +939,8 @@ def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
         _check_rounding()
     cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "pool_h": 1, "pool_w": 1, "padding": 0}
     drop_seed = 0x2ACE0000 + 42 + int(os.environ.get("SIENNA_SEED", "0"))  # the generators' seed, so the package matches theirs
-    write_sv_package(os.path.join(TB_DIR, "test_config_pkg.sv"),
-                     _config_items(cfg, fmt, "relu", SETS_IN_FLIGHT + 2, SETS_IN_FLIGHT, 1, [], fmt == "int8", drop_seed))
+    write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
+                      _config_items(cfg, fmt, "relu", SETS_IN_FLIGHT + 2, SETS_IN_FLIGHT, 1, [], fmt == "int8", drop_seed))
 
 
 # ── 6. Backends: build(), run_job(job, tag) -> (outputs, sets, cycles) ───────

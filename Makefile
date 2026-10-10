@@ -400,9 +400,18 @@ pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
 # ─────────────────────────────────────────────────────────────────────────────
+# TB_sienna_top reads these package items at run time from test_knobs.mem, so a build serves every test that agrees on the rest.
+TB_KNOBS = ACTIVATION_CODE NUM_SETS HAS_BIAS WEIGHT_CACHE ACCUM_PASSES MIXED_LEN MIXED_ACTS PACKED TRAINING_MODE DROPOUT_SEED
+# What a build depends on: each Verilator input but the package by checksum, the package without TB_KNOBS, and the flags.
+BUILD_KEY = { for f in $$(sed -e 's/^[^:]*://' -e 's/\\$$//' $(VERILATOR_DIR)/V$(TOP_MODULE)__ver.d | tr ' ' '\n' | sort -u); do \
+	  [ -z "$$f" ] || [ "$$f" = "$(PKG_FILE)" ] || md5sum "$$f"; done; \
+	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
+	echo '$(TOP_MODULE) $(VERILATOR_FLAGS)'; }
+
 verilator: pkg-check
 	@echo "=== Verilator simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 	@mkdir -p $(VERILATOR_DIR)
+	@rm -f $(VERILATOR_DIR)/build_key.txt
 	$(VERILATOR) --binary \
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
@@ -411,6 +420,7 @@ verilator: pkg-check
 		-o $(TOP_MODULE)_sim
 	@echo "-- Compiling Verilator C++ model"
 	$(MAKE) -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
+	@$(BUILD_KEY) > $(VERILATOR_DIR)/build_key.txt
 	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running simulation"
 	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
@@ -418,6 +428,19 @@ verilator: pkg-check
 ifneq ($(TRACE),0)
 	@echo "-- Trace ($(TRACE)) : $(VERILATOR_DIR)/$(TRACE_FILE)"
 endif
+
+# The last build, run on the stimulus now in testbenches/ without building; it refuses a build of other inputs, package items (but TB_KNOBS) or flags.
+sim: pkg-check
+	@[ -x $(VERILATOR_DIR)/$(TOP_MODULE)_sim ] && [ -r $(VERILATOR_DIR)/build_key.txt ] || { echo "ERROR: no finished build in $(VERILATOR_DIR): make verilator first"; exit 1; }
+	@$(BUILD_KEY) | cmp -s - $(VERILATOR_DIR)/build_key.txt || { echo "ERROR: $(VERILATOR_DIR) holds a build of other sources, package items or flags: make verilator"; exit 1; }
+	$(call copy_mem_files,$(VERILATOR_DIR))
+	@echo "-- Running simulation (no build: $(VERILATOR_DIR)'s inputs, package and flags are this run's)"
+	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
+	@echo "-- Done"
+
+# The key make sim compares with the build's (BUILD_KEY), printed.
+build-key:
+	@$(BUILD_KEY)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-module targets
@@ -620,4 +643,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack regression regression-summary
+        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack regression regression-summary sim build-key

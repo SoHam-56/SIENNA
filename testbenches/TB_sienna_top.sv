@@ -100,6 +100,7 @@ module TB_sienna_top #(
   logic [DATA_WIDTH-1:0] stream_results[$];
   int stream_bounds[$];
   int stream_ids[$];
+  int put_sets = 0;  // sets of the streaming pass that have put a word on L9, counted by the L9 consumer
   logic [DATA_WIDTH-1:0] acc_results[$];
   int acc_bounds[$];
   // Admission seen from the host: sets in flight plus credits held never exceed SETS_IN_FLIGHT.
@@ -253,6 +254,7 @@ module TB_sienna_top #(
       end
     end else begin
       // A word's slot is credited from the next cycle on: the producer's counter checks no credit comes with the put that frees it.
+      if (stream_on && (|out_put) && put_sets <= stream_bounds.size()) put_sets = stream_bounds.size() + 1;  // before this edge's completion: a set's words can all come with it
       for (int l = 0; l < NUM_LANES; l++) begin
         out_held[l] += int'(out_cr[l]);
         if (stream_on && out_held[l] == 0) starved++;
@@ -1023,6 +1025,7 @@ module TB_sienna_top #(
     stream_results.delete();
     stream_bounds.delete();
     stream_ids.delete();
+    put_sets = 0;
     n_started = 0;
     stream_id_base = id_base;
     ov_mesh_g = 0;
@@ -1104,8 +1107,7 @@ module TB_sienna_top #(
               automatic bit started = 0;
               while (!started && stream_bounds.size() < NUM_SETS) begin
                 @(negedge clk_i);
-                if (stream_bounds.size() >= HOLD_SET)
-                  for (int l = 0; l < NUM_LANES; l++) if (lane_q[l].size() != 0) started = 1;
+                started = (put_sets > HOLD_SET);  // a put, not lane_q: lane_q is empty again once a set's last words come with its completion
               end
               if (!started) begin
                 failed++;

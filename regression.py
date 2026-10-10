@@ -179,8 +179,8 @@ def apply_dropout(x: np.ndarray, p=0.5, training=False, seed=1, num_lanes=16) ->
 MASK_PAIR_P = 1e-5  # chance that two independent half-rate masks agree as often as a failing pair
 
 
-def check_masks_differ(test_name: str, masks: list) -> None:
-    """Sets' dropout masks must differ: no two agree on more than 75% of their windows, where independent masks would with chance below MASK_PAIR_P (from 70 windows, just the 75%)."""
+def check_masks_differ(test_name: str, masks: list, keep_p: float = 0.5) -> None:
+    """Sets' dropout masks must differ: no two agree on more than 75% of their windows, where independent masks would with chance below MASK_PAIR_P (from 70 windows, just the 75%), nor all pairs together more than chance allows."""
     for i in range(len(masks)):
         for j in range(i + 1, len(masks)):
             n = len(masks[i])
@@ -190,6 +190,27 @@ def check_masks_differ(test_name: str, masks: list) -> None:
             tail = sum(math.comb(n, m) for m in range(same, n + 1)) / 2**n  # independent masks agree about half the time
             if tail < MASK_PAIR_P:
                 raise RuntimeError(f"{test_name}: sets {i} and {j} dropout masks agree on {same / n:.0%} ({same} of {n}, chance {tail:.1e} if independent)")
+    if len(masks) > 1:  # all pairs together: weak correlation no single pair shows
+        m, n = len(masks), len(masks[0])
+        k = np.array(masks, dtype=np.int64).sum(axis=0)  # sets keeping each window
+        same = int((k * (k - 1) // 2 + (m - k) * (m - k - 1) // 2).sum())
+        tail = agree_total_chance(m, n, same, keep_p)
+        if tail < MASK_PAIR_P:
+            raise RuntimeError(f"{test_name}: the {m} sets' dropout masks agree on {same} of {m * (m - 1) // 2 * n} pair windows "
+                               f"({same / (m * (m - 1) // 2 * n):.1%}, chance {tail:.1e} if independent)")
+
+
+def agree_total_chance(m: int, n: int, same: int, q: float) -> float:
+    """Exact chance that m independent masks, each keeping each of n windows with chance q, agree on at least same pair windows in all."""
+    vmax = m * (m - 1) // 2
+    pmf = np.zeros(vmax + 1)  # one window's agreeing pairs: k kept of m gives C(k,2) + C(m-k,2)
+    for kk in range(m + 1):
+        pmf[kk * (kk - 1) // 2 + (m - kk) * (m - kk - 1) // 2] += math.comb(m, kk) * q**kk * (1 - q) ** (m - kk)
+    if same <= n * float(pmf @ np.arange(vmax + 1)):
+        return 1.0  # not above the mean
+    size = 1 << (n * vmax).bit_length()
+    dist = np.fft.irfft(np.fft.rfft(pmf, size) ** n, size)[:n * vmax + 1]  # the n windows are independent: an n-fold convolution
+    return float(max(dist[same:].sum(), 0.0))
 
 
 def write_bits(path: str, bits, fmt: str) -> None:
@@ -773,7 +794,7 @@ def generate_vectors(cfg: dict) -> None:
             if (Fk.flatten()[~keep] != 0).any():
                 raise RuntimeError(f"{test_name}: set {k}'s golden keeps a window its dropout mask drops")
             masks.append(tuple(keep.tolist()))
-    check_masks_differ(test_name, masks)
+    check_masks_differ(test_name, masks, 1 - cfg.get("dropout_p", 0.5))
 
     # Dump the intermediate Golden Trace for debug comparisons
     dump_golden_trace(test_name, C, C_act, C_pooled)
@@ -2591,7 +2612,7 @@ def test_regression_selects_nothing_fails():
 
 @selftest
 def test_dropout_mask_check():
-    # N = 8: 17 sets of 25 pooled windows with independent masks pass; equal seeds, and at N >= 16 (81 windows) more than 75% agreement, still fail
+    # Independent masks pass (N = 8: 25 windows, N = 16: 81); equal seeds, more than 75% of 81, and a weak shared component over 17 sets fail
     ms = [tuple(reg.dropout_keep(25, 0.5, reg.set_dropout_seed(0x2ACE0000 + 42, k), 32)) for k in range(17)]
     reg.check_masks_differ("n8_independent", ms)
     for bad in ([ms[0]] * 3, [(True,) * 81, (True,) * 61 + (False,) * 20]):
@@ -2600,7 +2621,19 @@ def test_dropout_mask_check():
             raise AssertionError(f"masks agreeing on {sum(a == b for a, b in zip(bad[0], bad[1]))} of {len(bad[0])} passed")
         except RuntimeError as e:
             assert "dropout masks agree" in str(e), e
-    reg.check_masks_differ("n16_60_of_81", [(True,) * 81, (True,) * 60 + (False,) * 21])
+    reg.check_masks_differ("n16_58_of_81", [(True,) * 81, (True,) * 58 + (False,) * 23])  # chance 6e-5 if independent
+    reg.check_masks_differ("n16_independent", [tuple(reg.dropout_keep(81, 0.5, reg.set_dropout_seed(0x2ACE0000 + 42, k), 32)) for k in range(17)])
+    # 17 sets sharing a component (each window the shared draw with chance 0.45): pairs agree about 60%, below the pair rule's 92% at 25 windows
+    rng = np.random.default_rng(3)
+    shared = rng.random(25) < 0.5
+    corr = [tuple(np.where(rng.random(25) < 0.45, shared, rng.random(25) < 0.5).tolist()) for _ in range(17)]
+    pairs = [sum(a == b for a, b in zip(corr[i], corr[j])) / 25 for i in range(17) for j in range(i + 1, 17)]
+    assert 0.55 < sum(pairs) / len(pairs) < 0.65 and max(pairs) < 0.92, (sum(pairs) / len(pairs), max(pairs))
+    try:
+        reg.check_masks_differ("correlated", corr)
+        raise AssertionError("17 sets at about 60% pairwise agreement passed")
+    except RuntimeError as e:
+        assert "pair windows" in str(e), e
 
 @selftest
 def test_fmt_fields_match_formats():

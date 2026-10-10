@@ -195,11 +195,11 @@ Each repo tags its own milestones: the name says what that version contains, the
 | SIENNA, SystolicMesh | `pipelined_mesh_v3` | 012b013, 407b2bc | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
 | SIENNA, SystolicMesh | `three_formats_v4` | 1a6b081, a32f237 | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
 | SIENNA, SystolicMesh | `job_packing_v5` | 3ff67e9, c569e1f | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
-| SIENNA, SystolicMesh | `stage_credits_v6` | 68625d6, 3fd3ef6 | 2026-10-07 | every module boundary on one credit link, output back-pressure, optional register stages | new |
+| SIENNA, SystolicMesh | `stage_credits_v6` | 09c4dc4, 10f6831 | 2026-10-10 | every module boundary on one credit link, output back-pressure, optional register stages; bf16 sums in fp32, gated model runs and model checks, dead code removed (moved from 68625d6, 3fd3ef6) | new |
 | GPNAE | `tytan_vdat2025` | 59c0aa6 | 2025-10-29 | the Taylor-series lane as published (VDAT 2025) | same |
 | GPNAE | `poly_lane_v1` | f1482f4 | 2026-09-25 | the fitted-polynomial lane, exact past the fits, ReLU and linear; fp32 | `pre_synthesis_v1` |
 | GPNAE | `three_formats_v2` | 0d407a7 | 2026-10-01 | the polynomial lane in fp32 or bf16, and a separate int8 lane | `pre_packing_v1` |
-| GPNAE | `credit_lanes_v3` | b1ef12d | 2026-10-07 | the polynomial lanes take inputs and give results on credit links; a circular input FIFO keeps word order | new |
+| GPNAE | `credit_lanes_v3` | afd786b | 2026-10-10 | the polynomial lanes take inputs and give results on credit links; a circular input FIFO keeps word order; terms_i and dead signals removed (moved from b1ef12d) | new |
 
 ## Conventions
 

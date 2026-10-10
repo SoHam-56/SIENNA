@@ -893,7 +893,7 @@ module TB_sienna_top #(
   // ── Streaming: K distinct sets through overlapped stages ──────────────
   // The monitor reads registered state on the falling edge, never a combinational view of start.
   int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
-  int pool_with_result = 0;  // pooling busy while a mesh result waited, so activation could have overlapped it
+  int pool_with_result = 0;  // pooling busy while a mesh result waited on an idle activation stage, so activation could have overlapped it
   int stream_id_base;  // sets started before the stream, which consumed ids
   wire mesh_computing = dut.systolic_array_inst.mesh_busy;  // a set between staging and a written result
   // A finished set waits for a result bank: the mesh is held up by the consumer.
@@ -906,8 +906,8 @@ module TB_sienna_top #(
     if (stream_on) begin
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
-      // A finished result sits in the mesh, not being pushed, while pooling runs.
-      if (maxpool_busy_tb && res_ready && !dut.wide_rd_valid) pool_with_result++;
+      // A finished result sits in the mesh, not being pushed, while pooling runs and the activation stage has neither taken it nor granted its beats.
+      if (maxpool_busy_tb && res_ready && !dut.wide_rd_valid && int'(dut.g_state) == 0 && !dut.l3_armed) pool_with_result++;
       if (mesh_blocked) bp_mesh++;  // a finished set waits because no result bank is free
       if (int'(dut.g_state) == 0 && res_ready && dut.act_full[dut.act_wr])
         bp_act++;  // a mesh result waits because both activation banks are full

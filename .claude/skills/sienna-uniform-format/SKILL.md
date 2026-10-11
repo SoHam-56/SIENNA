@@ -130,19 +130,20 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   sigmoid 7.22% (12.68% at range 8), tanh 8.59%, against the regression's 6.25% tolerance. The
   hardware matches its bit-exact model; the error is the lane design at 8 significand bits
   (sigmoid's 1 - P near -3.5, power-basis Horner for tanh). `2026-09-28_gpnae_gate.txt` (sienna-report history) has the table.
-  Decided for the gate 2026-10-05 (Soham, option 2): `make regression` (was `make check`) gates bf16 bit-exactness (`bf16/gpnae-verilator`) and reports this
-  accuracy (`bf16/gpnae-accuracy`), not gated (sienna-tooling). Improving the fit (earlier tail hand-off for negative sigmoid, a split tanh
+  Decided for the gate 2026-10-05 (Soham, option 2): GPNAE's `make regression` gates bf16 bit-exactness (`bf16/lane`) and reports this
+  accuracy (`bf16/lane-accuracy`), not gated (sienna-tooling). GPNAE's dense negative pattern act_neg_dense (61867b6) puts bf16 sigmoid's worst at 17.6%. Improving the fit (earlier tail hand-off for negative sigmoid, a split tanh
   range) is still open and would change GPNAE's coefficients, so it needs Soham's go-ahead.
-- **fp32 gpnae_model, negative sigmoid.** `regression.py --lane poly --format fp32 --model hw` fails 9 of 10 patterns,
-  sigmoid only (20-51% of outputs differ; SELU and tanh exact): the model's `fpAdder(P, -1)` for `fp32_down` does not
-  match the RTL. Seen in `g11_hw32` (2026-09-28) and `tlb_check_fp32` (2026-10-05). The RTL's accuracy is fine (0.06%
-  worst); the model is the gap. Not changed (GPNAE is published work).
+- **fp32 gpnae_model, negative sigmoid: closed 2026-10-10 (GPNAE 61867b6).** `--model hw` failed 9 of 10 patterns,
+  sigmoid only: the model took `fpAdder(P, -1)` where the RTL's `fp32_down` drops P's last bit (no guard bit). The model
+  now computes `fp32_down` stage for stage (the RTL is the intended arithmetic, unchanged), so fp32 is bit-exact on every
+  activation and pattern; GPNAE's `make regression` gates `fp32/lane` bit-exact and `fp32/lane-accuracy` at 1%.
 - **Findings in published units, reported and not changed.** D-1: fp32Adder raises overflow with
   underflow when a cancellation's exponent goes negative (the result is correctly zero; SIENNA does
   not use the flag). D-6: fp32Adder gives -0 for x + (-x) when the first operand is negative (IEEE
   nearest gives +0); fpAdder does the same by design. D-7: fp32Adder's stage 2-4 valid bits have no
   reset, so reset must be held 4+ cycles (the testbenches hold 8). F-GP1: GPNAE's `fp32_down`
-  differs from fp32Adder(P, -1) by a few ulp on sigmoid's negative inputs within 3.5.
+  differs from fp32Adder(P, -1) by a few ulp on sigmoid's negative inputs within 3.5 (it has no guard bit; gpnae_model
+  now models it, so this is a precision note, not a test gap).
 
 ## int8 (sub-project 2): agreed principles, design not written
 

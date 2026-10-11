@@ -2683,6 +2683,10 @@ def test_regression_target():
     assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
     assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
     assert make_n("check").returncode != 0  # the gate's old name is gone
+    with tempfile.TemporaryDirectory() as d:  # a relative MODEL_DIR reaches the points absolute: they run in a private copy
+        rel = os.path.relpath(d, ROOT)
+        lines = recipe("regression", "SMALL=1", f"MODEL_DIR={rel}")
+        assert all(f"--model-dir={os.path.realpath(d)}" in x.replace(d, os.path.realpath(d)) for x in lines if "--action " in x), lines[0]
 
 
 @selftest

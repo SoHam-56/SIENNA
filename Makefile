@@ -15,8 +15,10 @@ GEN_PKG ?= 1
 PYTHON ?= python3
 # model_runner.py has no default model directory, so make model needs one.
 MODEL_DIR ?=
-# Inferences per model in make model.
+# Inferences per model in make model; make regression runs 3.
 MODEL_COUNT ?= 1
+# make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
+SMALL ?= 0
 QUICK ?= 0
 # Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna_top parameter; 0 is wires.
 LINK_STAGES ?= 0
@@ -25,6 +27,10 @@ FORMATS = fp32 bf16 int8
 # Exactly one word, and one of FORMATS: anything left after filter-out, or a word count but 1, stops make.
 ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
 $(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
+endif
+
+ifneq ($(filter-out 0 1,$(SMALL))$(words $(SMALL)),1)
+$(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
 # COLLAPSE_K is 0 or 1, and 0 only for sm-verilator: TB_sienna_top passes only LINK_STAGES (and FAULT) to sienna_top, so -G cannot reach sienna_top's.
@@ -137,6 +143,8 @@ VERILATOR_DIR = $(PRJ_DIR)/Verilator
 
 # Very large meshes put thousands of PEs into a few generated functions that -Os takes hours on; OPT_FAST=-O0 builds in minutes.
 OPT_FAST ?= -Os
+# Simulation threads; several simulations at once each need fewer (Verilator's threads spin, so oversubscribed runs crawl).
+SIM_THREADS ?= $(shell nproc)
 VCS_DIR       = $(PRJ_DIR)/VCS
 
 TRACE ?= 0
@@ -192,7 +200,7 @@ VERILATOR_FLAGS = \
 	--timing \
 	--assert \
 	--top-module $(TOP_MODULE) \
-	--threads $(shell nproc) \
+	--threads $(SIM_THREADS) \
 	--build-jobs $(shell nproc) \
 	--output-split 20000 \
 	--output-split-cfuncs 20000 \
@@ -292,8 +300,11 @@ help:
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make regression FMT=int8          - One verdict: self-tests, model checks, sm-verilator, gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (regression.py --action all; long)"
-	@echo "                                      bf16: gpnae-verilator is bit-exact and gpnae-accuracy is reported, not gated"
+	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -j)"
+	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
+	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
+	@echo "  make regression-summary           - The table of the results in REG_DIR (default testbenches/results/regression)"
+	@echo "                                      SystolicMesh, GPNAE and ArithmeticLibrary each run their own: make -C <repo> regression"
 	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
 	@echo ""
 	@echo "Utility Targets:"
@@ -412,11 +423,11 @@ endif
 # Sub-module targets
 # ─────────────────────────────────────────────────────────────────────────────
 # The mesh TB takes its format only from SystolicMesh's regression, which patches EXP_W/MAN_W/COLLAPSE_K into it.
-# SM_CHECKS=0: without the model checks (aril-fpu, aril-narrow, model-tests), which make regression runs as steps of their own.
+# SM_CHECKS=0: without the model checks (aril-fpu, aril-narrow, model-tests); SystolicMesh's own make regression covers every N, tile size and format.
 SM_CHECKS ?= 1
 sm-verilator:
 	@echo "=== Systolic Mesh only: FMT=$(FMT) N=$(N) TILE=$(TILE) COLLAPSE_K=$(COLLAPSE_K) ==="
-	$(MAKE) -C SystolicMesh regression MATRIX_SIZE=$(N) \
+	$(MAKE) -C SystolicMesh mesh-regression MATRIX_SIZE=$(N) \
 		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)$(if $(filter 0,$(SM_CHECKS)), --no-checks)"
 
 # GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
@@ -565,9 +576,31 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# One verdict: the tool self-tests, the model checks (aril-fpu, aril-narrow, sm-model-tests), then sm-verilator, gpnae-verilator (bf16: bit-exact, then gpnae-accuracy, reported), pipeline, pack, gemm QUICK=1 and (int8) tflite, in FMT at N, TILE and LANES.
-regression:
-	$(PYTHON) regression.py --action all --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
+# make regression: SIENNA's points, each its own target (make -j runs them side by side), then the table; FMT=<f> narrows it to one format.
+comma := ,
+empty :=
+space := $(empty) $(empty)
+REG_FORMATS = $(subst $(space),$(comma),$(strip $(if $(filter file,$(origin FMT)),$(FORMATS),$(FMT))))
+REG_SELECT  = --formats $(REG_FORMATS)$(if $(filter 1,$(SMALL)), --small)
+REG_DIR    ?= $(TB_DIR)/results/regression
+REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(MODEL_DIR)
+ifneq ($(filter regression,$(MAKECMDGOALS)),)
+ifeq ($(origin REG_RUN),undefined)
+REG_RUN := $(shell date +%Y%m%d-%H%M%S)-$(shell echo $$PPID)
+endif
+REG_POINTS := $(shell $(PYTHON) regression.py --action points $(REG_SELECT))
+endif
+
+# One point, e.g. make regression/bf16/N8_T2/pipeline: runs in a private copy of the tree, writes $(REG_DIR)/<point>.log and .json.
+regression/%:
+	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(MODEL_DIR)$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
+
+regression: $(addprefix regression/,$(REG_POINTS))
+	@$(REG_SUMMARY) --run $(REG_RUN)
+
+# The table of the results already in REG_DIR (SMALL and FMT pick the points it expects); fails on any FAIL or NOT RUN.
+regression-summary:
+	@$(REG_SUMMARY)$(if $(REG_RUN), --run $(REG_RUN))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Clean
@@ -587,4 +620,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack regression
+        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack regression regression-summary

@@ -119,9 +119,12 @@ make model FMT=bf16 MODEL_DIR=<dir>             # model_runner.py has no default
 make perf-analysis FMT=bf16                     # regression.py --action perf; make perf is still the profiling build
 make tflite FMT=int8 PYTHON=<venv>/bin/python   # model_runner.py --action tflite; refuses any FMT but int8
 make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on sienna_layer (regression.py --action pack)
-make sm-verilator FMT=int8                      # SystolicMesh's model checks (aril-fpu, aril-narrow, model-tests), then its regression at N, TILE, COLLAPSE_K; SM_CHECKS=0 skips the checks
+make sm-verilator FMT=int8                      # SystolicMesh's model checks (aril-fpu, aril-narrow, model-tests), then its mesh-regression at N, TILE, COLLAPSE_K; SM_CHECKS=0 skips the checks
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses; GPNAE_MODEL=hw for bit-exact (floats)
-make regression FMT=int8 PYTHON=<venv>/bin/python  # one verdict (regression.py --action all): selftest, aril-fpu, aril-narrow, sm-model-tests, sm-verilator (SM_CHECKS=0), gpnae-verilator, pipeline, pack, gemm QUICK=1, tflite (int8); bf16 adds gpnae-accuracy, reported, not gated; farm
+make regression MODEL_DIR=<dir> PYTHON=<venv>/bin/python  # SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, one point per target (make -j), then one table; SMALL=1: N = 8, 16; FMT=<f>: one format (sienna-tooling)
+make -C SystolicMesh regression SMALL=1                 # each submodule has its own (GPNAE, SystolicMesh/ArithmeticLibrary too)
+make regression/bf16/N8_T2/pipeline              # one point; make regression-summary reprints the table from testbenches/results/regression
+make verilator SIM_THREADS=2                     # Verilator --threads (default nproc; SystolicMesh's 8); make -jN regression sets it per point
 ```
 
 SIENNA's Python is two scripts: `regression.py` (hardware sanity, every check above behind `--action`) and `model_runner.py` (the host stack: numerics, lowering, tiling, packing, the layer file, backends `RtlLayer` / `RtlSets` / `Emulator`). The `sienna-tooling` skill has their actions and the map from the deleted scripts (`pack_regression.py`, `gemm_sweep.py`, `perf_analysis.py`, `tflite_*.py`, `test_*.py`).
@@ -130,7 +133,7 @@ SIENNA's Python is two scripts: `regression.py` (hardware sanity, every check ab
 - **The guard (`pkg-check`)** stops the build before Verilator unless the package's `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W`, `OUT_W`, `N`, `TILE_SIZE` and `NUM_LANES` are those of `FMT`, `N`, `TILE`, `LANES` (`ACC_W` 32 in every format; `OUT_W` 32 in fp32 and int8, 16 in bf16). A pre-format package (no `EXP_W`) fails it in every FMT, and so does one without `OUT_W` or with bf16's old `ACC_W` 16 (bf16 sums in bf16). `regression.py --action selftest` covers it without a build.
 - `COLLAPSE_K` must be 0 or 1, and 0 is refused for every target but `sm-verilator` and `help`: `TB_sienna_top` has no parameters, so it always builds `sienna_top`'s default, 1. A collapse-k 0 SIENNA build is `sienna_jobs/cmds/sienna_ck0.sh`.
 - The tracked `testbenches/test_config_pkg.sv` is the fp32 default (`make pkg FMT=fp32 N=16 TILE=4`). Every build overwrites it, so don't commit it from a run.
-- `PYTHON` (default `python3`) runs the scripts; `tflite`, `model` and `make regression FMT=int8` need the `tflite` package, which the farm has in `sienna_jobs/venv`.
+- `PYTHON` (default `python3`) runs the scripts; `tflite`, `model` and make regression's tflite and model points need the `tflite` package (`PYTHON=<venv>/bin/python`).
 - **Packing ports.** `sienna_top` takes `pack_shift_i`, `pack_map_i` and table entries 1..7 (`pack_act_i`; int8 `pack_zp_i`, `pack_min_i`, `pack_max_i`, `pack_mx_i`, `pack_shx_i`, `pack_mout_i`, `pack_shout_i`, `pack_zout_i`) with each start; tied to 0 they give today's results and cycles. `sienna_layer` takes the same as layer configuration (`cfg_pack_*`, the layer file's L, P and E lines). Packing needs `LANES` = N or a multiple: the default 32 cannot pack at N = 64 (use `LANES=64` or `128`). The `sienna-packing` skill has the rules and refusals.
 - `gpnae-verilator` rewrites GPNAE's tracked `testbenches/gpnae_test_config.svh` for FMT, as GPNAE's regression always does.
 

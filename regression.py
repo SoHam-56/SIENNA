@@ -2517,7 +2517,7 @@ def test_parse_time_rejections():
     assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
     for t in ("pipeline", "regression", "verilator", "lint", "pkg", "pack"):
         r = make_n(t, "COLLAPSE_K=0")
-        assert r.returncode != 0 and "sienna_ck0.sh" in r.stderr, (t, r.stderr)
+        assert r.returncode != 0 and "needs a testbench that sets sienna_top's COLLAPSE_K" in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
     assert r.returncode != 0 and "Invalid COLLAPSE_K=2" in r.stderr, r.stderr
     for t in ("help", "sm-verilator"):  # the only targets collapse-k 0 is meaningful for, or harmless in
@@ -2723,6 +2723,8 @@ def test_regression_target():
     assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
     assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
     assert make_n("check").returncode != 0  # the gate's old name is gone
+    h = subprocess.run(["make", "-s", "help"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
+    assert "make sim " in h and "make build-key " in h and "sienna_ck0" not in open(os.path.join(ROOT, "Makefile")).read(), h[-300:]
     with tempfile.TemporaryDirectory() as d:  # a relative MODEL_DIR reaches the points absolute: they run in a private copy
         rel = os.path.relpath(d, ROOT)
         lines = recipe("regression", "SMALL=1", f"MODEL_DIR={rel}")

@@ -42,7 +42,7 @@ $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
 ifneq ($(filter-out sm-verilator help default,$(or $(MAKECMDGOALS),default)),)
-$(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a collapse-k 0 SIENNA build uses $$J/cmds/sienna_ck0.sh)
+$(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a collapse-k 0 SIENNA build needs a testbench that sets sienna_top's COLLAPSE_K)
 endif
 endif
 
@@ -280,6 +280,8 @@ help:
 	@echo ""
 	@echo "Simulation Targets:"
 	@echo "  make verilator           - Simulate using Verilator (no waveform)"
+	@echo "  make sim                 - Run the last TB_sienna_top build on the stimulus in testbenches/, no build; refuses a build of other inputs or flags"
+	@echo "  make build-key           - Print the key make sim compares with the build's (inputs, package without the run-time knobs, flags)"
 	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
 	@echo "  make verilator TRACE=vcd - Simulate + write VCD waveform (larger)"
 	@echo "  make vcs                 - Simulate using Synopsys VCS (no waveform)"

@@ -129,6 +129,14 @@ module TB_sienna_top #(
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
+  // Truth dump: every stage's words of the first plain streaming pass (S) and of the accumulate pass (A), for regression.py's true-function gates.
+  localparam int TR_IDS = 1 << ID_W;
+  integer tr_fd;
+  bit tr_on = 0;  // the pass running is dumped
+  string tr_pass = "-";
+  int tr_cur_k = -1;  // the pass's number of the set the host puts next (-1: a set with no result)
+  int tr_k[TR_IDS];  // per set id: the pass's number of the set holding it
+  int put_seq = 0;  // puts since reset: set ids count them modulo TR_IDS
   bit stream_on = 0;  // a streaming pass is running
   logic [DATA_WIDTH-1:0] stream_results[$];
   int stream_bounds[$];
@@ -325,6 +333,7 @@ module TB_sienna_top #(
           stream_ids.push_back(int'(done_set_id_o));
         end
         if (acc_on) acc_bounds.push_back(acc_results.size());
+        if (tr_on && tr_fd) foreach (w[i]) $fdisplay(tr_fd, "D %s %0d %0d %h", tr_pass, tr_k[int'(done_set_id_o)], i, w[i]);
       end
     end
   end
@@ -384,6 +393,8 @@ module TB_sienna_top #(
     end
     host_lnk.data = side_now();
     host_lnk.put  = 1'b1;
+    tr_k[put_seq % TR_IDS] = tr_cur_k;
+    put_seq++;
     if (bias_valid_i) check_mesh_bias(bias_want);
     @(negedge clk_i);
     host_lnk.put  = 1'b0;
@@ -557,6 +568,7 @@ module TB_sienna_top #(
   task automatic reset();
     $display("\n[STAGE] Reset");
     rstn_i = 0;
+    put_seq = 0;
     out_cr = '0;  // the downstream consumer drops its L9 credits with the reset, as it does every other link signal
     host_lnk.put = 1'b0;
     host_lnk.data = '0;
@@ -765,6 +777,91 @@ module TB_sienna_top #(
                     lane, word_val(32'(dut.dropout_data_in[lane]), DATA_WIDTH),
                     dut.dropout_data_in[lane]);
         end
+      end
+    end
+  end
+
+  // Truth dump lines, each tagged with the pass and the pass's set number k (M: the r-th result of the pass):
+  //   M pass r e sum word   a reducer's write of element e: the sum before fpNarrow (fp32; int32 in int8) and the word written
+  //   X pass k e word       the activation stage's input of element e (the mesh's word; int8: the requantize output)
+  //   A pass k e word       the activation bank as pooling takes it
+  //   P pass k lane j word keep   lane's j-th dropout input (window j*NUM_LANES + lane) and dropout's keep decision for it
+  //   D pass k i word       the i-th output word (window order)
+  localparam int TR_TPD = N / TILE_SIZE;  // output tiles per dimension, one reducer each
+  localparam logic [63:0] TR_THR = (((64'(1) << LFSR_WIDTH) - 64'(1)) * 64'(DROPOUT_P_PERCENT)) / 64'(100);  // dropout.sv's threshold
+  logic [TR_TPD*TR_TPD-1:0] tr_we;
+  logic [TR_TPD*TR_TPD-1:0][31:0] tr_addr;
+  logic [TR_TPD*TR_TPD-1:0][ACC_W-1:0] tr_sum;
+  logic [TR_TPD*TR_TPD-1:0][OUT_W-1:0] tr_word;
+  for (genvar ti = 0; ti < TR_TPD; ti++) begin : TR_ROW
+    for (genvar tj = 0; tj < TR_TPD; tj++) begin : TR_COL
+      assign tr_we[ti*TR_TPD+tj]   = dut.systolic_array_inst.sram_we_agg[ti*TR_TPD+tj];
+      assign tr_addr[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_addr_agg[ti*TR_TPD+tj];
+      assign tr_word[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj];
+      if (EXP_W == 8 && MAN_W == 7) begin : G_BF16  // bf16: the fp32 sum going into the reducer's fpNarrow
+        assign tr_sum[ti*TR_TPD+tj] = dut.systolic_array_inst.ROW[ti].COL[tj].acc_unit.G_NARROW.NARROW.x_i;
+      end else begin : G_SAME  // fp32 and int8 write the sum itself
+        assign tr_sum[ti*TR_TPD+tj] = ACC_W'(dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj]);
+      end
+    end
+  end
+  logic [LFSR_WIDTH-1:0] tr_lfsr[NUM_LANES];
+  for (genvar g = 0; g < NUM_LANES; g++) begin : TR_LANE
+    assign tr_lfsr[g] = dut.backend_lanes[g].dropout_inst.lfsr_next;  // the word this beat advances to decides keep
+  end
+  function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
+    return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
+  endfunction
+  initial tr_fd = $fopen("../testbenches/truth_dump.txt", "w");
+  initial begin : tr_monitor  // one process writes every monitor variable, on the falling edge
+    int wn[SRAM_DEPTH];  // results of the pass written so far, per element
+    int beat[TR_IDS];  // beats of each set id read from the mesh so far
+    int pj[NUM_LANES];  // dropout inputs of the pooled set so far, per lane
+    int q_id[$], q_i[$];
+    bit q_pk[$];
+    bit was_on;
+    was_on = 0;
+    forever begin
+      @(negedge clk_i);
+      if (tr_on && !was_on) wn = '{default: 0};
+      was_on = tr_on;
+      if (!rstn_i) begin
+        q_id.delete();
+        q_i.delete();
+        q_pk.delete();
+      end else begin
+        for (int t = 0; t < TR_TPD * TR_TPD; t++)
+          if (tr_we[t]) begin
+            automatic int e = int'(tr_addr[t]) % SRAM_DEPTH;
+            if (tr_on && tr_fd) $fdisplay(tr_fd, "M %s %0d %0d %h %h", tr_pass, wn[e], e, tr_sum[t], tr_word[t]);
+            wn[e]++;
+          end
+        if (dut.g_accept) beat[int'(dut.g_next_id)] = 0;
+        if (dut.wide_rd_valid) begin  // a beat leaves the mesh; floats fill with it, int8 after the requantize pipeline
+          q_id.push_back(int'(dut.g_set_id));
+          q_i.push_back(beat[int'(dut.g_set_id)]);
+          q_pk.push_back(dut.g_pack);
+          beat[int'(dut.g_set_id)]++;
+        end
+        if (dut.fill_v && q_id.size() != 0) begin
+          automatic int id = q_id.pop_front(), i = q_i.pop_front();
+          automatic bit pk = q_pk.pop_front();
+          if (tr_on && tr_fd)
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "X %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, pk), dut.fill_d[k]);
+        end
+        if (dut.p_accept) begin
+          for (int l = 0; l < NUM_LANES; l++) pj[l] = 0;
+          if (tr_on && tr_fd)
+            for (int e = 0; e < SRAM_DEPTH; e++)
+              $fdisplay(tr_fd, "A %s %0d %0d %h", tr_pass, tr_k[int'(dut.p_next_id)], e, dut.gpnae_out_mem[dut.act_rd_base+e]);
+        end
+        for (int l = 0; l < NUM_LANES; l++)
+          if (dut.dropout_in_valid[l]) begin
+            if (tr_on && tr_fd)
+              $fdisplay(tr_fd, "P %s %0d %0d %0d %h %0d", tr_pass, tr_k[int'(dut.p_set_id)], l, pj[l], dut.dropout_data_in[l],
+                        64'(tr_lfsr[l]) >= TR_THR);
+            pj[l]++;
+          end
       end
     end
   end
@@ -1094,6 +1191,7 @@ module TB_sienna_top #(
               apply_pack(k);
               apply_weight(k);
               wc_last_i = close_fill && (k_weight_cache != 0) && (k == k_num_sets - 1);
+              tr_cur_k = k;
 `ifdef PERF
               if (!overrun) wait_credit();
               $display("PERF %0d HOST_LOAD %0d", int'($time / 10), k);
@@ -1380,6 +1478,8 @@ module TB_sienna_top #(
     acc_beats = 0;
     acc_banks = 0;
     acc_on = 1;
+    tr_pass = "A";
+    tr_on = 1;
     for (int j = 0; j < n; j++) begin
       automatic int k = (j < 4) ? 0 : j - 4;  // the stream set whose rows this pass sends
       read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
@@ -1397,6 +1497,7 @@ module TB_sienna_top #(
       apply_pack(0);
       apply_weight(k);
       wc_last_i = (k_weight_cache != 0) && (j == n - 1);
+      tr_cur_k = (j == n - 1) ? G : -1;  // only the last pass has a result: set G's, the sum of group 0
       wait_credit();
       load_inputs();
       host_put();
@@ -1412,6 +1513,7 @@ module TB_sienna_top #(
       waited++;
     end
     acc_on = 0;
+    tr_on = 0;
     if ($test$plusargs("acc_fault") && acc_results.size() > 0) begin  // on purpose: the summed set's first output corrupted
       acc_results[0] = acc_results[0] ^ DATA_WIDTH'(1 << (DATA_WIDTH - 2));
       $display("  [FAULT acc] the accumulate pass's first output corrupted");
@@ -1617,7 +1719,10 @@ module TB_sienna_top #(
 `ifdef BACK_TO_BACK
       ids_used = 2;  // plus the back-to-back pass
 `endif
+      tr_pass = "S";
+      tr_on = 1;
       stream_all_sets(ids_used, 0, 0);
+      tr_on = 0;
       stream_all_sets(ids_used + k_num_sets, 1, 0);
     end
     reset_mid_stream();
@@ -1647,6 +1752,7 @@ module TB_sienna_top #(
     $display("==============================================");
 
     if (trace_fd) $fclose(trace_fd);
+    if (tr_fd) $fclose(tr_fd);
     if (lane_fd) $fclose(lane_fd);
 
     #100 $finish;

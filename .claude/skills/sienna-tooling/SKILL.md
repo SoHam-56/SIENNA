@@ -93,11 +93,11 @@ Every target keeps its name and arguments and calls the new script: `regression`
 at N = 16, T = 4 (`--action all`); records dated before that (skills, reports) mean that gate.
 
 Each repo owns its regression (Soham, 2026-10-10): SIENNA's runs SIENNA's tests only. SystolicMesh (`make regression
-[SMALL=1] [FMT=]`: model-tests, aril-fpu, aril-narrow once, the mesh at every N, tile size and format, collapse-k 1; the
-one-N run is `make mesh-regression MATRIX_SIZE=<n>`, which SIENNA's `make sm-verilator` calls), GPNAE (`make regression
-[FMT=]`: its two model checks once, the lane bit-exact against gpnae_model in each format, and its accuracy against
+[SMALL=1] [FMT=]`: model-tests, aril-fpu, aril-narrow once, the mesh at every N, tile size and format in collapse-k 1 and 0 (collapse-k 0
+at N = 64 needs 108 to 430+ GB and the large code model, LARGE_CODE=1); the one-N run is `make mesh-regression MATRIX_SIZE=<n>`, which SIENNA's `make sm-verilator` calls), GPNAE (`make regression
+[FMT=]`: its two model checks once, the published Taylor lane in fp32 as published, the poly lane bit-exact against gpnae_model in each format, and its accuracy against
 the functions: fp32 gated at 1%, bf16 reported, not gated) and ArithmeticLibrary (`make regression`: every
-unit bench and model check once) have their own, on the same engine.
+unit bench and model check once, each lint on its count lines) have their own, on the same engine.
 
 - **Engine.** `SystolicMesh/ArithmeticLibrary/Common/regress.py` (loaded by path as `aril_regress`, since every repo has
   a `regression.py`): a repo's `Spec` gives the points and each point's command, environment, verdict and reason not to

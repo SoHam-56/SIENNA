@@ -41,6 +41,7 @@ from model_runner import (  # noqa: E402
     apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
+import truth  # noqa: E402  AriL's true-function gates (Common/models, on the same path): every pipeline stage gates on it
 
 # Ensure we can import the mesh helpers
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
@@ -398,6 +399,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
     acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
     zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
     sat = [0, 0]  # activated SELU sets: lane inputs where lambda * x saturates, and all their lane inputs
+    scales = {}  # per activated set: its lane's real input scale and SELU output scale, for the truth gate
     for g, g0 in enumerate(starts):
         ks = list(range(g0, min(g0 + passes, num_sets)))
         act_g = acts_g[g]
@@ -416,6 +418,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
         for i, k in enumerate(ks):
             last = complete and i == len(ks) - 1
             rq_k = rq if last else _decoy_params(N)
+            if last:
+                scales[str(k)] = {"0": [float(rq["s_out"]), float(rq["s_selu"])]}
             write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), parts[i][0], "int8")
             write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), parts[i][1], "int8")
             _write_w32(os.path.join(TB_DIR, f"bias_{k}.mem"), hw_bias if i == 0 else np.zeros(N, np.int64))
@@ -437,6 +441,8 @@ def _generate_vectors_int8(cfg: dict) -> None:
     _write_s8(os.path.join(TB_DIR, "expected_output.mem"), F0)
     _write_s8(os.path.join(TB_DIR, "bound_output.mem"), np.zeros_like(F0))
     dump_golden_trace(test_name, C0.astype(np.float32), A0q.astype(np.float32), P0.astype(np.float32))
+    with open(TRUTH_SCALES, "w") as fh:
+        json.dump(scales, fh)
     mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
                          _config_items(cfg, "int8", act_type, num_sets, credits, passes, mixed, True, drop_seed))
     _check_mem_widths("int8", num_sets)
@@ -637,6 +643,7 @@ def _generate_vectors_packed(cfg: dict) -> None:
     use_bias = bool(cfg.get("bias", False))
     req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
     zqs = _zp_draws(np.random.RandomState(seed + 8000), PACK_ENTRIES, acts) if cfg.get("zp_random") else [None] * PACK_ENTRIES
+    scales = {}  # int8: per set and pack entry, the lane's real input scale and SELU output scale, for the truth gate
     for k in range(num_sets):
         sh, rng = pack_shift_of(N, k), np.random.RandomState(seed + 1000 + k)
         mp = pack_map_of(N, sh, k)
@@ -649,12 +656,16 @@ def _generate_vectors_packed(cfg: dict) -> None:
         drop = set_dropout_seed(drop_seed, k)
         if fmt == "int8":
             ents = _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs)
+            scales[str(k)] = {str(e): [float(q["s_out"]), float(q["s_selu"])] for e, (_, q) in enumerate(ents) if q}
         else:
             _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop)
             ents = [(a, None) for a in acts]
         _write_pack(os.path.join(TB_DIR, f"pack_{k}.mem"), sh, mp, ents)
     for name in ("matrix_west", "matrix_north", "expected_output", "bound_output"):  # the single-set pass runs set 0
         shutil.copy(os.path.join(TB_DIR, f"{name}_0.mem"), os.path.join(TB_DIR, f"{name}.mem"))
+    if fmt == "int8":
+        with open(TRUTH_SCALES, "w") as fh:
+            json.dump(scales, fh)
     mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),  # int8 always sends bias_<k>: it carries the folded input zero point
                          _config_items(cfg, fmt, act_type, num_sets, credits, 1, [], use_bias or fmt == "int8", drop_seed))
     if fmt != "fp32":
@@ -934,6 +945,203 @@ def dump_hardware_trace(
 
 
 # =============================================================================
+# PART 2b: TRUE-FUNCTION GATES PER STAGE (truth.py)
+# =============================================================================
+# Each stage of a pipeline test is judged against the true function of the words that stage actually received, from
+# TB_sienna_top's truth dump of the first plain streaming pass (S) and the accumulate pass (A). The TB's bit-exact (or fp32
+# tolerance) compare of the outputs stays as a diagnostic, still required.
+
+TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
+TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
+ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
+INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
+TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "activation", "maxpool", "dropout")
+
+
+def _tb_words(name: str) -> np.ndarray:
+    with open(os.path.join(TB_DIR, name)) as fh:
+        return np.array([int(t, 16) for t in fh.read().split()], dtype=np.int64)
+
+
+def _sx(v, bits: int) -> np.ndarray:
+    v = np.asarray(v, dtype=np.int64) & ((1 << bits) - 1)
+    return np.where(v >= 1 << (bits - 1), v - (1 << bits), v)
+
+
+def _tb_knobs() -> dict:
+    with open(os.path.join(TB_DIR, "test_knobs.mem")) as fh:
+        return {k: int(v) for k, v in (ln.split() for ln in fh if ln.strip())}
+
+
+def read_truth_dump(path: str, lanes: int) -> dict:
+    """{pass: {"M": {r: {e: (sum, word)}}, "X"/"A": {k: {e: word}}, "P": {k: {window: (word, keep)}}, "D": {k: {i: word}}}}."""
+    d = {}
+    with open(path) as fh:
+        for ln in fh:
+            t = ln.split()
+            if not t:
+                continue
+            g = d.setdefault(t[1], {"M": {}, "X": {}, "A": {}, "P": {}, "D": {}})
+            if t[0] == "M":
+                g["M"].setdefault(int(t[2]), {})[int(t[3])] = (int(t[4], 16), int(t[5], 16))
+            elif t[0] in ("X", "A", "D"):
+                g[t[0]].setdefault(int(t[2]), {})[int(t[3])] = int(t[4], 16)
+            elif t[0] == "P":
+                g["P"].setdefault(int(t[2]), {})[int(t[4]) * lanes + int(t[3])] = (int(t[5], 16), int(t[6]))
+            else:
+                raise ValueError(f"truth dump: unknown line {ln.strip()!r}")
+    return d
+
+
+def _full(m: dict, n: int, what: str) -> list:
+    """m's values in key order 0..n-1; anything missing or extra is a dump fault."""
+    if sorted(m) != list(range(n)):
+        raise RuntimeError(f"truth dump: {what} holds {len(m)} of {n} entries")
+    return [m[i] for i in range(n)]
+
+
+def _set_words(k: int, knobs: dict, N: int, fmt: str) -> dict:
+    """Set k as the TB drives it: each column's pack entry, each entry's activation and (int8) requantize and lane words."""
+    code0 = (knobs["mixed_acts"] >> (4 * (k % knobs["mixed_len"]))) & 15 if knobs["mixed_len"] else knobs["activation_code"]
+    ents = {0: {"act": ACT_NAMES[code0]}}
+    col_ent = np.zeros(N, dtype=np.int64)
+    sh = 0
+    if knobs["packed"]:
+        pk = _tb_words(f"pack_{k}.mem")
+        sh = int(pk[0])
+        mp = pk[1:1 + N // 2]
+        lg = N.bit_length() - 1
+        col_ent = np.array([mp[0] if sh == 0 else mp[c >> (lg - sh)] for c in range(N)], dtype=np.int64)
+        for e in range(1, PACK_ENTRIES):
+            o = 1 + N // 2 + 9 * (e - 1)
+            ents[e] = {"act": ACT_NAMES.get(int(pk[o]) & 7, "linear"), "zp": int(_sx(pk[o + 1], 8)), "amin": int(_sx(pk[o + 2], 8)),
+                       "amax": int(_sx(pk[o + 3], 8)), "zout": int(_sx(pk[o + 8], 8))}
+    if fmt == "int8":
+        rq = _tb_words(f"requant_{k}.mem")
+        ents[0].update(zp=int(_sx(rq[0], 8)), amin=int(_sx(rq[1], 8)), amax=int(_sx(rq[2], 8)), zout=int(_sx(rq[7], 8)))
+        mult, shift = rq[8:8 + N] & 0xFFFFFFFF, _sx(rq[8 + N:8 + 2 * N], 8)
+    else:
+        mult = shift = None
+    return {"ents": ents, "col_ent": col_ent, "sh": sh, "mult": mult, "shift": shift}
+
+
+def _int8_quant(ents: dict, scales: dict, k: int):
+    """Per entry (s_in, z_in, s_out, z_out) of the lane: the generator's real scales, the zero points the TB drove."""
+    out = {}
+    for e, w in ents.items():
+        sc = scales.get(str(k), {}).get(str(e))
+        if sc is None:
+            continue
+        s_in, s_selu = sc
+        a = w["act"]
+        s_out, z_out = (s_selu, w["zout"]) if a == "selu" else INT8_FIXED_OUT.get(a, (s_in, w["zp"]))
+        out[e] = (s_in, w["zp"], s_out, z_out)
+    return out
+
+
+def _drop_value(w: dict) -> int:
+    """D-5: dropout's int8 drop value, the output zero point of the entry's activation (SELU zout, sigmoid -128, ReLU and linear zp, tanh 0)."""
+    return {"selu": w["zout"], "sigmoid": -128, "relu": w["zp"], "linear": w["zp"]}.get(w["act"], 0)
+
+
+def _transfer(fmt: str, want, got) -> "truth.Result":
+    """The activation stage's inputs must be the mesh's words, exactly (an identity: L3 carries them unchanged)."""
+    want, got = np.asarray(want, dtype=np.int64), np.asarray(got, dtype=np.int64)
+    bad = np.flatnonzero(want != got)
+    return truth.Result(bad.size == 0, fmt, "transfer", int(want.size), float(bad.size), 0.0, int(bad[0]) if bad.size else 0, int(bad.size),
+                        int(bad.size), 0, 0, 0, [(int(i), int(got[i]), int(want[i])) for i in bad[:truth.FIRST]])
+
+
+def truth_test(N: int, fmt: str, lanes: int) -> dict:
+    """{stage (activation: 'activation <func>'): Result} over every activated set of the dumped passes of the test just run."""
+    knobs, pkg = _tb_knobs(), _pkg_fields(os.path.join(TB_DIR, "test_config_pkg.sv"))
+    if not os.path.exists(TRUTH_DUMP):
+        raise RuntimeError(f"no truth dump at {TRUTH_DUMP}")
+    dump = read_truth_dump(TRUTH_DUMP, lanes)
+    if "S" not in dump:
+        raise RuntimeError("truth dump: no streaming pass (S)")
+    scales = json.load(open(TRUTH_SCALES)) if fmt == "int8" else {}
+    P, K, W = knobs["accum_passes"], knobs["num_sets"], (pkg["IN_ROWS"] + 2 * pkg["PADDING"] - pkg["POOL_H"]) // pkg["POOL_H"] + 1
+    W *= (pkg["IN_COLS"] + 2 * pkg["PADDING"] - pkg["POOL_W"]) // pkg["POOL_W"] + 1
+    ph, pw, pad, p = pkg["POOL_H"], pkg["POOL_W"], pkg["PADDING"], pkg["DROPOUT_P_PERCENT"] / 100.0
+    acc = truth.acc_fmt(fmt)
+    res = {}
+    add = lambda name, r: res.setdefault(name, []).append(r)
+    for tag, g in dump.items():
+        acts = [k for k in range(K) if k % P == P - 1] if tag == "S" else [P - 1]
+        if tag not in ("S", "A"):
+            raise RuntimeError(f"truth dump: unknown pass {tag}")
+        M = _full(g["M"], len(acts), f"pass {tag}'s results")
+        for r, k in enumerate(acts):
+            sw = _set_words(k, knobs, N, fmt)
+            ce = sw["col_ent"]
+            pairs = _full(M[r], N * N, f"pass {tag} result {r}")
+            pre = np.array([a for a, _ in pairs], dtype=np.int64)
+            post = np.array([b for _, b in pairs], dtype=np.int64)
+            # matmul: the sum of the group's passes as the host sent them, the bias with the first, a packed set's blocks alone
+            passes = []
+            for j in range(k - P + 1, k + 1):
+                A, B = _tb_words(f"matrix_west_{j}.mem").reshape(N, N), _tb_words(f"matrix_north_{j}.mem").reshape(N, N)
+                if sw["sh"]:
+                    b = N >> sw["sh"]
+                    B = np.where(np.kron(np.eye(N // b), np.ones((b, b))).astype(bool), B, 0)
+                passes.append((A, B))
+            bias = None
+            if knobs["has_bias"]:
+                bw = _tb_words(f"bias_{k - P + 1}.mem")[:N]
+                bias = bw if fmt != "bf16" else truth.encode("fp32", truth.values("bf16", bw))  # the TB widens the row exactly
+            add("matmul", truth.gate_matmul(fmt, passes, pre.reshape(N, N), bias))
+            if fmt == "bf16":
+                add("narrow", truth.gate_narrow("bf16", pre, post))
+            X = np.array(_full(g["X"].get(k, {}), N * N, f"pass {tag} set {k}'s activation inputs"), dtype=np.int64)
+            Aw = np.array(_full(g["A"].get(k, {}), N * N, f"pass {tag} set {k}'s activation bank"), dtype=np.int64)
+            cols = np.arange(N * N) % N
+            ent = ce[cols]
+            if fmt == "int8":
+                zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
+                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, X))
+            else:
+                add("transfer", _transfer(fmt, post, X))
+            # activation: each element through its column's entry, on the word the stage received
+            q8 = _int8_quant(sw["ents"], scales, k) if fmt == "int8" else {}
+            for e in sorted(set(ent.tolist())):
+                func = sw["ents"][e]["act"]
+                m = ent == e
+                if fmt == "int8":
+                    if e not in q8:
+                        raise RuntimeError(f"truth_scales.json has no scales for set {k} entry {e}")
+                    add(f"activation {func}", truth.gate("int8", func, X[m], Aw[m], quant=q8[e]))
+                else:
+                    add(f"activation {func}", truth.gate(fmt, func, X[m], Aw[m]))
+            Pw = _full(g["P"].get(k, {}), W, f"pass {tag} set {k}'s dropout inputs")
+            Pv, keep = np.array([a for a, _ in Pw], dtype=np.int64), np.array([b for _, b in Pw], dtype=bool)
+            add("maxpool", truth.gate_maxpool(fmt, Aw.reshape(N, N), Pv, ph, pw, pad))
+            D = np.array(_full(g["D"].get(k, {}), W, f"pass {tag} set {k}'s outputs"), dtype=np.int64)
+            zpw = np.array([_drop_value(sw["ents"][int(ce[w % N])]) for w in range(W)]) if fmt == "int8" else 0
+            add("dropout", truth.gate_dropout(fmt, Pv, keep, D, p, bool(knobs["training_mode"]), zpw))
+            model = dropout_keep(W, p, set_dropout_seed(knobs["dropout_seed"], k), lanes)
+            if knobs["training_mode"] and (model != keep).any():
+                res.setdefault("_mask", []).append(int((model != keep).sum()))
+    return {k: (truth.merge(v) if not k.startswith("_") else v) for k, v in res.items()}
+
+
+def truth_report(res: dict) -> tuple:
+    """(lines, misses) for one test: a line per stage, and a '[FAIL] truth:' line per stage that misses."""
+    lines, bad = [], []
+    for name in sorted((k for k in res if not k.startswith("_")), key=lambda x: (TRUTH_STAGES.index(x.split()[0]), x)):
+        r = res[name]
+        lines.append("        " + (truth.line(r) if name.startswith("activation") else truth.stage_line(r)))
+        if not r.ok:
+            w = {"matmul": lambda: f"{truth.worst_text(r.worst)} of sum|ab|", "narrow": lambda: f"{r.worst_lsb} ULP",
+                 "requant": lambda: f"{r.worst_lsb} LSB from round(real)", "activation": lambda: truth.worst_text(r.worst) +
+                 (f" ({r.worst_lsb} LSB)" if r.fmt == "int8" else "")}.get(name.split()[0], lambda: f"|out - want| {r.worst:.6g}")()
+            bad.append(f"[FAIL] truth: {name.replace(' ', '/')} {w}, {r.over} of {r.n} over the bound; first: {r.first[:3]}")
+    if "_mask" in res:
+        lines.append(f"        diagnostic: dropout's keep decisions differ from regression.py's LFSR model in {sum(res['_mask'])} windows")
+    return lines, bad
+
+
+# =============================================================================
 # PART 3: REGRESSION ORCHESTRATOR
 # =============================================================================
 
@@ -1203,6 +1411,8 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         key = build_key(open(os.path.join(TB_DIR, "test_config_pkg.sv")).read())
         log_path = os.path.join(RESULTS_DIR, f"{t['name']}.log")
         print(f"      {_D}{'build' if key != built else 'the build of the test before'}{_X}")
+        if os.path.exists(TRUTH_DUMP):
+            os.remove(TRUTH_DUMP)  # a stale dump would be gated as this test's
         raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes, build=key != built)
         built = key if "-- Done" in raw_log or "-- Running simulation" in raw_log else None  # a failed build leaves no binary to reuse
 
@@ -1219,18 +1429,49 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         # 4. Dump Formatted HW Matrix Trace
         dump_hardware_trace(t["name"], N, print_to_console=(r["status"] != "PASS"))
 
-        # 5. Print Final Result
+        # 5. Print Final Result: the TB's compare (bit-exact; fp32 within tolerance) is a diagnostic, still required
         sym = ok("PASS") if r["status"] == "PASS" else err("FAIL")
         tot = max(r["total"], 1)
         print(
             f"      {sym}   exact {100*r['exact']/tot:5.1f}%  tol {100*r['tol']/tot:5.1f}%  fail {r['failed']:3d}  {r['cyc']:6d} cyc  {r['wall']:5.1f}s"
+            f"  (TB compare, diagnostic)"
         )
+
+        # 6. True-function gates per stage, on the TB's truth dump; a miss fails the test but the sweep goes on
+        if r["status"] in ("PASS", "FAIL"):
+            try:
+                r["truth"] = truth_test(N, fmt_name, lanes)
+                tl, tbad = truth_report(r["truth"])
+            except (RuntimeError, ValueError, OSError, KeyError) as e:
+                tl, tbad = [], [f"[FAIL] truth: none ({e})"]
+            print("      true-function gates (truth.py), every stage on its actual inputs:")
+            for ln in tl:
+                print(f"      {ln.strip()}")
+            for ln in tbad:
+                print(f"      {err(ln)}")
+            r["truth_ok"] = not tbad
+            if tbad and r["status"] == "PASS":
+                r["status"] = "FAIL"
+                continue
 
         if r["status"] != "PASS":
             print(f"  {_R}╚══  Sweep Aborted: {r['status']}.{_X}" + (f"\n      {r['fired']}" if "fired" in r else ""))
             sys.exit(1)
 
     print(f"\n  ╚══  Sweep Complete")
+
+    gated = [r for r in results if "truth" in r]
+    names = sorted({k for r in gated for k in r["truth"] if not k.startswith("_")},
+                   key=lambda x: (TRUTH_STAGES.index(x.split()[0]), x))
+    print(hdr(f"\n  TRUE-FUNCTION GATES, all tests ({fmt_name}, N={N}, TILE={T})"))
+    for name in names:
+        m = truth.merge([r["truth"].get(name) for r in gated])
+        print("  " + (truth.line(m) if name.startswith("activation") else truth.stage_line(m)))
+        for r in gated:
+            x = r["truth"].get(name)
+            if x is not None and not x.ok:
+                print(f"    miss: {r['name']}: {x.over} of {x.n}")
+    print(f"  TRUTH: {len(gated)} tests gated, {sum(not r.get('truth_ok', False) for r in gated)} with misses")
 
     passed = sum(1 for r in results if r["status"] == "PASS")
     print(hdr(f"\n{'═'*70}\n  SUMMARY  —  N={N}  TILE={T}\n{'═'*70}"))
@@ -2589,7 +2830,8 @@ def test_point_commands():
 @selftest
 def test_point_verdicts():
     n32 = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS))])  # every fp32 pipeline test
-    clean = f"\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n"
+    clean = (f"  TRUTH: {n32} tests gated, 0 with misses\n\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n"
+             f"  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n")
     plain = regress.ANSI.sub("", clean)
     v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
     assert n32 > 20 and v("int8/N8_T2/pipeline", clean) == f"FAIL ({n32} tests ran, int8 has {len([t for t in PIPELINE_TESTS if 'int8' in t.get('formats', tuple(FORMATS))])})"
@@ -2601,6 +2843,10 @@ def test_point_verdicts():
             ("fp32/N8_T2/pipeline", plain.replace("Sanity Clean", "Failures detected"), 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
             ("fp32/N8_T2/pipeline", "make: done\n", 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
             ("fp32/N8_T2/pipeline", clean + "%Error: x.sv:3: bad\n", 0, "FAIL (log: %Error: x.sv:3: bad)"),
+            ("fp32/N8_T2/pipeline", plain.replace(f"TRUTH: {n32} tests", f"TRUTH: {n32 - 1} tests"), 0, f"FAIL ({n32 - 1} of {n32} tests gated on the true function)"),
+            ("fp32/N8_T2/pipeline", plain.replace(f"  TRUTH: {n32} tests gated, 0 with misses\n", ""), 0, f"FAIL (0 of {n32} tests gated on the true function)"),
+            ("fp32/N8_T2/pipeline", "      [FAIL] truth: maxpool |out - want| 1, 3 of 81 over the bound\n" + plain.replace("0 with misses", "1 with misses"), 0,
+             "FAIL (true function: maxpool; 1 tests with misses)"),
             ("fp32/N8_T2/model", "MODEL GATE: PASS  fp32 N=8\n", 0, "PASS"), ("fp32/N8_T2/model", "MODEL GATE: FAIL  fp32\n", 0, "FAIL (log: MODEL GATE: FAIL  fp32)"),
             ("fp32/N8_T2/model", "built\n", 0, "FAIL (no 'MODEL GATE: PASS')"), ("int8/N8_T2/tflite", "MODEL GATE: PASS int8\n", 0, "PASS"),
             ("int8/N8_T2/tflite", "ok\n", 0, "FAIL (no 'MODEL GATE: PASS')"),
@@ -3422,13 +3668,21 @@ class SiennaSpec(regress.Spec):
             return regress.marker_verdict(text, rc, (r"^ALL \d+ PASSED$",))
         if k == "pipeline":
             m = re.findall(r"^\s*Passed\s*:\s*(\d+)\s*/\s*(\d+)\s*$", text, re.M)
+            g = re.findall(r"^\s*TRUTH: (\d+) tests gated, (\d+) with misses$", text, re.M)
+            miss = sorted(set(re.findall(r"\[FAIL\] truth: (\S+)", text)))
+            if miss:
+                return f"FAIL (true function: {', '.join(miss)}; {g[-1][1] if g else '?'} tests with misses)"
             if not m or "Sanity Clean" not in text:
                 return "FAIL (no 'Passed : X / X' with Sanity Clean)"
             x, y = map(int, m[-1])
             want = len([t for t in PIPELINE_TESTS if self.parse(name)["fmt"] in t.get("formats", tuple(FORMATS))])  # collapse-k 1 runs them all
             if x != y or y == 0:
                 return f"FAIL ({x} of {y} tests passed)"
-            return "PASS" if y == want else f"FAIL ({y} tests ran, {self.parse(name)['fmt']} has {want})"
+            if y != want:
+                return f"FAIL ({y} tests ran, {self.parse(name)['fmt']} has {want})"
+            if not g or int(g[-1][0]) != y:
+                return f"FAIL ({g[-1][0] if g else 0} of {y} tests gated on the true function)"
+            return "PASS"
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
         if k == "pack":

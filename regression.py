@@ -1048,6 +1048,27 @@ def build_key(pkg_text: str) -> str:
     return "".join(x for x in pkg_text.splitlines(True) if not knob.match(x))
 
 
+def build_sources() -> list:
+    """Every SV file TB_sienna_top's build compiles (make -n lint's command line) and every include file in its -I directories."""
+    r = subprocess.run(["make", "-s", "-n", "lint", "GEN_PKG=0"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
+    words = r.stdout.split()
+    files = {w for w in words if w.endswith((".sv", ".svh", ".v")) and os.path.isfile(w)}
+    for d in [w[2:] for w in words if w.startswith("-I")]:
+        files |= {os.path.join(d, f) for f in os.listdir(d) if f.endswith((".svh", ".vh"))} if os.path.isdir(d) else set()
+    return sorted(files)
+
+
+def knob_references(files: list) -> list:
+    """(file, line, knob) for each run-time knob a file names, but the package's own 'localparam int KNOB =' declarations."""
+    decl = re.compile(r"^\s*localparam\s+\w+\s+(" + "|".join(mr.TB_KNOBS) + r")\s*=")
+    out = []
+    for f in files:
+        for i, line in enumerate(open(f, errors="replace"), 1):
+            m = decl.match(line) if os.path.basename(f) == "test_config_pkg.sv" else None
+            out += [(f, i, k) for k in mr.TB_KNOBS if re.search(rf"\b{k}\b", line[m.end():] if m else line)]
+    return out
+
+
 def predicted_key(t: dict, N: int, T: int, lanes: int, fmt: str) -> str:
     """A test's build key from its configuration alone, to order the tests; the build decision reads the package the test wrote."""
     cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "fmt_name": fmt, **t}
@@ -2597,7 +2618,13 @@ def test_model_points_need_model_dir():
 def test_tb_knobs_are_run_time():
     # TB_sienna_top reads the TB-only settings from test_knobs.mem, so no knob value can reach its elaboration or the DUT's
     src = open(os.path.join(TB_DIR, "TB_sienna_top.sv")).read()
-    assert not [k for k in mr.TB_KNOBS if re.search(rf"\b{k}\b", src)], [k for k in mr.TB_KNOBS if re.search(rf"\b{k}\b", src)]
+    found = knob_references(build_sources())  # every file TB_sienna_top's build compiles or can include, the package's own declarations aside
+    assert not found and len(build_sources()) > 30, found
+    with tempfile.TemporaryDirectory() as d:  # the scan finds a knob anywhere but a package declaration
+        ref, pkg = os.path.join(d, "unit.svh"), os.path.join(d, "test_config_pkg.sv")
+        open(ref, "w").write("localparam int K = test_config_pkg::NUM_SETS;\n// PACKED only in a comment is a reference too\n")
+        open(pkg, "w").write("package test_config_pkg;\n  localparam int NUM_SETS = 17;\n  localparam int X = NUM_SETS;\nendpackage\n")
+        assert knob_references([ref, pkg]) == [(ref, 1, "NUM_SETS"), (ref, 2, "PACKED"), (pkg, 3, "NUM_SETS")], knob_references([ref, pkg])
     labels = set(re.findall(r'^\s*"(\w+)"\s*:', src[src.index("task automatic read_knobs"):], re.M))
     assert labels >= {k.lower() for k in mr.TB_KNOBS} and len(labels & {k.lower() for k in mr.TB_KNOBS}) == len(mr.TB_KNOBS), labels
     mk = re.search(r"^TB_KNOBS\s*=\s*(.*)$", open(os.path.join(ROOT, "Makefile")).read(), re.M)

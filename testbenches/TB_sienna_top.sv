@@ -65,25 +65,27 @@ module TB_sienna_top #(
   int k_activation_code, k_num_sets, k_has_bias, k_weight_cache, k_accum_passes, k_mixed_len, k_mixed_acts, k_packed, k_training_mode, k_dropout_seed;
   int hold_set;  // the hold pass's set: SETS_IN_FLIGHT+4 sets to put after it where k_num_sets allows, else set 0
   task automatic read_knobs();
-    int fd, v, seen;
+    int fd, v, seen, i;
     string key;
     fd = $fopen("test_knobs.mem", "r");
     if (fd == 0) $fatal(1, "TB_sienna_top: no test_knobs.mem: regression.py writes it with each test's stimulus (make pkg)");
     seen = 0;
     while ($fscanf(fd, "%s %d\n", key, v) == 2) begin
       case (key)
-        "activation_code": begin k_activation_code = v; seen |= 1 << 0; end
-        "num_sets":        begin k_num_sets = v;        seen |= 1 << 1; end
-        "has_bias":        begin k_has_bias = v;        seen |= 1 << 2; end
-        "weight_cache":    begin k_weight_cache = v;    seen |= 1 << 3; end
-        "accum_passes":    begin k_accum_passes = v;    seen |= 1 << 4; end
-        "mixed_len":       begin k_mixed_len = v;       seen |= 1 << 5; end
-        "mixed_acts":      begin k_mixed_acts = v;      seen |= 1 << 6; end
-        "packed":          begin k_packed = v;          seen |= 1 << 7; end
-        "training_mode":   begin k_training_mode = v;   seen |= 1 << 8; end
-        "dropout_seed":    begin k_dropout_seed = v;    seen |= 1 << 9; end
+        "activation_code": begin i = 0; k_activation_code = v; end
+        "num_sets":        begin i = 1; k_num_sets = v;        end
+        "has_bias":        begin i = 2; k_has_bias = v;        end
+        "weight_cache":    begin i = 3; k_weight_cache = v;    end
+        "accum_passes":    begin i = 4; k_accum_passes = v;    end
+        "mixed_len":       begin i = 5; k_mixed_len = v;       end
+        "mixed_acts":      begin i = 6; k_mixed_acts = v;      end
+        "packed":          begin i = 7; k_packed = v;          end
+        "training_mode":   begin i = 8; k_training_mode = v;   end
+        "dropout_seed":    begin i = 9; k_dropout_seed = v;    end
         default: $fatal(1, "TB_sienna_top: test_knobs.mem names an unknown setting '%s'", key);
       endcase
+      if (seen[i]) $fatal(1, "TB_sienna_top: test_knobs.mem sets '%s' twice", key);
+      seen[i] = 1'b1;
     end
     $fclose(fd);
     if (seen != 10'h3FF) $fatal(1, "TB_sienna_top: test_knobs.mem lacks settings (mask %b of 10)", seen[9:0]);

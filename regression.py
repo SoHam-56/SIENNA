@@ -2626,6 +2626,8 @@ def test_tb_knobs_are_run_time():
         open(pkg, "w").write("package test_config_pkg;\n  localparam int NUM_SETS = 17;\n  localparam int X = NUM_SETS;\nendpackage\n")
         assert knob_references([ref, pkg]) == [(ref, 1, "NUM_SETS"), (ref, 2, "PACKED"), (pkg, 3, "NUM_SETS")], knob_references([ref, pkg])
     labels = set(re.findall(r'^\s*"(\w+)"\s*:', src[src.index("task automatic read_knobs"):], re.M))
+    task = src[src.index("task automatic read_knobs"):src.index("endtask", src.index("task automatic read_knobs"))]
+    assert re.search(r"if \(seen\[i\]\) \$fatal\(1, .*twice", task), task  # a setting given twice stops the run (simulated: the duplicate-knob run)
     assert labels >= {k.lower() for k in mr.TB_KNOBS} and len(labels & {k.lower() for k in mr.TB_KNOBS}) == len(mr.TB_KNOBS), labels
     mk = re.search(r"^TB_KNOBS\s*=\s*(.*)$", open(os.path.join(ROOT, "Makefile")).read(), re.M)
     assert mk and mk.group(1).split() == list(mr.TB_KNOBS), mk and mk.group(1)

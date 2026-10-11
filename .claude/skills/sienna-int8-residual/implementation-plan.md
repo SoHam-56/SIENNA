@@ -51,7 +51,7 @@ Five inputs or conditions the spec implies but no test in its Verification secti
 - **P-6 (scope of the host interface):** this plan builds the device-protocol half that G4's TFLite check needs: `TB_model_run` reads the `A` line, `model_runner.write_layer` writes it from `job["add"]`, `RtlLayer.run_job` passes it, plus the numerics helpers (`add_words`, `tflite_add_codes`, `add_lane_params`, `int8_residual_exact`). The frontend lowering stays 2b. `regression.py` builds the residual-block jobs by hand from the interpreter's tensors.
 - **P-7 (where each G4 test lives):** set-level tests in `TB_sienna_top` (`int8_residual_relu`, `_linear_nopool`, `_tanh`, `_sigmoid_selu_nopool`, `_train`, `_then_relu_nopool`, `_two_layers_nopool`, `_accum2_mixed_nopool`); layer-level cases in `sienna_layer` / `TB_model_run` through `regression.py --action residual` (`resnet_relu`, `deep_cached`, `deep_uncached`, `tiles`, `relu6_conv_linear_add`, `tanh_after_add`). `_deep` and `_tiles` are `sienna_layer` notions (dt, cache, rt, ct) that `TB_sienna_top` does not have.
 - **P-8 (G1 exhaustive):** the exhaustive pairs run in a TB loop whose results are dumped and checked by `check_add.py` against `ipu.tflite_add` or the interpreter, as `check_ipu.py` checks dumps; a vector file of 154 corner sets x 65,536 pairs would be 0.6 GB.
-- **P-9 (perf):** `regression.py --action perf` skips residual configs (its analyser groups sets by `accum_passes`), and its report says so; the perf model is not extended.
+- **P-9 (perf):** `regression.py --action perf` skips residual configs (its analyser groups sets by `accum_passes`), and its report says so; the perf model is not extended. (Reversed by Task 2.10b, Soham 2026-10-11: the model covers the residual tests and the lane fixes.)
 - **P-10 (gates):** the sigmoid hard gate is GPNAE's 5 gated sigmoid `INT8_CASES` (1,280 outputs) in `GPNAE/regression.py`, plus the dense 65,536 in `check_gpnae_model_int8.py`; tanh and SELU stay reported (spec).
 - **P-11 (rounding):** if G0b's winner is not DOUBLE (the conv's pin), stop before Task 1.5 and ask Soham: the ADD would need its own pin (`ADD_ROUNDING` in `sienna_fmt_pkg` and `ipu`).
 - **P-12 (hold_mem):** a register array in RTL (`[PER_LANE][NUM_LANES] x 8`); its occupancy bits `hm_v` exist only under `ifndef SYNTHESIS`, for `a_hold_push_empty` and `a_add_pop_full`.
@@ -2008,7 +2008,7 @@ Expected: `int8_residual` everywhere, 0 uncommitted changes except SIENNA's ` M 
 
 Every Phase 2 path is relative to `$T` unless it starts with `$A` (ArithmeticLibrary) or `$J`. `sienna_top.sv`, `sienna_layer.sv`, `sienna_set_side.svh` and `TB_model_run.sv` are identical from `2529f0f` to the merged main `9fa414e` (checked: `git diff --stat 2529f0f 9fa414e` on them is empty), so their line numbers below are the merged main's; `regression.py`, `Makefile`, `TB_sienna_top.sv` and `model_runner.py` were rewritten by `regression_sweep`, so their steps name functions, not lines (checked on `9fa414e`: `SiennaSpec.points/parse/argv/verdict`, `KINDS`, `reg_lanes`, `mr.TB_KNOBS`, `mr._config_items`, `mr.write_test_config`, the Makefile's `TB_KNOBS`, `BUILD_KEY`, `check-files`, `regression/%`; `TB_sienna_top`'s `read_knobs`, `is_partial`, `act_of`, `apply_bias`, `side_now`, `stream_bounds`, `verify_slice`, `accum_null_pass`, `rq_id`/`rq_bank`/`rq_byp`; `read_word_file` from `int8_tb_util.svh`).
 
-Standing rules for every Phase 2 step (Soham's, partly in the Global Constraints): every test gates on a reference and is shown able to fail; assertions sample registered terms; builds, simulations, Yosys and TensorFlow run on slurm (`L`); N <= 32 while testing, one N = 64 sweep after check-in (Task 2.12); reports are `.log`; comments are one line; no Co-Authored-By or generated-by trailers; farm tooling (`$J/cmds/*`) stays out of the repos; `make regression` takes `FMT` and `SMALL` only from its command line; the hardware stays general (runtime ADD words, any scales, zero points and clamps; no model-specific tuning).
+Standing rules for every Phase 2 step (Soham's, partly in the Global Constraints): every test gates on a reference and is shown able to fail; assertions sample registered terms; builds, simulations, Yosys and TensorFlow run on slurm (`L`); N = 8 and 16 at every valid tile size while testing (Soham, 2026-10-11: "test with lowest runtime tests, n=8 to 16 for each valid tile size"; `pow2_tile_sizes` gives 2, 4, 8 at N = 8 and 2, 4, 8, 16 at N = 16, listed below as `NT`), and N = 32 and 64 only in Task 2.12's final sweep after check-in, with the base tree beside them; reports are `.log`; comments are one line; no Co-Authored-By or generated-by trailers; farm tooling (`$J/cmds/*`) stays out of the repos; `make regression` takes `FMT` and `SMALL` only from its command line; the hardware stays general (runtime ADD words, any scales, zero points and clamps; no model-specific tuning). Single-point runs loop over every (N, T) of `NT="8,2 8,4 8,8 16,2 16,4 16,8 16,16"` with `for nt in $NT; do n=${nt%,*}; t=${nt#*,}; ...; done`; `res_g4_pts.sh` covers every tile size of its N by itself. A mutant needs one failing run, so mutants stay at one (N, T).
 
 ### Task 2.0: The merge point: a state check, GPNAE's carried verdict test, reference tree, reference runs
 
@@ -2020,7 +2020,7 @@ Phase 1 already sits on the merged main: the controller rebased the four `int8_r
 - Create (local): `$J/cmds/res_g4_pts.sh`, `$J/cmds/res_cmp_points.py`, `$J/res_mut/m_gp_rc.patch`
 
 **Interfaces:**
-- Produces: `TB=/proj/scratch/spramanik/int8_res_base` (merged main, all four repos); reference runs `rs2_base_<fmt>_n<n>` (fmt fp32, bf16, int8; n 8, 16, 32), `rs2_base_ck0_int8_<n>` (n 8, 16, 32), `rs2_base_gptfl`; `$J/cmds/res_g4_pts.sh FMT N` (every `make regression` point of FMT at size N, each judged by `SiennaSpec.verdict`; the pipeline kind runs in place so its per-test logs stay in `results/res/pipeline/N<n>_T<t>/`); `$J/cmds/res_cmp_points.py REF NEW [--tree TREE --words-acts ACTS --cycles-acts ACTS]` (test-by-test comparison of two runs' pipeline logs, used from Task 2.2 on; int8 allows `--words-acts sigmoid`, bf16 `--words-acts sigmoid,tanh,selu --cycles-acts sigmoid` per spec Decision 5).
+- Produces: `TB=/proj/scratch/spramanik/int8_res_base` (merged main, all four repos); reference runs `rs2_base_<fmt>_n<n>` (fmt fp32, bf16, int8; n 8, 16), `rs2_base_ck0_int8_8` (T = 2), `rs2_base_ck0_int8_16` (T = 4) and `rs2_base_ck0_int8_<n>_t<t>` for the other tile sizes at N = 8 and 16, `rs2_base_gptfl`; `rs2_base_ck0_int8_32` (T = 8) also exists and is Task 2.12's N = 32 collapse-k 0 reference; `$J/cmds/res_g4_pts.sh FMT N` (every `make regression` point of FMT at size N, each judged by `SiennaSpec.verdict`; the pipeline kind runs in place so its per-test logs stay in `results/res/pipeline/N<n>_T<t>/`); `$J/cmds/res_cmp_points.py REF NEW [--tree TREE --words-acts ACTS --cycles-acts ACTS]` (test-by-test comparison of two runs' pipeline logs, used from Task 2.2 on; int8 allows `--words-acts sigmoid`, bf16 `--words-acts sigmoid,tanh,selu --cycles-acts sigmoid` per spec Decision 5).
 
 - [ ] **Step 1: Check the merged state** (login node, git only)
 
@@ -2219,18 +2219,13 @@ sys.exit(0 if not bad and n else 1)
 ```bash
 chmod +x $J/cmds/res_g4_pts.sh $J/cmds/res_cmp_points.py
 python3 $J/cmds/res_cmp_points.py rs1_base_gp_int8 rs1_base_gp_int8; echo "exit=$?"   # no pipeline logs: must not pass
-for f in fp32 bf16 int8; do
-  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_${f}_n8 64 24 $J/cmds/res_g4_pts.sh $f 8
-  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_${f}_n16 64 24 $J/cmds/res_g4_pts.sh $f 16
-  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_${f}_n32 64 48 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 32
+# done 2026-10-11 (ledger): rs2_base_{fp32,bf16,int8}_n8 and _n16 (res_g4_pts.sh, 84 points, all PASS), rs2_base_ck0_int8_8 (T 2), _16 (T 4), _32 (T 8), rs2_base_gptfl; rs2_base_*_n32 cancelled (N = 32 moves to Task 2.12)
+for nt in 8,4 8,8 16,2 16,8 16,16; do n=${nt%,*}; t=${nt#*,}   # the collapse-k 0 tile sizes the done runs do not cover
+  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_ck0_int8_${n}_t$t 64 24 $J/cmds/sienna_ck0.sh $n $t int8
 done
-for nt in "8 2" "16 4" "32 8"; do set -- $nt
-  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_ck0_int8_$1 64 $([ $1 -ge 32 ] && echo 48 || echo 24) $([ $1 -ge 32 ] && echo $J/cmds/int8_O0.sh) $J/cmds/sienna_ck0.sh $1 $2 int8
-done
-TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_gptfl 32 2 $J/cmds/res_py.sh . regression.py --action gpnae-tflite --report testbenches/results/res/gpnae_tflite.log
 ```
 
-Expected: the comparison of a run without pipeline logs prints `0 reference tests ...`, `DIFFERS`, `exit=1`. The allowances' control (review C1: packed tests carry their lanes' activations in `pack_acts`), on the login node: `python3 $J/cmds/res_cmp_points.py - - --tree $T --words-acts sigmoid --list | command grep -cxE 'packed_mixed_act_nopool|packed_bias_cached_train_nopool|int8_packed_zp_random_nopool|int8_mixed_act_train'` → `4`; a count below 4 means the allowance misses a sigmoid test: fix the script before any comparison. Each `rs2_base_*_n*` run ends `res_g4_pts: <f> N<n>: <k> of <k> points PASS` (N = 8: 3 tile sizes, N = 16: 4, N = 32: 5; 4 kinds each) and `exit=0`; each `rs2_base_ck0_int8_*` ends `Passed : X / X` with `Sanity Clean`; `python3 $J/cmds/res_cmp_points.py rs2_base_int8_n16 rs2_base_int8_n16` prints `IDENTICAL` (the script's own control). Keep every run's results (per-test words and cycles): they are the references of Tasks 2.2 to 2.11. `rs2_base_gptfl`'s report is the 2a TFLite logistic agreement (spec Risk 5).
+Expected: the comparison of a run without pipeline logs prints `0 reference tests ...`, `DIFFERS`, `exit=1`. The allowances' control (review C1: packed tests carry their lanes' activations in `pack_acts`), on the login node: `python3 $J/cmds/res_cmp_points.py - - --tree $T --words-acts sigmoid --list | command grep -cxE 'packed_mixed_act_nopool|packed_bias_cached_train_nopool|int8_packed_zp_random_nopool|int8_mixed_act_train'` → `4`; a count below 4 means the allowance misses a sigmoid test: fix the script before any comparison. The done runs: each `rs2_base_<f>_n8` and `_n16` ended `res_g4_pts: <f> N<n>: <k> of <k> points PASS` (N = 8: 3 tile sizes, N = 16: 4; 4 kinds each: 28 points per format, 84 in all) and `exit=0`, and `rs2_base_ck0_int8_8`, `_16`, `_32` ended `Passed : X / X` with `Sanity Clean`; the five new `rs2_base_ck0_int8_<n>_t<t>` runs must end the same way; `python3 $J/cmds/res_cmp_points.py rs2_base_int8_n16 rs2_base_int8_n16` prints `IDENTICAL` (the script's own control). Keep every run's results (per-test words and cycles): they are the references of Tasks 2.2 to 2.11. `rs2_base_gptfl`'s report is the 2a TFLite logistic agreement (spec Risk 5).
 
 - [ ] **Step 6: No SIENNA commit.** (GPNAE: Step 3's one commit; the pointers move in Tasks 2.1 and 2.2.)
 
@@ -2332,16 +2327,17 @@ Expected now: `NOT-IN-POINTER` (SIENNA's index names SystolicMesh 2bf84b9, whose
 ```bash
 git -C $T diff --cached --submodule=log SystolicMesh | head -20     # only ArithmeticLibrary's bump commits
 git -C $T/SystolicMesh diff --stat 2bf84b9 $(git -C $T rev-parse :SystolicMesh)   # G3 as a tree diff: one line, ArithmeticLibrary
-for f in fp32 bf16 int8; do L rs2_bump_${f}_n16 64 24 $J/cmds/res_g4_pts.sh $f 16; done
-L rs2_bump_int8_n8 64 24 $J/cmds/res_g4_pts.sh int8 8
+for f in fp32 bf16 int8; do for n in 8 16; do L rs2_bump_${f}_n$n 64 24 $J/cmds/res_g4_pts.sh $f $n; done; done
 ```
 
 then (login node):
 
 ```bash
-python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n16 rs2_bump_fp32_n16
-python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n16 rs2_bump_bf16_n16 --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
-for n in 16 8; do python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_bump_int8_n$n --tree $T --words-acts sigmoid; done
+for n in 8 16; do
+  python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_bump_fp32_n$n
+  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_bump_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_bump_int8_n$n --tree $T --words-acts sigmoid
+done
 ```
 
 Expected: the tree diff prints ` ArithmeticLibrary | 2 +-` and ` 1 file changed, 1 insertion(+), 1 deletion(-)` only (G3: the mesh is unchanged). Every run ends `res_g4_pts: <f> N<n>: <k> of <k> points PASS` (each passes against goldens regenerated from the bumped models: GPNAE's ladder for int8 and Task 1.14's bf16 lane, the references spec Decision 5 names). fp32 `IDENTICAL`. int8 `IDENTICAL-EXCEPT-ALLOWED` (cycles identical everywhere; words differ only in tests with a sigmoid set, such as `int8_mixed_act_train` (act sigmoid) and `int8_packed_zp_random_nopool` (a sigmoid entry in `pack_acts`); their per-test counts go to the ledger). bf16 `IDENTICAL-EXCEPT-ALLOWED` (Ruling F5 as extended for Q2, spec Decision 5: words differ only in tests with a sigmoid, tanh or SELU set, cycles only in tests with a sigmoid set; per-test word and cycle counts to the ledger). Any other difference (a result, a cycle outside bf16's sigmoid tests, a word in a test the allowances do not cover) is a stop.
@@ -2350,7 +2346,7 @@ Expected: the tree diff prints ` ArithmeticLibrary | 2 +-` and ` 1 file changed,
 
 ```bash
 git -C $T add GPNAE SystolicMesh Makefile synth/sienna_rtl.f
-git -C $T commit -m "Bump GPNAE and SystolicMesh (int8_residual): GPNAE's int8 sigmoid takes an exact ladder for |x| >= 2.5 (0 of 65536 dense and 0 of 1280 gated inputs outside GPNAE's tolerance, from 3370 and 34; sigmoid tests' goldens follow gpnae_model, <k> words changed at N = 16, cycles unchanged), ArithmeticLibrary adds tfliteAdd (TFLite's int8 ADD) and qadd_lat(). The Makefile and synth/sienna_rtl.f list tfliteAdd.sv. The mesh is unchanged (G3: its tree differs only in the library pointer). Runs rs2_bump_{fp32,bf16,int8}_n16, rs2_bump_int8_n8."
+git -C $T commit -m "Bump GPNAE and SystolicMesh (int8_residual): GPNAE's int8 sigmoid takes an exact ladder for |x| >= 2.5 (0 of 65536 dense and 0 of 1280 gated inputs outside GPNAE's tolerance, from 3370 and 34; sigmoid tests' goldens follow gpnae_model, <k> words changed at N = 16, cycles unchanged), ArithmeticLibrary adds tfliteAdd (TFLite's int8 ADD) and qadd_lat(). The Makefile and synth/sienna_rtl.f list tfliteAdd.sv. The mesh is unchanged (G3: its tree differs only in the library pointer). Runs rs2_bump_{fp32,bf16,int8}_n{8,16}."
 ```
 
 Append to the message, with the counts from `rs2_bump_bf16_n16`'s comparison: ` GPNAE's bf16 lane follows Task 1.14 (spec Decision 5: sigmoid for x < 0 through the fp32 tail with Newton steps, tanh refit, SELU x + x(lambda - 1)): <w> words changed in <t> bf16 tests with a sigmoid, tanh or SELU set and cycles changed in <c> bf16 sigmoid tests at N = 16, each against goldens from the 1.14 model.` (`<w>`, `<t>`, `<c>` are the comparison's counts.)
@@ -2412,11 +2408,10 @@ In the `ifndef SYNTHESIS` accept terms (sienna_top lines 1172-1178): declare `lo
 
 ```bash
 L rs2_fadd 64 4 $J/cmds/mk.sh pipeline FMT=fp32 N=16 TILE=4 TEST=matmul_relu_nopool EXTRA_FLAGS=-DTB_FLOAT_ADD
-for f in fp32 bf16 int8; do L rs2_side_${f}_n16 64 24 $J/cmds/res_g4_pts.sh $f 16; done
-L rs2_side_int8_n8 64 24 $J/cmds/res_g4_pts.sh int8 8
+for f in fp32 bf16 int8; do for n in 8 16; do L rs2_side_${f}_n$n 64 24 $J/cmds/res_g4_pts.sh $f $n; done; done
 ```
 
-Expected: `rs2_fadd` log holds `Assertion failed` with `a_float_no_add` (and the run FAILS: the parsers fail any log with `Assertion failed`); the four runs end `res_g4_pts: ... points PASS`, and `python3 $J/cmds/res_cmp_points.py rs2_bump_<f>_n<n> rs2_side_<f>_n<n>` prints `IDENTICAL` for fp32, bf16 and int8 at N = 16 and int8 at N = 8 (no allowance: both runs have the same models) (the sideband widens L0 by 162 bits, which no stage reads yet).
+Expected: `rs2_fadd` log holds `Assertion failed` with `a_float_no_add` (and the run FAILS: the parsers fail any log with `Assertion failed`); the six runs end `res_g4_pts: ... points PASS`, and `python3 $J/cmds/res_cmp_points.py rs2_bump_<f>_n<n> rs2_side_<f>_n<n>` prints `IDENTICAL` for fp32, bf16 and int8 at N = 8 and 16 (no allowance: both runs have the same models) (the sideband widens L0 by 162 bits, which no stage reads yet).
 
 - [ ] **Step 4: Commit (SIENNA), RTL first**
 
@@ -2897,7 +2892,7 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
 
 In `_generate_vectors_int8`: after `credits = ...`, `residual = bool(cfg.get("residual") or cfg.get("residual_every"))` and `groups = _residual_layout(cfg, passes, mixed, credits, act_type) if residual else None`; `num_sets` becomes `groups[-1][0] + passes + groups[-1][2]` when `residual`, else today's expression; the `num_sets % passes` check runs only when not `residual`; `reals` is built as today; then `if residual: first = _write_residual_groups(cfg, groups, reals, seed, req_rng, drop_seed)` and today's group loop is the `else` branch, its `first` gaining `act_type` as a fifth element; the single-set pass reads `a0, b0, hb0, rq0, act0 = first` and calls `_golden_int8([(a0, b0)], hb0, rq0, cfg, act0, drop_seed)`; the last line is `_check_mem_widths("int8", num_sets, residual)`. (A residual test has no `bias` key, so `fold_bias(None, ...)` gives the zero-point fold alone, as today's `bias_real = None`; its SELU saturation count is not printed.)
 
-`perf`: skip residual configs (P-9): in `perf_main`, after the format filter, `args.configs = [c for c in args.configs if not (cfgs[c].get("residual") or cfgs[c].get("residual_every"))]` with `cfgs = {t["name"]: t for t in PIPELINE_TESTS}`, and add the header line `"residual tests (int8 ADD) are not modelled and not run here"`.
+`perf`: skip residual configs (P-9; Task 2.10b removes this skip once the model covers them): in `perf_main`, after the format filter, `args.configs = [c for c in args.configs if not (cfgs[c].get("residual") or cfgs[c].get("residual_every"))]` with `cfgs = {t["name"]: t for t in PIPELINE_TESTS}`, and add the header line `"residual tests (int8 ADD) are not modelled and not run here"`.
 
 - [ ] **Step 4: `TB_sienna_top`** — on the merged TB:
 
@@ -3047,13 +3042,11 @@ with `a_real_has_bank`'s antecedent gaining `&& !set_hold[p_next_id]`.
 - [ ] **Step 5: Run the residual tests and the existing ones**
 
 ```bash
-L rs2_res16 64 6 $J/cmds/mk.sh pipeline FMT=int8 N=16 TILE=4 TEST=int8_residual PYTHON=$J/venv/bin/python
-L rs2_res8 64 6 $J/cmds/mk.sh pipeline FMT=int8 N=8 TILE=2 TEST=int8_residual PYTHON=$J/venv/bin/python
-L rs2_res32 64 12 $J/cmds/int8_O0.sh $J/cmds/mk.sh pipeline FMT=int8 N=32 TILE=8 TEST=int8_residual PYTHON=$J/venv/bin/python
-for f in fp32 bf16 int8; do L rs2_r_${f}_n16 64 24 $J/cmds/res_g4_pts.sh $f 16; done
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_res_n${n}_t$t 64 6 $J/cmds/mk.sh pipeline FMT=int8 N=$n TILE=$t TEST=int8_residual PYTHON=$J/venv/bin/python; done
+for f in fp32 bf16 int8; do for n in 8 16; do L rs2_r_${f}_n$n 64 24 $J/cmds/res_g4_pts.sh $f $n; done; done
 ```
 
-Expected: the eight residual tests `RESULT: PASSED` at N = 8, 16, 32 (`Passed : 8 / 8`, `Sanity Clean`), each with `[HOLD/ADD]` lines whose pairs equal the test's hold/add pairs; across the eight tests at least one non-zero count of each reachable cross (`hold release with an L3 grant`, `hold done with a bank done`) and `grants held for an add drain` > 0 (an add set's last beat with the next accept is excluded by design: `a_add_last_no_accept`, Task 2.7) in `int8_residual_then_relu_nopool` (record which crosses stay 0: a 0 is reported as not reachable at that point, as the credits work did, not hidden); no `Assertion failed`. The three tables end `points PASS`, and `python3 $J/cmds/res_cmp_points.py rs2_side_<f>_n16 rs2_r_<f>_n16` prints `IDENTICAL` for fp32 and bf16 and, for int8, lists the eight residual tests as new and every other test identical (the ADD path carries only add-set beats).
+Expected: the eight residual tests `RESULT: PASSED` at every (N, T) of `NT` (`Passed : 8 / 8`, `Sanity Clean`, seven runs), each with `[HOLD/ADD]` lines whose pairs equal the test's hold/add pairs; across the eight tests at least one non-zero count of each reachable cross (`hold release with an L3 grant`, `hold done with a bank done`) and `grants held for an add drain` > 0 (an add set's last beat with the next accept is excluded by design: `a_add_last_no_accept`, Task 2.7) in `int8_residual_then_relu_nopool` (record which crosses stay 0: a 0 is reported as not reachable at that point, as the credits work did, not hidden); no `Assertion failed`. The six tables end `points PASS`, and `python3 $J/cmds/res_cmp_points.py rs2_side_<f>_n<n> rs2_r_<f>_n<n>` (N = 8 and 16) prints `IDENTICAL` for fp32 and bf16 and, for int8, lists the eight residual tests as new and every other test identical (the ADD path carries only add-set beats).
 
 - [ ] **Step 6: The integration depth probe** (carried from Task 1.7: `tfliteAdd`'s stage 1 is 51 (DOUBLE) / 50 (SINGLE) levels from its inputs, and `add_lanes`' drivers, the `hold_mem` read mux on `q1_i` and the per-set ADD words, add to it directly). Probe `add_lanes` with sienna_top's drivers, per changed cone under `dchr` (`map -r`), against `tfliteRequant`'s `dchr` worst; whole-design `ltp` swings about 5 levels on identical RTL (memory note `yosys-ltp-depth-is-noisy`), so it does not decide.
 
@@ -3064,7 +3057,7 @@ Expected: the eight residual tests `RESULT: PASSED` at N = 8, 16, 32 (`Passed : 
 
 // Yosys-only wrapper of add_lanes with sienna_top's drivers (yosys_depth.sh): hold_mem and its read mux on q1, requantize's result register on q2, the ADD words from a register.
 module yd_addl_top #(
-    parameter int N = 32,
+    parameter int N = 32,  // synthesis only, minutes: N = 32 (and 64, at 128 lanes) give hold_mem's deepest read mux, 32 entries; N = 16 gives 8
     parameter int NUM_LANES = 32
 ) (
     input  logic                                    clk_i,
@@ -3108,7 +3101,7 @@ L rs2_yd_add_dchr_d 32 2 bash $J/cmds/yosys_depth.sh tfliteAdd ROUNDING=DOUBLE d
 L rs2_yd_addl_dchr 32 8 bash $J/cmds/yosys_depth.sh add_lanes_drv - dchr
 ```
 
-Expected: each run leaves `results/yd/<tag>/depth.txt` (one line per register group) and `ltp.txt`. Read from `depth.txt`: `tfliteRequant`'s worst register group in each rounding (the yardstick), `tfliteAdd`'s stage-1 groups alone (the control: about 51), and `add_lanes_drv`'s `u.LANE[*].u` stage-1 groups (q1's path through `hold_mem[rd_idx]`, PER_LANE = 32 entries at N = 32, and q2's from `rq_d`). Record all of them in the ledger. Pass: `add_lanes_drv`'s stage-1 groups are no deeper than `tfliteRequant`'s `dchr` worst. If they are deeper, apply the fallbacks in order (controller ruling Q3; neither costs beat rate):
+Expected: each run leaves `results/yd/<tag>/depth.txt` (one line per register group) and `ltp.txt`. Read from `depth.txt`: `tfliteRequant`'s worst register group in each rounding (the yardstick), `tfliteAdd`'s stage-1 groups alone (the control: about 51), and `add_lanes_drv`'s `u.LANE[*].u` stage-1 groups (q1's path through `hold_mem[rd_idx]`, PER_LANE = 32 entries at N = 32, and q2's from `rq_d`; the probe stays at N = 32 although simulation stops at 16, because the mux's depth grows with PER_LANE, 32 at N = 32 and 64, 8 at N = 16, and a Yosys run takes minutes). Record all of them in the ledger. Pass: `add_lanes_drv`'s stage-1 groups are no deeper than `tfliteRequant`'s `dchr` worst. If they are deeper, apply the fallbacks in order (controller ruling Q3; neither costs beat rate):
 
 (a) Read `hold_mem` one stage early: the add beat's index is known at requantize's stage `RQL-2`, a beat ahead. In Step 4's block replace `assign hold_rd_idx = tg_idx[RQL-1];` and the `.q1_i(hold_mem[hold_rd_idx])` connection with
 
@@ -3118,7 +3111,7 @@ Expected: each run leaves `results/yd/<tag>/depth.txt` (one line per register gr
     assign hold_rd_idx = tg_idx[RQL-1];  // the beat whose hold_q add_lanes takes (Task 2.7's occupancy checks)
 ```
 
-and `.q1_i(hold_q)`. Hold beat j is written before add beat j reaches stage `RQL-2` (set order, `a_rq_one_set`; a hold beat being written at `RQL-1` in that cycle has a higher index), so the early read never meets its own write. In the wrapper, `.q1_i(hold_q)` with `always_ff @(posedge clk_i) if (add_in_i) hold_q <= hold_mem[rd_idx_i];`. Rerun `rs2_yd_addl_dchr` (as `rs2_yd_addl_dchr_a`) and Step 5's runs (as `rs2_res8_a`, `rs2_res16_a`, `rs2_res32_a`, `rs2_r_<f>_n16_a`), with the same Expected lines; Task 2.7's `m_off` then patches `hold_mem[tg_idx[RQL-2]]` to `hold_mem[tg_idx[RQL-2] + 1'b1]`.
+and `.q1_i(hold_q)`. Hold beat j is written before add beat j reaches stage `RQL-2` (set order, `a_rq_one_set`; a hold beat being written at `RQL-1` in that cycle has a higher index), so the early read never meets its own write. In the wrapper, `.q1_i(hold_q)` with `always_ff @(posedge clk_i) if (add_in_i) hold_q <= hold_mem[rd_idx_i];`. Rerun `rs2_yd_addl_dchr` (as `rs2_yd_addl_dchr_a`) and Step 5's runs (as `rs2_res_n<n>_t<t>_a` over `NT` and `rs2_r_<f>_n<n>_a`), with the same Expected lines; Task 2.7's `m_off` then patches `hold_mem[tg_idx[RQL-2]]` to `hold_mem[tg_idx[RQL-2] + 1'b1]`.
 
 (b) Only if (a) cannot be written (stage `RQL-2` does not exist, `RQL < 2`): one more stage on the ADD path, `qadd_lat()` 7, through Task 1.3's split. In ArithmeticLibrary: `tfliteAdd` registers stage 1's products before the `RDBPOT` (`sienna_fmt_pkg::qadd_lat()` returns 7, `TB_sienna_fmt_pkg` expects 7), then `L rs2_g1_7 32 8 $J/cmds/res_g1.sh` → no `GATE-FAIL` line and `exit=0`, then the Task 2.1 Step 5 bumps and Task 2.2's pointers; rerun this step's probe and Step 5's runs. Every other beat keeps `req_lat()`, so only add beats take the extra cycle.
 
@@ -3128,7 +3121,7 @@ Record which fallback ran, and its depth numbers, in the ledger and the RTL comm
 
 ```bash
 git -C $T add src/sienna_top.sv
-git -C $T commit -m "sienna_top: the int8 residual ADD. A hold set's requantized beats go to hold_mem (PER_LANE x NUM_LANES bytes, N^2) by beat index, with no bypass write, no bank_done and no act_wr toggle; once its last beat is in it returns its L6 reservation, joins gp_sets and pooling passes it as a null, like a partial set. An add set's beats leave requantize into add_lanes with hold_mem's beat of the same index and the add set's own ADD words, and come back into the fill (fill_v, fill_d) with their tags; only add beats take the extra qadd_lat() cycles. The grant after an add set waits until no add beat is in requantize or add_lanes (rq_room, and rq_drain covers add_lanes), so the two sources never present a beat together. An add set's lanes take the ADD's zp_o as their input zero point, and its ReLU or linear drop value is zp_o. Runs rs2_res8, rs2_res16, rs2_res32: the eight residual tests bit-exact; every other test's words and cycles unchanged (rs2_r_*)."
+git -C $T commit -m "sienna_top: the int8 residual ADD. A hold set's requantized beats go to hold_mem (PER_LANE x NUM_LANES bytes, N^2) by beat index, with no bypass write, no bank_done and no act_wr toggle; once its last beat is in it returns its L6 reservation, joins gp_sets and pooling passes it as a null, like a partial set. An add set's beats leave requantize into add_lanes with hold_mem's beat of the same index and the add set's own ADD words, and come back into the fill (fill_v, fill_d) with their tags; only add beats take the extra qadd_lat() cycles. The grant after an add set waits until no add beat is in requantize or add_lanes (rq_room, and rq_drain covers add_lanes), so the two sources never present a beat together. An add set's lanes take the ADD's zp_o as their input zero point, and its ReLU or linear drop value is zp_o. Runs rs2_res_n{8,16}_t*: the eight residual tests bit-exact at every tile size of N = 8 and 16; every other test's words and cycles unchanged (rs2_r_*)."
 git -C $T add regression.py testbenches/TB_sienna_top.sv model_runner.py Makefile
 git -C $T commit -m "Eight int8 residual pipeline tests (relu, linear_nopool, tanh with 2 depth passes, sigmoid_selu_nopool, train, then_relu_nopool, two_layers_nopool, accum2_mixed_nopool), zp_random and req_random with random ADD scales; per set add_<k>.mem (flags partial, bias, hold, add and the set's activation, then the ADD's words), so hold sets are linear and each group takes its activation from mixed_acts; the run-time knob RESIDUAL (model_runner's and the Makefile's TB_KNOBS, _config_items), so residual tests share the int8 builds. The golden is the conv's requantize, ipu.tflite_add, the lane with z_in = zp_o, pooling and dropout to zp_o, from model_runner's new numerics add_lane_params and int8_residual_exact; its self-test checks it element by element against ipu and that zp1, zp_o and the lane's zero point each move it (a golden without the ADD fails it: rs2_mut_rg). TB_sienna_top counts hold/add pairs and the same-cycle crosses (a hold release with an L3 grant, a hold done with a bank done, grants held for an add drain); run_regression fails a residual test whose pair counts are missing or wrong. perf skips residual tests (not modelled). Each test failed on the RTL before the previous commit (rs2_resf_*)."
 ```
@@ -3460,19 +3453,19 @@ Delete the `G_INT_NO_RESIDUAL` block (lines 553-556). Comments: line 9 gains "in
 - [ ] **Step 3: Run the cases to see them pass**
 
 ```bash
-for n in 8 16; do for t in 2 4; do L rs2_lay_n${n}_t$t 64 6 $J/cmds/res_py.sh . regression.py --action residual --n $n --tile $t; done; done
-L rs2_lay_n32_t8 64 12 $J/cmds/int8_O0.sh $J/cmds/res_py.sh . regression.py --action residual --n 32 --tile 8 --lanes 32
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_lay_n${n}_t$t 64 6 $J/cmds/res_py.sh . regression.py --action residual --n $n --tile $t; done
 ```
 
-Expected: every case `0 mismatches`, `sets` equal to expected, both "the golden differs" counts above 0 (above 0 for zp_1 wherever zp_1 != 0), `RESIDUAL: PASS`. Also the float residual layer is unchanged: `L rs2_lay_fp32 64 6 $J/cmds/mk.sh gemm FMT=fp32 N=16 TILE=4 LANES=32 QUICK=1 PYTHON=$J/venv/bin/python` and `L rs2_lay_fp32p 64 6 $J/cmds/mk.sh pack FMT=fp32 N=16 TILE=4 LANES=32 PYTHON=$J/venv/bin/python`; then (login node; `grid_` lines end in wall-clock seconds and `pack`'s case lines in `| wall Ns`, so those are stripped):
+Expected: every case `0 mismatches`, `sets` equal to expected, both "the golden differs" counts above 0 (above 0 for zp_1 wherever zp_1 != 0), `RESIDUAL: PASS`. Also the float residual layer is unchanged, at every (N, T): `for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_lay_fp32_n${n}_t$t 64 6 $J/cmds/mk.sh gemm FMT=fp32 N=$n TILE=$t LANES=32 QUICK=1 PYTHON=$J/venv/bin/python; L rs2_lay_fp32p_n${n}_t$t 64 6 $J/cmds/mk.sh pack FMT=fp32 N=$n TILE=$t LANES=32 PYTHON=$J/venv/bin/python; done`; then (login node; `grid_` lines end in wall-clock seconds and `pack`'s case lines in `| wall Ns`, so those are stripped):
 
 ```bash
-B=$J/runs/rs2_base_fp32_n16/results/regression/fp32/N16_T4
-command diff <(awk '/^grid_/{NF--} /^(grid_|layer_)/' $B/gemm.log) <(awk '/^grid_/{NF--} /^(grid_|layer_)/' $J/runs/rs2_lay_fp32/stdout.log)
-command diff <(command grep -E '^fp32 N=|^PACK ' $B/pack.log | sed 's/ | wall .*//') <(command grep -E '^fp32 N=|^PACK ' $J/runs/rs2_lay_fp32p/stdout.log | sed 's/ | wall .*//')
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}; B=$J/runs/rs2_base_fp32_n$n/results/regression/fp32/N${n}_T$t
+  command diff <(awk '/^grid_/{NF--} /^(grid_|layer_)/' $B/gemm.log) <(awk '/^grid_/{NF--} /^(grid_|layer_)/' $J/runs/rs2_lay_fp32_n${n}_t$t/stdout.log)
+  command diff <(command grep -E '^fp32 N=|^PACK ' $B/pack.log | sed 's/ | wall .*//') <(command grep -E '^fp32 N=|^PACK ' $J/runs/rs2_lay_fp32p_n${n}_t$t/stdout.log | sed 's/ | wall .*//')
+done
 ```
 
-Expected: both print nothing (the gemm rows' sets, cycles and errors, and each packed case's sets, cycles and mismatches, equal; they include the cached residual layer).
+Expected: every diff prints nothing (the gemm rows' sets, cycles and errors, and each packed case's sets, cycles and mismatches, equal; they include the cached residual layer).
 
 - [ ] **Step 4: Commit (SIENNA), RTL first**
 
@@ -3649,9 +3642,7 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
 - [ ] **Step 2: Run** (TensorFlow: the venv, on the farm)
 
 ```bash
-L rs2_tfl16 64 6 $J/cmds/res_py.sh . regression.py --action residual --n 16 --tile 4 --tflite --mid-reset --cases tiles
-L rs2_tfl8 64 6 $J/cmds/res_py.sh . regression.py --action residual --n 8 --tile 2 --tflite --mid-reset --cases tiles
-L rs2_tfl32 64 12 $J/cmds/int8_O0.sh $J/cmds/res_py.sh . regression.py --action residual --n 32 --tile 8 --tflite --mid-reset --cases tiles
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_tfl_n${n}_t$t 64 6 $J/cmds/res_py.sh . regression.py --action residual --n $n --tile $t --tflite --mid-reset --cases tiles; done
 ```
 
 Expected: `tflite block: 4096 outputs, 0 differ ...` and `tflite block_s2: 1024 outputs, 0 differ ...` (the print counts `Y.size`: 4 images x 64 rows x 16 channels, and 4 x 16 x 16), `tflite block_s2 shortcut layer: 1024 outputs, 0 differ ...`, the conv's own codes `0 differ`, the `ADD input 1 is the residual` answer recorded (spec: ResNet-8's op 3 lists the residual first); `residual tiles mid-reset control (+mid_reset=1 +hold_check): the check fires outside the hold window`; `residual tiles mid-reset asked from <c> cycles, landed at <a>, inside the hold window: ... 0 differ from the run without it, 0 from the golden` with `<a> >= <c>` (both recorded in the ledger); `RESIDUAL: PASS`; no `Assertion failed` (with `a_add_pop_full` live, a stale `hold_mem` read after the reset would fire). If the converter does not produce the expected ops (`the converter made ...`), report its op list to Soham (spec Risk 2: the residual block's int8 form is assumed from the float model) before changing the model.
@@ -3771,6 +3762,138 @@ git -C $T add regression.py Makefile
 git -C $T commit -m "make regression runs the int8 unit benches once (add-lanes, and rq-lanes: TB_requant_lanes, a new make target), each passing only on its bench's lines (test_unit_points failed before; a requant_lanes mutant fails rq-lanes: rs2_mut_rql). Runs rs2_rql, rs2_pt_units."
 ```
 
+### Task 2.10b: The performance model: the bf16 and int8 lane fixes and the residual ADD, validated against measured cycles
+
+(Soham, 2026-10-11; plan-review finding M15.) Runs after Task 2.10 (the ADD RTL and the residual point are in) and before G4 (Task 2.11). It starts only once Tasks 1.14bc and 1.16 are complete (Phase 2 waits for them; their reports, `.superpowers/sdd/implementation-plan/task-1.14bc-report.md` and `task-1.16-report.md` in n8_fix, give their measured lane cycles).
+
+**Files:**
+- Modify: `regression.py` (perf section: `in_tail`, `tail_ops`, `lane_cycles`, `DN_LAT`, `rtl_lat`, `model`, `analyse`, `one_config`, `perf_main`)
+- Create (local): `$J/cmds/res_perf_err.py`, `$J/res_mut/m_perf_sig.patch`
+
+**Interfaces:**
+- Consumes: Task 1.14a's GPNAE (`7524088..ef0ac38`: bf16 sigmoid for every x < 0 through the fp32 tail with two Newton steps; its report `task-1.14a-report.md`: 13 cycles per input before, 38-44 on the mixed pattern and 74-76 all-negative after), Task 1.14bc's bf16 tanh and SELU and Task 1.16's int8 lane changes (their reports), Task 2.6's `add_lanes` (add beats take `qadd_lat()` more cycles).
+- Produces: `--action perf` models every activation path as built and the residual tests (P-9's skip goes); `$J/cmds/res_perf_err.py --base RUN... --new RUN...` (the model's per-test error against measured cycles, bounded by today's error on the base tree), printing `PERF MODEL: PASS|FAIL`.
+
+The model's error per test and quantity is `|model - measured| / measured`, from each report's `Design model :` line: host load, mesh latency, and activation where the model gives one (the mesh interval is host-bound in `TB_sienna_top`, so it is not compared). The bound of a test is its error under today's model on the base tree at the same (format, N, T); a test new on the branch (the residual tests) is bounded by the worst base error of that quantity at that (format, N, T). A branch test above its bound fails.
+
+- [ ] **Step 1: Today's model on the base tree** (the bound), every format and every (N, T) of `NT`:
+
+```bash
+for f in fp32 bf16 int8; do for nt in $NT; do n=${nt%,*}; t=${nt#*,}
+  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_perf_${f}_n${n}_t$t 64 12 $J/cmds/mk.sh perf-analysis FMT=$f N=$n TILE=$t LANES=32 PYTHON=$J/venv/bin/python
+done; done
+```
+
+Expected: each of the 21 runs ends `Report: .../pipeline_performance_report.log`, `mk.sh: make perf-analysis ... exit=0`, and no `[ERROR] perf:` line; the report and its `.json` part are in `$J/runs/<run>/results/perf/`.
+
+`$J/cmds/res_perf_err.py`:
+
+```python
+#!/usr/bin/env python3
+"""The perf model's error per test against measured cycles, bounded by today's model on the base tree; args: --base RUN... --new RUN... (the same (format, N, T) in order); exit 1 when a new test leaves its bound."""
+import argparse
+import re
+import sys
+
+R = "/proj/work/spramanik/sienna_jobs/runs"
+DM = re.compile(r"Design model : host (\d+) \(measured (\d+)\), mesh interval \d+ \(measured min \d+, host-bound\), mesh latency (\d+) "
+                r"\(measured (\d+)[^)]*\), activation (\S+) \(measured (\d+)\)")
+
+
+def errors(run: str) -> dict:
+    """{test: {quantity: |model - measured| / measured}} of one perf run; a test with no Design model line maps to None."""
+    txt = open(f"{R}/{run}/results/perf/pipeline_performance_report.log", errors="replace").read()
+    out = {}
+    for name, body in re.findall(r"^--- ([\w]+)(?::[^\n]*)?\n(.*?)(?=^--- |^=====|\Z)", txt, re.S | re.M):
+        m = DM.search(body)
+        if not m:
+            out[name] = None
+            continue
+        h, hm, ml, mlm, a, am = m.groups()
+        e = {"host": abs(int(h) - int(hm)) / int(hm), "mesh_lat": abs(int(ml) - int(mlm)) / int(mlm)}
+        if a != "-":
+            e["act"] = abs(int(a) - int(am)) / int(am)
+        out[name] = e
+    return out
+
+
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument("--base", nargs="+", required=True)
+ap.add_argument("--new", nargs="+", required=True)
+a = ap.parse_args()
+if len(a.base) != len(a.new):
+    sys.exit("res_perf_err: --base and --new need the same runs, one per (format, N, T)")
+bad, n = [], 0
+for rb, rn in zip(a.base, a.new):
+    b, w = errors(rb), errors(rn)
+    worst = {q: max((e[q] for e in b.values() if e and q in e), default=0.0) for q in ("host", "mesh_lat", "act")}
+    for t, e in w.items():
+        n += 1
+        if e is None:
+            bad.append(f"{rn} {t}: no Design model line (the simulation did not pass)")
+            continue
+        for q, v in e.items():
+            bound = b[t][q] if b.get(t) and q in b[t] else worst[q]
+            ok = v <= bound + 1e-9
+            print(f"{rn} {t} {q}: model error {100 * v:.2f}%, bound {100 * bound:.2f}%{'' if ok else '  OUT'}")
+            if not ok:
+                bad.append(f"{rn} {t} {q}: {100 * v:.2f}% > {100 * bound:.2f}%")
+    bad += [f"{rn} {t}: missing from the new run" for t in b if t not in w]
+print("\n".join(bad))
+print(f"PERF MODEL: {'PASS' if n and not bad else 'FAIL'} ({n} tests, {len(bad)} outside their bound)")
+sys.exit(0 if n and not bad else 1)
+```
+
+Its own control (login node): `python3 $J/cmds/res_perf_err.py --base rs2_base_perf_fp32_n8_t2 --new rs2_base_perf_fp32_n8_t2` → `PERF MODEL: PASS` (every error equals its bound), and `python3 $J/cmds/res_perf_err.py --base rs2_base_perf_fp32_n8_t2 --new rs2_base_perf_bf16_n8_t2` → `PERF MODEL: FAIL` (another format's errors against fp32's bounds: at least one leaves it). Record every base run's per-test errors in the ledger: they are the bound.
+
+- [ ] **Step 2: The failing validation** — the branch with today's model, the same 21 runs:
+
+```bash
+for f in fp32 bf16 int8; do for nt in $NT; do n=${nt%,*}; t=${nt#*,}
+  L rs2_perf_red_${f}_n${n}_t$t 64 12 $J/cmds/mk.sh perf-analysis FMT=$f N=$n TILE=$t LANES=32 PYTHON=$J/venv/bin/python
+done; done
+P8() { for f in fp32 bf16 int8; do for nt in $NT; do n=${nt%,*}; t=${nt#*,}; printf "$1_${f}_n${n}_t$t "; done; done; }
+python3 $J/cmds/res_perf_err.py --base $(P8 rs2_base_perf) --new $(P8 rs2_perf_red)
+```
+
+Expected: `PERF MODEL: FAIL`, with `OUT` on the activation of bf16 tests with a sigmoid set (the model still has 13 cycles per input where Task 1.14a's lane takes 38-76) and of the tests Tasks 1.14bc and 1.16 changed; the residual tests do not run yet (P-9's skip), so they are not checked here. This is the control the ruling asks for: a model with the old bf16 sigmoid latency fails.
+
+- [ ] **Step 3: The model changes, one commit each** (each in `regression.py`'s perf section; login node: `python3 regression.py --action selftest` → `ALL <n> PASSED` before each commit, the perf fixtures' tests included)
+
+(a) bf16 sigmoid through the fp32 tail (Task 1.14a). `in_tail` gains as its first line `if FMT == "bf16" and act == "sigmoid" and x < 0: return True  # Task 1.14a: every negative bf16 sigmoid input takes the fp32 tail`; `tail_ops` takes the fp32 units for a bf16 tail (`cm, ca = (UNIT_LAT["fp32"][0] if FMT == "bf16" else MUL_LAT) + 2, (UNIT_LAT["fp32"][1] if FMT == "bf16" else ADD_LAT) + 2  # bf16's tail computes in fp32 since Task 1.14a`) and, for bf16 sigmoid, replaces the closing `u = 1 - E, v = E u, w = 1 - v, s = E w` steps with gpnae_tail's states in 1.14a's RTL (1 + E, then two Newton steps of the reciprocal, each a multiply, a subtract from 2 and a multiply, then the output step), counted in the same request, issue, unit, update form; `DN_LAT["bf16"]` stays (positive inputs keep the polynomial). The model must reproduce 1.14a's measured 38-44 cycles per input on the mixed pattern and 74-76 all-negative: check with `python3 -B -c 'import regression as r; r.perf_init(); r.FMT = "bf16"; r.MUL_LAT, r.ADD_LAT = r.UNIT_LAT["bf16"]; print([r.tail_ops(x, "sigmoid") for x in (-0.5, -3.0, -8.0)])'` against the report's per-input figures. Commit: `git -C $T add regression.py && git -C $T commit -m "perf model: bf16 sigmoid for x < 0 through the fp32 tail with two Newton steps (GPNAE Task 1.14a): in_tail, tail_ops in fp32 units; 13 cycles per input before, 38-44 mixed and 74-76 all-negative as measured."`
+
+(b) bf16 tanh and SELU (Task 1.14bc): the model follows that task's lane as its report states it (which inputs take the fp32 tail, the polynomial degrees in `DEGREE` if the refit changed them, SELU's x + x(lambda - 1) step in `lane_cycles`' per-element latency), each figure from the report. Commit: `perf model: bf16 tanh and SELU as Task 1.14bc built them (<the report's changes>).` with the report's changes named in the message.
+
+(c) int8 lanes (Task 1.16): the int8 branch of `lane_cycles` and `degree` follow that task's lane as its report states it. Commit: `perf model: the int8 lanes as Task 1.16 built them (<the report's changes>).`
+
+(d) The residual ADD. Remove Task 2.5's skip (the `args.configs = [c for c in args.configs if not (cfgs[c].get("residual") or cfgs[c].get("residual_every"))]` line and its header line), so residual tests run. `rtl_lat` also parses `qadd_lat` (`body("qadd_lat", r"return (\d+);")[0]`, global `QADD_LAT`). `analyse(ev, k_sets, passes, flags=None)`: with `flags` (the `add_<k>.mem` first words, read from `mr.TB_DIR` in `one_config` for a residual test), the sets that enter the activation stage are those without the partial bit, in order, and `written`, `g_up`, `g_dn` index that sequence; a hold set's activation interval goes to a `hold` list, not to an output; the steady state is the add sets' completion interval over their group's sets. `model` gives a residual test `act` = the add set's stage, `per_lane + 4 + QADD_LAT` for ReLU and linear and `lane_stage(...) + QADD_LAT` for a lane activation, and `hold` = `per_lane + 4`; `one_config`'s `Design model :` line keeps its form and appends `, hold set {m['hold']} (measured {median of hold})` for residual tests. Commit: `perf model: the residual tests run and are modelled (P-9's skip goes): an add set's activation stage takes qadd_lat() more, a hold set passes the stage with no output; analyse indexes the stage's sets by add_<k>.mem's flags.`
+
+- [ ] **Step 4: Validate** — the branch with the updated model:
+
+```bash
+for f in fp32 bf16 int8; do for nt in $NT; do n=${nt%,*}; t=${nt#*,}
+  L rs2_perf_${f}_n${n}_t$t 64 12 $J/cmds/mk.sh perf-analysis FMT=$f N=$n TILE=$t LANES=32 PYTHON=$J/venv/bin/python
+done; done
+python3 $J/cmds/res_perf_err.py --base $(P8 rs2_base_perf) --new $(P8 rs2_perf)   # P8 as in Step 2
+```
+
+Expected: every run `exit=0`; `PERF MODEL: PASS (<n> tests, 0 outside their bound)`, the residual tests included (bounded by the worst base error of their quantity at their (format, N, T)). A test outside its bound is a model defect: fix it as a new commit and rerun its run.
+
+- [ ] **Step 5: The control on the final model** — the old bf16 sigmoid latency alone must fail:
+
+```bash
+$J/cmds/res_mkmut.sh m_perf_sig regression.py '    if FMT == "bf16" and act == "sigmoid" and x < 0: return True  # Task 1.14a: every negative bf16 sigmoid input takes the fp32 tail' ''
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}
+  L rs2_perf_mut_bf16_n${n}_t$t 64 12 $J/cmds/res_mut.sh $J/res_mut/m_perf_sig.patch $J/cmds/mk.sh perf-analysis FMT=bf16 N=$n TILE=$t LANES=32 PYTHON=$J/venv/bin/python
+done
+B8() { for nt in $NT; do n=${nt%,*}; t=${nt#*,}; printf "$1_bf16_n${n}_t$t "; done; }
+python3 $J/cmds/res_perf_err.py --base $(B8 rs2_base_perf) --new $(B8 rs2_perf_mut)
+```
+
+Expected: `PERF MODEL: FAIL`, with `OUT` on the activation of the bf16 tests with a sigmoid set (and only bf16 runs, since the patch touches only bf16's path). Record both verdicts in the ledger.
+
+- [ ] **Step 6: No further commit** (Step 3's four commits are the task's).
+
 ### Task 2.11: Gate G4, the reports and the docs
 
 **Files:**
@@ -3782,7 +3905,7 @@ git -C $T commit -m "make regression runs the int8 unit benches once (add-lanes,
 - Consumes: every earlier task; the Task 2.0 reference runs.
 - Produces: G4's verdict and report; docs that say what is built.
 
-- [ ] **Step 1: The sweep** (N = 8, 16, 32 at every tile size, every format; both mesh modes for the set-level tests, the layer cases and the TFLite blocks (review row D6); random power-up)
+- [ ] **Step 1: The sweep** (N = 8 and 16 at every tile size, every format; N = 32 and 64 in Task 2.12; both mesh modes for the set-level tests, the layer cases and the TFLite blocks (review row D6); random power-up)
 
 `$J/cmds/res_ck0_res.sh` (`sienna_ck0.sh` switches only `sienna_top`'s default and runs only the pipeline tests; `sienna_layer` passes its own `COLLAPSE_K` parameter, default 1, to `sienna_top`, so a layer run in collapse-k 0 switches both):
 
@@ -3800,17 +3923,11 @@ exec /proj/work/spramanik/sienna_jobs/venv/bin/python regression.py --action res
 
 ```bash
 chmod +x $J/cmds/res_ck0_res.sh
-for f in fp32 bf16 int8; do
-  L rs2_g4_${f}_n8 64 24 $J/cmds/res_g4_pts.sh $f 8
-  L rs2_g4_${f}_n16 64 24 $J/cmds/res_g4_pts.sh $f 16
-  L rs2_g4_${f}_n32 64 48 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 32
+for f in fp32 bf16 int8; do for n in 8 16; do L rs2_g4_${f}_n$n 64 24 $J/cmds/res_g4_pts.sh $f $n; done; done
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}
+  L rs2_g4_ck0_int8_${n}_t$t 64 24 $J/cmds/sienna_ck0.sh $n $t int8
+  L rs2_g4_ck0res_${n}_t$t 64 12 $J/cmds/res_ck0_res.sh $n $t
 done
-L rs2_g4_ck0_int8_8 64 24 $J/cmds/sienna_ck0.sh 8 2 int8
-L rs2_g4_ck0_int8_16 64 24 $J/cmds/sienna_ck0.sh 16 4 int8
-L rs2_g4_ck0_int8_32 64 48 $J/cmds/int8_O0.sh $J/cmds/sienna_ck0.sh 32 8 int8
-L rs2_g4_ck0res_8 64 12 $J/cmds/res_ck0_res.sh 8 2
-L rs2_g4_ck0res_16 64 12 $J/cmds/res_ck0_res.sh 16 4
-L rs2_g4_ck0res_32 64 24 $J/cmds/int8_O0.sh $J/cmds/res_ck0_res.sh 32 8
 L rs2_g4_units 32 2 $J/cmds/res_pts_units.sh
 ```
 
@@ -3827,24 +3944,26 @@ make residual FMT=int8 N=$1 TILE=$2 LANES=32 PYTHON=$P; b=$?
 echo "res_ri: N=$1 T=$2 pipeline exit=$a residual exit=$b"; [ $a -eq 0 ] && [ $b -eq 0 ]
 ```
 
-(`make pipeline` passes `SIM_ARGS` to `TB_sienna_top`; `RtlLayer.run_job` passes it to `TB_model_run` since Task 2.8, and `residual_main`'s first line prints it.) `chmod +x $J/cmds/res_ri.sh && L rs2_g4_ri_8 64 8 $J/cmds/res_ri.sh 8 2 && L rs2_g4_ri_16 64 8 $J/cmds/res_ri.sh 16 4 && L rs2_g4_ri_32 64 16 $J/cmds/int8_O0.sh $J/cmds/res_ri.sh 32 8` (N = 8, 16 and 32, as the spec's G4 sentence lists them), and the TFLite logistic agreement after the ladder: `L rs2_g4_gptfl 32 2 $J/cmds/res_py.sh . regression.py --action gpnae-tflite --report testbenches/results/res/gpnae_tflite.log` (run_snap.sh copies back only `testbenches/results`: the report is then `$J/runs/rs2_g4_gptfl/results/res/gpnae_tflite.log`).
+(`make pipeline` passes `SIM_ARGS` to `TB_sienna_top`; `RtlLayer.run_job` passes it to `TB_model_run` since Task 2.8, and `residual_main`'s first line prints it.) `chmod +x $J/cmds/res_ri.sh && for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_g4_ri_n${n}_t$t 64 8 $J/cmds/res_ri.sh $n $t; done` (every (N, T) of `NT`; N = 32, which the spec's G4 sentence also lists, runs in Task 2.12), and the TFLite logistic agreement after the ladder: `L rs2_g4_gptfl 32 2 $J/cmds/res_py.sh . regression.py --action gpnae-tflite --report testbenches/results/res/gpnae_tflite.log` (run_snap.sh copies back only `testbenches/results`: the report is then `$J/runs/rs2_g4_gptfl/results/res/gpnae_tflite.log`).
 
-Expected: every `res_g4_pts` run ends `points PASS` (int8 now with 5 kinds per (N, T), `residual` included); the three `sienna_ck0.sh` runs end `Passed : X / X` with `Sanity Clean` (the eight residual tests included: X is 8 more than `rs2_base_ck0_int8_<n>`'s); the three `res_ck0_res` runs print `residual: ... collapse-k 0 ...` and end `RESIDUAL: PASS`; `rs2_g4_units` `res_pts_units: add-lanes exit=0 rq-lanes exit=0`; `res_ri: N=<n> T=<t> pipeline exit=0 residual exit=0` in each of the three, with `residual: ... sim args '+verilator+rand+reset+2'` in its log. A collapse-k 0 layer run is new (no flow ran `sienna_layer` at COLLAPSE_K = 0 before): if `rs2_g4_ck0res_*` fails, run `res_ck0_res.sh`'s two `sed` lines with `regression.py --action gemm --n 16 --tile 4 --format int8 --quick` on the reference tree `$TB` to tell a residual defect from an older collapse-k 0 layer defect. If the base tree fails too, it is a pre-existing bug (controller ruling Q6): record it in the ledger with both runs, tell Soham, and fix it in its own task before synthesis (the controller adds it to this plan, test first); G4's collapse-k 0 layer verdict waits for that fix and is rerun after it.
+Expected: every `res_g4_pts` run ends `points PASS` (int8 now with 5 kinds per (N, T), `residual` included); the seven `sienna_ck0.sh` runs end `Passed : X / X` with `Sanity Clean` (the eight residual tests included: X is 8 more than the reference's); the seven `res_ck0_res` runs print `residual: ... collapse-k 0 ...` and end `RESIDUAL: PASS`; `rs2_g4_units` `res_pts_units: add-lanes exit=0 rq-lanes exit=0`; `res_ri: N=<n> T=<t> pipeline exit=0 residual exit=0` in each of the seven, with `residual: ... sim args '+verilator+rand+reset+2'` in its log. A collapse-k 0 layer run is new (no flow ran `sienna_layer` at COLLAPSE_K = 0 before): if `rs2_g4_ck0res_*` fails, run `res_ck0_res.sh`'s two `sed` lines with `regression.py --action gemm --n 16 --tile 4 --format int8 --quick` on the reference tree `$TB` to tell a residual defect from an older collapse-k 0 layer defect. If the base tree fails too, it is a pre-existing bug (controller ruling Q6): record it in the ledger with both runs, tell Soham, and fix it in its own task before synthesis (the controller adds it to this plan, test first); G4's collapse-k 0 layer verdict waits for that fix and is rerun after it.
 
 - [ ] **Step 2: Compare with the references** (login node):
 
 ```bash
-for n in 8 16 32; do
+for n in 8 16; do
   python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_g4_fp32_n$n
   python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_g4_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
   python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_g4_int8_n$n --tree $T --words-acts sigmoid
-  python3 $J/cmds/res_cmp_points.py rs2_base_ck0_int8_$n rs2_g4_ck0_int8_$n --tree $T --words-acts sigmoid
+done
+for nt in $NT; do n=${nt%,*}; t=${nt#*,}; b=rs2_base_ck0_int8_${n}_t$t; [ $nt = 8,2 ] && b=rs2_base_ck0_int8_8; [ $nt = 16,4 ] && b=rs2_base_ck0_int8_16
+  python3 $J/cmds/res_cmp_points.py $b rs2_g4_ck0_int8_${n}_t$t --tree $T --words-acts sigmoid
 done
 ```
 
 Required: fp32 `IDENTICAL` (results, cycles and words; spec). bf16 (Ruling F5 as extended for Q2, spec Decisions 4 and 5): `IDENTICAL-EXCEPT-ALLOWED`, every test identical in results; words identical except in tests with a sigmoid, tanh or SELU set and cycles identical except in tests with a sigmoid set, each counted per test; the new bf16 outputs are judged by the runs themselves, which pass against goldens regenerated from Task 1.14's model. int8, both mesh modes: every pre-existing test identical in results and cycles, words identical except tests with sigmoid sets, counted per test (spec: "that count is reported"); the eight residual tests listed as new. Any other difference is a stop.
 
-- [ ] **Step 3: The G4 report** — `$J/runs/rs2_g4/g4_residual_gate.log`: the run names and trees; the verdicts per (format, N) and mesh mode; the comparison results with the int8 sigmoid word counts and the bf16 sigmoid, tanh and SELU word counts and sigmoid cycle counts per test; the residual tests' `[HOLD/ADD]` cross counts per point (which crosses were reached, which not), and that the add set's last beat with the next accept is excluded by design (`rq_room`; `a_add_last_no_accept`, shown firing by `m_roomonly`), so spec Risk 3's third coincidence is closed by design, not by coverage; that the word allowances are per test, not per set (in an allowed mixed or packed test a non-sigmoid set's words could move unnoticed by the comparison; each run still gates every set on its own golden); that the perf model (`regression.py`'s `DN_LAT`, `in_tail`, `tail_ops`, `lane_cycles`) does not model Task 1.14's bf16 sigmoid tail, so `make perf-analysis FMT=bf16` mispredicts sigmoid (a known gap, not gated: `--action perf` only reports); the layer cases and TFLite lines in both mesh modes (including which ADD input is the residual, and where the mid-stream reset landed); the add-lanes bench and its mutants (Task 2.4); the mutant verdicts of Task 2.7; the integration depth probe (Task 2.6 Step 6: `add_lanes` with its drivers against `tfliteRequant`'s `dchr` worst, labelled topological levels, not timing); the TFLite logistic agreement before (`rs2_base_gptfl`) and after; the area and latency of the spec's estimate table unchanged and labelled estimates (no synthesis ran); `GATE G4 (int8 residual): PASS`. The repo's history copies keep the directory's `.txt` naming (`2026-09-30_sienna_int8_g4.txt`; controller ruling M14: the `.log` rule is for generated output, which stays `.log` on the farm, and the repos gitignore `*.log`, so a committed `.log` copy would be ignored). With `X=txt` (each copy dated by its report's own file date):
+- [ ] **Step 3: The G4 report** — `$J/runs/rs2_g4/g4_residual_gate.log`: the run names and trees; the verdicts per (format, N) and mesh mode; the comparison results with the int8 sigmoid word counts and the bf16 sigmoid, tanh and SELU word counts and sigmoid cycle counts per test; the residual tests' `[HOLD/ADD]` cross counts per point (which crosses were reached, which not), and that the add set's last beat with the next accept is excluded by design (`rq_room`; `a_add_last_no_accept`, shown firing by `m_roomonly`), so spec Risk 3's third coincidence is closed by design, not by coverage; that the word allowances are per test, not per set (in an allowed mixed or packed test a non-sigmoid set's words could move unnoticed by the comparison; each run still gates every set on its own golden); the perf model's validation (Task 2.10b: `PERF MODEL: PASS` against the base tree's bound, and the control `m_perf_sig` failing); the layer cases and TFLite lines in both mesh modes (including which ADD input is the residual, and where the mid-stream reset landed); the add-lanes bench and its mutants (Task 2.4); the mutant verdicts of Task 2.7; the integration depth probe (Task 2.6 Step 6: `add_lanes` with its drivers against `tfliteRequant`'s `dchr` worst, labelled topological levels, not timing); the TFLite logistic agreement before (`rs2_base_gptfl`) and after; the area and latency of the spec's estimate table unchanged and labelled estimates (no synthesis ran); `GATE G4 (int8 residual): PASS`. The repo's history copies keep the directory's `.txt` naming (`2026-09-30_sienna_int8_g4.txt`; controller ruling M14: the `.log` rule is for generated output, which stays `.log` on the farm, and the repos gitignore `*.log`, so a committed `.log` copy would be ignored). With `X=txt` (each copy dated by its report's own file date):
 
 ```bash
 H=$T/.claude/skills/sienna-report/history
@@ -3857,11 +3976,11 @@ done
 Expected: `COPIED` four times.
 
 - [ ] **Step 4: The docs** (README style: what it is and why it is fast, no file tours; skills: what is true now)
-  - `sienna-int8-residual/SKILL.md`: a status line at the top ("Implemented and verified <date> on branch `int8_residual` in all four repos, at N = 8-32; N = 64 in the final sweep") and an "As built" section listing every departure from the spec with its reason: `qadd_lat()` (P-1), G0b in ArithmeticLibrary (P-2), the lanes' z_in = zp_o (P-3), the fit scoring on the 2a lane (P-4), two rescales per threshold (P-5), the device-protocol half of the host interface (P-6, Ruling F26; spec row D5), the test split (P-7), the dump checker (P-8), perf skipping residual tests (P-9), the layer cases and TFLite blocks in both mesh modes (D6), the measured change counts (int8 sigmoid words; bf16 sigmoid, tanh and SELU words and sigmoid cycles, Decision 5), the cross counts reached, the depth numbers (`tfliteAdd` 52 against 53; `add_lanes` with its drivers). Keep Decisions 4 and 5 (bf16, Soham 2026-10-10 and 2026-10-11) in its decisions list.
+  - `sienna-int8-residual/SKILL.md`: a status line at the top ("Implemented and verified <date> on branch `int8_residual` in all four repos, at N = 8 and 16 at every tile size; N = 32 and 64 in the final sweep") and an "As built" section listing every departure from the spec with its reason: `qadd_lat()` (P-1), G0b in ArithmeticLibrary (P-2), the lanes' z_in = zp_o (P-3), the fit scoring on the 2a lane (P-4), two rescales per threshold (P-5), the device-protocol half of the host interface (P-6, Ruling F26; spec row D5), the test split (P-7), the dump checker (P-8), perf skipping residual tests (P-9, reversed by Task 2.10b: the model covers them), the layer cases and TFLite blocks in both mesh modes (D6), the measured change counts (int8 sigmoid words; bf16 sigmoid, tanh and SELU words and sigmoid cycles, Decision 5), the cross counts reached, the depth numbers (`tfliteAdd` 52 against 53; `add_lanes` with its drivers). Keep Decisions 4 and 5 (bf16, Soham 2026-10-10 and 2026-10-11) in its decisions list.
   - `sienna-int8/SKILL.md`: status line (2b's pre-synthesis RTL part done: the residual ADD and the sigmoid ladder); the G2 line's "sigmoid 3370/65536 outside" becomes history with the new figure (0 of 65,536, a hard gate).
   - `sienna-uniform-format/SKILL.md` (Ruling F7): the bf16 activation-accuracy lines give Task 1.14's measured bf16 sigmoid, tanh and SELU figures (before and after, with run names; spec Decision 5) and say which bf16 gates are hard; the earlier figures become history.
   - `sienna-rtl`: `add_lanes.sv` in the file map; the hold and add sets in the activation stage; the trap that a hold set needs an L3 grant (and so a free activation bank) though it fills none.
-  - `sienna-tooling`: the known gap that the perf model does not model Task 1.14's bf16 sigmoid tail (`DN_LAT`, `in_tail`, `tail_ops`, `lane_cycles`; `perf-analysis FMT=bf16` mispredicts sigmoid); `--action residual` (with `--collapse-k`), `--action add-vectors`, `make residual`, `make add-lanes`, the `int8/N<n>_T<t>/residual` point and the once-only `add-lanes` and `rq-lanes` points (94 points with SMALL=1, 237 in full), the `RESIDUAL` run-time knob and `add_<k>.mem`, the `A` line in the device protocol.
+  - `sienna-tooling`: the perf model covers Task 1.14's bf16 lane, Task 1.16's int8 lanes and the residual tests, validated per test against measured cycles (Task 2.10b); `--action residual` (with `--collapse-k`), `--action add-vectors`, `make residual`, `make add-lanes`, the `int8/N<n>_T<t>/residual` point and the once-only `add-lanes` and `rq-lanes` points (94 points with SMALL=1, 237 in full), the `RESIDUAL` run-time knob and `add_<k>.mem`, the `A` line in the device protocol.
   - `sienna-credits`: one line under "Rules the RTL relies on": `hold_mem` is internal to the activation stage, set order (`a_rq_one_set`) fixes its occupancy, no new link.
   - `README.md` (SIENNA): one sentence in the int8 part: residual layers add TFLite's int8 ADD bit-exactly, at full rate, in the activation stage. `$A/README.md`: the `tfliteAdd` unit in the unit list. `GPNAE/README.md`: int8 sigmoid is exact past |x| = 2.5.
 
@@ -3883,9 +4002,9 @@ git -C $T commit -m "Skills, README and report history for the int8 residual ADD
 - No source changes (unless the N = 64 sweep finds a defect, which then gets its own fix commit, test first, and is reported); `.claude/skills/sienna-report/history/<date>_sienna_int8_residual_n64.txt` (Step 4)
 
 **Interfaces:**
-- Produces: `int8_residual` pushed to GitHub in all four repos, only after Soham's explicit OK; the N = 64 sweep's report. This plan merges nothing into main: a merge into main, and deleting the branches, each wait for Soham's own word (memory: branches only while developing), outside this task.
+- Produces: `int8_residual` pushed to GitHub in all four repos, only after Soham's explicit OK; the N = 32 and N = 64 sweep's report; the old-against-new perf report `$J/runs/rs2_perf/perf_results.log` and the new results page (replacing `sienna_results.html` only with Soham's OK). This plan merges nothing into main: a merge into main, and deleting the branches, each wait for Soham's own word (memory: branches only while developing), outside this task.
 
-- [ ] **Step 1: Ask Soham to approve the push** (visible to others), with the four gate reports and the commit lists (`git -C $T/<repo> log --oneline origin/main..int8_residual` per repo). In the same ask, request his OK for Step 3's two collapse-k 0 runs at N = 64 (`rs2_n64_ck0_int8` and `rs2_base_ck0_int8_64`, 500 GB and 16 CPUs on the od-512/768 nodes, which he allows only for this item). Do not push without his explicit OK, and do not launch those two runs without it; every other Phase 2 run stays on the on-demand partitions od-16/64/128-gb-8-cores. Before asking, check every repo against GitHub's main and for trailers (a clone's `origin` can be a local repository, so fetch from the GitHub URL):
+- [ ] **Step 1: Ask Soham to approve the push** (visible to others), with the four gate reports and the commit lists (`git -C $T/<repo> log --oneline origin/main..int8_residual` per repo). In the same ask, request his OK for Step 3's two collapse-k 0 runs at N = 64 (`rs2_n64_ck0_int8` and `rs2_base_ck0_int8_64`) and Step 3b's twelve collapse-k 0 perf runs at N = 64 (`rs2_perf_{base,new}_k0_<fmt>_n64_t<t>`), 500 GB and 16 CPUs on the od-512/768 nodes, which he allows only for the collapse-k 0 N = 64 item; and his OK to replace the published results page `/proj/work/spramanik/sienna_report/sienna_results.html` with Step 3b's new one. Do not push without his explicit OK, do not launch those runs without it, and do not replace the page without it; every other Phase 2 run stays on the on-demand partitions od-16/64/128-gb-8-cores. Before asking, check every repo against GitHub's main and for trailers (a clone's `origin` can be a local repository, so fetch from the GitHub URL):
 
 ```bash
 declare -A URL=([.]=git@github.com:SoHam-56/SIENNA.git [GPNAE]=git@github.com:SoHam-56/GPNAE.git \
@@ -3910,11 +4029,18 @@ done
 
 Expected: `PUSHED` four times (ArithmeticLibrary, GPNAE, SystolicMesh, SIENNA), each remote head equal to the local one; only then say "pushed". `GPNAE/ArithmeticLibrary` holds the same commit as `$A` (`ARIL-SAME`), so one ArithmeticLibrary push serves both. A `PUSH-FAIL` or `MISMATCH` stops the loop before any outer repository is pushed (each pointer must name a pushed commit); report it. (ArithmeticLibrary's library push needs the SSH URL, memory: SIENNA repo layout.) No merge into main follows here.
 
-- [ ] **Step 3: The N = 64 sweep** (all formats, both mesh modes; after check-in only)
+- [ ] **Step 3: The N = 32 and N = 64 sweep** (all formats, both mesh modes; after check-in only; Soham 2026-10-11: testing stops at N = 16, so N = 32 runs here too)
 
-The branch and its references run side by side in one sweep (controller ruling 2): the reference tree `$TB` (merged main 9fa414e, Task 2.0) at N = 64 in each format, through the same scripts, so the references have the layout `res_cmp_points.py` reads: `$J/runs/rs2_base_<fmt>_n64/results/res/pipeline/N64_T<t>/<test>.log` per tile size (t = 2, 4, 8, 16, 32, 64) and `results/regression/<fmt>/N64_T<t>/<kind>.log` per point; the collapse-k 0 run's `results/pipeline/<test>.log`. Memory: N = 64's largest process peaks at 13 GB (README, measured), so every res_g4_pts run takes 100 GB on the 128 GB partition; the collapse-k 0 mesh at N = 64 took 500 GB in `regression_farm.sh`'s mesh points, so the two collapse-k 0 runs take its partitions, only with Soham's OK from Step 1 (without it they are not launched, and the G4 report says the N = 64 collapse-k 0 run was not done).
+The branch and its references run side by side in one sweep (controller ruling 2): the reference tree `$TB` (merged main 9fa414e, Task 2.0) at N = 32 and 64 in each format, through the same scripts, so the references have the layout `res_cmp_points.py` reads: `$J/runs/rs2_base_<fmt>_n<n>/results/res/pipeline/N<n>_T<t>/<test>.log` per tile size (t = 2, 4, 8, 16, 32 at N = 32; also 64 at N = 64) and `results/regression/<fmt>/N<n>_T<t>/<kind>.log` per point; the N = 32 collapse-k 0 reference is Task 2.0's `rs2_base_ck0_int8_32` (T = 8, the same tree); the collapse-k 0 run's `results/pipeline/<test>.log`. Memory: N = 64's largest process peaks at 13 GB (README, measured), so every res_g4_pts run takes 100 GB on the 128 GB partition; the collapse-k 0 mesh at N = 64 took 500 GB in `regression_farm.sh`'s mesh points, so the two collapse-k 0 runs take its partitions, only with Soham's OK from Step 1 (without it they are not launched, and the G4 report says the N = 64 collapse-k 0 run was not done).
 
 ```bash
+for f in fp32 bf16 int8; do
+  L rs2_n32_$f 64 48 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 32
+  TREE=$TB $J/cr_msgs/cr_launch.sh rs2_base_${f}_n32 64 48 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 32
+done
+L rs2_n32_ck0_int8 64 48 $J/cmds/int8_O0.sh $J/cmds/sienna_ck0.sh 32 8 int8
+L rs2_n32_ck0res 64 24 $J/cmds/int8_O0.sh $J/cmds/res_ck0_res.sh 32 8
+L rs2_n32_ri 64 16 $J/cmds/int8_O0.sh $J/cmds/res_ri.sh 32 8
 for f in fp32 bf16 int8; do
   PARTITION=od-128-gb-8-cores L rs2_n64_$f 100 72 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 64
   TREE=$TB PARTITION=od-128-gb-8-cores $J/cr_msgs/cr_launch.sh rs2_base_${f}_n64 100 72 $J/cmds/int8_O0.sh $J/cmds/res_g4_pts.sh $f 64
@@ -3923,19 +4049,157 @@ CPUS=16 PARTITION=od-512-gb-16-cores,od-768-gb-24-cores L rs2_n64_ck0_int8 500 7
 TREE=$TB CPUS=16 PARTITION=od-512-gb-16-cores,od-768-gb-24-cores $J/cr_msgs/cr_launch.sh rs2_base_ck0_int8_64 500 72 $J/cmds/int8_O0.sh $J/cmds/sienna_ck0.sh 64 16 int8
 ```
 
-Before giving an ETA, ssh to each node and check whether it compiles or simulates (memory: farm stdout is buffered; progress is in the node's /tmp snapshot). Expected: every run ends `points PASS` (the branch's residual points at N = 64 use 128 lanes, `reg_lanes`; the references have no residual kind), both collapse-k 0 runs `Sanity Clean`. Then (login node), as Task 2.11 Step 2 with its allowances:
+Before giving an ETA, ssh to each node and check whether it compiles or simulates (memory: farm stdout is buffered; progress is in the node's /tmp snapshot). Expected: every `res_g4_pts` run ends `points PASS` (the branch's residual points use 32 lanes at N = 32 and 128 at N = 64, `reg_lanes`; the references have no residual kind), every collapse-k 0 run `Sanity Clean`, `rs2_n32_ck0res` `RESIDUAL: PASS`, `rs2_n32_ri` `res_ri: N=32 T=8 pipeline exit=0 residual exit=0`. Then (login node), as Task 2.11 Step 2 with its allowances:
 
 ```bash
-python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n64 rs2_n64_fp32
-python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n64 rs2_n64_bf16 --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
-python3 $J/cmds/res_cmp_points.py rs2_base_int8_n64 rs2_n64_int8 --tree $T --words-acts sigmoid
-python3 $J/cmds/res_cmp_points.py rs2_base_ck0_int8_64 rs2_n64_ck0_int8 --tree $T --words-acts sigmoid
-for f in fp32 bf16 int8; do command diff <(command grep -E "^$f/N64_" $J/runs/rs2_base_${f}_n64/stdout.log) <(command grep -E "^$f/N64_" $J/runs/rs2_n64_$f/stdout.log | command grep -v '/residual: '); done
+for n in 32 64; do
+  python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_n${n}_fp32
+  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_n${n}_bf16 --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_n${n}_int8 --tree $T --words-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_ck0_int8_$n rs2_n${n}_ck0_int8 --tree $T --words-acts sigmoid
+  for f in fp32 bf16 int8; do command diff <(command grep -E "^$f/N${n}_" $J/runs/rs2_base_${f}_n$n/stdout.log) <(command grep -E "^$f/N${n}_" $J/runs/rs2_n${n}_$f/stdout.log | command grep -v '/residual: '); done
+done
 ```
 
-Expected: fp32 `IDENTICAL`, bf16 and int8 (both mesh modes) `IDENTICAL` or `IDENTICAL-EXCEPT-ALLOWED` with the allowed counts recorded, the eight residual tests new; the verdict diffs print nothing (every common point `PASS` in both). Any other difference is a stop, as at N <= 32.
+Expected: fp32 `IDENTICAL`, bf16 and int8 (both mesh modes) `IDENTICAL` or `IDENTICAL-EXCEPT-ALLOWED` with the allowed counts recorded, the eight residual tests new; the verdict diffs print nothing (every common point `PASS` in both). Any other difference is a stop, as at N = 8 and 16.
 
-- [ ] **Step 4: The report** — write `.claude/skills/sienna-report/history/<date>_sienna_int8_residual_n64.txt` (as in Task 2.11 Step 3; the runs, both trees and the comparisons above) and commit it (`git -C $T add .claude/skills/sienna-report/history && git -C $T commit -m "Report history: the N = 64 sweep of the int8 residual work (<runs>): <verdict>."`). Pushing it is visible to others: ask Soham, then push it as in Step 2 (SIENNA only) and verify with `git ls-remote`.
+- [ ] **Step 3b: Performance, old against new, and the new results report** (Soham, 2026-10-11): `--action perf` on both trees at N = 8, 16, 32 and 64, every tile size, every format, both mesh modes. Per test: cycles, latency in µs at 950 MHz, operations (matmul 2·M·N·K, here 2N³ per set; activations counted separately, one operation per element of a non-linear activation, not as multiply-adds; the ADD one operation per element), throughput (GFLOPS or TFLOPS in fp32 and bf16, TOPS in int8), and old against new with every change attributed (1.14a, 1.14bc, 1.16, the ADD) and an unexplained change flagged.
+
+`$J/cmds/res_perf_ck0.sh`:
+
+```bash
+#!/bin/bash
+# --action perf with the mesh's depth slices (COLLAPSE_K=0 in sienna_top); args: N T FMT LANES; run from a snapshot root.
+export VERILATOR_ROOT="$HOME/.local/share/verilator"
+sed -i -E 's/(parameter int +COLLAPSE_K +=) 1,/\1 0,/' src/sienna_top.sv
+command grep -qE 'parameter int +COLLAPSE_K += 0,' src/sienna_top.sv || { echo "res_perf_ck0: COLLAPSE_K not switched"; exit 1; }
+exec /proj/work/spramanik/sienna_jobs/venv/bin/python regression.py --action perf --n $1 --tile-size $2 --format $3 --lanes $4 --slices
+```
+
+The sweep (every run also writes a line `<fmt> <n> <t> <mode> <base run> <new run>` to `$J/runs/rs2_perf_pairs.txt`, local); the collapse-k 0 runs at N = 64 only with Soham's OK from Step 1:
+
+```bash
+chmod +x $J/cmds/res_perf_ck0.sh; : > $J/runs/rs2_perf_pairs.txt
+ts() { case $1 in 8) echo 2 4 8;; 16) echo 2 4 8 16;; 32) echo 2 4 8 16 32;; 64) echo 2 4 8 16 32 64;; esac; }
+for f in fp32 bf16 int8; do for n in 8 16 32 64; do for t in $(ts $n); do for k in k1 k0; do
+  l=$([ $n -ge 64 ] && echo 128 || echo 32); W=$([ $n -ge 32 ] && echo $J/cmds/int8_O0.sh)
+  M="64 12"; X=""; [ $n -eq 32 ] && M="64 24"; [ $n -eq 64 ] && { M="100 48"; X="PARTITION=od-128-gb-8-cores"; }
+  [ $n -eq 64 ] && [ $k = k0 ] && { M="500 72"; X="CPUS=16 PARTITION=od-512-gb-16-cores,od-768-gb-24-cores"; }
+  if [ $k = k1 ]; then C="$J/cmds/mk.sh perf-analysis FMT=$f N=$n TILE=$t LANES=$l PYTHON=$J/venv/bin/python"; else C="$J/cmds/res_perf_ck0.sh $n $t $f $l"; fi
+  for tr in base new; do
+    env $X TREE=$([ $tr = base ] && echo $TB || echo $T) $J/cr_msgs/cr_launch.sh rs2_perf_${tr}_${k}_${f}_n${n}_t$t $M $W $C
+  done
+  echo "$f $n $t $k rs2_perf_base_${k}_${f}_n${n}_t$t rs2_perf_new_${k}_${f}_n${n}_t$t" >> $J/runs/rs2_perf_pairs.txt
+done; done; done; done
+```
+
+Expected: 216 runs (3 formats x 18 (N, T) x 2 mesh modes x 2 trees), each ending `Report: ...` with exit 0 and no `[ERROR] perf:` line.
+
+`$J/cmds/res_perf_report.py` (the old-against-new report; farm-side output is `.log`):
+
+```python
+#!/usr/bin/env python3
+"""Old against new perf per test: cycles, latency in us at 950 MHz, ops and throughput, each change attributed; args: TREE (the branch) PAIRS OUT_DIR; exit 1 on an unexplained change."""
+import json
+import os
+import sys
+
+R, MHZ = "/proj/work/spramanik/sienna_jobs/runs", 950.0
+tree, pairs, out = sys.argv[1:4]
+sys.path.insert(0, tree)
+import regression as reg
+CFG = {t["name"]: t for t in reg.PIPELINE_TESTS}
+
+
+def rows(run: str) -> dict:
+    """{test: (first-output latency, steady cycles per set)} of one perf run, from its report's .json part."""
+    d = json.load(open(f"{R}/{run}/results/perf/pipeline_performance_report.json"))
+    return {r[0]: (int(r[1]), float(r[2])) for r in d["rows"] if r[-1] == "pass"}
+
+
+def cause(name: str, fmt: str):
+    """What may move a test's cycles on the branch; None: nothing may."""
+    t = CFG[name]
+    if t.get("residual") or t.get("residual_every"):
+        return "ADD (new test)"
+    a = {t["act"], *t.get("mixed_acts", []), *t.get("pack_acts", [])}
+    c = (["1.14a"] if fmt == "bf16" and "sigmoid" in a else []) + (["1.14bc"] if fmt == "bf16" and a & {"tanh", "selu"} else []) + \
+        (["1.16"] if fmt == "int8" and a & {"sigmoid", "tanh", "selu"} else [])
+    return "+".join(c) or None
+
+
+def ops(name: str, n: int) -> tuple:
+    """Per set: matmul 2 N^3; activations N^2 per output of a non-linear activation; ADD N^2 per add set; over the test's sets."""
+    t, nl = CFG[name], lambda a: 0.0 if a == "linear" else 1.0
+    P, mixed = t.get("accum_passes", 1), t.get("mixed_acts", [])
+    if t.get("residual") or t.get("residual_every"):
+        g = reg._residual_layout(dict(t), P, mixed, reg.SETS_IN_FLIGHT, t["act"])
+        sets = g[-1][0] + P + g[-1][2]
+        return 2 * n ** 3, n * n * sum(nl(a) for *_, a in g) / sets, n * n * sum(r for _, _, r, _ in g) / sets
+    if t.get("pack_acts"):
+        return 2 * n ** 3, n * n * sum(nl(a) for a in t["pack_acts"]) / len(t["pack_acts"]) / P, 0.0
+    ns = t.get("num_sets", len(mixed) or -(-(reg.SETS_IN_FLIGHT + 2) // P) * P)
+    acts = [mixed[(g0 + P - 1) % len(mixed)] if mixed else t["act"] for g0 in range(0, ns, P)]
+    return 2 * n ** 3, n * n * sum(nl(a) for a in acts) / ns, 0.0
+
+
+def rate(o: float, cyc: float, fmt: str) -> str:
+    """o operations per cyc cycles at 950 MHz, in the format's unit."""
+    r = o / cyc * MHZ * 1e6
+    return f"{r / 1e12:.3f} TOPS" if fmt == "int8" else f"{r / 1e12:.3f} TFLOPS" if r >= 1e12 else f"{r / 1e9:.1f} GFLOPS"
+
+
+L, J, bad = [], [], []
+for line in open(pairs):
+    f, n, tl, k, rb, rn = line.split()
+    n = int(n)
+    b, w = rows(rb), rows(rn)
+    for name in sorted(set(b) | set(w)):
+        if name not in w:
+            bad.append(f"{f} N={n} T={tl} {k} {name}: missing from the branch")
+            continue
+        lat, cyc = w[name]
+        mm, ac, ad = ops(name, n)
+        old = b.get(name)
+        moved = old is None or old != (lat, cyc)
+        why = cause(name, f)
+        tag = "unchanged" if not moved else why if why else "UNEXPLAINED"
+        if tag == "UNEXPLAINED":
+            bad.append(f"{f} N={n} T={tl} {k} {name}: cycles/set {old[1]} -> {cyc}, latency {old[0]} -> {lat}, no cause")
+        L.append(f"{f} N={n} T={tl} {k} {name}: cycles/set {old[1] if old else '-'} -> {cyc}, latency {old[0] if old else '-'} -> {lat} cycles "
+                 f"({lat / MHZ:.3f} us), matmul {rate(mm, cyc, f)}, activations {rate(ac, cyc, f)}, ADD {rate(ad, cyc, f)}; {tag}")
+        J.append(dict(fmt=f, n=n, tile=int(tl), mode=k, test=name, old=old, cycles=cyc, latency=lat, latency_us=lat / MHZ,
+                      matmul_ops=mm, act_ops=ac, add_ops=ad, change=tag))
+os.makedirs(out, exist_ok=True)
+L += bad + [f"PERF RESULTS: {len(J)} tests, {sum(x['change'] not in ('unchanged', 'UNEXPLAINED') for x in J)} changed with a cause, "
+            f"{len(bad)} unexplained or missing; clock 950 MHz ASSUMED (no timing run)"]
+open(os.path.join(out, "perf_results.log"), "w").write("\n".join(L) + "\n")
+json.dump(J, open(os.path.join(out, "perf_results.json"), "w"), indent=1)
+print("\n".join(L[-len(bad) - 1:]))
+sys.exit(1 if bad else 0)
+```
+
+```bash
+chmod +x $J/cmds/res_perf_report.py
+python3 $J/cmds/res_perf_report.py $T $J/runs/rs2_perf_pairs.txt $J/runs/rs2_perf; echo "exit=$?"
+head -1 $J/runs/rs2_perf_pairs.txt | awk '{print $1, $2, $3, $4, $6, $6}' > /tmp/rs2_perf_ctl.txt   # control: the branch against itself
+python3 $J/cmds/res_perf_report.py $T /tmp/rs2_perf_ctl.txt /tmp/rs2_perf_ctl | tail -1
+awk 'NR == 1 {print "fp32", $2, $3, $4, "rs2_perf_new_" $4 "_bf16_n" $2 "_t" $3, "rs2_perf_new_" $4 "_fp32_n" $2 "_t" $3}' $J/runs/rs2_perf_pairs.txt > /tmp/rs2_perf_ctl2.txt
+python3 $J/cmds/res_perf_report.py $T /tmp/rs2_perf_ctl2.txt /tmp/rs2_perf_ctl2; echo "exit=$?"   # control: fp32 judged against bf16's cycles
+```
+
+Expected: the main report ends `PERF RESULTS: <n> tests, <c> changed with a cause, 0 unexplained or missing`, `exit=0`, and every changed test's cause is one of `1.14a`, `1.14bc`, `1.16` or `ADD (new test)`; the self-comparison ends `0 unexplained or missing` with every test `unchanged` (the comparison sees no change where there is none); the cross-format control exits 1 with `UNEXPLAINED` lines (an fp32 test whose cycles moved has no cause, so the check fails as it must). An unexplained change on the real comparison is a stop: report it.
+
+The new results page: in `/proj/work/spramanik/sienna_jobs/report/build_results.py` (local), `TREE` becomes `$T`'s path (`/proj/scratch/spramanik/int8_res`, for the test list and the PERF parser), `PERF_JSON = "/proj/work/spramanik/sienna_jobs/runs/rs2_perf/perf_results.json"` is added, and a section renders it per format, N, tile size and mesh mode (cycles, µs, matmul, activation and ADD throughput, old against new and the cause); then (login node, parsing only):
+
+```bash
+cd /proj/work/spramanik/sienna_jobs/report && python3 build_results.py /proj/work/spramanik/sienna_report/sienna_results_new.html /proj/work/spramanik/sienna_report/results_report_build_new.log; echo "exit=$?"
+tail -5 /proj/work/spramanik/sienna_report/results_report_build_new.log
+```
+
+Expected: `exit=0`; the build log names the perf results it drew (N = 8, 16, 32, 64, every format and mode) and lists no `not plotted` size. With Soham's OK from Step 1 only: `cp /proj/work/spramanik/sienna_report/sienna_results.html /proj/work/spramanik/sienna_report/sienna_results_pre_int8res.html && cp /proj/work/spramanik/sienna_report/sienna_results_new.html /proj/work/spramanik/sienna_report/sienna_results.html` (the old page kept beside it); without it the new page stays `sienna_results_new.html`.
+
+- [ ] **Step 4: The report** — write `.claude/skills/sienna-report/history/<date>_sienna_int8_residual_n32_n64.txt` (as in Task 2.11 Step 3; the runs, both trees, the comparisons above and Step 3b's `perf_results.log`) and commit it (`git -C $T add .claude/skills/sienna-report/history && git -C $T commit -m "Report history: the N = 32 and N = 64 sweep of the int8 residual work (<runs>): <verdict>."`). Pushing it is visible to others: ask Soham, then push it as in Step 2 (SIENNA only) and verify with `git ls-remote`.
 
 ---
 

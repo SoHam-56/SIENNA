@@ -15,6 +15,8 @@ GEN_PKG ?= 1
 PYTHON ?= python3
 # model_runner.py has no default model directory, so make model needs one.
 MODEL_DIR ?=
+# Inferences per model in make model.
+MODEL_COUNT ?= 1
 QUICK ?= 0
 # Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna_top parameter; 0 is wires.
 LINK_STAGES ?= 0
@@ -533,7 +535,8 @@ model:
 		--n $(N) \
 		--tile-size $(TILE) \
 		--lanes $(LANES) \
-		--format $(FMT)
+		--format $(FMT) \
+		--count $(MODEL_COUNT)
 
 # GEMM shape sweep on sienna_layer, built at N, TILE and LANES.
 gemm:

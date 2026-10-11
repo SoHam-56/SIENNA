@@ -2493,6 +2493,8 @@ def test_regression_target():
     r = make_n("regression", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
     assert make_n("check").returncode != 0  # the gate's old name is gone
+    count = lambda *a: make_n("model", "MODEL_DIR=/m", *a).stdout.split()[-2:]
+    assert count() == ["--count", "1"] and count("MODEL_COUNT=3") == ["--count", "3"]  # inferences per model
 
 
 @selftest

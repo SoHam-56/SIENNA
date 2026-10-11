@@ -163,6 +163,7 @@ How `make regression` works:
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
 - `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
 - The model points (the four MLPerf Tiny models, in fp32 and bf16) need `MODEL_DIR`. Without it they show NOT RUN and the regression fails.
+- Run times, measured on 8-core machines: `SMALL=1` takes about 3.5 hours one point at a time and about 20 minutes with every point in parallel; `make -j4 regression SMALL=1 FMT=int8` on one machine takes about 12 minutes. A point at N = 64 takes up to hours (the fp32 pipeline at tile size 16: about 4 hours), so the full sweep takes about three days one point at a time (estimated from one tile size per N) and is bound by its longest points in parallel.
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.

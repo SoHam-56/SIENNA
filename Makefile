@@ -190,7 +190,7 @@ define copy_mem_files
 	for d in $(MEM_DIRS); do \
 		for p in $(MEM_PATTERNS); do \
 			if ls $$d/$$p 1>/dev/null 2>&1; then \
-				cp -u $$d/$$p $(1)/; \
+				cp $$d/$$p $(1)/; \
 				echo "   Copied $$p from $$d"; \
 				copied=1; \
 			fi; \

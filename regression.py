@@ -2636,6 +2636,8 @@ def test_sim_reuses_only_its_own_build():
     r = make_n("sim", "GEN_PKG=0", "FMT=fp32")
     assert r.returncode == 0 and "build_key.txt" in r.stdout and "cmp" in r.stdout and "verilator --binary" not in r.stdout, r.stdout[-400:]
     mk = open(os.path.join(ROOT, "Makefile")).read()
+    cp = mk[mk.index("define copy_mem_files"):mk.index("endef", mk.index("define copy_mem_files"))]
+    assert "cp $$d/$$p $(1)/" in cp and "cp -u" not in cp, cp  # every test's stimulus copied, whatever the timestamps: cp -u skipped a file of the same second
     rec = mk[mk.index("\nverilator: pkg-check"):mk.index("\n\n", mk.index("\nverilator: pkg-check") + 2)]  # make verilator: the key goes only after a whole build
     assert rec.index("rm -f $(VERILATOR_DIR)/build_key.txt") < rec.index("$(VERILATOR) --binary") < rec.index("-f V$(TOP_MODULE).mk") < rec.index("> $(VERILATOR_DIR)/build_key.txt"), rec
     with tempfile.TemporaryDirectory() as d:  # the key itself: knob values leave it unchanged; any other item, an input file or a flag changes it

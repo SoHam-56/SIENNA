@@ -8,7 +8,7 @@ Contains:
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
   5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors
-  6. Tool self-tests (--action selftest) and the one-verdict gate (--action all, make regression)
+  6. Tool self-tests (--action selftest) and make regression's points and summary (--action points, point, summary)
 """
 
 import argparse
@@ -46,11 +46,11 @@ import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
 
 from conv_tests import _basic_pair, _general_pair, _kernel_size
-from matmul_tests import _ref_matmul, write_mem
+from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "all")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -2487,14 +2487,111 @@ def test_pack_target():
 
 
 @selftest
+def test_regression_points():
+    small, full = SPEC.points(True, list(FORMATS)), SPEC.points(False, list(FORMATS))
+    sweep = lambda pts: sorted({(SPEC.parse(p)["n"], SPEC.parse(p)["tile"]) for p in pts if p != "selftest"})
+    assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
+    assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
+    assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
+    assert len(small) == len(set(small)) == 1 + 7 * 12 and len(full) == len(set(full)) == 1 + 18 * 12, (len(small), len(full))
+    for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
+        for n, t in sweep(full):
+            assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == kinds, (f, n, t)
+    assert SPEC.points(True, ["int8"]) == ["selftest"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
+    assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
+    for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
+                "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu"):
+        try:
+            SPEC.parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"parse accepted {bad}")
+
+
+@selftest
+def test_point_commands():
+    py, opts = sys.executable, type("O", (), {"model_dir": "/m"})()
+    at = lambda f, n, t, l: [f"FMT={f}", f"PYTHON={py}", f"N={n}", f"TILE={t}", f"LANES={l}"]
+    assert SPEC.argv("fp32/N64_T64/pipeline", opts) == ["make", "pipeline", *at("fp32", 64, 64, 128)]
+    assert SPEC.argv("bf16/N8_T4/model", opts) == ["make", "model", *at("bf16", 8, 4, 32), "MODEL_DIR=/m", "MODEL_COUNT=3"]
+    assert SPEC.argv("int8/N32_T8/gemm", opts) == ["make", "gemm", *at("int8", 32, 8, 32), "QUICK=1"]
+    assert SPEC.argv("int8/N8_T2/tflite", opts) == ["make", "tflite", *at("int8", 8, 2, 32)] and SPEC.argv("fp32/N16_T2/pack", opts)[1] == "pack"
+    assert SPEC.argv("selftest", opts)[1:] == ["regression.py", "--action", "selftest"]
+    saved = {k: os.environ.get(k) for k in ("GPNAE_MODEL", "TEST", "N", "LINK_STAGES")}
+    os.environ.update(GPNAE_MODEL="hw", TEST="selu", N="32", LINK_STAGES="1")
+    try:
+        env = regress.point_env(SPEC, "fp32/N32_T2/pipeline", "s -j4 --jobserver-auth=3,4", 8)
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
+    assert env["TRACE"] == "0" and env["OPT_FAST"] == "-O0" and env["SIM_THREADS"] == "2" and not {"GPNAE_MODEL", "TEST", "N", "LINK_STAGES"} & set(env)
+    for args in (("lint", "GEN_PKG=0"), ("-C", "SystolicMesh", "lint"), ("-C", "GPNAE", "verilator")):  # every Verilator build of this tree takes SIM_THREADS
+        out = make_n(*args, "SIM_THREADS=3").stdout
+        assert "--threads 3" in out and "--threads 8" not in out, (args, out[:300])
+    r = make_n("sm-verilator", "FMT=bf16", "N=32", "TILE=8")  # the mesh alone, for one N, as before
+    assert r.returncode == 0 and "mesh-regression MATRIX_SIZE=32" in r.stdout and "--tiles 8" in r.stdout, r.stdout[-300:]
+
+
+@selftest
+def test_point_verdicts():
+    clean = "\x1b[1m  Passed      : \x1b[92m33\x1b[0m / 33\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n"
+    plain = regress.ANSI.sub("", clean)
+    v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
+    for p, text, rc, want in (
+            ("fp32/N8_T2/pipeline", clean, 0, "PASS"), ("fp32/N8_T2/pipeline", clean, 1, "FAIL (exit 1)"),
+            ("fp32/N8_T2/pipeline", plain.replace("33 / 33", "32 / 33"), 0, "FAIL (32 of 33 tests passed)"),
+            ("fp32/N8_T2/pipeline", plain.replace("33 / 33", "0 / 0"), 0, "FAIL (0 of 0 tests passed)"),
+            ("fp32/N8_T2/pipeline", plain.replace("Sanity Clean", "Failures detected"), 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
+            ("fp32/N8_T2/pipeline", "make: done\n", 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
+            ("fp32/N8_T2/pipeline", clean + "%Error: x.sv:3: bad\n", 0, "FAIL (log: %Error: x.sv:3: bad)"),
+            ("fp32/N8_T2/model", "MODEL GATE: PASS  fp32 N=8\n", 0, "PASS"), ("fp32/N8_T2/model", "MODEL GATE: FAIL  fp32\n", 0, "FAIL (log: MODEL GATE: FAIL  fp32)"),
+            ("fp32/N8_T2/model", "built\n", 0, "FAIL (no 'MODEL GATE: PASS')"), ("int8/N8_T2/tflite", "MODEL GATE: PASS int8\n", 0, "PASS"),
+            ("int8/N8_T2/tflite", "ok\n", 0, "FAIL (no 'MODEL GATE: PASS')"),
+            ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 with outputs that differ\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "GEMM int8: 0 cases\n", 0, "FAIL (no 'grid_\\d+x\\d+x\\d+ ')"), ("fp32/N8_T2/gemm", "grid_1x8x8 1\nFAIL grid_1x8x8: error\n", 0, "FAIL (log: FAIL grid_1x8x8: error)"),
+            ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')")):
+        got = v(p, text, rc)
+        assert got == want, (p, text, rc, got, want)
+
+
+@selftest
+def test_model_points_need_model_dir():
+    with tempfile.TemporaryDirectory() as d:
+        o = lambda md: type("O", (), {"model_dir": md})()
+        assert SPEC.not_run("fp32/N8_T2/pipeline", o("")) is None and SPEC.not_run("fp32/N8_T2/model", o(d)).startswith(f"MODEL_DIR={d} is missing pretrainedResnet.tflite")
+        assert "MODEL_DIR unset" in SPEC.not_run("bf16/N8_T2/model", o("")) and "does not exist" in SPEC.not_run("bf16/N8_T2/model", o(d + "/x"))
+        assert all("make regression MODEL_DIR=<directory with pretrainedResnet.tflite, ad01_fp32.tflite" in SPEC.not_run("fp32/N8_T2/model", o(x)) for x in ("", d))
+        for m in mr.MODELS.values():
+            open(os.path.join(d, m), "w").write("")
+        assert SPEC.not_run("fp32/N8_T2/model", o(d)) is None
+
+
+@selftest
 def test_regression_target():
-    r = make_n("regression", "FMT=int8", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
-    assert r.returncode == 0 and r.stdout.split() == "py regression.py --action all --format int8 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    py = f"PYTHON={sys.executable}"
+    def recipe(*args):
+        r = make_n(*args, py)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.splitlines()
+    for args, pts in ((("SMALL=1",), SPEC.points(True, list(FORMATS))), ((), SPEC.points(False, list(FORMATS))),
+                      (("SMALL=1", "FMT=int8"), SPEC.points(True, ["int8"]))):
+        lines = recipe("regression", "MODEL_DIR=/m", *args)
+        names = [x.split("--name ")[1].split()[0] for x in lines if "--action point " in x]
+        assert names == pts, (args, sorted(set(names) ^ set(pts))[:5])
+        assert all("--results " in x and "--model-dir=/m" in x and "--run " in x and x.rstrip().endswith("--keep-going") for x in lines if "--action point " in x), lines[:2]
+        assert "--action summary" in lines[-1] and "--run " in lines[-1] and ("--small" in lines[-1]) == ("SMALL=1" in args), lines[-1]
+        assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
+    one = recipe("regression/fp32/N8_T2/pipeline")
+    assert len(one) == 1 and "--name fp32/N8_T2/pipeline" in one[0] and "--keep-going" not in one[0] and "--run" not in one[0], one
+    s = recipe("regression-summary", "SMALL=1")
+    assert len(s) == 1 and "--action summary" in s[0] and "--small" in s[0] and "--run" not in s[0], s
     r = make_n("regression", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+    r = make_n("regression", "SMALL=2")
+    assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
+    assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
     assert make_n("check").returncode != 0  # the gate's old name is gone
-    count = lambda *a: make_n("model", "MODEL_DIR=/m", *a).stdout.split()[-2:]
-    assert count() == ["--count", "1"] and count("MODEL_COUNT=3") == ["--count", "3"]  # inferences per model
 
 
 @selftest
@@ -2535,50 +2632,6 @@ def test_backends_share_run_job():
         assert callable(getattr(cls, "build")) and callable(getattr(cls, "run_job")), cls
     y, sets, cyc = mr.Emulator(16, 32, tempfile.gettempdir()).run_job(fjob, "t")
     assert np.array_equal(y, mr.job_reference(fjob)[1].astype(np.float32)) and sets == 4 and cyc == 0, (sets, cyc)
-
-
-@selftest
-def test_check_reported_steps():
-    args = lambda fmt: argparse.Namespace(fmt=fmt, n=16, tile=4, lanes=32)
-    steps = {f: {n: (argv, g) for n, argv, g in check_steps(args(f))} for f in ("fp32", "bf16", "int8")}
-    assert "GPNAE_MODEL=hw" in steps["bf16"]["gpnae-verilator"][0] and steps["bf16"]["gpnae-verilator"][1]  # bit-exact, gated
-    assert "GPNAE_MODEL=exact" in steps["bf16"]["gpnae-accuracy"][0] and not steps["bf16"]["gpnae-accuracy"][1]  # reported only
-    for f in ("fp32", "int8"):  # one gated accuracy step: fp32's hw model of negative sigmoid does not match the RTL (GPNAE item)
-        assert "gpnae-accuracy" not in steps[f] and "GPNAE_MODEL=exact" in steps[f]["gpnae-verilator"][0] and steps[f]["gpnae-verilator"][1]
-    assert all(g for f in ("fp32", "int8") for _, g in steps[f].values())
-    assert [n for n, (_, g) in steps["bf16"].items() if not g] == ["gpnae-accuracy"]
-    for f in steps:  # the model checks: gated in every format, before sm-verilator, which skips them
-        names = list(steps[f])
-        assert names[1:5] == ["aril-fpu", "aril-narrow", "sm-model-tests", "sm-verilator"] and all(steps[f][n][1] for n in names[1:4]), names
-        assert "SM_CHECKS=0" in steps[f]["sm-verilator"][0] and steps[f]["aril-narrow"][0][1:4] == ["-C", "SystolicMesh", "aril-narrow"], steps[f]
-    with tempfile.TemporaryDirectory() as d:
-        leak = os.path.join(d, "env.log")
-        os.environ["GPNAE_MODEL"], saved_mf = "hw", os.environ.get("MAKEFLAGS")
-        os.environ["MAKEFLAGS"] = " -- TEST=selu"
-        try:
-            run_step([sys.executable, "-c", "import os; print(sorted(set(os.environ) & {'GPNAE_MODEL', 'MAKEFLAGS', 'TEST'}))"], leak)
-        finally:
-            del os.environ["GPNAE_MODEL"]
-            os.environ.pop("MAKEFLAGS") if saved_mf is None else os.environ.__setitem__("MAKEFLAGS", saved_mf)
-        assert open(leak).read().strip() == "[]", open(leak).read()
-    global CHECK_DIR
-    saved, py = CHECK_DIR, [sys.executable, "-c"]
-    with tempfile.TemporaryDirectory() as d:
-        CHECK_DIR = d
-        try:
-            for fake, code in (([("ok", py + ["pass"], True), ("acc", py + ["raise SystemExit(1)"], False)], 0),
-                               ([("ok", py + ["pass"], True), ("bad", py + ["raise SystemExit(1)"], True)], 1)):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    try:
-                        all_main(["--format", "bf16"], steps=lambda a, f=fake: f)
-                    except SystemExit as e:
-                        got = e.code
-                table = open(os.path.join(d, "regression_bf16_N16_T4_L32.log")).read()
-                assert got == code, (got, table)
-                assert code or "REGRESSION PASS: 1 of 1 gated steps passed; 1 reported, not gated" in table and "FAIL (exit 1), reported, not gated" in table, table
-            assert "REGRESSION FAIL: 1 of 2 gated steps passed" in table, table
-        finally:
-            CHECK_DIR = saved
 
 
 @selftest
@@ -3152,78 +3205,99 @@ def selftest_main(argv=None) -> None:
     sys.exit(1 if bad else 0)
 
 
-# ── all (the one-verdict gate) ───────────────────────────────────────────────
-
-CHECK_DIR = os.path.join(ROOT, "testbenches", "results", "regression")
-FIRING = re.compile(r"^.*(?:Assertion failed|%Error).*$", re.M)  # _parse_log's witness: a firing assertion leaves the exit status clean
+# ── make regression: SIENNA's tests at every N, tile size and format ─────────
 
 
-REPORTED = {("gpnae-accuracy", "bf16")}  # open accuracy items (sienna-uniform-format): run and shown, not counted in the verdict
+def _engine():
+    """ArithmeticLibrary's make regression engine, under its own name (SystolicMesh and GPNAE each have a regression.py too)."""
+    import importlib.util
+    s = importlib.util.spec_from_file_location("aril_regress", os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "regress.py"))
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
 
 
-def check_steps(a) -> list:
-    """The gate's steps as (name, argv, gated): the self-tests, the model checks, then make targets in the build's format, N, TILE and LANES."""
-    mk = lambda target, *extra: ["make", target, f"FMT={a.fmt}", f"N={a.n}", f"TILE={a.tile}", f"LANES={a.lanes}", f"PYTHON={sys.executable}", *extra]
-    gpnae = [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=hw")), ("gpnae-accuracy", mk("gpnae-verilator", "GPNAE_MODEL=exact"))] \
-        if a.fmt == "bf16" else [("gpnae-verilator", mk("gpnae-verilator", "GPNAE_MODEL=exact"))]  # bf16: bit-exact gated, accuracy reported
-    sm = lambda target: ["make", "-C", "SystolicMesh", target, f"PYTHON={sys.executable}"]  # checks against their own references, any format
-    steps = [("selftest", [sys.executable, os.path.abspath(__file__), "--action", "selftest"]),
-             ("aril-fpu", sm("aril-fpu")), ("aril-narrow", sm("aril-narrow")), ("sm-model-tests", sm("model-tests")),
-             ("sm-verilator", mk("sm-verilator", "SM_CHECKS=0")), *gpnae, ("pipeline", mk("pipeline")), ("pack", mk("pack")), ("gemm", mk("gemm", "QUICK=1"))]
-    steps += [("tflite", mk("tflite"))] if a.fmt == "int8" else []
-    return [(name, argv, (name, a.fmt) not in REPORTED) for name, argv in steps]
+regress = _engine()
+KINDS = ("pipeline", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8 (int8's models)
+MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
 
-STEP_ENV_DROP = ("MAKEFLAGS", "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES", "GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K")  # make regression's own variables must not narrow a step
+def reg_lanes(n: int) -> int:
+    """Activation lanes of a point, as the sweeps build them: 32 up to N = 32, 128 at N = 64."""
+    return 128 if n >= 64 else 32
 
 
-def run_step(argv: list, log_path: str) -> str:
-    """Runs one step with its output teed to log_path: PASS, or FAIL naming the exit status or the firing the log holds."""
-    env = {k: v for k, v in os.environ.items() if k not in STEP_ENV_DROP}
-    with open(log_path, "w") as log:
-        try:
-            p = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-        except OSError as e:
-            log.write(f"cannot run {argv[0]}: {e}\n")
-            return f"FAIL (cannot run: {e})"
-        for line in p.stdout:
-            sys.stdout.write(line)
-            log.write(line)
-        rc = p.wait()
-    fired = FIRING.search(open(log_path, errors="replace").read())
-    return f"FAIL (exit {rc})" if rc else f"FAIL (log: {fired.group(0).strip()[:60]})" if fired else "PASS"
+class SiennaSpec(regress.Spec):
+    title = "SIENNA REGRESSION"
+    formats = tuple(FORMATS)
+    sized = True
+    drop = ("GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES")
+
+    def points(self, small, formats):
+        if not formats:
+            return []
+        return ["selftest"] + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
+                               for t in pow2_tile_sizes(n) for k in KINDS if (k != "model" or f != "int8") and (k != "tflite" or f == "int8")]
+
+    def parse(self, name):
+        if name == "selftest":
+            return {"n": 0, "kind": "selftest"}
+        m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z]+)", name)
+        if not m or m.group(1) not in FORMATS or m.group(4) not in KINDS:
+            raise ValueError(f"{name}: points are selftest and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
+        f, n, t, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+        if n not in regress.SIZES or t not in pow2_tile_sizes(n):
+            raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
+        if k == "model" and f == "int8" or k == "tflite" and f != "int8":
+            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8")
+        return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k}
+
+    def argv(self, name, opts):
+        p, py = self.parse(name), sys.executable
+        if p["kind"] == "selftest":
+            return [py, "regression.py", "--action", "selftest"]
+        mk = ["make", p["kind"], f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
+        return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(p["kind"], [])
+
+    def verdict(self, name, text, rc):
+        k = self.parse(name)["kind"]
+        v = regress.common_verdict(text, rc)
+        if v:
+            return v
+        text = regress.ANSI.sub("", text)
+        if k == "selftest":
+            return regress.marker_verdict(text, rc, (r"^ALL \d+ PASSED$",))
+        if k == "pipeline":
+            m = re.findall(r"^\s*Passed\s*:\s*(\d+)\s*/\s*(\d+)\s*$", text, re.M)
+            if not m or "Sanity Clean" not in text:
+                return "FAIL (no 'Passed : X / X' with Sanity Clean)"
+            x, y = map(int, m[-1])
+            return "PASS" if x == y > 0 else f"FAIL ({x} of {y} tests passed)"
+        if k in ("model", "tflite"):
+            return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
+        if k == "pack":
+            return regress.marker_verdict(text, rc, (r"^PACK REGRESSION PASS: 0 mismatching outputs$",))
+        return regress.marker_verdict(text, rc, (r"^grid_\d+x\d+x\d+ ",), (r"^FAIL ",))  # gemm: its rows, and it stops on a FAIL line
+
+    def not_run(self, name, opts):
+        if self.parse(name)["kind"] != "model":
+            return None
+        d, need = getattr(opts, "model_dir", ""), list(mr.MODELS.values())
+        how = f"make regression MODEL_DIR=<directory with {', '.join(need)}>"
+        if not d:
+            return f"MODEL_DIR unset: the model points need {how}"
+        if not os.path.isdir(d):
+            return f"MODEL_DIR={d} does not exist: {how}"
+        missing = [m for m in need if not os.path.isfile(os.path.join(d, m))]
+        return f"MODEL_DIR={d} is missing {', '.join(missing)}: {how}" if missing else None
 
 
-def all_main(argv=None, steps=check_steps) -> None:
-    """Self-tests, the model checks, then the SystolicMesh and GPNAE regressions, the SIENNA pipeline, pack, gemm --quick and (int8) tflite via make; one table, exit 1 if any gated step failed."""
-    ap = argparse.ArgumentParser(description=all_main.__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="all")
-    ap.add_argument("--format", dest="fmt", default="fp32", choices=sorted(mr.FORMATS))
-    ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--tile", type=int, default=4)
-    ap.add_argument("--lanes", type=int, default=32)
-    a = ap.parse_args(argv)
-    os.makedirs(CHECK_DIR, exist_ok=True)
-    tag = f"{a.fmt}_N{a.n}_T{a.tile}_L{a.lanes}"
-    rows = []
-    for name, cmd, gated in steps(a):
-        log_path = os.path.join(CHECK_DIR, f"{name}_{tag}.log")
-        print(hdr(f"\n=== check: {name}  ({' '.join(cmd)}) ==="), flush=True)
-        t0 = time.time()
-        v = run_step(cmd, log_path)
-        rows.append((name, v if gated else f"{v}, reported, not gated", gated, time.time() - t0, log_path))
-    n_gated = sum(g for _, _, g, _, _ in rows)
-    failed = sum(g and v != "PASS" for _, v, g, _, _ in rows)
-    table = [f"REGRESSION {tag}", f"{'step':<16}{'verdict':<48}{'secs':>8}  log"] + [f"{n:<16}{v:<48}{s:8.1f}  {p}" for n, v, _, s, p in rows]
-    table.append(f"REGRESSION {'PASS' if failed == 0 else 'FAIL'}: {n_gated - failed} of {n_gated} gated steps passed"
-                 + (f"; {len(rows) - n_gated} reported, not gated" if len(rows) > n_gated else ""))
-    open(os.path.join(CHECK_DIR, f"regression_{tag}.log"), "w").write("\n".join(table) + "\n")
-    print("\n" + "\n".join(table))
-    sys.exit(1 if failed else 0)
+SPEC = SiennaSpec(ROOT, os.path.join(ROOT, "testbenches", "results", "regression"))
 
 
 MAINS = {"pack": pack_main, "gemm": gemm_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
-         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "selftest": selftest_main, "all": all_main}  # each parses its own options (regression.py --action A --help)
+         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "selftest": selftest_main,
+         **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point", "summary")}}  # each parses its own options (regression.py --action A --help)
 
 if __name__ == "__main__":
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)  # no abbreviation: pack's --act is not --action

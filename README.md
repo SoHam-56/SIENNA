@@ -128,10 +128,10 @@ Read them as an indication of where the architecture stands.
 
 ## Verification
 
-- `make regression` runs every check below and gives one verdict. It passes in fp32, bf16 and int8.
+- `make regression` runs SIENNA's tests (the pipeline, the models, packed layers, the GEMM sweep and the int8 TFLite layers) at every size: N = 8, 16, 32 and 64, every tile size each N allows, in fp32, bf16 and int8, then prints one table of verdicts. SystolicMesh, GPNAE and ArithmeticLibrary each have their own `make regression` for their parts.
 - The pipeline regression runs 32 tests in fp32, 33 in bf16 and 41 in int8, on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32, and at 64 × 64 in fp32.
-- The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails the regression.
+- The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
 - The int8 layers match the TensorFlow Lite interpreter bit for bit on 16 × 16 and 64 × 64 meshes, including SAME-padded convolutions with per-channel scales and input zero points.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random and held for 500 cycles mid-stream.
 
@@ -146,7 +146,8 @@ git clone --recursive https://github.com/SoHam-56/SIENNA.git
 cd SIENNA
 make help                              # every target and the current configuration
 
-make regression FMT=int8               # the full sanity check: one verdict
+make regression SMALL=1 MODEL_DIR=<dir>  # every test at N = 8 and 16, the sizes a 16 GB machine can build
+make regression MODEL_DIR=<dir>          # every test at N = 8 to 64 (days one at a time: use make -j)
 make pipeline FMT=bf16                 # the pipeline tests only (TEST=tanh narrows them)
 make tflite FMT=int8                   # int8 TFLite layers, bit for bit against the interpreter
 make model FMT=fp32 MODEL_DIR=<dir>    # MLPerf Tiny models end to end
@@ -154,6 +155,14 @@ make perf-analysis FMT=bf16            # cycle-level throughput per stage
 ```
 
 `FMT` (`fp32`, `bf16`, `int8`), `N` (matrix size, default 16), `TILE` (array size, default 4) and `LANES` (activation lanes, default 32) apply to every target.
+
+How `make regression` works:
+- It is a list of *points*. A point is one check at one configuration, e.g. `bf16/N8_T2/pipeline` (the pipeline tests in bf16 at N = 8, tile size 2); the checks are `pipeline`, `model`, `pack`, `gemm` and `tflite`. `python3 regression.py --action points` lists them.
+- Each point is its own make target, so `make -j4 regression SMALL=1` runs four at a time, each simulating on a quarter of the cores; `make regression/bf16/N8_T2/pipeline` runs one alone.
+- Each point builds in a private copy of the tree and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`.
+- A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
+- `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
+- The model points (the four MLPerf Tiny models, in fp32 and bf16) need `MODEL_DIR`. Without it they show NOT RUN and the regression fails.
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.

@@ -1,6 +1,6 @@
 ---
 name: sienna-tooling
-description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, one-verdict gate) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
+description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, make regression's points and table) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
 ---
 
 # SIENNA tooling: two scripts
@@ -78,13 +78,52 @@ never the other way round.
 - `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite` (was gpnae_int8_tflite.py)
 - `--action rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
-- `--action all` — one verdict: selftest, the model checks with their own references (aril-fpu, aril-narrow, sm-model-tests: `make -C SystolicMesh <target>`), the SystolicMesh (with SM_CHECKS=0, since those ran) and GPNAE regressions (via make), the SIENNA regression, pack, gemm quick, and tflite (int8); prints a table and exits non-zero on any failure (farm launching stays in sienna_jobs, outside git)
+- `--action points [--small] [--formats f,...]`, `--action point --name P`, `--action summary` — make regression (below); they replaced `--action all`, the single-point gate, on 2026-10-10
 
 ### Makefile
 
 Every target keeps its name and arguments and calls the new script: `regression`, `pkg`, `pack`, `gemm`,
 `perf-analysis`, `model`, `tflite` (and a new `check` for `regression.py --action all`; since 2026-10-05 the gate is `make regression` and the pipeline suite `make pipeline`). test_makefile_fmt's checks move into
 `selftest` and follow the new recipes.
+
+## make regression (2026-10-10)
+
+"Regression means running all the tests we have in a sweep and seeing whether the design is still healthy: N = 8 through
+64 and every valid tile size for each N" (Soham, 2026-10-10). Until 2026-10-10 `make regression` was a one-verdict gate
+at N = 16, T = 4 (`--action all`); records dated before that (skills, reports) mean that gate.
+
+Each repo owns its regression (Soham, 2026-10-10): SIENNA's runs SIENNA's tests only. SystolicMesh (`make regression
+[SMALL=1] [FMT=]`: model-tests, aril-fpu, aril-narrow once, the mesh at every N, tile size and format, collapse-k 1; the
+one-N run is `make mesh-regression MATRIX_SIZE=<n>`, which SIENNA's `make sm-verilator` calls), GPNAE (`make regression
+[FMT=]`: its lane in each format, bf16's accuracy reported, not gated) and ArithmeticLibrary (`make regression`: every
+unit bench and model check once) have their own, on the same engine.
+
+- **Engine.** `SystolicMesh/ArithmeticLibrary/Common/regress.py` (loaded by path as `aril_regress`, since every repo has
+  a `regression.py`): a repo's `Spec` gives the points and each point's command, environment, verdict and reason not to
+  run; the engine runs a point in a private copy of the tree (`copy_tree`: git's tracked and untracked, not ignored,
+  files of the repo and its submodules, so ignored stale stimulus and old builds never reach a run), with TRACE=0,
+  OPT_FAST=-O0 from N = 32 (-Os compiles a large mesh for hours), SIM_THREADS = cores / N under make -jN (1 under an
+  unlimited -j; every Verilator Makefile passes it to `--threads`: Verilator's threads spin, and four 8-thread
+  simulations on 8 cores took a 30 s GPNAE run past 55 min) and none of the caller's make variables, writes
+  `<REG_DIR>/<point>.log` and `.json` (rc, seconds, run, host), keeps a failing point's `testbenches/results` in
+  `<point>.artifacts/`, and writes the table. Its own self-tests are ArithmeticLibrary's `regression.py --action selftest`.
+- **SIENNA's points** (`SiennaSpec` in regression.py): `selftest` once, and per N in {8, 16, 32, 64} (SMALL=1: {8, 16})
+  x every power-of-2 tile size x format: `pipeline` (`make pipeline`), `model` in fp32 and bf16 (`make model
+  MODEL_COUNT=3`, the four MLPerf Tiny models), `pack`, `gemm` (QUICK=1) and `tflite` in int8. LANES is 32 up to
+  N = 32 and 128 at N = 64. Names are `selftest` and `fmt/N<n>_T<t>/kind`: 85 points with SMALL=1, 217 in full;
+  FMT=<f> narrows to one format (only when FMT is given: `$(origin FMT)`).
+- **Targets.** Each point is `make regression/<point>`, so `make -j` runs them side by side; `make regression` runs
+  them all with `--keep-going` (a failing point does not stop the others), then the summary for its own run.
+  `make regression-summary` prints the table of what is in REG_DIR (default `testbenches/results/regression`) without
+  running anything. REG_RUN names the run: `make regression` sets one, each result records it, and the summary turns a
+  result of another run into NOT RUN (stale). Without REG_RUN the summary takes any run.
+- **Verdicts**, never "finished cleanly": pipeline `Passed : X / X` with X > 0 and `Sanity Clean`; model and tflite
+  `MODEL GATE: PASS`; pack `PACK REGRESSION PASS: 0 mismatching outputs`; gemm its `grid_*` rows and no `FAIL` line;
+  every point exit 0 and no `Assertion failed` / `%Error` line. Model points without a usable MODEL_DIR (unset, missing,
+  or without the four .tflite files) are NOT RUN with how to set it. The summary exits 1 on any gated FAIL or NOT RUN,
+  on no point selected, or when no point ran.
+- Self-tests: `test_regression_points`, `test_point_commands`, `test_point_verdicts`, `test_model_points_need_model_dir`,
+  `test_regression_target` (make -n).
 
 ## Rules
 
@@ -129,7 +168,8 @@ The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.m
 | `gpnae_int8_tflite.py --report F` | `regression.py --action gpnae-tflite --report F` | |
 | `testbenches/gen_rq_lanes.py OUT` | `regression.py --action rq-vectors OUT` | |
 | `python3 test_makefile_fmt.py` (and the other four `test_*.py`) | `regression.py --action selftest` (38 tests) | |
-| | `regression.py --action all [--format --n --tile --lanes]` | `make regression` (was `make check`) |
+| | `regression.py --action all [--format --n --tile --lanes]` (until 2026-10-10) | `make regression` (was `make check`) |
+| `regression.py --action all` | `--action points`, `point`, `summary`: every N, tile size and format (2026-10-10) | `make regression`, `make regression/<point>`, `make regression-summary` |
 | `make regression` (the pipeline suite) | `regression.py --action regression` (unchanged) | `make pipeline` |
 | `tflite_int8_run.py [--n --tile-size --lanes --models --work]` | `model_runner.py --action tflite` (same options) | `make tflite` |
 | `tflite_pack_run.py [--n --tile-size --lanes --models]` | `model_runner.py --action tflite --pack` (same options) | |
@@ -185,7 +225,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 ### Known gaps (deferred minors, from the ledger)
 
 - `--action selftest` does not parse its arguments (`--action selftest --bogus` runs the tests).
-- `--action all` does not flush per line, so a piped console lags; its table names log paths inside the run's tree.
+- (`--action all`, now gone, did not flush per line.)
 - perf helpers called without `perf_init()` meet None globals (only `perf_main` and the perf self-tests call it).
 - model_runner's `--action` / `--pack` arguments are declared in the sub-parsers for help only.
 - `pack_precheck` (Middle end) reads `COLLAPSE_K`, owned by Device build: a reach-in across sections.

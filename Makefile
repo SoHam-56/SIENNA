@@ -606,7 +606,7 @@ space := $(empty) $(empty)
 REG_FORMATS = $(subst $(space),$(comma),$(strip $(if $(filter file,$(origin FMT)),$(FORMATS),$(FMT))))
 REG_SELECT  = --formats $(REG_FORMATS)$(if $(filter 1,$(SMALL)), --small)
 REG_DIR    ?= $(TB_DIR)/results/regression
-REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(MODEL_DIR)
+REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(abspath $(MODEL_DIR))
 ifneq ($(filter regression,$(MAKECMDGOALS)),)
 ifeq ($(origin REG_RUN),undefined)
 REG_RUN := $(shell date +%Y%m%d-%H%M%S)-$(shell echo $$PPID)
@@ -616,7 +616,7 @@ endif
 
 # One point, e.g. make regression/bf16/N8_T2/pipeline: runs in a private copy of the tree, writes $(REG_DIR)/<point>.log and .json.
 regression/%:
-	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(MODEL_DIR)$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
+	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(abspath $(MODEL_DIR))$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
 
 regression: $(addprefix regression/,$(REG_POINTS))
 	@$(REG_SUMMARY) --run $(REG_RUN)

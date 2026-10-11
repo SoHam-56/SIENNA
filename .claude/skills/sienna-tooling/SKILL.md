@@ -124,6 +124,13 @@ unit bench and model check once) have their own, on the same engine.
   on no point selected, or when no point ran.
 - Self-tests: `test_regression_points`, `test_point_commands`, `test_point_verdicts`, `test_model_points_need_model_dir`,
   `test_regression_target` (make -n).
+- **Run times** (measured 2026-10-10, 8-core machines, one build per group): SIENNA SMALL=1 (85 points) 3.4 h one point
+  at a time, 20 min with every point in parallel, model points the largest share (108 of 203 min); a fresh clone's
+  `make -j4 regression SMALL=1 FMT=int8` on one machine 12 min. N = 32 T = 8: pipeline fp32 29 min, bf16 19, int8 7;
+  model fp32 11, bf16 8. N = 64 T = 16: pipeline fp32 3 h 57 min, bf16 1 h 59 min, int8 55 min; model fp32 48 min,
+  bf16 29; pack fp32 21 min; gemm fp32 10 min. The full sweep was not run after these changes: about 2.7 days one
+  point at a time, estimated from one tile size per N. SystolicMesh SMALL=1 22 min one point at a time (fp32 N = 64
+  T = 16 mesh 57 min), ArithmeticLibrary 10 min, GPNAE 2 min.
 
 ### One build per hardware group (2026-10-10)
 

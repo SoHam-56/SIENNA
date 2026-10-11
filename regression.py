@@ -2598,7 +2598,13 @@ def test_point_verdicts():
             ("fp32/N8_T2/model", "built\n", 0, "FAIL (no 'MODEL GATE: PASS')"), ("int8/N8_T2/tflite", "MODEL GATE: PASS int8\n", 0, "PASS"),
             ("int8/N8_T2/tflite", "ok\n", 0, "FAIL (no 'MODEL GATE: PASS')"),
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
-            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 with outputs that differ\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 with outputs that differ from the bit-exact model\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 with outputs that differ from the bit-exact model')"),
+            ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu")), 0, "PASS"),
+            ("fp32/N8_T2/gemm", "grid_1x8x8 1\nlayer_tanh_bias  64 max err 9.3e-04 of the output range\n", 0, "FAIL (no 'layer_sigmoid_bias .* max err ')"),
+            ("bf16/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"  layer_{x}: 0 outputs differ from the bit-exact model\n" for x in ("tanh", "sigmoid", "selu"))
+             + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n", 0, "PASS"),
+            ("bf16/N8_T2/gemm", "grid_1x8x8 1\n  layer_tanh: 0 outputs differ from the bit-exact model\n", 0, "FAIL (no '  layer_sigmoid: 0 outputs differ from the bit-exact model')"),
             ("int8/N8_T2/gemm", "GEMM int8: 0 cases\n", 0, "FAIL (no 'grid_\\d+x\\d+x\\d+ ')"), ("fp32/N8_T2/gemm", "grid_1x8x8 1\nFAIL grid_1x8x8: error\n", 0, "FAIL (log: FAIL grid_1x8x8: error)"),
             ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')")):
         got = v(p, text, rc)
@@ -3413,7 +3419,11 @@ class SiennaSpec(regress.Spec):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
         if k == "pack":
             return regress.marker_verdict(text, rc, (r"^PACK REGRESSION PASS: 0 mismatching outputs$",))
-        return regress.marker_verdict(text, rc, (r"^grid_\d+x\d+x\d+ ",), (r"^FAIL ",))  # gemm: its rows, and it stops on a FAIL line
+        acts = ("tanh", "sigmoid", "selu")  # gemm: its rows, every activation's own check, and no FAIL line
+        need = {"fp32": [rf"^layer_{x}_bias .* max err " for x in acts],
+                "bf16": [rf"^  layer_{x}: 0 outputs differ from the bit-exact model$" for x in acts] + [r"^layer_bias_special .* 0 outputs differ from the bit-exact model$"],
+                "int8": [r"^GEMM int8: \d+ cases, 0 with outputs that differ from the bit-exact model$"]}[self.parse(name)["fmt"]]
+        return regress.marker_verdict(text, rc, [r"^grid_\d+x\d+x\d+ "] + need, (r"^FAIL ",))
 
     def not_run(self, name, opts):
         if self.parse(name)["kind"] != "model":

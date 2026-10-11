@@ -2572,6 +2572,13 @@ def test_point_commands():
         for k, v in saved.items():
             os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
     assert env["TRACE"] == "0" and env["OPT_FAST"] == "-O0" and env["SIM_THREADS"] == "2" and not {"GPNAE_MODEL", "TEST", "N", "LINK_STAGES"} & set(env)
+    pe = lambda n: regress.point_env(SPEC, n, "s", 8).get("OPT_FAST")
+    assert [pe(f"fp32/N{n}_T2/{k}") for n, k in ((8, "pack"), (16, "pack"), (8, "gemm"), (16, "gemm"))] == ["-O0"] * 4  # the short pack and gemm simulations build at -O0 at every N
+    assert pe("fp32/N8_T2/pipeline") is None and pe("fp32/N16_T4/pipeline") is None and pe("int8/N8_T2/tflite") is None and pe("bf16/N16_T4/model") is None and pe("selftest") is None  # the long ones keep -Os below N = 32
+    assert pe("fp32/N32_T2/pipeline") == pe("fp32/N32_T2/model") == "-O0"  # from N = 32 every point builds at -O0 (point_env)
+    cores = regress._cores()
+    for args in ((), ("-C", "SystolicMesh"), ("-C", "GPNAE")):
+        assert f"-j {cores} --build-jobs {cores} " in make_n(*args, "verilator").stdout, args  # Verilator takes every core in all three repos
     for args in (("lint", "GEN_PKG=0"), ("-C", "SystolicMesh", "lint"), ("-C", "GPNAE", "verilator")):  # every Verilator build of this tree takes SIM_THREADS
         out = make_n(*args, "SIM_THREADS=3").stdout
         assert "--threads 3" in out and "--threads 8" not in out, (args, out[:300])
@@ -3392,6 +3399,11 @@ class SiennaSpec(regress.Spec):
         if k == "model" and f == "int8" or k == "tflite" and f != "int8":
             raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8")
         return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k}
+
+    def env(self, name, env):
+        if self.parse(name)["kind"] in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
+            env = dict(env, OPT_FAST="-O0")
+        return env
 
     def argv(self, name, opts):
         p, py = self.parse(name), sys.executable

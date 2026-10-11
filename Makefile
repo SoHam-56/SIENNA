@@ -204,6 +204,7 @@ VERILATOR_FLAGS = \
 	--assert \
 	--top-module $(TOP_MODULE) \
 	--threads $(SIM_THREADS) \
+	-j $(shell nproc) \
 	--build-jobs $(shell nproc) \
 	--output-split 20000 \
 	--output-split-cfuncs 20000 \

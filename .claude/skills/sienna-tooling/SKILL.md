@@ -112,14 +112,17 @@ unit bench and model check once) have their own, on the same engine.
   x every power-of-2 tile size x format: `pipeline` (`make pipeline`), `model` in fp32 and bf16 (`make model
   MODEL_COUNT=3`, the four MLPerf Tiny models), `pack`, `gemm` (QUICK=1) and `tflite` in int8. LANES is 32 up to
   N = 32 and 128 at N = 64. Names are `selftest` and `fmt/N<n>_T<t>/kind`: 85 points with SMALL=1, 217 in full;
-  FMT=<f> narrows to one format (only when FMT is given: `$(origin FMT)`).
-- **Targets.** Each point is `make regression/<point>`, so `make -j` runs them side by side; `make regression` runs
+  SMALL= and FMT= narrow it only on make's command line (`$(origin)`), never from the environment; MODEL_DIR reaches the
+  points absolute (`$(abspath)`, and the engine's `--model-dir`), since a point runs in a private copy.
+- **Targets.** Each point is `make regression/<point>`, so `make -jN` runs N side by side (N for the memory, never a bare -j); `make regression` runs
   them all with `--keep-going` (a failing point does not stop the others), then the summary for its own run.
   `make regression-summary` prints the table of what is in REG_DIR (default `testbenches/results/regression`) without
   running anything. REG_RUN names the run: `make regression` sets one, each result records it, and the summary turns a
   result of another run into NOT RUN (stale). Without REG_RUN the summary takes any run.
-- **Verdicts**, never "finished cleanly": pipeline `Passed : X / X` with X > 0 and `Sanity Clean`; model and tflite
-  `MODEL GATE: PASS`; pack `PACK REGRESSION PASS: 0 mismatching outputs`; gemm its `grid_*` rows and no `FAIL` line;
+- **Verdicts**, never "finished cleanly": pipeline `Passed : X / X` with X = every pipeline test of the format (32 fp32,
+  33 bf16, 41 int8) and `Sanity Clean`; model and tflite `MODEL GATE: PASS`; pack `PACK REGRESSION PASS: 0 mismatching
+  outputs`; gemm its `grid_*` rows, each check's own line (fp32 the three `layer_<act>_bias` errors, bf16 `layer_<act>: 0
+  outputs differ` and layer_bias_special's 0, int8 `GEMM int8: N cases, 0 with outputs that differ`) and no `FAIL` line;
   every point exit 0 and no `Assertion failed` / `%Error` line. Model points without a usable MODEL_DIR (unset, missing,
   or without the four .tflite files) are NOT RUN with how to set it. The summary exits 1 on any gated FAIL or NOT RUN,
   on no point selected, or when no point ran.
@@ -142,8 +145,10 @@ that build with `make sim`. Measured: a build is 70 s at N = 16 against 1-2 s of
 N = 64 fp32.
 - Every generator writes `test_config_pkg.sv` with every item (TB_sienna_multi still reads the knobs from it) and, beside
   it, `test_knobs.mem` (`write_test_config`: lowercase name and value per line). TB_sienna_top reads the knobs from that
-  file at time 0 (`read_knobs`: each exactly once, any other name or a missing one is `$fatal`) and names none of them
-  as package items, so no knob value can reach its elaboration or the DUT's.
+  file at time 0 (`read_knobs`: a missing, unknown or repeated setting is `$fatal`), and no file the build compiles or
+  can include names one but the package's own declarations (`knob_references` over `build_sources`), so no knob value
+  can reach the elaboration or the DUT. `copy_mem_files` copies every stimulus file (plain `cp`: `cp -u` could skip a
+  test's files written in the same second as the last one's on a coarse-timestamp filesystem).
 - `run_regression` orders the tests by group (`build_order`, from each test's configuration) and builds when the
   package the test just wrote differs, outside the knobs, from the build on disk (`build_key`); a failed build is never
   reused. `make sim` runs the binary only when `BUILD_KEY` (every Verilator input but the package by checksum, the
@@ -258,8 +263,6 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 - perf helpers called without `perf_init()` meet None globals (only `perf_main` and the perf self-tests call it).
 - model_runner's `--action` / `--pack` arguments are declared in the sub-parsers for help only.
 - `pack_precheck` (Middle end) reads `COLLAPSE_K`, owned by Device build: a reach-in across sections.
-- In bf16 the two GPNAE steps write the same GPNAE result files, so only the accuracy run's report stays on disk
-  (each step's console log in `testbenches/results/check/` keeps both).
 - No `make -n` self-test for the gemm recipe's `--tile`.
 
 ### Gate

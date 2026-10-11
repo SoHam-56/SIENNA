@@ -121,7 +121,7 @@ make tflite FMT=int8 PYTHON=<venv>/bin/python   # model_runner.py --action tflit
 make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on sienna_layer (regression.py --action pack)
 make sm-verilator FMT=int8                      # SystolicMesh's model checks (aril-fpu, aril-narrow, model-tests), then its mesh-regression at N, TILE, COLLAPSE_K; SM_CHECKS=0 skips the checks
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses; GPNAE_MODEL=hw for bit-exact (floats)
-make regression MODEL_DIR=<dir> PYTHON=<venv>/bin/python  # SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, one point per target (make -j), then one table; SMALL=1: N = 8, 16; FMT=<f>: one format (sienna-tooling)
+make regression MODEL_DIR=<dir> PYTHON=<venv>/bin/python  # SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, one point per target (make -jN, N for the memory), then one table; SMALL=1: N = 8, 16; FMT=<f>: one format (sienna-tooling)
 make -C SystolicMesh regression SMALL=1                 # each submodule has its own (GPNAE, SystolicMesh/ArithmeticLibrary too)
 make regression/bf16/N8_T2/pipeline              # one point; make regression-summary reprints the table from testbenches/results/regression
 make sim GEN_PKG=0                               # the last TB_sienna_top build on the stimulus now in testbenches/; refuses a build of other inputs, package items (but the run-time knobs) or flags

@@ -29,7 +29,10 @@ ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
 $(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
 endif
 
-ifneq ($(filter-out 0 1,$(SMALL))$(words $(SMALL)),1)
+# make regression: only SMALL= and FMT= on make's command line narrow it, not exported ones.
+REG_SMALL = $(if $(filter command line,$(origin SMALL)),$(SMALL),0)
+REG_FMT   = $(if $(filter command line,$(origin FMT)),$(FMT))
+ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
@@ -603,8 +606,8 @@ pack:
 comma := ,
 empty :=
 space := $(empty) $(empty)
-REG_FORMATS = $(subst $(space),$(comma),$(strip $(if $(filter file,$(origin FMT)),$(FORMATS),$(FMT))))
-REG_SELECT  = --formats $(REG_FORMATS)$(if $(filter 1,$(SMALL)), --small)
+REG_FORMATS = $(subst $(space),$(comma),$(strip $(or $(REG_FMT),$(FORMATS))))
+REG_SELECT  = --formats $(REG_FORMATS)$(if $(filter 1,$(REG_SMALL)), --small)
 REG_DIR    ?= $(TB_DIR)/results/regression
 REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(abspath $(MODEL_DIR))
 ifneq ($(filter regression,$(MAKECMDGOALS)),)

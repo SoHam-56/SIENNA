@@ -2581,13 +2581,16 @@ def test_point_commands():
 
 @selftest
 def test_point_verdicts():
-    clean = "\x1b[1m  Passed      : \x1b[92m33\x1b[0m / 33\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n"
+    n32 = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS))])  # every fp32 pipeline test
+    clean = f"\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n"
     plain = regress.ANSI.sub("", clean)
     v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
+    assert n32 > 20 and v("int8/N8_T2/pipeline", clean) == f"FAIL ({n32} tests ran, int8 has {len([t for t in PIPELINE_TESTS if 'int8' in t.get('formats', tuple(FORMATS))])})"
     for p, text, rc, want in (
             ("fp32/N8_T2/pipeline", clean, 0, "PASS"), ("fp32/N8_T2/pipeline", clean, 1, "FAIL (exit 1)"),
-            ("fp32/N8_T2/pipeline", plain.replace("33 / 33", "32 / 33"), 0, "FAIL (32 of 33 tests passed)"),
-            ("fp32/N8_T2/pipeline", plain.replace("33 / 33", "0 / 0"), 0, "FAIL (0 of 0 tests passed)"),
+            ("fp32/N8_T2/pipeline", plain.replace(f"{n32} / {n32}", "5 / 5"), 0, f"FAIL (5 tests ran, fp32 has {n32})"),  # a test lost on the way
+            ("fp32/N8_T2/pipeline", plain.replace(f"{n32} / {n32}", f"{n32 - 1} / {n32}"), 0, f"FAIL ({n32 - 1} of {n32} tests passed)"),
+            ("fp32/N8_T2/pipeline", plain.replace(f"{n32} / {n32}", "0 / 0"), 0, "FAIL (0 of 0 tests passed)"),
             ("fp32/N8_T2/pipeline", plain.replace("Sanity Clean", "Failures detected"), 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
             ("fp32/N8_T2/pipeline", "make: done\n", 0, "FAIL (no 'Passed : X / X' with Sanity Clean)"),
             ("fp32/N8_T2/pipeline", clean + "%Error: x.sv:3: bad\n", 0, "FAIL (log: %Error: x.sv:3: bad)"),
@@ -3402,7 +3405,10 @@ class SiennaSpec(regress.Spec):
             if not m or "Sanity Clean" not in text:
                 return "FAIL (no 'Passed : X / X' with Sanity Clean)"
             x, y = map(int, m[-1])
-            return "PASS" if x == y > 0 else f"FAIL ({x} of {y} tests passed)"
+            want = len([t for t in PIPELINE_TESTS if self.parse(name)["fmt"] in t.get("formats", tuple(FORMATS))])  # collapse-k 1 runs them all
+            if x != y or y == 0:
+                return f"FAIL ({x} of {y} tests passed)"
+            return "PASS" if y == want else f"FAIL ({y} tests ran, {self.parse(name)['fmt']} has {want})"
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
         if k == "pack":

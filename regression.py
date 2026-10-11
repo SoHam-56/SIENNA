@@ -2687,6 +2687,10 @@ def test_regression_target():
         rel = os.path.relpath(d, ROOT)
         lines = recipe("regression", "SMALL=1", f"MODEL_DIR={rel}")
         assert all(f"--model-dir={os.path.realpath(d)}" in x.replace(d, os.path.realpath(d)) for x in lines if "--action " in x), lines[0]
+    env = dict(MAKE_ENV, FMT="bf16", SMALL="1")  # exported, FMT and SMALL do not narrow it: only make's command line does
+    r = subprocess.run(["make", "-s", "-n", "regression", py], cwd=ROOT, env=env, capture_output=True, text=True)
+    names = [x.split("--name ")[1].split()[0] for x in r.stdout.splitlines() if "--action point " in x]
+    assert r.returncode == 0 and names == SPEC.points(False, list(FORMATS)), (r.stderr[-200:], len(names))
 
 
 @selftest

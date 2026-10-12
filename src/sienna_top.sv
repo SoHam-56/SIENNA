@@ -150,6 +150,8 @@ module sienna_top #(
   logic byp_wr, byp_bank;  // int8: a ReLU or linear beat to write, and its bank
   logic byp_pack;  // int8: the draining beat's set was packed
   logic [FCNT_W-1:0] byp_idx;  // its element within each lane's block
+  logic hold_done;  // int8: a hold set's last beat is in hold_mem: its L6 reservation goes back, pooling may pass it
+  logic fill_add;  // int8: the fill beat this cycle came through add_lanes
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
@@ -162,6 +164,11 @@ module sienna_top #(
   logic                  set_train[NUM_IDS];
   logic [LFSR_WIDTH-1:0] set_seed [NUM_IDS];
   logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
+  logic set_hold[NUM_IDS], set_add[NUM_IDS];  // int8 residual: a hold set, an add set
+  logic g_hold, g_add;  // the activation stage's set is a hold set, an add set
+  logic [159:0] g_add_w;  // its ADD words, {zp1, zp2, m1, s1, m2, s2, mo, so, zpo, min, max}
+  logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
+  assign g_add_zpo = g_add_w[23:16];
   logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = the set's own)
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
@@ -773,6 +780,8 @@ module sienna_top #(
       host_next_id <= '0;
       g_pack    <= 1'b0;
       g_ents    <= '0;
+      g_hold    <= 1'b0;
+      g_add     <= 1'b0;
       for (int k = 0; k < NUM_IDS; k++) begin
         set_train[k] <= 1'b0;
         set_seed[k]  <= '1;
@@ -780,6 +789,8 @@ module sienna_top #(
         set_pack[k]  <= '0;
         set_map[k]   <= '0;
         set_ents[k]  <= '0;
+        set_hold[k]  <= 1'b0;
+        set_add[k]   <= 1'b0;
       end
       for (int k = 0; k < NUM_LANES; k++) begin
         lane_ent[k]   <= '0;
@@ -794,6 +805,8 @@ module sienna_top #(
         set_ents[host_next_id] <= side.act;
         set_train[host_next_id] <= side.train;
         set_seed[host_next_id]  <= side.seed;
+        set_hold[host_next_id] <= IS_INT && side.res_hold;
+        set_add[host_next_id]  <= IS_INT && side.res_add;
         host_next_id <= host_next_id + 1'b1;
       end
       if (l3_grant) l3_armed <= 1'b1;
@@ -829,6 +842,8 @@ module sienna_top #(
       if (g_accept) begin
         g_pack <= (set_pack[g_next_id] != '0);
         g_ents <= set_ents[g_next_id];
+        g_hold <= set_hold[g_next_id];
+        g_add  <= set_add[g_next_id];
         for (int k = 0; k < NUM_LANES; k++) lane_ent[k] <= ent_of(set_map[g_next_id], set_pack[g_next_id], k % N);
       end
       if (p_accept)
@@ -849,6 +864,9 @@ module sienna_top #(
     logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][31:0] s_mout[NUM_IDS];
+    logic [159:0] s_add[NUM_IDS];  // int8 residual: an add set's ADD words, {zp1, zp2, m1, s1, m2, s2, mo, so, zpo, min, max}
+    logic [7:0]   pe_add_zpo;  // the pooled set's ADD output zero point, for the drop value
+    logic         pe_add;  // the pooled set is an add set
     logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_shout, ge_zout;  // the activation stage's copy of its set's entries
     logic [PACK_ENTRIES-1:0][15:0] ge_mx;
     logic [PACK_ENTRIES-1:0][4:0]  ge_shx;
@@ -867,6 +885,7 @@ module sienna_top #(
         s_mout[host_next_id]  <= side.mout;
         s_shout[host_next_id] <= side.shout;
         s_zout[host_next_id]  <= side.zout;
+        s_add[host_next_id]   <= {side.add_zp1, side.add_zp2, side.add_m1, side.add_s1, side.add_m2, side.add_s2, side.add_mo, side.add_so, side.add_zpo, side.add_min, side.add_max};
       end
       if (g_accept) begin
         g_mult   <= s_mult[g_next_id];
@@ -880,14 +899,19 @@ module sienna_top #(
         ge_shout <= s_shout[g_next_id];
         ge_zout  <= s_zout[g_next_id];
       end
+      if (g_accept) g_add_w <= s_add[g_next_id];  // the activation stage's copy, like ge_mout
       if (p_accept || p_null) begin  // the edge p_set_id loads on
         pe_zp   <= s_zp[p_next_id];
         pe_zout <= s_zout[p_next_id];
+        pe_add_zpo <= s_add[p_next_id][23:16];
       end
     end
     always_ff @(posedge clk_i or negedge rstn_i)  // reset, as set_ents is, so p_zp reads tanh's 0 before the first pooled set
       if (!rstn_i) pe_act <= '0;
       else if (p_accept || p_null) pe_act <= set_ents[p_next_id];
+    always_ff @(posedge clk_i or negedge rstn_i)  // reset, as pe_act is
+      if (!rstn_i) pe_add <= 1'b0;
+      else if (p_accept || p_null) pe_add <= set_add[p_next_id];
     for (genvar k = 0; k < NUM_LANES; k++) begin : G_LANE_PAR
       assign g_zp[k]    = ge_zp[lane_ent[k]];
       assign g_min[k]   = ge_min[lane_ent[k]];
@@ -918,6 +942,7 @@ module sienna_top #(
     assign g_shout = '0;
     assign g_zout  = '0;
     assign p_zp    = '0;
+    assign g_add_w = '0;
   end
 
   // =========================================================================
@@ -987,6 +1012,8 @@ module sienna_top #(
     // The bank is full when a ReLU or linear set's last beat leaves the pipeline, or when the lanes return a set.
     assign bank_done  = (byp_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1)) || (g_done && !act_bypass);
     assign bank_sel   = byp_wr ? tg_bank[RQL-1] : act_wr;
+    assign hold_done  = 1'b0;  // Task 2.6 drives it from hold_mem
+    assign fill_add   = 1'b0;  // Task 2.6 drives it from add_lanes
 `ifndef SYNTHESIS
     a_rq_tag_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) fill_v == tg_v[RQL-1])
       else $error("sienna_top: the requantize sideband is out of step with requant_lanes");
@@ -1008,6 +1035,8 @@ module sienna_top #(
     assign byp_bank   = 1'b0;
     assign byp_pack   = 1'b0;
     assign byp_idx    = '0;
+    assign hold_done  = 1'b0;
+    assign fill_add   = 1'b0;
     assign byp_all_in = (fill_count[0] == PER_LANE[FCNT_W-1:0]);
     assign rq_drain   = 1'b0;
     assign rq_room    = 1'b1;
@@ -1170,12 +1199,13 @@ module sienna_top #(
 `ifndef SYNTHESIS
   // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
   logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
+  logic acc_hold_q, acc_add_q;  // the registered accept was a hold set, an add set
   logic acc_credit_q, acc_mready_q;  // a host credit was granted and a staging credit held, at the put
   logic [2:0] acc_shift_q;
   always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum, acc_credit_q, acc_mready_q} <= '0;
+    if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum, acc_credit_q, acc_mready_q, acc_hold_q, acc_add_q} <= '0;
     else begin
-      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q} <= {host_accept, side.accumulate, side.pack_shift, last_accum};
+      {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, acc_hold_q, acc_add_q} <= {host_accept, side.accumulate, side.pack_shift, last_accum, side.res_hold, side.res_add};
       {acc_credit_q, acc_mready_q} <= {l0_out != 0, l1_cnt != 0};
       if (host_accept) last_accum <= side.accumulate;
     end
@@ -1273,6 +1303,10 @@ module sienna_top #(
     else $error("sienna_top: pack shift %0d leaves blocks narrower than 2 of N=%0d", acc_shift_q, N);
   a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q && !acc_prev_accum_q)
     else $error("sienna_top: a packed set cannot be a partial sum or continue one");
+  if (!IS_INT) begin : G_FLOAT_NO_ADD
+    a_float_no_add: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> !(acc_hold_q || acc_add_q))
+      else $error("sienna_top: a_float_no_add: a float set was put as a hold or add set; the residual ADD is int8 only");
+  end
 `ifdef ASSERT_SELFTEST
   a_selftest: assert property (@(posedge clk_i) disable iff (!rstn_i) 1'b0)
     else $error("sienna_top: assertion self-test fired, so assertions are live");

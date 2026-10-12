@@ -20,4 +20,17 @@ typedef struct packed {
   logic [PACK_ENTRIES-1:0][7:0]               zout;
   logic [N-1:0][31:0]                         mult;           // int8 per output channel: requantize multiplier (Q0.31) and signed shift
   logic [N-1:0][7:0]                          shift;
+  logic                                       res_hold;       // int8 residual: the last depth pass; its beats go to hold_mem, no bank, no output
+  logic                                       res_add;        // int8 residual: the identity pass; its beats meet hold_mem in add_lanes
+  logic [7:0]                                 add_zp1;        // the ADD's words (tfliteAdd): input zero points, multipliers and shifts, output zero point and clamp
+  logic [7:0]                                 add_zp2;
+  logic [31:0]                                add_m1;
+  logic [7:0]                                 add_s1;
+  logic [31:0]                                add_m2;
+  logic [7:0]                                 add_s2;
+  logic [31:0]                                add_mo;
+  logic [7:0]                                 add_so;
+  logic [7:0]                                 add_zpo;
+  logic [7:0]                                 add_min;
+  logic [7:0]                                 add_max;
 } set_side_t;

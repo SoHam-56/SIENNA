@@ -948,14 +948,15 @@ def dump_hardware_trace(
 # PART 2b: TRUE-FUNCTION GATES PER STAGE (truth.py)
 # =============================================================================
 # Each stage of a pipeline test is judged against the true function of the words that stage actually received, from
-# TB_sienna_top's truth dump of the first plain streaming pass (S) and the accumulate pass (A). The TB's bit-exact (or fp32
-# tolerance) compare of the outputs stays as a diagnostic, still required.
+# TB_sienna_top's truth dump of every streaming pass (S1..S4: plain, credit overrun, after a reset, the output hold) and the
+# accumulate pass (A). The TB's bit-exact (or fp32 tolerance) compare of the outputs stays as a diagnostic, still required.
 
 TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
 INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
 TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "activation", "maxpool", "dropout")
+TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
 
 def _tb_words(name: str) -> np.ndarray:
@@ -1058,19 +1059,21 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
     if not os.path.exists(TRUTH_DUMP):
         raise RuntimeError(f"no truth dump at {TRUTH_DUMP}")
     dump = read_truth_dump(TRUTH_DUMP, lanes)
-    if "S" not in dump:
-        raise RuntimeError("truth dump: no streaming pass (S)")
+    want = set(TRUTH_STREAMS) | (set() if knobs["packed"] else {"A"})  # the TB skips the accumulate pass for packed sets
+    if set(dump) != want:
+        raise RuntimeError(f"truth dump: passes {sorted(dump)}, the TB runs {sorted(want)}")
     scales = json.load(open(TRUTH_SCALES)) if fmt == "int8" else {}
     P, K, W = knobs["accum_passes"], knobs["num_sets"], (pkg["IN_ROWS"] + 2 * pkg["PADDING"] - pkg["POOL_H"]) // pkg["POOL_H"] + 1
     W *= (pkg["IN_COLS"] + 2 * pkg["PADDING"] - pkg["POOL_W"]) // pkg["POOL_W"] + 1
     ph, pw, pad, p = pkg["POOL_H"], pkg["POOL_W"], pkg["PADDING"], pkg["DROPOUT_P_PERCENT"] / 100.0
     acc = truth.acc_fmt(fmt)
     res = {}
-    add = lambda name, r: res.setdefault(name, []).append(r)
-    for tag, g in dump.items():
-        acts = [k for k in range(K) if k % P == P - 1] if tag == "S" else [P - 1]
-        if tag not in ("S", "A"):
-            raise RuntimeError(f"truth dump: unknown pass {tag}")
+    def add(name, r):
+        res.setdefault(name, []).append(r)
+        if not r.ok:
+            res.setdefault("_passes", {}).setdefault(name, set()).add(tag)
+    for tag, g in sorted(dump.items()):
+        acts = [k for k in range(K) if k % P == P - 1] if tag.startswith("S") else [P - 1]
         M = _full(g["M"], len(acts), f"pass {tag}'s results")
         for r, k in enumerate(acts):
             sw = _set_words(k, knobs, N, fmt)
@@ -1122,7 +1125,7 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
             model = dropout_keep(W, p, set_dropout_seed(knobs["dropout_seed"], k), lanes)
             if knobs["training_mode"] and (model != keep).any():
                 res.setdefault("_mask", []).append(int((model != keep).sum()))
-    return {k: (truth.merge(v) if not k.startswith("_") else v) for k, v in res.items()}
+    return {k: (truth.merge(v) if not k.startswith("_") else v) for k, v in res.items()} | {"_npass": len(dump)}
 
 
 def truth_report(res: dict) -> tuple:
@@ -1135,7 +1138,9 @@ def truth_report(res: dict) -> tuple:
             w = {"matmul": lambda: f"{truth.worst_text(r.worst)} of sum|ab|", "narrow": lambda: f"{r.worst_lsb} ULP",
                  "requant": lambda: f"{r.worst_lsb} LSB from round(real)", "activation": lambda: truth.worst_text(r.worst) +
                  (f" ({r.worst_lsb} LSB)" if r.fmt == "int8" else "")}.get(name.split()[0], lambda: f"|out - want| {r.worst:.6g}")()
-            bad.append(f"[FAIL] truth: {name.replace(' ', '/')} {w}, {r.over} of {r.n} over the bound; first: {r.first[:3]}")
+            where = ", ".join(sorted(res.get("_passes", {}).get(name, ())))
+            bad.append(f"[FAIL] truth: {name.replace(' ', '/')} {w}, {r.over} of {r.n} over the bound in passes {where}; first: {r.first[:3]}")
+    lines.append(f"        {res.get('_npass', 0)} passes gated ({', '.join(TRUTH_STREAMS)} and the accumulate pass A unless packed)")
     if "_mask" in res:
         lines.append(f"        diagnostic: dropout's keep decisions differ from regression.py's LFSR model in {sum(res['_mask'])} windows")
     return lines, bad

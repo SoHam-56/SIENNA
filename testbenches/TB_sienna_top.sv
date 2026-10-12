@@ -129,11 +129,13 @@ module TB_sienna_top #(
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
-  // Truth dump: every stage's words of the first plain streaming pass (S) and of the accumulate pass (A), for regression.py's true-function gates.
+  // Truth dump: every stage's words of each streaming pass (S1, S2, ...) and of the accumulate pass (A), for regression.py's true-function gates.
   localparam int TR_IDS = 1 << ID_W;
   integer tr_fd;
   bit tr_on = 0;  // the pass running is dumped
   string tr_pass = "-";
+  int tr_seq = 0;  // passes dumped so far: a new one restarts the monitor's per-element result counts
+  int tr_streams = 0;  // streaming passes so far
   int tr_cur_k = -1;  // the pass's number of the set the host puts next (-1: a set with no result)
   int tr_k[TR_IDS];  // per set id: the pass's number of the set holding it
   int put_seq = 0;  // puts since reset: set ids count them modulo TR_IDS
@@ -820,12 +822,12 @@ module TB_sienna_top #(
     int pj[NUM_LANES];  // dropout inputs of the pooled set so far, per lane
     int q_id[$], q_i[$];
     bit q_pk[$];
-    bit was_on;
-    was_on = 0;
+    int seen;
+    seen = 0;
     forever begin
       @(negedge clk_i);
-      if (tr_on && !was_on) wn = '{default: 0};
-      was_on = tr_on;
+      if (tr_seq != seen) wn = '{default: 0};
+      seen = tr_seq;
       if (!rstn_i) begin
         q_id.delete();
         q_i.delete();
@@ -1174,6 +1176,10 @@ module TB_sienna_top #(
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
+    tr_streams++;
+    tr_pass = $sformatf("S%0d", tr_streams);
+    tr_seq++;
+    tr_on = 1;
 `ifdef PERF
     $display("PERF %0d PASS %0d %0d", int'($time / 10), id_base, overrun);
 `endif
@@ -1299,6 +1305,7 @@ module TB_sienna_top #(
     join_any
     disable fork;
     stream_on = 0;
+    tr_on = 0;
     out_hold = 0;
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", k_num_sets, ($time - t0) / 10);
@@ -1480,6 +1487,7 @@ module TB_sienna_top #(
     acc_banks = 0;
     acc_on = 1;
     tr_pass = "A";
+    tr_seq++;
     tr_on = 1;
     for (int j = 0; j < n; j++) begin
       automatic int k = (j < 4) ? 0 : j - 4;  // the stream set whose rows this pass sends
@@ -1720,10 +1728,7 @@ module TB_sienna_top #(
 `ifdef BACK_TO_BACK
       ids_used = 2;  // plus the back-to-back pass
 `endif
-      tr_pass = "S";
-      tr_on = 1;
       stream_all_sets(ids_used, 0, 0);
-      tr_on = 0;
       stream_all_sets(ids_used + k_num_sets, 1, 0);
     end
     reset_mid_stream();

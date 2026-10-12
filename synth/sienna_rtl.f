@@ -35,5 +35,6 @@ Maxpool/Maxpool_2D.sv
 Dropout/dropout.sv
 src/fwft.sv
 src/requant_lanes.sv
+src/add_lanes.sv
 src/sienna_top.sv
 src/sienna_layer.sv

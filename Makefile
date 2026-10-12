@@ -74,6 +74,7 @@ PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 TOP_FILES = \
 	sienna_top.sv \
 	requant_lanes.sv \
+	add_lanes.sv \
 	fwft.sv \
 	sienna_multi.sv \
 	sienna_layer.sv

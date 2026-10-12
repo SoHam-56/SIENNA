@@ -432,7 +432,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
             last = complete and i == len(ks) - 1
             rq_k = rq if last else _decoy_params(N)
             if last:
-                scales[str(k)] = {"0": [float(rq["s_out"]), float(rq["s_selu"])]}
+                scales[str(k)] = {"0": [float(rq["s_out"]), float(rq["s_selu"])], "ratio": rq["ratio"]}
             write_op_mem(os.path.join(TB_DIR, f"matrix_west_{k}.mem"), parts[i][0], "int8")
             write_op_mem(os.path.join(TB_DIR, f"matrix_north_{k}.mem"), parts[i][1], "int8")
             _write_w32(os.path.join(TB_DIR, f"bias_{k}.mem"), hw_bias if i == 0 else np.zeros(N, np.int64))
@@ -670,6 +670,12 @@ def _generate_vectors_packed(cfg: dict) -> None:
         if fmt == "int8":
             ents = _packed_int8(cfg, k, A, B, bias, sh, col_ent, acts, drop, req_rng, zqs)
             scales[str(k)] = {str(e): [float(q["s_out"]), float(q["s_selu"])] for e, (_, q) in enumerate(ents) if q}
+            ratio = [None] * N  # per column, its entry's real ratio s_a s_w / s_out (none where the multipliers are random)
+            for e, (_, q) in enumerate(ents):
+                if q and q.get("ratio") is not None:
+                    for c, r in zip(np.flatnonzero(col_ent == e), q["ratio"]):
+                        ratio[int(c)] = r
+            scales[str(k)]["ratio"] = ratio
         else:
             _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop)
             ents = [(a, None) for a in acts]
@@ -968,7 +974,7 @@ TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
 INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
-TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "activation", "maxpool", "dropout")
+TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "multiplier", "activation", "maxpool", "dropout")
 TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
 
@@ -1080,7 +1086,7 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
     W *= (pkg["IN_COLS"] + 2 * pkg["PADDING"] - pkg["POOL_W"]) // pkg["POOL_W"] + 1
     ph, pw, pad, p = pkg["POOL_H"], pkg["POOL_W"], pkg["PADDING"], pkg["DROPOUT_P_PERCENT"] / 100.0
     acc = truth.acc_fmt(fmt)
-    res = {}
+    res, mult_seen = {}, set()
     def add(name, r):
         res.setdefault(name, []).append(r)
         if not r.ok:
@@ -1116,6 +1122,11 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
             if fmt == "int8":
                 zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
                 add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, X))
+                ratio = scales.get(str(k), {}).get("ratio") or []
+                cs = [c for c in range(min(N, len(ratio))) if ratio[c] is not None]
+                if cs and k not in mult_seen:  # the host's multipliers, once per set: within their own quantization of s_a s_w / s_out
+                    mult_seen.add(k)
+                    add("multiplier", truth.gate_multiplier(sw["mult"][cs], sw["shift"][cs], [ratio[c] for c in cs]))
             else:
                 add("transfer", _transfer(fmt, post, X))
             # activation: each element through its column's entry, on the word the stage received
@@ -1149,7 +1160,8 @@ def truth_report(res: dict) -> tuple:
         lines.append("        " + (truth.line(r) if name.startswith("activation") else truth.stage_line(r)))
         if not r.ok:
             w = {"matmul": lambda: f"{truth.worst_text(r.worst)} of sum|ab|", "narrow": lambda: f"{r.worst_lsb} ULP",
-                 "requant": lambda: f"{r.worst_lsb} LSB from round(real)", "activation": lambda: truth.worst_text(r.worst) +
+                 "requant": lambda: f"{r.worst_lsb} LSB from round(real)", "multiplier": lambda: f"{r.worst:.3f} LSB of the multiplier",
+                 "activation": lambda: truth.worst_text(r.worst) +
                  (f" ({r.worst_lsb} LSB)" if r.fmt == "int8" else "")}.get(name.split()[0], lambda: f"|out - want| {r.worst:.6g}")()
             where = ", ".join(sorted(res.get("_passes", {}).get(name, ())))
             bad.append(f"[FAIL] truth: {name.replace(' ', '/')} {w}, {r.over} of {r.n} over the bound in passes {where}; first: {r.first[:3]}")

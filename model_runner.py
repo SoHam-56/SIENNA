@@ -181,7 +181,8 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
         shift = rng.randint(-12, 1, s_w.size).astype(np.int64)
     mx, shx = gpnae_model.rescale_params(s_out)
     rq = dict(mult=mult, shift=shift, zp=z_out, amin=max(-128, z_out) if act == "relu" else -128, amax=127,
-              mx=mx, shx=shx, s_out=s_out)
+              mx=mx, shx=shx, s_out=s_out,
+              ratio=None if rng is not None else [s_a * float(s) / s_out for s in s_w])  # the real ratios the multipliers encode
     if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
         rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
     x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs

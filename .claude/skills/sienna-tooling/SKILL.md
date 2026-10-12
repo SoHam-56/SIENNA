@@ -75,7 +75,7 @@ never the other way round.
 - `--action pack [--act] [--rows ...]` — packed layers vs each job alone (was pack_regression.py)
 - `--action gemm [--quick] [--engine]` — GEMM sweep (was gemm_sweep.py)
 - `--action perf ...` — streamed-set performance analysis (was perf_analysis.py)
-- `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite` (was gpnae_int8_tflite.py)
+- `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite --report F` (was gpnae_int8_tflite.py): the int8 tanh and sigmoid lane at TFLite's converter scales, gated on the true function (truth.py, exit 1 and `ACCURACY: FAIL` on a miss); its agreement with TFLite's integer TANH and LOGISTIC is printed beside the gate, not gated
 - `--action rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
 - `--action points [--small] [--formats f,...]`, `--action point --name P`, `--action summary` — make regression (below); they replaced `--action all`, the single-point gate, on 2026-10-10

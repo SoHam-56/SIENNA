@@ -166,9 +166,6 @@ module sienna_top #(
   logic                  set_accum[NUM_IDS];  // the set is a partial sum: accumulate it, output nothing
   logic set_hold[NUM_IDS], set_add[NUM_IDS];  // int8 residual: a hold set, an add set
   logic g_hold, g_add;  // the activation stage's set is a hold set, an add set
-  logic [159:0] g_add_w;  // its ADD words, {zp1, zp2, m1, s1, m2, s2, mo, so, zpo, min, max}
-  logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
-  assign g_add_zpo = g_add_w[23:16];
   logic [2:0] set_pack[NUM_IDS];  // each set's pack shift, block map and table activations (entry 0 = the set's own)
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
@@ -202,6 +199,9 @@ module sienna_top #(
   // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
   // =========================================================================
   `include "sienna_set_side.svh"
+  add_words_t g_add_w;  // the activation stage's set's ADD words
+  logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
+  assign g_add_zpo = g_add_w.zpo;
   localparam int SIDE_W = $bits(set_side_t);
   localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
   localparam int L3_W   = NUM_LANES * OUT_W + 3;  // a result beat: {packed, last, first, one word per lane}
@@ -864,7 +864,7 @@ module sienna_top #(
     logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][31:0] s_mout[NUM_IDS];
-    logic [159:0] s_add[NUM_IDS];  // int8 residual: an add set's ADD words, {zp1, zp2, m1, s1, m2, s2, mo, so, zpo, min, max}
+    add_words_t   s_add[NUM_IDS];  // int8 residual: an add set's ADD words
     logic [7:0]   pe_add_zpo;  // the pooled set's ADD output zero point, for the drop value
     logic         pe_add;  // the pooled set is an add set
     logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_shout, ge_zout;  // the activation stage's copy of its set's entries
@@ -885,7 +885,8 @@ module sienna_top #(
         s_mout[host_next_id]  <= side.mout;
         s_shout[host_next_id] <= side.shout;
         s_zout[host_next_id]  <= side.zout;
-        s_add[host_next_id]   <= {side.add_zp1, side.add_zp2, side.add_m1, side.add_s1, side.add_m2, side.add_s2, side.add_mo, side.add_so, side.add_zpo, side.add_min, side.add_max};
+        s_add[host_next_id]   <= '{zp1: side.add_zp1, zp2: side.add_zp2, m1: side.add_m1, s1: side.add_s1, m2: side.add_m2, s2: side.add_s2,
+                                   mo: side.add_mo, so: side.add_so, zpo: side.add_zpo, min: side.add_min, max: side.add_max};
       end
       if (g_accept) begin
         g_mult   <= s_mult[g_next_id];
@@ -903,7 +904,7 @@ module sienna_top #(
       if (p_accept || p_null) begin  // the edge p_set_id loads on
         pe_zp   <= s_zp[p_next_id];
         pe_zout <= s_zout[p_next_id];
-        pe_add_zpo <= s_add[p_next_id][23:16];
+        pe_add_zpo <= s_add[p_next_id].zpo;
       end
     end
     always_ff @(posedge clk_i or negedge rstn_i)  // reset, as set_ents is, so p_zp reads tanh's 0 before the first pooled set

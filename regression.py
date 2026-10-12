@@ -3029,19 +3029,20 @@ def test_regression_points():
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 21 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9, (len(small), len(full))
+    assert len(small) == len(set(small)) == 1 + 7 * 21 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 == 313, (len(small), len(full))
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
-        for n, t in sweep(full):  # collapse-k 0 and back-to-back: the pipeline at N = 8 and 16; packing needs collapse-k 1
-            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else []) + kinds[1:]
+        for n, t in sweep(full):  # back-to-back at every N, collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
+            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:]
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
     assert [(SPEC.parse(f"int8/N8_T2/{k}")["ck"], SPEC.parse(f"int8/N8_T2/{k}")["b2b"]) for k in ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b")] \
         == [(1, False), (0, False), (1, True), (0, True)]
+    assert [SPEC.parse(p)[x] for p in ("fp32/N64_T64/pipeline-b2b",) for x in ("ck", "b2b", "lanes")] == [1, True, 128]
     assert SPEC.points(True, ["int8"]) == ["selftest"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
-                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0", "fp32/N32_T8/pipeline-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
+                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
                 "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0"):
         try:
             SPEC.parse(bad)
@@ -3084,6 +3085,10 @@ def test_point_commands():
     assert [pe(f"fp32/N{n}_T2/{k}") for n, k in ((8, "pack"), (16, "pack"), (8, "gemm"), (16, "gemm"))] == ["-O0"] * 4  # the short pack and gemm simulations build at -O0 at every N
     assert pe("fp32/N8_T2/pipeline") is None and pe("fp32/N16_T4/pipeline") is None and pe("int8/N8_T2/tflite") is None and pe("bf16/N16_T4/model") is None and pe("selftest") is None  # the long ones keep -Os below N = 32
     assert pe("fp32/N32_T2/pipeline") == pe("fp32/N32_T2/model") == "-O0"  # from N = 32 every point builds at -O0 (point_env)
+    for n, t in ((8, 2), (16, 4), (32, 2), (64, 16)):  # a -b2b point builds and runs as its plain pipeline point, plus the define
+        plain, b2b = f"bf16/N{n}_T{t}/pipeline", f"bf16/N{n}_T{t}/pipeline-b2b"
+        assert pe(b2b) == pe(plain) == ("-O0" if n >= 32 else None), (n, pe(b2b), pe(plain))
+        assert SPEC.argv(b2b, opts) == SPEC.argv(plain, opts) + ["EXTRA_FLAGS=-DBACK_TO_BACK"] and not any("LARGE_CODE" in a for a in SPEC.argv(b2b, opts)), n
     cores = regress._cores()
     for args in ((), ("-C", "SystolicMesh"), ("-C", "GPNAE")):
         assert f"-j {cores} --build-jobs {cores} " in make_n(*args, "verilator").stdout, args  # Verilator takes every core in all three repos
@@ -3252,7 +3257,8 @@ def test_regression_target():
     assert [p for p in small if p.endswith("-b2b")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
                                                        for k in ("pipeline-b2b", "pipeline-ck0-b2b")]
     full = [x.split("--name ")[1].split()[0] for x in recipe("regression", "MODEL_DIR=/m") if "--action point " in x]
-    assert {SPEC.parse(p)["n"] for p in full if p.endswith("-b2b")} == {8, 16} and len([p for p in full if p.endswith("-b2b")]) == 3 * 7 * 2
+    assert {SPEC.parse(p)["n"] for p in full if p.endswith("-b2b")} == {8, 16, 32, 64} and len([p for p in full if p.endswith("-b2b")]) == 3 * (7 * 2 + 11)
+    assert {SPEC.parse(p)["n"] for p in full if p.endswith("-ck0-b2b")} == {8, 16}
     one = recipe("regression/fp32/N8_T2/pipeline")
     assert len(one) == 1 and "--name fp32/N8_T2/pipeline" in one[0] and "--keep-going" not in one[0] and "--run" not in one[0], one
     s = recipe("regression-summary", "SMALL=1")
@@ -3903,7 +3909,7 @@ regress = _engine()
 KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
 PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
-B2B_SIZES = (8, 16)  # pipeline-b2b and pipeline-ck0-b2b: the pipeline points built with -DBACK_TO_BACK, at the small sizes
+B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
 

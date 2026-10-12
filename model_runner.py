@@ -2,7 +2,7 @@
 """SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers)."""
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
-#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact, exact_sum, exact_layer; TFLite's kernels
+#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact, add_words, tflite_add_codes, exact_sum, exact_layer; TFLite's kernels
 #   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_layer, job_of
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
 #   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
@@ -210,6 +210,20 @@ def activate_int8(R, act: str, rq: dict) -> np.ndarray:
 def drop_zp(act: str, rq: dict) -> int:
     """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
     return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
+
+
+ADD_FIELDS = ("zp1", "zp2", "m1", "s1", "m2", "s2", "mo", "so", "zpo", "amin", "amax")  # a layer's ADD words, tfliteAdd's order
+
+
+def add_words(s1, z1, s2, z2, s_out, z_out, act: str) -> dict:
+    """A layer's ADD words from its inputs' and output's quantization (TFLite's Prepare, ipu.add_params) and the fused activation's clamp."""
+    amin, amax = activation_range(act if act in ("relu", "relu6") else "none", s_out, int(z_out))
+    return dict(zp1=int(z1), zp2=int(z2), **ipu.add_params(s1, s2, s_out), zpo=int(z_out), amin=int(amin), amax=int(amax))
+
+
+def tflite_add_codes(q1, q2, add: dict) -> np.ndarray:
+    """ipu.tflite_add of two int8 code arrays with a layer's ADD words, in the pinned rounding."""
+    return np.asarray(ipu.tflite_add(q1, q2, *[add[k] for k in ADD_FIELDS], ROUNDING), np.int64)
 
 
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:

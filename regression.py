@@ -2616,8 +2616,41 @@ def pack_models_main(argv=None) -> None:
 
 # ── gpnae-tflite (was gpnae_int8_tflite.py) ──────────────────────────────────
 
+GPTFL_OPS = (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic"))  # (truth.py function, GPNAE control word, TFLite op)
+
+
+def gpnae_tflite_judge(rows):
+    """Report lines and pass flag: each row (func, op, quant, q, hw, tfl, ex) gated on truth.py, TFLite agreement characterization only."""
+    L = ["GPNAE int8 lane (gpnae_model, bit-exact with the RTL at G2) on every int8 input, quantization from TFLite's converter (BUILTIN_REF)",
+         "Gate: truth.py, the lane's words against the true function of the real input (bound "
+         f"{100 * truth.BOUND:g}%, int8 floor {truth.I8_FLOOR} LSB, target {100 * truth.TARGET:g}%); TFLite agreement is characterization, not gated",
+         f"{'op':<9}{'s_in':>11}{'z_in':>6}{'truth':>6}{'worst':>9}{'LSB':>4}{'>bound':>7}{'>1%':>5}"
+         f"{'equal':>7}{'|d|=1':>7}{'max |d|':>8}{'TFLite-exact':>13}{'lane-exact':>11}"]
+    res = {}
+    for func, op, quant, q, hw, tfl, ex in rows:
+        r = truth.gate("int8", func, q, hw, quant=quant)
+        res.setdefault(func, []).append(r)
+        d = np.abs(hw - tfl)
+        L.append(f"{op:<9}{quant[0]:>11.6f}{quant[1]:>6}{'PASS' if r.ok else 'FAIL':>6}{truth.worst_text(r.worst):>9}{r.worst_lsb:>4}{r.over:>7}"
+                 f"{r.over_target:>5}{int((d == 0).sum()):>7}{int((d == 1).sum()):>7}{int(d.max()):>8}"
+                 f"{int(np.abs(tfl - ex).max()):>13}{int(np.abs(hw - ex).max()):>11}")
+        L += [f"  miss: q {m[1]} lane {m[2]} true {m[3]}" for m in r.first]
+    if not res:
+        return L + ["ACCURACY: FAIL (no gated case)"], False
+    merged = {f: truth.merge(rs) for f, rs in res.items()}
+    L += [truth.line(m) for m in merged.values()]
+    ok = all(m.ok for m in merged.values())
+    body = "; ".join(f"{f} worst {truth.worst_text(m.worst)} ({m.worst_lsb} LSB), {m.over} of {m.n} over {100 * truth.BOUND:g}%, "
+                     f"{m.over_target} over {100 * truth.TARGET:g}%" for f, m in merged.items())
+    L.append(f"ACCURACY: {'PASS' if ok else 'FAIL'} (true function, truth.py, int8; bound {100 * truth.BOUND:g}%, target {100 * truth.TARGET:g}%: {body})")
+    agree = "; ".join(f"{op} {sum(int((r[4] == r[5]).sum()) for r in rows if r[1] == op)} of {sum(r[3].size for r in rows if r[1] == op)} equal, "
+                      f"max |d| {max(int(np.abs(r[4] - r[5]).max()) for r in rows if r[1] == op)}" for op in dict.fromkeys(r[1] for r in rows))
+    L.append(f"TFLITE AGREEMENT (characterization, not gated): {agree}")
+    return L, ok
+
+
 def gpnae_tflite_main(argv=None):
-    """GPNAE's int8 tanh and sigmoid (the lane model, bit-exact with the RTL at G2) against TFLite's int8 TANH and LOGISTIC; reported, not gated."""
+    """GPNAE's int8 tanh and sigmoid lane on TFLite-derived scales, gated on the true function (truth.py); TFLite's TANH and LOGISTIC agreement is reported, not gated."""
     p = argparse.ArgumentParser(description=gpnae_tflite_main.__doc__)
     p.add_argument("--action", choices=ACTIONS, default="gpnae-tflite")
     p.add_argument("--report", required=True)
@@ -2625,20 +2658,19 @@ def gpnae_tflite_main(argv=None):
     _tf_imports()
     lane = gpnae_model.Lane(gpnae_model.INT8, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", gpnae_model.coeff_file(gpnae_model.INT8))))
     q = np.arange(-128, 128, dtype=np.int64)
-    L = ["GPNAE int8 lane against TFLite int8 (BUILTIN_REF), every int8 input; the input quantization is the converter's",
-         f"{'op':<9}{'s_in':>11}{'z_in':>6}{'equal':>7}{'|d|=1':>7}{'max |d|':>8}{'TFLite-exact':>13}{'lane-exact':>11}"]
-    for act, code, op in (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic")):
-        for case in gpnae_model.INT8_CASES[act]:
-            tfl, s, z = activation_int8(op, case.s_in, case.z_in)
+    rows = []
+    for func, code, op in GPTFL_OPS:
+        for case in gpnae_model.INT8_CASES[func]:
+            tfl, s, z = activation_int8(op, case.s_in, case.z_in)  # asserts TFLite's output quantization is the lane's (case.s_out, case.z_out)
             c = case._replace(s_in=s, z_in=z)
             hw = lane.run(q, code, gpnae_model.int8_params(c, code))
-            ex = gpnae_model.exact_int8(q, code, c)
-            d = np.abs(hw - tfl)
-            L.append(f"{op:<9}{s:>11.6f}{z:>6}{int((d == 0).sum()):>7}{int((d == 1).sum()):>7}{int(d.max()):>8}"
-                     f"{int(np.abs(tfl - ex).max()):>13}{int(np.abs(hw - ex).max()):>11}")
+            rows.append((func, op, (s, z, c.s_out, c.z_out), q, hw, tfl, gpnae_model.exact_int8(q, code, c)))
+    L, ok = gpnae_tflite_judge(rows)
     os.makedirs(os.path.dirname(os.path.abspath(a.report)), exist_ok=True)
     open(a.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L))
+    if not ok:
+        sys.exit(1)
 
 
 # ── rq-vectors (was testbenches/gen_rq_lanes.py) ─────────────────────────────
@@ -3878,6 +3910,34 @@ def test_tflite_ref():
     print(f"test_tflite_ref: {checks} checks, {fails} failures")
     print(f"RESULT: {'PASSED' if fails == 0 else 'FAILED'}")
     assert fails == 0, f"{fails} of {checks} checks failed"
+
+
+# ── gpnae-tflite's gate (no TensorFlow: GPNAE's own case scales stand in for the converter's) ──
+
+def gptfl_rows(ladder=True, tfl=None):
+    """gpnae_tflite_judge's rows for the lane on INT8_CASES' tanh and sigmoid; tfl(hw, ex) gives the TFLite words (default ex)."""
+    rom = gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", gpnae_model.coeff_file(gpnae_model.INT8)))
+    lane, q, rows = gpnae_model.Lane(gpnae_model.INT8, rom, ladder=ladder), np.arange(-128, 128, dtype=np.int64), []
+    for func, code, op in GPTFL_OPS:
+        for c in gpnae_model.INT8_CASES[func]:
+            hw, ex = lane.run(q, code, gpnae_model.int8_params(c, code)), gpnae_model.exact_int8(q, code, c)
+            rows.append((func, op, (c.s_in, c.z_in, c.s_out, c.z_out), q, hw, ex if tfl is None else tfl(hw, ex), ex))
+    return rows
+
+
+@selftest
+def test_gptfl_gate():
+    L, ok = gpnae_tflite_judge(gptfl_rows())
+    assert ok and L[-2].startswith("ACCURACY: PASS (true function, truth.py") and "TFLITE AGREEMENT (characterization, not gated)" in L[-1], L[-3:]
+    L, ok = gpnae_tflite_judge(gptfl_rows(ladder=False))  # the 2a lane: sigmoid saturated past 3.5
+    assert not ok and L[-2].startswith("ACCURACY: FAIL") and "sigmoid worst 100.000% (7 LSB), 34 of 1280 over 10%" in L[-2], L[-3:]
+    L, ok = gpnae_tflite_judge(gptfl_rows(tfl=lambda hw, ex: 127 - hw))  # TFLite far off: characterization only, the verdict stands
+    assert ok and L[-2].startswith("ACCURACY: PASS") and "tanh 0 of 1280 equal" in L[-1], L[-2:]
+    off = [r[:4] + (np.clip(r[4] + 3 * (r[0] == "tanh"), -128, 127),) + r[5:] for r in gptfl_rows()]  # tanh 3 LSB high
+    L, ok = gpnae_tflite_judge(off)
+    assert not ok and "TRUTH int8 tanh: FAIL" in "\n".join(L) and "TRUTH int8 sigmoid: PASS" in "\n".join(L), L[-4:]
+    L, ok = gpnae_tflite_judge([])
+    assert not ok and L[-1] == "ACCURACY: FAIL (no gated case)"  # nothing gated is not a pass
 
 
 def selftest_main(argv=None) -> None:

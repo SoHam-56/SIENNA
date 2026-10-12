@@ -98,7 +98,8 @@ SM_LIB_FILES = \
 	Adders/Int/src/intAdder.sv \
 	Converters/FPNarrow/src/fpNarrow.sv \
 	Multipliers/Fx/src/fxMac.sv \
-	Requant/src/tfliteRequant.sv
+	Requant/src/tfliteRequant.sv \
+	Add/src/tfliteAdd.sv
 
 # gpnae_poly's lane only: the published gpnae.sv and its InputFIFO / SeLu / sigtan build in GPNAE's own Makefile.
 GPNAE_FILES = \

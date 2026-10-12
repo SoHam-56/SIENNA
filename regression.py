@@ -41,7 +41,20 @@ from model_runner import (  # noqa: E402
     apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
-import truth  # noqa: E402  AriL's true-function gates (Common/models, on the same path): every pipeline stage gates on it
+
+
+def _load_truth():
+    """SystolicMesh's ArithmeticLibrary copy of truth.py, by its path (GPNAE's copy may be first on sys.path); registered as truth."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "Common", "models", "truth.py")
+    spec = importlib.util.spec_from_file_location("truth", path)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["truth"] = m  # any later import truth gets this one
+    spec.loader.exec_module(m)
+    return m
+
+
+truth = _load_truth()  # AriL's true-function gates: every pipeline stage gates on them
 
 # Ensure we can import the mesh helpers
 sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
@@ -2748,6 +2761,18 @@ def test_guard_checks_geometry():
         assert rc == 0 and "N=32 TILE=8 LANES=32" in out, out
         rc, out = pkg_guard(fixture_pkg(d, "int8"), "FMT=int8", "LANES=64")
         assert rc != 0 and "LANES=64" in out, out
+
+
+@selftest
+def test_truth_is_systolicmesh_copy():
+    # the gates load SystolicMesh's ArithmeticLibrary copy by path, and GPNAE's copy must be the same bytes
+    sm = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models")
+    gp = os.path.join(ROOT, "GPNAE", "ArithmeticLibrary", "Common", "models")
+    assert os.path.realpath(truth.__file__) == os.path.realpath(os.path.join(sm, "truth.py")), truth.__file__
+    assert sys.modules["truth"] is truth
+    for f in ("truth.py", "test_truth.py"):
+        a, b = open(os.path.join(sm, f), "rb").read(), open(os.path.join(gp, f), "rb").read()
+        assert a == b, f"{f}: SystolicMesh's and GPNAE's ArithmeticLibrary copies differ ({len(a)} and {len(b)} bytes); fast-forward GPNAE's"
 
 
 @selftest

@@ -975,7 +975,7 @@ TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
 INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
-TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "multiplier", "activation", "maxpool", "dropout")
+TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "multiplier", "relu", "activation", "maxpool", "dropout")
 TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
 
@@ -1063,6 +1063,13 @@ def _int8_quant(ents: dict, scales: dict, k: int):
         s_out, z_out = (s_selu, w["zout"]) if a == "selu" else INT8_FIXED_OUT.get(a, (s_in, w["zp"]))
         out[e] = (s_in, w["zp"], s_out, z_out)
     return out
+
+
+def _relu_clamp(w: dict, k: int, e: int) -> "truth.Result":
+    """An int8 ReLU entry is the requantize clamp (sienna_top runs the lane as linear): its minimum must be max(zp, -128), the fused ReLU."""
+    ok = w["amin"] == max(w["zp"], -128)
+    return truth.Result(ok, "int8", "relu clamp", 1, 0.0 if ok else float(w["zp"] - w["amin"]), 0.0, 0, int(not ok), int(not ok), 0, 0, 0,
+                        [] if ok else [(k, e, w["amin"], w["zp"])])
 
 
 def _drop_value(w: dict) -> int:
@@ -1154,6 +1161,12 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
                 if fmt == "int8":
                     if e not in q8:
                         raise RuntimeError(f"truth_scales.json has no scales for set {k} entry {e}")
+                    if func == "relu":  # sienna_top runs int8 ReLU as the requantize clamp: its activation stage is the identity
+                        w = sw["ents"][e]
+                        add("activation relu", truth.gate("int8", "linear", X[m], Aw[m], quant=(1.0, w["zp"], 1.0, w["zp"]))._replace(func="relu"))
+                        if str(e) in scales.get(str(k), {}):  # a calibrated ReLU entry: its clamp must start at its zero point
+                            add("relu clamp", _relu_clamp(w, k, e))
+                        continue
                     add(f"activation {func}", truth.gate("int8", func, X[m], Aw[m], quant=q8[e]))
                 else:
                     add(f"activation {func}", truth.gate(fmt, func, X[m], Aw[m]))
@@ -2867,6 +2880,13 @@ def test_truth_synthetic_dump():
         assert not res[stage].ok and res["_passes"][stage] == {tag}, (plant.__name__, stage, res[stage].ok, res.get("_passes"))
         lines, bad = truth_report(res)
         assert any(x.startswith(f"[FAIL] truth: {stage} ") and f"in passes {tag};" in x for x in bad), (plant.__name__, bad)
+
+
+@selftest
+def test_int8_relu_is_the_clamp():
+    # int8 ReLU: the requantize clamp from the zero point, then an identity activation stage
+    assert _relu_clamp({"amin": 5, "zp": 5}, 0, 0).ok and _relu_clamp({"amin": -128, "zp": -128}, 0, 0).ok
+    assert not _relu_clamp({"amin": -100, "zp": 5}, 3, 2).ok and _relu_clamp({"amin": -100, "zp": 5}, 3, 2).first == [(3, 2, -100, 5)]
 
 
 @selftest

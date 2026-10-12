@@ -190,7 +190,7 @@ G_POST cycle, k moves into a 5-bit buffer written beside `x_buf`, still at no cy
   - The RTL is bit-exact against the model on the 5 gated cases, on threshold cases (a rescale for each t_i that lands
     codes on t_i - 1 and t_i, both signs) and on a 64-scale sweep.
   - Against exact, the model gives 0 of 65,536 dense and 0 of 1,280 gated outside tolerance. This becomes a **hard gate**
-    for sigmoid; tanh is already at 0, and SELU above x = 487.29 stays reported.
+    for sigmoid; tanh is already at 0, and SELU is gated on every int8 set (Task 1.16's block-float post stage; no 487.29 limit).
   - tanh, SELU, the float lanes and `gpnae.sv` give identical outputs (diff empty).
   - Mutants: a threshold off by 1, a ladder starting at 3.5, the positive branch computed as k - 128.
 - **G3.** The mesh does not change. A diff of the SystolicMesh tree confirms it, so G3 does not rerun.

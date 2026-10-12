@@ -148,6 +148,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   SELU's output scale on lane inputs clipped to [-16, 487.29], not [-16, 16]. Lane latency unchanged. The one
   dense-sweep output it changed (x = 5791, s_in = 1/32: 75 -> 76, exact 75.498) comes from DOUBLE rounding on the
   coarser 2^-22 grid, in both branches, not from the floor: the new output is 0.502 LSB from exact, against 0.498.
+- Superseded 2026-10-12 (sienna-int8-residual Task 1.16, Soham's 'fix all lanes'): the int8 SELU post stage is block-float. It multiplies the unrounded r = (q - z_in) * mx (sign from r) in 2^-(shx+18) units, which fit int32 for every legal parameter, and the host sets mout = QM(s_in / (2^7 mx s_out)), saturated to (2^31 - 1, 0) where QM would left-shift. There is no 487.29 limit, no selu_saturates check and no host SELU refusal; the true-function gate (truth.py) passes every int8 set. SELU ROM rows 0-2 are 3451/1238/151. Input scales >= 16 stay refused for every activation until the restructure.
 - D-8 in `gpnae_poly_int8` (2026-10-01): FSM state, counters and valid bits are reset; its data registers (buffers,
   unit operands, element tags, `final_result_o`) load in a reset-free `always_ff`.
 - Requantize drain overlap (5a, 2026-10-01): the requantize pipeline carries per-beat parameters, and the next set's

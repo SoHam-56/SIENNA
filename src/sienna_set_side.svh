@@ -34,3 +34,18 @@ typedef struct packed {
   logic [7:0]                                 add_min;
   logic [7:0]                                 add_max;
 } set_side_t;
+
+// One add set's ADD words as tfliteAdd takes them; every reader names a field, so no bit position is written twice.
+typedef struct packed {
+  logic [7:0]  zp1;
+  logic [7:0]  zp2;
+  logic [31:0] m1;
+  logic [7:0]  s1;
+  logic [31:0] m2;
+  logic [7:0]  s2;
+  logic [31:0] mo;
+  logic [7:0]  so;
+  logic [7:0]  zpo;
+  logic [7:0]  min;
+  logic [7:0]  max;
+} add_words_t;

@@ -2014,7 +2014,7 @@ Run rules (Soham, 2026-10-11, standing): every core of a node, with `make -k -j$
 
 True-function gates (Tasks 1.15a and 1.15b, `truth.py` in ArithmeticLibrary's `Common/models`): every Phase 2 test also passes them, per stage of every pass (matmul within 1% of sum|ab| in the floats and exact in int8 on the int32-wrapped sum, bf16 narrowing, requantize within 1 LSB of round(real), each activation within the waiver against its float64 function, max pooling and dropout exact). The residual ADD stage gets its own gate (Task 2.6), the one stage that is not a true-function gate: spec Decision 1 makes int8 ADD bit-exact to TFLite's reference kernel, and `truth.gate_add` says so where it is defined.
 
-Expected differences against the base tree (9fa414e), with their causes, in every base-against-branch comparison (Tasks 2.2, 2.11, 2.12, and the perf report): bf16 words in tests with a sigmoid, tanh or SELU set, and bf16 cycles in tests with a sigmoid set (Tasks 1.14a and 1.16: `--words-acts sigmoid,tanh,selu --cycles-acts sigmoid`); fp32 words in tests with a tanh set, where tanh(x) = x below T_TINY (Task 1.16: `--words-acts tanh`); int8 words in tests with a sigmoid set (GPNAE's ladder) or a SELU set (Task 1.16's block-float post stage: `--words-acts sigmoid,selu`). Not allowed, since nothing should change: int8 ReLU through the lane (Task 1.16 fixed the lane's standalone ReLU, which SIENNA does not use: it runs int8 ReLU as the requantize clamp) and tfliteRequant's saturating left shift (no change inside TFLite's defined range). Points that exist only on the branch (`pipeline-ck0`, `pipeline-b2b`, `pipeline-ck0-b2b`, `model-ck0`, `gemm-ck0`, `tflite-ck0`, `residual`, `add-lanes`, `rq-lanes`) have no base counterpart: they are gated on their own verdicts, not compared.
+Expected differences against the base tree (9fa414e), with their causes, in every base-against-branch comparison (Tasks 2.2, 2.11, 2.12, and the perf report): bf16 words in tests with a sigmoid, tanh or SELU set, and bf16 cycles in tests with a sigmoid, tanh or SELU set, the shared fp32 tail (Tasks 1.14a and 1.16: `--words-acts sigmoid,tanh,selu --cycles-acts sigmoid,tanh,selu`); fp32 words in tests with a tanh set, where tanh(x) = x below T_TINY (Task 1.16: `--words-acts tanh`); int8 words in tests with a sigmoid set (GPNAE's ladder) or a SELU set (Task 1.16's block-float post stage: `--words-acts sigmoid,selu`). Not allowed, since nothing should change: int8 ReLU through the lane (Task 1.16 fixed the lane's standalone ReLU, which SIENNA does not use: it runs int8 ReLU as the requantize clamp) and tfliteRequant's saturating left shift (no change inside TFLite's defined range). Points that exist only on the branch (`pipeline-ck0`, `pipeline-b2b`, `pipeline-ck0-b2b`, `model-ck0`, `gemm-ck0`, `tflite-ck0`, `residual`, `add-lanes`, `rq-lanes`) have no base counterpart: they are gated on their own verdicts, not compared.
 
 ### Task 2.0: The merge point: a state check of Phase 1 as built, the reference tree and runs (done)
 
@@ -2149,7 +2149,7 @@ ap.add_argument("ref")
 ap.add_argument("new")
 ap.add_argument("--tree", default=None, help="the new run's tree; its PIPELINE_TESTS name the tests an allowance covers")
 ap.add_argument("--words-acts", default="", help="activations whose tests may differ in words, counted (int8: sigmoid; bf16: sigmoid,tanh,selu)")
-ap.add_argument("--cycles-acts", default="", help="activations whose tests may differ in cycles, counted (bf16: sigmoid, spec Decision 5)")
+ap.add_argument("--cycles-acts", default="", help="activations whose tests may differ in cycles, counted (bf16: sigmoid, tanh, SELU: the shared fp32 tail, spec Decision 5)")
 ap.add_argument("--list", action="store_true", help="print the tests --words-acts covers and stop (the control of Task 2.0 Step 5)")
 a = ap.parse_args()
 acts = lambda s: {x for x in s.split(",") if x}
@@ -2306,7 +2306,7 @@ then (login node), with the preamble's expected differences:
 ```bash
 for n in 8 16; do
   python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_bump_fp32_n$n --tree $T --words-acts tanh
-  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_bump_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_bump_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid,tanh,selu
   python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_bump_int8_n$n --tree $T --words-acts sigmoid,selu
 done
 ```
@@ -4003,7 +4003,7 @@ Expected: every `res_g4_pts` run ends `points PASS` (int8 now with 5 kinds per (
 ```bash
 for n in 8 16; do
   python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_g4_fp32_n$n --tree $T --words-acts tanh
-  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_g4_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_g4_bf16_n$n --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid,tanh,selu
   python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_g4_int8_n$n --tree $T --words-acts sigmoid,selu
 done
 ```
@@ -4131,7 +4131,7 @@ Before giving an ETA, ssh to each node and check whether it compiles or simulate
 ```bash
 for n in 32 64; do
   python3 $J/cmds/res_cmp_points.py rs2_base_fp32_n$n rs2_n${n}_fp32 --tree $T --words-acts tanh
-  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_n${n}_bf16 --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid
+  python3 $J/cmds/res_cmp_points.py rs2_base_bf16_n$n rs2_n${n}_bf16 --tree $T --words-acts sigmoid,tanh,selu --cycles-acts sigmoid,tanh,selu
   python3 $J/cmds/res_cmp_points.py rs2_base_int8_n$n rs2_n${n}_int8 --tree $T --words-acts sigmoid,selu
   python3 $J/cmds/res_cmp_points.py rs2_base_ck0_int8_$n rs2_n${n}_ck0_int8 --tree $T --words-acts sigmoid,selu
   for f in fp32 bf16 int8; do command diff <(command grep -E "^$f/N${n}_" $J/runs/rs2_base_${f}_n$n/stdout.log) <(command grep -E "^$f/N${n}_" $J/runs/rs2_n${n}_$f/stdout.log | command grep -vE '/(residual|pipeline-b2b|model-ck0|gemm-ck0|tflite-ck0): '); done

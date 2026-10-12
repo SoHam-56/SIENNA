@@ -739,6 +739,12 @@ module TB_sienna_top #(
       failed++;
       $display("  [FAIL]     [%0d] exp=NONE  act=0x%h", i, actual_results[i]);
     end
+
+    // An empty golden compares nothing, so the pass fails even with nothing captured
+    if (n_exp == 0) begin
+      failed++;
+      $display("  [FAIL]     no expected words: an empty golden is no reference");
+    end
   endtask
 
   // ── File and Console Output Monitors ──────────────────────────────────

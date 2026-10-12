@@ -15,6 +15,7 @@ SystolicMesh/ArithmeticLibrary/Adders/Int/src/intAdder.sv
 SystolicMesh/ArithmeticLibrary/Converters/FPNarrow/src/fpNarrow.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Fx/src/fxMac.sv
 SystolicMesh/ArithmeticLibrary/Requant/src/tfliteRequant.sv
+SystolicMesh/ArithmeticLibrary/Add/src/tfliteAdd.sv
 SystolicMesh/src/engine/ProcessingElement.sv
 SystolicMesh/src/engine/AccumulationUnit.sv
 SystolicMesh/src/mem/MeshOutputSram.sv

@@ -438,6 +438,11 @@ def _generate_vectors_int8(cfg: dict) -> None:
             _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F))
             if k == 0:
                 first = (parts[0][0], parts[0][1], hw_bias, rq_k)
+            if k == 1:  # the back-to-back pass: set 1 alone, not partial, with its own bias, requantize words and activation
+                Fb = _golden_int8([parts[i]], hw_bias if i == 0 else np.zeros(N, np.int64), rq_k, cfg,
+                                  mixed[1 % len(mixed)] if mixed else act_type, set_dropout_seed(drop_seed, 1))[4]
+                _write_s8(os.path.join(TB_DIR, "expected_b2b.mem"), Fb)
+                _write_s8(os.path.join(TB_DIR, "bound_b2b.mem"), np.zeros_like(Fb))
     # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
     a0, b0, hb0, rq0 = first
     C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)
@@ -457,7 +462,7 @@ def _check_mem_widths(fmt: str, num_sets: int) -> None:
     """Every operand, bias and expected word the TB reads must be the format's width: a stale fp32 file would be truncated."""
     d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4  # int8: operands and results 2 digits; int32 bias and requantize words 8
     per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
-    names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output")]
+    names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output", "expected_b2b", "bound_b2b")]
     names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
     names += [] if fmt == "int8" else ["expected_accum.mem"]  # int8's accumulate pass reads its group's own golden
     for fn in names:
@@ -674,6 +679,8 @@ def _generate_vectors_packed(cfg: dict) -> None:
         _write_pack(os.path.join(TB_DIR, f"pack_{k}.mem"), sh, mp, ents)
     for name in ("matrix_west", "matrix_north", "expected_output", "bound_output"):  # the single-set pass runs set 0
         shutil.copy(os.path.join(TB_DIR, f"{name}_0.mem"), os.path.join(TB_DIR, f"{name}.mem"))
+    for name in ("expected", "bound"):  # the back-to-back pass runs set 1 alone; packed sets never accumulate
+        shutil.copy(os.path.join(TB_DIR, f"{name}_output_1.mem"), os.path.join(TB_DIR, f"{name}_b2b.mem"))
     if fmt == "int8":
         with open(TRUTH_SCALES, "w") as fh:
             json.dump(scales, fh)
@@ -811,6 +818,16 @@ def generate_vectors(cfg: dict) -> None:
                 fp32_error_bound(run_s if passes > 1 else Sk, N * passes, cfg, act_k,
                                  run if passes > 1 else (_ref_matmul(Ak, Bk) + bk).astype(np.float32))
             write_mem(os.path.join(TB_DIR, f"bound_output_{k}.mem"), Bnd)
+        if k == 1:  # the back-to-back pass: set 1 alone, not partial, with its own bias (a group's first pass only) and activation
+            seed1 = set_dropout_seed(drop_seed, 1)
+            if exact:
+                Fb = _golden_bits([(fmt_bits(Ak, fmt), fmt_bits(Bk, fmt))], bbk if use_bias and k % passes == 0 else None, cfg, act_k, seed1, fmt)[3]
+                write_bits(os.path.join(TB_DIR, "expected_b2b.mem"), Fb, fmt)
+                write_bits(os.path.join(TB_DIR, "bound_b2b.mem"), np.zeros_like(Fb), fmt)
+            else:
+                C1 = (_ref_matmul(Ak, Bk) + bk).astype(np.float32)
+                write_mem(os.path.join(TB_DIR, "expected_b2b.mem"), _golden_from_c(C1, cfg, act_k, seed1)[3])
+                write_mem(os.path.join(TB_DIR, "bound_b2b.mem"), fp32_error_bound(Sk, N, cfg, act_k, C1))
         if cfg.get("training", False) and not partial:  # the set's keep decisions, not Fk != 0: an output already zero is not a drop
             keep = dropout_keep(Fk.size, cfg.get("dropout_p", 0.5), set_dropout_seed(drop_seed, k), cfg.get("lanes", 32))
             if (Fk.flatten()[~keep] != 0).any():
@@ -2873,6 +2890,71 @@ def test_truth_synthetic_dump():
         assert not res[stage].ok and res["_passes"][stage] == {tag}, (plant.__name__, stage, res[stage].ok, res.get("_passes"))
         lines, bad = truth_report(res)
         assert any(x.startswith(f"[FAIL] truth: {stage} ") and f"in passes {tag};" in x for x in bad), (plant.__name__, bad)
+
+
+def _tb_b2b_files() -> tuple:
+    """The expected and bound files TB_sienna_top's back-to-back pass reads."""
+    src = open(os.path.join(ROOT, "testbenches", "TB_sienna_top.sv")).read()
+    blk = src[src.index("[STAGE] BACK TO BACK"):]
+    blk = blk[:blk.index("collect_outputs")]
+    get = lambda q: re.search(r'read_mem_file\("([^"]+)",\s*' + q + r"\)", blk).group(1)
+    return get("expected_results"), get("bound_results")
+
+
+def _set1_alone(cfg: dict, fmt: str) -> tuple:
+    """Set 1 as the back-to-back pass drives it, from its files in TB_DIR: alone, not partial; (golden words, fp32 bound or None)."""
+    knobs, N = _tb_knobs(), cfg["n"]
+    sw = _set_words(1, knobs, N, fmt)
+    act, seed = sw["ents"][0]["act"], set_dropout_seed(knobs["dropout_seed"], 1)
+    biased = knobs["has_bias"] != 0 and 1 % knobs["accum_passes"] == 0  # apply_bias: only a group's first pass sends its bias
+    A, B = _tb_words("matrix_west_1.mem"), _tb_words("matrix_north_1.mem")
+    if fmt == "int8":
+        rq = dict(sw["ents"][0], mult=sw["mult"], shift=sw["shift"])
+        hb = _sx(_tb_words("bias_1.mem"), 32) if biased else np.zeros(N, np.int64)
+        return np.asarray(_golden_int8([(_sx(A, 8), _sx(B, 8))], hb, rq, cfg, act, seed)[4]).ravel() & 0xFF, None
+    if fmt != "fp32":
+        bb = _tb_words("bias_1.mem") if biased else None
+        return np.asarray(_golden_bits([(A, B)], bb, cfg, act, seed, fmt)[3]).ravel(), None
+    A, B = _pad_square(A, N).astype(np.uint32).view(np.float32), _pad_square(B, N).astype(np.uint32).view(np.float32)
+    b = _tb_words("bias_1.mem").astype(np.uint32).view(np.float32) if biased else np.zeros(N, np.float32)
+    C = (_ref_matmul(A, B) + b).astype(np.float32)
+    S = np.abs(A).astype(np.float64) @ np.abs(B).astype(np.float64) + np.abs(b)
+    F = np.asarray(_golden_from_c(C, cfg, act, seed)[3], np.float32).ravel().view(np.uint32).astype(np.int64)
+    return F, np.asarray(fp32_error_bound(S, N, cfg, act, C), np.float32).ravel().view(np.uint32).astype(np.int64)
+
+
+@selftest
+def test_b2b_golden_is_set1_alone():
+    # the back-to-back pass runs set 1 alone, not partial, so its golden is set 1's own, never its accumulate group's sum
+    exp_f, bnd_f = _tb_b2b_files()
+    g = globals()
+    saved = {k: g[k] for k in ("TB_DIR", "RESULTS_DIR", "TRUTH_DUMP", "TRUTH_SCALES")}
+    ran, acc = 0, 0
+    for fmt in FORMATS:
+        for t in [x for x in PIPELINE_TESTS if fmt in x.get("formats", tuple(FORMATS))]:
+            with tempfile.TemporaryDirectory() as d:
+                g.update(TB_DIR=d, RESULTS_DIR=os.path.join(d, "results"), TRUTH_DUMP=os.path.join(d, "truth_dump.txt"),
+                         TRUTH_SCALES=os.path.join(d, "truth_scales.json"))
+                try:
+                    cfg = {"n": 8, "tile_size": 2, "lanes": 32, "host_words": 8, "fmt_name": fmt, **t}
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        generate_vectors(cfg)
+                    got = _tb_words(exp_f)
+                    if t.get("packed"):  # packed sets never accumulate: set 1 alone is the stream's set 1
+                        want, bnd = _tb_words("expected_output_1.mem"), _tb_words("bound_output_1.mem")
+                    else:
+                        want, bnd = _set1_alone(cfg, fmt)
+                    n_bad = int((got != want).sum()) if got.size == want.size else -1
+                    assert n_bad == 0, (fmt, t["name"], exp_f, f"{n_bad} of {want.size} words differ (-1: {got.size} words, want {want.size})")
+                    if bnd is not None:
+                        gb = _tb_words(bnd_f)
+                        assert gb.size == bnd.size and (gb == bnd).all(), (fmt, t["name"], bnd_f, "bound differs")
+                    ran += 1
+                    acc += t.get("accum_passes", 1) > 1
+                finally:
+                    g.update(saved)
+    runs = [x for f in FORMATS for x in PIPELINE_TESTS if f in x.get("formats", tuple(FORMATS))]
+    assert ran == len(runs) and acc == sum(x.get("accum_passes", 1) > 1 for x in runs) >= 20, (ran, acc)
 
 
 @selftest

@@ -1701,8 +1701,8 @@ module TB_sienna_top #(
       // A different matrix with its own golden, so a replayed first result cannot pass.
       read_mem_file("matrix_west_1.mem", west_data_queue);
       read_mem_file("matrix_north_1.mem", north_data_queue);
-      read_mem_file("expected_output_1.mem", expected_results);
-      read_mem_file("bound_output_1.mem", bound_results);
+      read_mem_file("expected_b2b.mem", expected_results);  // set 1 alone, not its accumulate group's sum
+      read_mem_file("bound_b2b.mem", bound_results);
       dropout_seed_i = set_seed(1);
       activation_function_i = act_of(1);
       apply_bias(1);

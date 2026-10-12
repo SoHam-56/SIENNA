@@ -1295,7 +1295,7 @@ def build_order(tests: list, N: int, T: int, lanes: int, fmt: str) -> list:
 def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 4, lanes: int = 32, build: bool = True) -> tuple:
     t0 = time.time()
     process = subprocess.Popen(
-        ["make", "verilator" if build else "sim", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}",
+        ["make", "verilator" if build else "sim", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}", f"COLLAPSE_K={mr.COLLAPSE_K}",
          "GEN_PKG=0"],  # GEN_PKG=0: build the package this test just wrote, in its format and geometry
         cwd=ROOT,
         stdout=subprocess.PIPE,
@@ -2746,6 +2746,18 @@ def test_guard_checks_geometry():
 
 
 @selftest
+def test_guard_checks_collapse_k():
+    with tempfile.TemporaryDirectory() as d:
+        ck0 = fixture_pkg(d, "bf16", edit={"COLLAPSE_K": 0})
+        rc, out = pkg_guard(ck0, "FMT=bf16")
+        assert rc != 0 and "COLLAPSE_K=0, but the build asks for COLLAPSE_K=1" in out, out
+        rc, out = pkg_guard(ck0, "FMT=bf16", "COLLAPSE_K=0")
+        assert rc == 0, out
+        rc, out = pkg_guard(fixture_pkg(d, "bf16", drop=("COLLAPSE_K",)), "FMT=bf16")
+        assert rc != 0 and "COLLAPSE_K=missing" in out, out
+
+
+@selftest
 def test_guard_missing_file():
     with tempfile.TemporaryDirectory() as d:
         rc, out = pkg_guard(os.path.join(d, "none.sv"), "FMT=fp32")
@@ -2756,9 +2768,12 @@ def test_guard_missing_file():
 def test_parse_time_rejections():
     r = make_n("pipeline", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
-    for t in ("pipeline", "regression", "verilator", "lint", "pkg", "pack"):
+    for t in ("regression", "pack", "gemm", "model", "tflite", "perf-analysis"):
         r = make_n(t, "COLLAPSE_K=0")
-        assert r.returncode != 0 and "needs a testbench that sets sienna_top's COLLAPSE_K" in r.stderr, (t, r.stderr)
+        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top only" in r.stderr, (t, r.stderr)
+    for t in ("pipeline", "verilator", "lint", "pkg", "sim", "build-key"):  # TB_sienna_top sets sienna_top's COLLAPSE_K from the package
+        r = make_n(t, "COLLAPSE_K=0")
+        assert "COLLAPSE_K=0 reaches" not in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
     assert r.returncode != 0 and "Invalid COLLAPSE_K=2" in r.stderr, r.stderr
     for t in ("help", "sm-verilator"):  # the only targets collapse-k 0 is meaningful for, or harmless in
@@ -2781,14 +2796,17 @@ def test_regression_points():
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 12 and len(full) == len(set(full)) == 1 + 18 * 12, (len(small), len(full))
+    assert len(small) == len(set(small)) == 1 + 7 * 15 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 3, (len(small), len(full))
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
-        for n, t in sweep(full):
-            assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == kinds, (f, n, t)
+        for n, t in sweep(full):  # collapse-k 0: the pipeline at N = 8 and 16 (TB_sienna_top's COLLAPSE_K); packing needs collapse-k 1
+            want = kinds[:1] + (["pipeline-ck0"] if n <= 16 else []) + kinds[1:]
+            assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
+    assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
     assert SPEC.points(True, ["int8"]) == ["selftest"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
-                "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu"):
+                "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
+                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0"):
         try:
             SPEC.parse(bad)
         except ValueError:
@@ -2805,6 +2823,9 @@ def test_point_commands():
     assert SPEC.argv("int8/N32_T8/gemm", opts) == ["make", "gemm", *at("int8", 32, 8, 32), "QUICK=1"]
     assert SPEC.argv("int8/N8_T2/tflite", opts) == ["make", "tflite", *at("int8", 8, 2, 32)] and SPEC.argv("fp32/N16_T2/pack", opts)[1] == "pack"
     assert SPEC.argv("selftest", opts)[1:] == ["regression.py", "--action", "selftest"]
+    assert SPEC.argv("bf16/N16_T4/pipeline-ck0", opts) == ["make", "pipeline", *at("bf16", 16, 4, 32), "COLLAPSE_K=0"]
+    r = make_n("pipeline", "FMT=int8", "N=8", "TILE=2", "COLLAPSE_K=0", "PYTHON=py")
+    assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr
     saved = {k: os.environ.get(k) for k in ("GPNAE_MODEL", "TEST", "N", "LINK_STAGES")}
     os.environ.update(GPNAE_MODEL="hw", TEST="selu", N="32", LINK_STAGES="1")
     try:
@@ -2830,6 +2851,7 @@ def test_point_commands():
 @selftest
 def test_point_verdicts():
     n32 = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS))])  # every fp32 pipeline test
+    n32p = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS)) and t.get("packed")])  # collapse-k 0 skips these
     clean = (f"  TRUTH: {n32} tests gated, 0 with misses\n\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n"
              f"  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n")
     plain = regress.ANSI.sub("", clean)
@@ -2859,7 +2881,9 @@ def test_point_verdicts():
              + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n", 0, "PASS"),
             ("bf16/N8_T2/gemm", "grid_1x8x8 1\n  layer_tanh: 0 outputs differ from the bit-exact model\n", 0, "FAIL (no '  layer_sigmoid: 0 outputs differ from the bit-exact model')"),
             ("int8/N8_T2/gemm", "GEMM int8: 0 cases\n", 0, "FAIL (no 'grid_\\d+x\\d+x\\d+ ')"), ("fp32/N8_T2/gemm", "grid_1x8x8 1\nFAIL grid_1x8x8: error\n", 0, "FAIL (log: FAIL grid_1x8x8: error)"),
-            ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')")):
+            ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')"),
+            ("fp32/N8_T2/pipeline-ck0", plain.replace(str(n32), str(n32 - n32p)), 0, "PASS"),
+            ("fp32/N8_T2/pipeline-ck0", plain, 0, f"FAIL ({n32} tests ran, fp32 has {n32 - n32p})")):
         got = v(p, text, rc)
         assert got == want, (p, text, rc, got, want)
 
@@ -2966,6 +2990,8 @@ def test_regression_target():
         assert all("--results " in x and "--model-dir=/m" in x and "--run " in x and x.rstrip().endswith("--keep-going") for x in lines if "--action point " in x), lines[:2]
         assert "--action summary" in lines[-1] and "--run " in lines[-1] and ("--small" in lines[-1]) == ("SMALL=1" in args), lines[-1]
         assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
+    small = [x.split("--name ")[1].split()[0] for x in recipe("regression", "SMALL=1", "MODEL_DIR=/m") if "--action point " in x]
+    assert [p for p in small if p.endswith("-ck0")] == [f"{f}/N{n}_T{t}/pipeline-ck0" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)]
     one = recipe("regression/fp32/N8_T2/pipeline")
     assert len(one) == 1 and "--name fp32/N8_T2/pipeline" in one[0] and "--keep-going" not in one[0] and "--run" not in one[0], one
     s = recipe("regression-summary", "SMALL=1")
@@ -3612,7 +3638,8 @@ def _engine():
 
 
 regress = _engine()
-KINDS = ("pipeline", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8 (int8's models)
+KINDS = ("pipeline", "pipeline-ck0", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
+CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
 
@@ -3631,20 +3658,25 @@ class SiennaSpec(regress.Spec):
         if not formats:
             return []
         return ["selftest"] + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
-                               for t in pow2_tile_sizes(n) for k in KINDS if (k != "model" or f != "int8") and (k != "tflite" or f == "int8")]
+                               for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)]
+
+    @staticmethod
+    def _offered(f, n, k):
+        """model in fp32 and bf16, tflite in int8, pipeline-ck0 at CK0_SIZES."""
+        return (k != "model" or f != "int8") and (k != "tflite" or f == "int8") and (k != "pipeline-ck0" or n in CK0_SIZES)
 
     def parse(self, name):
         if name == "selftest":
             return {"n": 0, "kind": "selftest"}
-        m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z]+)", name)
+        m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z0-9-]+)", name)
         if not m or m.group(1) not in FORMATS or m.group(4) not in KINDS:
             raise ValueError(f"{name}: points are selftest and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
         f, n, t, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
-        if k == "model" and f == "int8" or k == "tflite" and f != "int8":
-            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8")
-        return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k}
+        if not self._offered(f, n, k):
+            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, pipeline-ck0 at N = {', '.join(map(str, CK0_SIZES))}")
+        return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if k.endswith("-ck0") else 1}
 
     def env(self, name, env):
         if self.parse(name)["kind"] in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
@@ -3655,8 +3687,9 @@ class SiennaSpec(regress.Spec):
         p, py = self.parse(name), sys.executable
         if p["kind"] == "selftest":
             return [py, "regression.py", "--action", "selftest"]
-        mk = ["make", p["kind"], f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
-        return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(p["kind"], [])
+        mk = ["make", p["kind"].removesuffix("-ck0"), f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
+        return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"],
+                     "pipeline-ck0": ["COLLAPSE_K=0"]}.get(p["kind"], [])
 
     def verdict(self, name, text, rc):
         k = self.parse(name)["kind"]
@@ -3666,7 +3699,7 @@ class SiennaSpec(regress.Spec):
         text = regress.ANSI.sub("", text)
         if k == "selftest":
             return regress.marker_verdict(text, rc, (r"^ALL \d+ PASSED$",))
-        if k == "pipeline":
+        if k in ("pipeline", "pipeline-ck0"):
             m = re.findall(r"^\s*Passed\s*:\s*(\d+)\s*/\s*(\d+)\s*$", text, re.M)
             g = re.findall(r"^\s*TRUTH: (\d+) tests gated, (\d+) with misses$", text, re.M)
             miss = sorted(set(re.findall(r"\[FAIL\] truth: (\S+)", text)))
@@ -3675,7 +3708,8 @@ class SiennaSpec(regress.Spec):
             if not m or "Sanity Clean" not in text:
                 return "FAIL (no 'Passed : X / X' with Sanity Clean)"
             x, y = map(int, m[-1])
-            want = len([t for t in PIPELINE_TESTS if self.parse(name)["fmt"] in t.get("formats", tuple(FORMATS))])  # collapse-k 1 runs them all
+            want = len([t for t in PIPELINE_TESTS if self.parse(name)["fmt"] in t.get("formats", tuple(FORMATS))
+                        and not (k == "pipeline-ck0" and t.get("packed"))])  # collapse-k 1 runs them all, collapse-k 0 all but the packed
             if x != y or y == 0:
                 return f"FAIL ({x} of {y} tests passed)"
             if y != want:

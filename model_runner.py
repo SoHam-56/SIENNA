@@ -929,6 +929,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
         ("DROPOUT_SEED", drop_seed, "int"),
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
+        ("COLLAPSE_K", COLLAPSE_K, "int"),  # TB_sienna_top sets sienna_top's mesh mode from it: a build item, not a run-time knob
     ]
 
 

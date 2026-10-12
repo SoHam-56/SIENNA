@@ -36,13 +36,13 @@ ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
-# COLLAPSE_K is 0 or 1, and 0 only for sm-verilator: TB_sienna_top passes only LINK_STAGES (and FAULT) to sienna_top, so -G cannot reach sienna_top's.
+# COLLAPSE_K is 0 or 1; TB_sienna_top takes it from the package (make pkg, the guard checks it), sienna_layer's runs and make regression's points do not take it.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
-ifneq ($(filter-out sm-verilator help default,$(or $(MAKECMDGOALS),default)),)
-$(error COLLAPSE_K=0: TB_sienna_top builds sienna_top's default collapse-k 1; a collapse-k 0 SIENNA build needs a testbench that sets sienna_top's COLLAPSE_K)
+ifneq ($(filter model gemm tflite pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
+$(error COLLAPSE_K=0 reaches TB_sienna_top only (pipeline, pkg, verilator, sim, lint and the like): sienna_layer's model, gemm, tflite and pack runs build collapse-k 1, and make regression's points choose their own (<fmt>/N<n>_T<t>/pipeline-ck0))
 endif
 endif
 
@@ -272,7 +272,7 @@ help:
 	@echo "Precision (one variable for every build and run):"
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1); 0 only for sm-verilator, as TB_sienna_top builds 1"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top and sm-verilator; sienna_layer's runs build 1"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"
@@ -401,7 +401,13 @@ pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 		echo "       The package was written for another geometry: run make pkg with these N, TILE, LANES, or pass the package's."; \
 		exit 1; \
 	fi; \
-	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent} ACC_W=$$a OUT_W=$$o"
+	c=$$(field COLLAPSE_K); \
+	if [ "$$c" != "$(COLLAPSE_K)" ]; then \
+		echo "ERROR: $(PKG_FILE) has COLLAPSE_K=$${c:-missing}, but the build asks for COLLAPSE_K=$(COLLAPSE_K)."; \
+		echo "       The package is for the other mesh mode or predates it: run make pkg with this COLLAPSE_K, or pass the package's."; \
+		exit 1; \
+	fi; \
+	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent} ACC_W=$$a OUT_W=$$o"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top

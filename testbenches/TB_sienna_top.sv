@@ -184,6 +184,7 @@ module TB_sienna_top #(
 
   // ── DUT ───────────────────────────────────────────────────────────────
   sienna_top #(
+      .COLLAPSE_K       (COLLAPSE_K),  // the package's mesh mode: 1 full-depth tiles, 0 depth slices and the reduce tree
       .NUM_LANES        (NUM_LANES),
       .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
       .N                (N),

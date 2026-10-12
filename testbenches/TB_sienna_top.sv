@@ -129,7 +129,8 @@ module TB_sienna_top #(
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
-  // Truth dump: every stage's words of each streaming pass (S1, S2, ...) and of the accumulate pass (A), for regression.py's true-function gates.
+  // Truth dump: every stage's words of the single-set pass (P0), the back-to-back pass (B2B, when built), each streaming pass (S1, S2, ...)
+  // and the accumulate pass (A), for regression.py's true-function gates.
   localparam int TR_IDS = 1 << ID_W;
   integer tr_fd;
   bit tr_on = 0;  // the pass running is dumped
@@ -815,7 +816,14 @@ module TB_sienna_top #(
   function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
     return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
   endfunction
-  initial tr_fd = $fopen("../testbenches/truth_dump.txt", "w");
+  initial begin
+    tr_fd = $fopen("../testbenches/truth_dump.txt", "w");
+`ifdef BACK_TO_BACK
+    if (tr_fd) $fdisplay(tr_fd, "H b2b 1");  // the passes this build runs: regression.py requires each one's lines
+`else
+    if (tr_fd) $fdisplay(tr_fd, "H b2b 0");
+`endif
+  end
   initial begin : tr_monitor  // one process writes every monitor variable, on the falling edge
     int wn[SRAM_DEPTH];  // results of the pass written so far, per element
     int beat[TR_IDS];  // beats of each set id read from the mesh so far
@@ -1660,6 +1668,10 @@ module TB_sienna_top #(
     training_mode_i       = k_training_mode[0];
     dropout_seed_i        = set_seed(0);
     @(posedge clk_i);
+    tr_cur_k = 0;  // set 0 alone
+    tr_pass = "P0";
+    tr_seq++;
+    tr_on = 1;
     host_put();
     $display("  start pulse sent @ %0t", $time);
     print_status("immediately after start");
@@ -1667,6 +1679,7 @@ module TB_sienna_top #(
 
     collect_outputs();
     verify_outputs();
+    tr_on = 0;
 
 `ifdef BACK_TO_BACK
     // Run a second, distinct matrix WITHOUT asserting reset. Anything that carries state
@@ -1704,6 +1717,10 @@ module TB_sienna_top #(
       @(posedge clk_i);
       $display("  [B2B] gate before put: state=%0d north_empty=%0b west_empty=%0b credits=%0d",
                dut_stage, dut.north_queue_empty, dut.west_queue_empty, host_cnt);
+      tr_cur_k = 1;  // set 1 alone
+      tr_pass = "B2B";
+      tr_seq++;
+      tr_on = 1;
       host_put();
       $display("  [B2B] gate at put    : state=%0d north_empty=%0b west_empty=%0b",
                dut_stage, dut.north_queue_empty, dut.west_queue_empty);
@@ -1712,6 +1729,7 @@ module TB_sienna_top #(
 
       collect_outputs();
       verify_outputs();
+      tr_on = 0;
 
       // $time evaluates in the 1ns timeunit (a 10ns clock is 10 units), even though %0t prints ps.
       $display(" BACK_TO_BACK second-pass cycles : %0d", ($time - t_second_start) / 10);

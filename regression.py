@@ -967,8 +967,9 @@ def dump_hardware_trace(
 # PART 2b: TRUE-FUNCTION GATES PER STAGE (truth.py)
 # =============================================================================
 # Each stage of a pipeline test is judged against the true function of the words that stage actually received, from
-# TB_sienna_top's truth dump of every streaming pass (S1..S4: plain, credit overrun, after a reset, the output hold) and the
-# accumulate pass (A). The TB's bit-exact (or fp32 tolerance) compare of the outputs stays as a diagnostic, still required.
+# TB_sienna_top's truth dump of every pass: the single-set pass (P0), the back-to-back pass (B2B, in a -DBACK_TO_BACK build), each
+# streaming pass (S1..S4: plain, credit overrun, after a reset, the output hold) and the accumulate pass (A). The TB's bit-exact
+# (or fp32 tolerance) compare of the outputs stays as a diagnostic, still required.
 
 TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
@@ -1000,6 +1001,9 @@ def read_truth_dump(path: str, lanes: int) -> dict:
         for ln in fh:
             t = ln.split()
             if not t:
+                continue
+            if t[0] == "H":  # the build's passes
+                d.setdefault("_hdr", {})[t[1]] = int(t[2])
                 continue
             g = d.setdefault(t[1], {"M": {}, "X": {}, "A": {}, "P": {}, "D": {}})
             if t[0] == "M":
@@ -1035,10 +1039,12 @@ def _set_words(k: int, knobs: dict, N: int, fmt: str) -> dict:
         for e in range(1, PACK_ENTRIES):
             o = 1 + N // 2 + 9 * (e - 1)
             ents[e] = {"act": ACT_NAMES.get(int(pk[o]) & 7, "linear"), "zp": int(_sx(pk[o + 1], 8)), "amin": int(_sx(pk[o + 2], 8)),
-                       "amax": int(_sx(pk[o + 3], 8)), "zout": int(_sx(pk[o + 8], 8))}
+                       "amax": int(_sx(pk[o + 3], 8)), "mx": int(pk[o + 4] & 0xFFFF), "shx": int(pk[o + 5] & 0x1F),
+                       "mout": int(pk[o + 6] & 0xFFFFFFFF), "shout": int(_sx(pk[o + 7], 8)), "zout": int(_sx(pk[o + 8], 8))}
     if fmt == "int8":
         rq = _tb_words(f"requant_{k}.mem")
-        ents[0].update(zp=int(_sx(rq[0], 8)), amin=int(_sx(rq[1], 8)), amax=int(_sx(rq[2], 8)), zout=int(_sx(rq[7], 8)))
+        ents[0].update(zp=int(_sx(rq[0], 8)), amin=int(_sx(rq[1], 8)), amax=int(_sx(rq[2], 8)), mx=int(rq[3] & 0xFFFF), shx=int(rq[4] & 0x1F),
+                       mout=int(rq[5] & 0xFFFFFFFF), shout=int(_sx(rq[6], 8)), zout=int(_sx(rq[7], 8)))
         mult, shift = rq[8:8 + N] & 0xFFFFFFFF, _sx(rq[8 + N:8 + 2 * N], 8)
     else:
         mult = shift = None
@@ -1050,8 +1056,8 @@ def _int8_quant(ents: dict, scales: dict, k: int):
     out = {}
     for e, w in ents.items():
         sc = scales.get(str(k), {}).get(str(e))
-        if sc is None:
-            continue
+        if sc is None:  # a set the generator calibrated no lane for (P0's or B2B's partial): the scales its words encode
+            sc = [w["mx"] * 2.0 ** -w["shx"] / 2048, 2.0 ** (9 - w["shout"]) / w["mout"] if w["mout"] else np.inf]
         s_in, s_selu = sc
         a = w["act"]
         s_out, z_out = (s_selu, w["zout"]) if a == "selu" else INT8_FIXED_OUT.get(a, (s_in, w["zp"]))
@@ -1078,7 +1084,10 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
     if not os.path.exists(TRUTH_DUMP):
         raise RuntimeError(f"no truth dump at {TRUTH_DUMP}")
     dump = read_truth_dump(TRUTH_DUMP, lanes)
-    want = set(TRUTH_STREAMS) | (set() if knobs["packed"] else {"A"})  # the TB skips the accumulate pass for packed sets
+    hdr = dump.pop("_hdr", {})
+    if "b2b" not in hdr:
+        raise RuntimeError("truth dump: no 'H b2b' line")
+    want = {"P0"} | set(TRUTH_STREAMS) | ({"B2B"} if hdr["b2b"] else set()) | (set() if knobs["packed"] else {"A"})  # no A for packed sets
     if set(dump) != want:
         raise RuntimeError(f"truth dump: passes {sorted(dump)}, the TB runs {sorted(want)}")
     scales = json.load(open(TRUTH_SCALES)) if fmt == "int8" else {}
@@ -1091,8 +1100,9 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
         res.setdefault(name, []).append(r)
         if not r.ok:
             res.setdefault("_passes", {}).setdefault(name, set()).add(tag)
+    alone = {"P0": 0, "B2B": 1}  # the single-set and back-to-back passes put set 0 and set 1 alone, from their own files
     for tag, g in sorted(dump.items()):
-        acts = [k for k in range(K) if k % P == P - 1] if tag.startswith("S") else [P - 1]
+        acts = [k for k in range(K) if k % P == P - 1] if tag.startswith("S") else [alone[tag]] if tag in alone else [P - 1]
         M = _full(g["M"], len(acts), f"pass {tag}'s results")
         for r, k in enumerate(acts):
             sw = _set_words(k, knobs, N, fmt)
@@ -1102,15 +1112,22 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
             post = np.array([b for _, b in pairs], dtype=np.int64)
             # matmul: the sum of the group's passes as the host sent them, the bias with the first, a packed set's blocks alone
             passes = []
-            for j in range(k - P + 1, k + 1):
-                A, B = _tb_words(f"matrix_west_{j}.mem").reshape(N, N), _tb_words(f"matrix_north_{j}.mem").reshape(N, N)
+            if tag == "P0":  # matrix_west.mem; B from cache tile 0 when cached
+                files = [("matrix_west.mem", "matrix_north_0.mem" if knobs["weight_cache"] else "matrix_north.mem")]
+            elif tag == "B2B":
+                files = [("matrix_west_1.mem", "matrix_north_1.mem")]
+            else:
+                files = [(f"matrix_west_{j}.mem", f"matrix_north_{j}.mem") for j in range(k - P + 1, k + 1)]
+            for fw, fn in files:
+                A, B = _tb_words(fw).reshape(N, N), _tb_words(fn).reshape(N, N)
                 if sw["sh"]:
                     b = N >> sw["sh"]
                     B = np.where(np.kron(np.eye(N // b), np.ones((b, b))).astype(bool), B, 0)
                 passes.append((A, B))
             bias = None
-            if knobs["has_bias"]:
-                bw = _tb_words(f"bias_{k - P + 1}.mem")[:N]
+            first = k if tag in alone else k - P + 1  # apply_bias: the bias rides on a set k with k % P == 0
+            if knobs["has_bias"] and first % P == 0:
+                bw = _tb_words(f"bias_{first}.mem")[:N]
                 bias = bw if fmt != "bf16" else truth.encode("fp32", truth.values("bf16", bw))  # the TB widens the row exactly
             add("matmul", truth.gate_matmul(fmt, passes, pre.reshape(N, N), bias))
             if fmt == "bf16":
@@ -1165,7 +1182,7 @@ def truth_report(res: dict) -> tuple:
                  (f" ({r.worst_lsb} LSB)" if r.fmt == "int8" else "")}.get(name.split()[0], lambda: f"|out - want| {r.worst:.6g}")()
             where = ", ".join(sorted(res.get("_passes", {}).get(name, ())))
             bad.append(f"[FAIL] truth: {name.replace(' ', '/')} {w}, {r.over} of {r.n} over the bound in passes {where}; first: {r.first[:3]}")
-    lines.append(f"        {res.get('_npass', 0)} passes gated ({', '.join(TRUTH_STREAMS)} and the accumulate pass A unless packed)")
+    lines.append(f"        {res.get('_npass', 0)} passes gated (P0, B2B when built, {', '.join(TRUTH_STREAMS)}, and A unless packed)")
     if "_mask" in res:
         lines.append(f"        diagnostic: dropout's keep decisions differ from regression.py's LFSR model in {sum(res['_mask'])} windows")
     return lines, bad

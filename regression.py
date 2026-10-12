@@ -1412,6 +1412,7 @@ def _parse_log(raw: str) -> dict:
         "tol": tol,
         "failed": fail,
         "cyc": ex(r"asserted @ \d+\s+\((\d+) cycles\)"),
+        "b2b": bool(re.search(r"^ BACK_TO_BACK: (?:PASSED|FAILED)", raw, re.M)),  # a -DBACK_TO_BACK build ran its back-to-back pass
     }
 
 
@@ -1542,6 +1543,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             if x is not None and not x.ok:
                 print(f"    miss: {r['name']}: {x.over} of {x.n}")
     print(f"  TRUTH: {len(gated)} tests gated, {sum(not r.get('truth_ok', False) for r in gated)} with misses")
+    print(f"  BACK_TO_BACK: {sum(r.get('b2b', False) for r in results)} of {len(results)} tests ran the back-to-back pass")
 
     passed = sum(1 for r in results if r["status"] == "PASS")
     print(hdr(f"\n{'═'*70}\n  SUMMARY  —  N={N}  TILE={T}\n{'═'*70}"))
@@ -3027,17 +3029,20 @@ def test_regression_points():
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 15 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 3, (len(small), len(full))
+    assert len(small) == len(set(small)) == 1 + 7 * 21 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9, (len(small), len(full))
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
-        for n, t in sweep(full):  # collapse-k 0: the pipeline at N = 8 and 16 (TB_sienna_top's COLLAPSE_K); packing needs collapse-k 1
-            want = kinds[:1] + (["pipeline-ck0"] if n <= 16 else []) + kinds[1:]
+        for n, t in sweep(full):  # collapse-k 0 and back-to-back: the pipeline at N = 8 and 16; packing needs collapse-k 1
+            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else []) + kinds[1:]
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
+    assert [(SPEC.parse(f"int8/N8_T2/{k}")["ck"], SPEC.parse(f"int8/N8_T2/{k}")["b2b"]) for k in ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b")] \
+        == [(1, False), (0, False), (1, True), (0, True)]
     assert SPEC.points(True, ["int8"]) == ["selftest"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
-                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0"):
+                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0", "fp32/N32_T8/pipeline-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
+                "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0"):
         try:
             SPEC.parse(bad)
         except ValueError:
@@ -3055,6 +3060,16 @@ def test_point_commands():
     assert SPEC.argv("int8/N8_T2/tflite", opts) == ["make", "tflite", *at("int8", 8, 2, 32)] and SPEC.argv("fp32/N16_T2/pack", opts)[1] == "pack"
     assert SPEC.argv("selftest", opts)[1:] == ["regression.py", "--action", "selftest"]
     assert SPEC.argv("bf16/N16_T4/pipeline-ck0", opts) == ["make", "pipeline", *at("bf16", 16, 4, 32), "COLLAPSE_K=0"]
+    assert SPEC.argv("int8/N8_T2/pipeline-b2b", opts) == ["make", "pipeline", *at("int8", 8, 2, 32), "EXTRA_FLAGS=-DBACK_TO_BACK"]
+    assert SPEC.argv("fp32/N16_T8/pipeline-ck0-b2b", opts) == ["make", "pipeline", *at("fp32", 16, 8, 32), "COLLAPSE_K=0", "EXTRA_FLAGS=-DBACK_TO_BACK"]
+    with tempfile.TemporaryDirectory() as d:  # a -b2b point's make pipeline passes the define to the Verilator flags of the make regression.py starts
+        fake = os.path.join(d, "py")
+        open(fake, "w").write(f"#!/bin/sh\nexec make -s -n -C {ROOT} lint GEN_PKG=0 FMT=int8 N=8 TILE=2\n")
+        os.chmod(fake, 0o755)
+        for extra, want in (([], False), (["EXTRA_FLAGS=-DBACK_TO_BACK"], True)):
+            r = subprocess.run(["make", "-s", "pipeline", "FMT=int8", "N=8", "TILE=2", f"PYTHON={fake}", *extra], cwd=ROOT, env=MAKE_ENV,
+                               capture_output=True, text=True)
+            assert r.returncode == 0 and "--lint-only" in r.stdout and ("-DBACK_TO_BACK" in r.stdout.split()) == want, (extra, r.stdout[-300:], r.stderr[-300:])
     r = make_n("pipeline", "FMT=int8", "N=8", "TILE=2", "COLLAPSE_K=0", "PYTHON=py")
     assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr
     saved = {k: os.environ.get(k) for k in ("GPNAE_MODEL", "TEST", "N", "LINK_STAGES")}
@@ -3083,8 +3098,8 @@ def test_point_commands():
 def test_point_verdicts():
     n32 = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS))])  # every fp32 pipeline test
     n32p = len([t for t in PIPELINE_TESTS if "fp32" in t.get("formats", tuple(FORMATS)) and t.get("packed")])  # collapse-k 0 skips these
-    clean = (f"  TRUTH: {n32} tests gated, 0 with misses\n\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n"
-             f"  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n")
+    clean = (f"  TRUTH: {n32} tests gated, 0 with misses\n  BACK_TO_BACK: 0 of {n32} tests ran the back-to-back pass\n"
+             f"\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n")
     plain = regress.ANSI.sub("", clean)
     v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
     assert n32 > 20 and v("int8/N8_T2/pipeline", clean) == f"FAIL ({n32} tests ran, int8 has {len([t for t in PIPELINE_TESTS if 'int8' in t.get('formats', tuple(FORMATS))])})"
@@ -3114,7 +3129,18 @@ def test_point_verdicts():
             ("int8/N8_T2/gemm", "GEMM int8: 0 cases\n", 0, "FAIL (no 'grid_\\d+x\\d+x\\d+ ')"), ("fp32/N8_T2/gemm", "grid_1x8x8 1\nFAIL grid_1x8x8: error\n", 0, "FAIL (log: FAIL grid_1x8x8: error)"),
             ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')"),
             ("fp32/N8_T2/pipeline-ck0", plain.replace(str(n32), str(n32 - n32p)), 0, "PASS"),
-            ("fp32/N8_T2/pipeline-ck0", plain, 0, f"FAIL ({n32} tests ran, fp32 has {n32 - n32p})")):
+            ("fp32/N8_T2/pipeline-ck0", plain, 0, f"FAIL ({n32} tests ran, fp32 has {n32 - n32p})"),
+            ("fp32/N8_T2/pipeline", plain.replace(f"0 of {n32} tests ran the back", f"{n32} of {n32} tests ran the back"), 0,
+             f"FAIL ({n32} of {n32} tests ran the back-to-back pass)"),  # a plain point built with -DBACK_TO_BACK
+            ("fp32/N8_T2/pipeline", plain.replace(f"  BACK_TO_BACK: 0 of {n32} tests ran the back-to-back pass\n", ""), 0, "FAIL (no BACK_TO_BACK count)"),
+            ("fp32/N8_T2/pipeline-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32} of {n32} tests ran the back"), 0, "PASS"),
+            ("fp32/N8_T2/pipeline-b2b", plain, 0, f"FAIL (0 of {n32} tests ran the back-to-back pass)"),  # built without the define
+            ("fp32/N8_T2/pipeline-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32 - 1} of {n32} tests ran the back"), 0,
+             f"FAIL ({n32 - 1} of {n32} tests ran the back-to-back pass)"),
+            ("fp32/N8_T2/pipeline-ck0-b2b", plain.replace(str(n32), str(n32 - n32p)).replace(f"0 of {n32 - n32p} tests ran the back",
+             f"{n32 - n32p} of {n32 - n32p} tests ran the back"), 0, "PASS"),
+            ("fp32/N8_T2/pipeline-ck0-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32} of {n32} tests ran the back"), 0,
+             f"FAIL ({n32} tests ran, fp32 has {n32 - n32p})")):
         got = v(p, text, rc)
         assert got == want, (p, text, rc, got, want)
 
@@ -3223,6 +3249,10 @@ def test_regression_target():
         assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
     small = [x.split("--name ")[1].split()[0] for x in recipe("regression", "SMALL=1", "MODEL_DIR=/m") if "--action point " in x]
     assert [p for p in small if p.endswith("-ck0")] == [f"{f}/N{n}_T{t}/pipeline-ck0" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)]
+    assert [p for p in small if p.endswith("-b2b")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
+                                                       for k in ("pipeline-b2b", "pipeline-ck0-b2b")]
+    full = [x.split("--name ")[1].split()[0] for x in recipe("regression", "MODEL_DIR=/m") if "--action point " in x]
+    assert {SPEC.parse(p)["n"] for p in full if p.endswith("-b2b")} == {8, 16} and len([p for p in full if p.endswith("-b2b")]) == 3 * 7 * 2
     one = recipe("regression/fp32/N8_T2/pipeline")
     assert len(one) == 1 and "--name fp32/N8_T2/pipeline" in one[0] and "--keep-going" not in one[0] and "--run" not in one[0], one
     s = recipe("regression-summary", "SMALL=1")
@@ -3870,8 +3900,10 @@ def _engine():
 
 
 regress = _engine()
-KINDS = ("pipeline", "pipeline-ck0", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
+KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
+PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
+B2B_SIZES = (8, 16)  # pipeline-b2b and pipeline-ck0-b2b: the pipeline points built with -DBACK_TO_BACK, at the small sizes
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
 
@@ -3894,8 +3926,9 @@ class SiennaSpec(regress.Spec):
 
     @staticmethod
     def _offered(f, n, k):
-        """model in fp32 and bf16, tflite in int8, pipeline-ck0 at CK0_SIZES."""
-        return (k != "model" or f != "int8") and (k != "tflite" or f == "int8") and (k != "pipeline-ck0" or n in CK0_SIZES)
+        """model in fp32 and bf16, tflite in int8, the -ck0 kinds at CK0_SIZES, the -b2b kinds at B2B_SIZES."""
+        return ((k != "model" or f != "int8") and (k != "tflite" or f == "int8") and ("-ck0" not in k or n in CK0_SIZES)
+                and (not k.endswith("-b2b") or n in B2B_SIZES))
 
     def parse(self, name):
         if name == "selftest":
@@ -3907,8 +3940,9 @@ class SiennaSpec(regress.Spec):
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
         if not self._offered(f, n, k):
-            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, pipeline-ck0 at N = {', '.join(map(str, CK0_SIZES))}")
-        return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if k.endswith("-ck0") else 1}
+            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, the -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
+                             f" and the -b2b kinds at N = {', '.join(map(str, B2B_SIZES))}")
+        return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if "-ck0" in k else 1, "b2b": k.endswith("-b2b")}
 
     def env(self, name, env):
         if self.parse(name)["kind"] in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
@@ -3919,9 +3953,10 @@ class SiennaSpec(regress.Spec):
         p, py = self.parse(name), sys.executable
         if p["kind"] == "selftest":
             return [py, "regression.py", "--action", "selftest"]
-        mk = ["make", p["kind"].removesuffix("-ck0"), f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
-        return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"],
-                     "pipeline-ck0": ["COLLAPSE_K=0"]}.get(p["kind"], [])
+        k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"]
+        mk = ["make", k, f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
+        return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(k, []) \
+            + (["COLLAPSE_K=0"] if p["ck"] == 0 else []) + (["EXTRA_FLAGS=-DBACK_TO_BACK"] if p["b2b"] else [])
 
     def verdict(self, name, text, rc):
         k = self.parse(name)["kind"]
@@ -3931,7 +3966,7 @@ class SiennaSpec(regress.Spec):
         text = regress.ANSI.sub("", text)
         if k == "selftest":
             return regress.marker_verdict(text, rc, (r"^ALL \d+ PASSED$",))
-        if k in ("pipeline", "pipeline-ck0"):
+        if k in PIPELINE_KINDS:
             m = re.findall(r"^\s*Passed\s*:\s*(\d+)\s*/\s*(\d+)\s*$", text, re.M)
             g = re.findall(r"^\s*TRUTH: (\d+) tests gated, (\d+) with misses$", text, re.M)
             miss = sorted(set(re.findall(r"\[FAIL\] truth: (\S+)", text)))
@@ -3941,13 +3976,17 @@ class SiennaSpec(regress.Spec):
                 return "FAIL (no 'Passed : X / X' with Sanity Clean)"
             x, y = map(int, m[-1])
             want = len([t for t in PIPELINE_TESTS if self.parse(name)["fmt"] in t.get("formats", tuple(FORMATS))
-                        and not (k == "pipeline-ck0" and t.get("packed"))])  # collapse-k 1 runs them all, collapse-k 0 all but the packed
+                        and not ("-ck0" in k and t.get("packed"))])  # collapse-k 1 runs them all, collapse-k 0 all but the packed
             if x != y or y == 0:
                 return f"FAIL ({x} of {y} tests passed)"
             if y != want:
                 return f"FAIL ({y} tests ran, {self.parse(name)['fmt']} has {want})"
             if not g or int(g[-1][0]) != y:
                 return f"FAIL ({g[-1][0] if g else 0} of {y} tests gated on the true function)"
+            b = re.findall(r"^\s*BACK_TO_BACK: (\d+) of (\d+) tests ran the back-to-back pass$", text, re.M)
+            nb = int(b[-1][0]) if b and int(b[-1][1]) == y else None
+            if nb != (y if k.endswith("-b2b") else 0):  # a -b2b point runs the pass in every test, a plain point in none
+                return f"FAIL ({'no BACK_TO_BACK count' if nb is None else f'{nb} of {y} tests ran the back-to-back pass'})"
             return "PASS"
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))

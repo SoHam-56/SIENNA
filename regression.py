@@ -7,7 +7,7 @@ Contains:
   2. Live Status Streamer
   3. Formatted Matrix Trace Dumper
   4. Regression Orchestrator & Scoreboard
-  5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors
+  5. Hardware checks behind --action: pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors, add-vectors
   6. Tool self-tests (--action selftest) and make regression's points and summary (--action points, point, summary)
 """
 
@@ -64,7 +64,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -2752,6 +2752,34 @@ def rq_vectors_main(argv=None) -> None:
         f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in out))
 
 
+# ── add-vectors: TB_add_lanes' vectors ────────────────────────────────────────
+
+ADD_LANES, ADD_SETS, ADD_PER = 32, 6, 8  # TB_add_lanes' geometry: lanes, sets, beats per set
+
+
+def add_vectors_main(argv=None) -> None:
+    """Vectors for TB_add_lanes: per set its ADD words, then per beat a tag and each lane's q1, q2 and expected code; arg: output .mem path."""
+    ap = argparse.ArgumentParser(description=add_vectors_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="add-vectors")
+    ap.add_argument("out")
+    a = ap.parse_args(argv)
+    rng = np.random.default_rng(29)
+    lines = []
+    for s in range(ADD_SETS):
+        sc = [float(np.float32(2.0 ** e)) for e in rng.uniform(-8, 1, 3)]
+        z = [int(v) for v in rng.integers(-128, 128, 3)]
+        add = mr.add_words(sc[0], z[0], sc[1], z[1], sc[2], z[2], ("none", "relu", "relu6")[s % 3])
+        lines.append(" ".join(f"{add[k] & 0xFFFFFFFF:08x}" for k in mr.ADD_FIELDS))
+        for b in range(ADD_PER):
+            q1, q2 = rng.integers(-128, 128, ADD_LANES), rng.integers(-128, 128, ADD_LANES)
+            want = mr.tflite_add_codes(q1, q2, add)
+            lines.append(f"{(s * ADD_PER + b) & 0xFFFF:04x} " + " ".join(f"{int(x) & 0xFF:02x}{int(y) & 0xFF:02x}{int(w) & 0xFF:02x}"
+                                                                     for x, y, w in zip(q1, q2, want)))
+    with open(a.out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, rounding {mr.ROUNDING}")
+
+
 # ── Self-tests ───────────────────────────────────────────────────────────────
 # (were test_makefile_fmt.py, test_pack_jobs.py, test_perf_analysis.py, test_regression_parse.py, test_tflite_ref.py)
 
@@ -4085,7 +4113,7 @@ SPEC = SiennaSpec(ROOT, os.path.join(ROOT, "testbenches", "results", "regression
 
 
 MAINS = {"pack": pack_main, "gemm": gemm_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
-         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "selftest": selftest_main,
+         "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point", "summary")}}  # each parses its own options (regression.py --action A --help)
 
 if __name__ == "__main__":
@@ -4101,7 +4129,7 @@ if __name__ == "__main__":
         default="regression",
         choices=ACTIONS,
         help="Action to perform; pkg writes test_config_pkg.sv and one --test's stimulus (default %s); "
-             "pack, gemm, perf, oracle, pack-models, gpnae-tflite and rq-vectors take their own options (--action A --help)" % PKG_DEFAULT_TEST,
+             "pack, gemm, perf, oracle, pack-models, gpnae-tflite, rq-vectors and add-vectors take their own options (--action A --help)" % PKG_DEFAULT_TEST,
     )
     p.add_argument("--matrix-size", "--n", type=int, default=16)
     p.add_argument("--tile-size", type=int, default=4)

@@ -3138,6 +3138,8 @@ def test_point_verdicts():
             ("fp32/N8_T2/pipeline", plain.replace(f"0 of {n32} tests ran the back", f"{n32} of {n32} tests ran the back"), 0,
              f"FAIL ({n32} of {n32} tests ran the back-to-back pass)"),  # a plain point built with -DBACK_TO_BACK
             ("fp32/N8_T2/pipeline", plain.replace(f"  BACK_TO_BACK: 0 of {n32} tests ran the back-to-back pass\n", ""), 0, "FAIL (no BACK_TO_BACK count)"),
+            ("fp32/N8_T2/pipeline-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32 - 1} of {n32 - 1} tests ran the back"), 0,
+             f"FAIL (BACK_TO_BACK counts {n32 - 1} tests, Passed counts {n32})"),  # the two counts disagree on the tests
             ("fp32/N8_T2/pipeline-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32} of {n32} tests ran the back"), 0, "PASS"),
             ("fp32/N8_T2/pipeline-b2b", plain, 0, f"FAIL (0 of {n32} tests ran the back-to-back pass)"),  # built without the define
             ("fp32/N8_T2/pipeline-b2b", plain.replace(f"0 of {n32} tests ran the back", f"{n32 - 1} of {n32} tests ran the back"), 0,
@@ -3990,7 +3992,9 @@ class SiennaSpec(regress.Spec):
             if not g or int(g[-1][0]) != y:
                 return f"FAIL ({g[-1][0] if g else 0} of {y} tests gated on the true function)"
             b = re.findall(r"^\s*BACK_TO_BACK: (\d+) of (\d+) tests ran the back-to-back pass$", text, re.M)
-            nb = int(b[-1][0]) if b and int(b[-1][1]) == y else None
+            if b and int(b[-1][1]) != y:
+                return f"FAIL (BACK_TO_BACK counts {b[-1][1]} tests, Passed counts {y})"
+            nb = int(b[-1][0]) if b else None
             if nb != (y if k.endswith("-b2b") else 0):  # a -b2b point runs the pass in every test, a plain point in none
                 return f"FAIL ({'no BACK_TO_BACK count' if nb is None else f'{nb} of {y} tests ran the back-to-back pass'})"
             return "PASS"

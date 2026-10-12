@@ -2792,6 +2792,83 @@ def test_guard_checks_geometry():
         assert rc != 0 and "LANES=64" in out, out
 
 
+def _synthetic_truth(mod=None) -> dict:
+    """truth_test on a dump built from the bit-exact models for bf16 matmul_random_tanh_train at N=8 T=2, in a scratch TB_DIR;
+    mod(tag, k, arrs) may plant a fault in one set's arrays (pre, post, X, A, P, keep, D) first."""
+    t = next(x for x in PIPELINE_TESTS if x["name"] == "matmul_random_tanh_train")
+    N, T, lanes, fmt = 8, 2, 32, "bf16"
+    g = globals()
+    saved = {k: g[k] for k in ("TB_DIR", "RESULTS_DIR", "TRUTH_DUMP", "TRUTH_SCALES")}
+    with tempfile.TemporaryDirectory() as d:
+        g.update(TB_DIR=d, RESULTS_DIR=os.path.join(d, "results"), TRUTH_DUMP=os.path.join(d, "truth_dump.txt"),
+                 TRUTH_SCALES=os.path.join(d, "truth_scales.json"))
+        try:
+            cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "fmt_name": fmt, **t}
+            with contextlib.redirect_stdout(io.StringIO()):
+                generate_vectors(cfg)
+            knobs, pkg = _tb_knobs(), _pkg_fields(os.path.join(d, "test_config_pkg.sv"))
+            W = ((N + 2 * pkg["PADDING"] - pkg["POOL_H"]) // pkg["POOL_H"] + 1) ** 2
+            p = pkg["DROPOUT_P_PERCENT"] / 100.0
+            out = ["H b2b 0"]
+            for tag in ("P0", "S1", "S2", "S3", "S4", "A"):
+                ks = range(knobs["num_sets"]) if tag.startswith("S") else [0]
+                for r, k in enumerate(ks):
+                    Ab = _tb_words("matrix_west.mem" if tag == "P0" else f"matrix_west_{k}.mem").reshape(N, N)
+                    Bb = _tb_words("matrix_north.mem" if tag == "P0" else f"matrix_north_{k}.mem").reshape(N, N)
+                    seed = set_dropout_seed(knobs["dropout_seed"], k)
+                    C, Aout, Pool, Dw = _golden_bits([(Ab, Bb)], None, cfg, "tanh", seed, fmt)
+                    C = np.asarray(C, np.int64).ravel()
+                    arrs = {"pre": C << 16, "post": C.copy(), "X": C.copy(), "A": np.asarray(Aout, np.int64).ravel(),
+                            "P": np.asarray(Pool, np.int64).ravel(), "keep": dropout_keep(W, p, seed, lanes).astype(int),
+                            "D": np.asarray(Dw, np.int64).ravel(), "Ab": Ab, "Bb": Bb}
+                    if mod:
+                        mod(tag, k, arrs)
+                    out += [f"M {tag} {r} {e} {int(arrs['pre'][e]) & 0xFFFFFFFF:08x} {int(arrs['post'][e]):04x}" for e in range(N * N)]
+                    out += [f"X {tag} {k} {e} {int(arrs['X'][e]):04x}" for e in range(N * N)]
+                    out += [f"A {tag} {k} {e} {int(arrs['A'][e]):04x}" for e in range(N * N)]
+                    out += [f"P {tag} {k} {w % lanes} {w // lanes} {int(arrs['P'][w]):04x} {int(arrs['keep'][w])}" for w in range(W)]
+                    out += [f"D {tag} {k} {i} {int(arrs['D'][i]):04x}" for i in range(W)]
+            with open(TRUTH_DUMP, "w") as fh:
+                fh.write("\n".join(out) + "\n")
+            return truth_test(N, fmt, lanes)
+        finally:
+            g.update(saved)
+
+
+@selftest
+def test_truth_synthetic_dump():
+    # the models' own words pass every stage of every pass; each planted fault fails its own gate, in its own pass
+    clean = _synthetic_truth()
+    assert clean["_npass"] == 6 and all(r.ok for k, r in clean.items() if not k.startswith("_")), {k: r.ok for k, r in clean.items() if not k.startswith("_")}
+    assert {"matmul", "narrow", "transfer", "activation tanh", "maxpool", "dropout"} <= set(clean), sorted(clean)
+
+    def drop(tag, k, a):  # the first product of every element left out of set 3's sums in S2
+        if (tag, k) == ("S2", 3):
+            A, B = truth.values("bf16", a["Ab"]), truth.values("bf16", a["Bb"])
+            a["pre"] = truth.encode("fp32", truth.values("fp32", a["pre"]) - np.outer(A[:, 0], B[0, :]).ravel())
+            a["post"] = a["X"] = truth.narrow_ref("bf16", a["pre"])
+
+    def trunc(tag, k, a):  # set 2's sums in S3 sit above half an ULP, and the narrowing truncates them
+        if (tag, k) == ("S3", 2):
+            a["pre"] = (a["post"] << 16) | 0xC000
+
+    def swap(tag, k, a):  # two activation inputs of set 5 in S1 swapped
+        if (tag, k) == ("S1", 5):
+            i, j = [int(x) for x in np.flatnonzero(a["X"] != a["X"][0])[:1]] + [0]
+            a["X"][[i, j]] = a["X"][[j, i]]
+
+    def keep(tag, k, a):  # dropout's keep decision flipped on set 1's first nonzero window in S4
+        if (tag, k) == ("S4", 1):
+            w = int(np.flatnonzero(truth.values("bf16", a["P"]) != 0)[0])
+            a["keep"][w] ^= 1
+
+    for plant, stage, tag in ((drop, "matmul", "S2"), (trunc, "narrow", "S3"), (swap, "transfer", "S1"), (keep, "dropout", "S4")):
+        res = _synthetic_truth(plant)
+        assert not res[stage].ok and res["_passes"][stage] == {tag}, (plant.__name__, stage, res[stage].ok, res.get("_passes"))
+        lines, bad = truth_report(res)
+        assert any(x.startswith(f"[FAIL] truth: {stage} ") and f"in passes {tag};" in x for x in bad), (plant.__name__, bad)
+
+
 @selftest
 def test_truth_is_systolicmesh_copy():
     # the gates load SystolicMesh's ArithmeticLibrary copy by path, and GPNAE's copy must be the same bytes

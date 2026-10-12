@@ -380,6 +380,9 @@ module TB_sienna_top #(
     s.zout          = {pack_zout_i, gp_zout_i};
     s.mult          = req_mult_i;
     s.shift         = req_shift_i;
+`ifdef TB_FLOAT_ADD
+    s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a float build fires a_float_no_add
+`endif
     return s;
   endfunction
 

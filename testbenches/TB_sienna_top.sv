@@ -732,6 +732,13 @@ module TB_sienna_top #(
       failed++;
       $display("  [FAIL]     [%0d] exp=0x%h  act=MISSING", i, expected_results[i]);
     end
+
+    // Words captured beyond the expected ones: an empty or short golden must not pass
+    for (int i = n_exp; i < n_act; i++) begin
+      total_elements++;
+      failed++;
+      $display("  [FAIL]     [%0d] exp=NONE  act=0x%h", i, actual_results[i]);
+    end
   endtask
 
   // ── File and Console Output Monitors ──────────────────────────────────

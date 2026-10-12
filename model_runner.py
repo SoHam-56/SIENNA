@@ -186,16 +186,10 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
     if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
         rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
     x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
-    x_hi = gpnae_model.SELU_POS_SAT / 2048.0  # the lane's SELU: Q4.11 below 0, lambda * x exact up to here (int32 in 2^-22)
-    _, s_selu, z_selu = quant_act(apply_activation(np.clip(x, -16.0, x_hi).astype(np.float32), "selu"))
-    mout, shout = gpnae_model.quantize_multiplier(2.0 ** -22 / s_selu)  # the lane's SELU value, in units of 2^-22, to its int8 code (D-4)
+    _, s_selu, z_selu = quant_act(apply_activation(np.maximum(x, -16.0).astype(np.float32), "selu"))  # Q4.11's floor; SELU is flat there
+    mout, shout = gpnae_model.selu_out_params(s_out, mx, s_selu)  # the lane's SELU accumulator, 2^-(shx + 18), to its int8 code (D-4)
     rq.update(mout=int(mout), shout=int(shout), zout=z_selu, s_selu=s_selu)
     return rq
-
-
-def selu_saturates(mx: int, shx: int, z_in: int, q) -> np.ndarray:
-    """True where lane input code q rescales (gp_mx, gp_shx, zero point z_in), unsaturated, to x >= 487.29, where lambda * x leaves int32 in 2^-22."""
-    return gpnae_model.selu_pos_saturates(gpnae_model.rescale_wide(np.asarray(q, np.int64), int(z_in), int(mx), int(shx)))
 
 
 def int8_lane():
@@ -735,8 +729,6 @@ def pack_jobs(models: list, N: int, int8: bool) -> tuple:
         q = m.get("req")
         if int8:
             mult[c * b:c * b + cc], shift[c * b:c * b + cc] = q["mult"], q["shift"]
-            if m["act"] == "selu" and np.any(selu_saturates(q["mx"], q["shx"], q["zp"], np.arange(q["amin"], q["amax"] + 1))):
-                raise ValueError(f"model {c}: its SELU input range reaches x = 487.29, where the int8 lane saturates")
         key = (m["act"],) + (tuple(int(q[x]) for x in ("zp", "amin", "amax", "mx", "shx", "mout", "shout", "zout")) if int8 else ())
         if key not in keys:
             keys.append(key)
@@ -972,8 +964,6 @@ class RtlLayer:
         if int8 and job.get("req") is None:
             raise ValueError(f"{tag}: an int8 job needs its requantize parameters (job['req'])")
         rq = job.get("req")
-        if int8 and job["act"] == "selu" and selu_saturates(rq["mx"], rq["shx"], rq["zp"], rq["amax"]):  # the clamp's top code
-            raise ValueError(f"{tag}: SELU layer input range reaches x = 487.29: the int8 lane saturates lambda * x at int32 (512)")
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
         pk = job.get("pack")
         if pk:

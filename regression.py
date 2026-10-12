@@ -39,7 +39,7 @@ import model_runner as mr  # noqa: E402  the numerics and the device build packa
 from model_runner import (  # noqa: E402
     FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _check_rounding, _config_items, activate_int8, activation_to_code,
     apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
-    quant_act, quant_weights, requant_params, requantize, selu_saturates, wrap32, write_sv_package)
+    quant_act, quant_weights, requant_params, requantize, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 
 
@@ -411,7 +411,6 @@ def _generate_vectors_int8(cfg: dict) -> None:
     starts = list(range(0, num_sets, passes))
     acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
     zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
-    sat = [0, 0]  # activated SELU sets: lane inputs where lambda * x saturates, and all their lane inputs
     scales = {}  # per activated set: its lane's real input scale and SELU output scale, for the truth gate
     for g, g0 in enumerate(starts):
         ks = list(range(g0, min(g0 + passes, num_sets)))
@@ -424,10 +423,6 @@ def _generate_vectors_int8(cfg: dict) -> None:
         acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
         rq = requant_params(acc, s_a, s_w, act_g, req_rng, zqs[g])
         complete = len(ks) == passes  # always, since num_sets is a whole number of groups
-        if act_g == "selu" and complete:
-            R = requantize(acc, rq)
-            sat[0] += int(np.sum(selu_saturates(rq["mx"], rq["shx"], rq["zp"], R)))
-            sat[1] += R.size
         for i, k in enumerate(ks):
             last = complete and i == len(ks) - 1
             rq_k = rq if last else _decoy_params(N)
@@ -443,9 +438,6 @@ def _generate_vectors_int8(cfg: dict) -> None:
             _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F))
             if k == 0:
                 first = (parts[0][0], parts[0][1], hw_bias, rq_k)
-    if sat[1]:
-        print(f"      SELU saturation: {sat[0]} of {sat[1]} lane inputs at x >= {gpnae_model.SELU_POS_SAT / 2048:.2f}, where lambda * x "
-              f"saturates at int32 (bit-exact against the saturating golden)")
     # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
     a0, b0, hb0, rq0 = first
     C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)
@@ -1057,7 +1049,8 @@ def _int8_quant(ents: dict, scales: dict, k: int):
     for e, w in ents.items():
         sc = scales.get(str(k), {}).get(str(e))
         if sc is None:  # a set the generator calibrated no lane for (P0's or B2B's partial): the scales its words encode
-            sc = [w["mx"] * 2.0 ** -w["shx"] / 2048, 2.0 ** (9 - w["shout"]) / w["mout"] if w["mout"] else np.inf]
+            s_in = w["mx"] * 2.0 ** -w["shx"] / 2048  # SELU's output: acc 2^-(shx + 18) times mout 2^(shout - 31) is the code
+            sc = [s_in, s_in * 2.0 ** (24 - w["shout"]) / (w["mx"] * w["mout"]) if w["mout"] and w["mx"] else np.inf]
         s_in, s_selu = sc
         a = w["act"]
         s_out, z_out = (s_selu, w["zout"]) if a == "selu" else INT8_FIXED_OUT.get(a, (s_in, w["zp"]))
@@ -3420,18 +3413,19 @@ def test_int8_shared_entry():
 
 
 @selftest
-def test_selu_saturation_refused():
-    # Review Focus 5: an int8 SELU entry whose lane input reaches x >= 487.29 must be refused, not packed.
-    req = dict(mult=np.full(2, 1 << 30), shift=np.zeros(2, np.int64), zp=-128, amin=-128, amax=127, mx=(1 << 15) - 1, shx=0,
-               mout=1, shout=0, zout=0)
-    assert np.any(mr.selu_saturates(req["mx"], req["shx"], req["zp"], np.arange(req["amin"], req["amax"] + 1))), \
-        "the test's req does not saturate"
+def test_selu_large_scale_accepted():
+    # Task 1.16: the int8 lane's SELU is exact past lambda * x = 512, so a large-scale SELU entry packs and runs; its output shift is <= 0.
+    acc = np.arange(-2000, 2000, dtype=np.int64).reshape(-1, 2) * 500  # real inputs to +-1000: s_out about 7.8, lambda * x to 1051
+    req = mr.requant_params(acc, 1e-3, np.ones(2), "selu")
+    x = (mr.requantize(acc, req) - req["zp"]) * req["s_out"]
+    assert x.max() * gpnae_model.LAMBDA_F > 512 and req["shout"] <= 0 and (req["mout"], req["shout"]) == \
+        gpnae_model.selu_out_params(req["s_out"], req["mx"], req["s_selu"]), (x.max(), req["mout"], req["shout"])
     m = {"W": np.ones((2, 2)), "bias": None, "act": "selu", "req": req, "inputs": [np.ones((1, 2))]}
-    try:
-        mr.pack_jobs([m], 16, int8=True)
-    except ValueError:
-        return
-    raise AssertionError("pack_jobs accepted a saturating SELU entry")
+    job, _ = mr.pack_jobs([m], 16, int8=True)
+    assert job["pack"]["ents"][0][0] == "selu"
+    y = mr.activate_int8(mr.requantize(acc, req), "selu", req)
+    t = np.clip(np.floor(np.where(x > 0, gpnae_model.LAMBDA_F * x, gpnae_model.LA_F * np.expm1(np.minimum(x, 0))) / req["s_selu"] + 0.5) + req["zout"], -128, 127)
+    assert np.abs(y - t).max() <= 1, np.abs(y - t).max()  # the lane's words against the true function, past 512 too
 
 
 def _packed(N, rng_seed=9):

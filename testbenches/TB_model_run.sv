@@ -97,6 +97,7 @@ module TB_model_run #(
       .NUM_LANES     (NUM_LANES),
       .N             (N),
       .TILE_SIZE     (TILE_SIZE),
+      .COLLAPSE_K    (COLLAPSE_K),  // the package's mesh mode, a build item as in TB_sienna_top
       .SETS_IN_FLIGHT(SETS_IN_FLIGHT),
       .DATA_WIDTH    (DATA_WIDTH),
       .EXP_W         (EXP_W),

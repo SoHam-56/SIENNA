@@ -1464,7 +1464,7 @@ module TB_sienna_top #(
     if (k_residual != 0) begin
       automatic int whole = 0;  // add sets whose add_lanes beats are exactly PER_LANE
       foreach (res_add_set[k]) whole += int'(res_add_set[k] == PER_LANE);
-      $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add sets of %0d beats %0d, add beats of other sets %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
+      $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add sets of %0d beats %0d, add beats of other sets %0d, hold done with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
                res_holds, res_add_beats, PER_LANE, whole, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
     end
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.

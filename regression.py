@@ -1644,7 +1644,7 @@ def _parse_log(raw: str) -> dict:
 
 
 HOLD_ADD = re.compile(r"^\[HOLD/ADD\] hold sets done (\d+), add beats (\d+), add sets of (\d+) beats (\d+), add beats of other sets (\d+), "
-                      r"hold release with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass
+                      r"hold done with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass
 
 
 def _residual_pairs_bad(raw: str, per_lane: int) -> str:

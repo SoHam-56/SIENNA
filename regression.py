@@ -347,17 +347,39 @@ def _golden_int8_residual(parts, hw_bias, rq: dict, R, add: dict, ra: dict, cfg:
     return C, Y, A, P, np.where(keep, P.flatten(), drop_zp(act, ra)).reshape(P.shape)
 
 
-def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=None) -> tuple:
-    """An add set's inputs for a conv output q1 (scale s1, zero point z1): the residual codes, the ADD's words and the lane's; setting fixes (s2 / s1, z2, s_out factor)."""
+ADD_TIGHT = (40, 91)  # a tight ADD clamp: amin and amax this many codes below and above zp_o, as a fused RELU6 or RELU_N1_TO_1 would cut
+ADD_TRIES = 32  # draws of an add set before its writer gives up on a quarter of the outputs off the rails and 16 codes
+LANE_ACTS = ("tanh", "sigmoid", "selu")  # a lane activation after the ADD: its inputs kept off saturation
+ADD_SPAN = {"tanh": 2.0, "sigmoid": 4.0}  # tanh and sigmoid: R mostly cancels the conv, so the real sums lie in an uneven part of +-span
+
+
+def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=None, tight=False) -> tuple:
+    """An add set's inputs for a conv output q1 (scale s1, zero point z1): the residual codes, the ADD's words and the lane's.
+    setting fixes (s2 / s1, z2, s_out factor), a layer's; tight clamps zp_o +- ADD_TIGHT codes.
+    A lane activation takes s2 within 2^+-1 of s1 (tanh, sigmoid: 2^0..1, R cancelling the conv to ADD_SPAN) and s_out at or above its calibration;
+    zp_random ReLU calibrates on the unclamped sums, so zp_o is interior and its clamp cuts the negative sums."""
     N = q1.shape[0]
-    f2, z2, fo = setting or (2.0 ** rng.uniform(-3.0, 3.0), int(rng.randint(-100, 101)) if zp_random else 0, 2.0 ** rng.uniform(-1.0, 1.0))
+    lane, span = act in LANE_ACTS, ADD_SPAN.get(act)
+    f2, z2, fo = setting or (2.0 ** rng.uniform(*((0.0, 1.0) if span else (-1.0, 1.0) if lane else (-3.0, 3.0))),
+                             int(rng.randint(-100, 101)) if zp_random else 0, 2.0 ** rng.uniform(*((0.0, 1.0) if lane else (-0.5, 1.0))))
     s2 = s1 * f2
     R = rng.randint(-128, 128, (N, N)).astype(np.int64)
+    if span:
+        lo, hi = -span * rng.uniform(0.2, 1.0), span * rng.uniform(0.2, 1.0)  # uneven, so zp_o is off 0
+        R = np.clip(np.rint(z2 + (rng.uniform(lo, hi, (N, N)) - s1 * (q1 - z1)) / s2), -128, 127).astype(np.int64)
     y = s1 * (q1 - z1) + s2 * (R - z2)
-    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if act == "relu" else y)
+    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if act == "relu" and not zp_random else y)
     s_out *= fo if zp_random else 1.0  # random ADD scales: the output scale off its calibration, so some outputs clamp
     add = mr.add_words(s1, z1, s2, z2, s_out, z_out, act)
-    return R, add, mr.add_lane_params(add, s_out, mr.tflite_add_codes(q1, R, add))
+    if tight:
+        add.update(amin=max(-128, z_out - int(rng.randint(*ADD_TIGHT))), amax=min(127, z_out + int(rng.randint(*ADD_TIGHT))))
+    return R, add, dict(mr.add_lane_params(add, s_out, mr.tflite_add_codes(q1, R, add)), setting=(f2, z2, fo))
+
+
+def _off_rails(F, ra: dict) -> tuple:
+    """An add set's final outputs: the share off the rails (-128, 127 and the ADD's clamp) and the number of distinct codes."""
+    F = np.asarray(F).ravel()
+    return float(np.mean(~np.isin(F, [-128, 127, ra["amin"], ra["amax"]]))), len(np.unique(F))
 
 
 def _identity_requant(N: int, ra: dict) -> dict:
@@ -425,8 +447,8 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
     N = cfg.get("n", 16)
     zqs = (_zp_draws(np.random.RandomState(seed + 8000), len(groups), ["linear" if r else a for _, _, r, a in groups])
            if cfg.get("zp_random") else [None] * len(groups))
-    srng = np.random.RandomState(seed + 9500)
-    settings = [(2.0 ** srng.uniform(-3.0, 3.0), int(srng.randint(-100, 101)), 2.0 ** srng.uniform(-1.0, 1.0)) for _ in range(2)]
+    layers = cfg.get("add_layers", 0)  # add_layers L: groups g and g + L share a layer's (s2 / s1, z2, s_out factor)
+    setting = {}  # layer -> its first group's
     w = lambda name, k: os.path.join(TB_DIR, f"{name}_{k}.mem")
     first, scales = None, {}
 
@@ -437,15 +459,27 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
             _write_s8(os.path.join(TB_DIR, "bound_b2b.mem"), np.zeros_like(Fb))
 
     for g, (g0, P, res, act_g) in enumerate(groups):
+        L = g % layers if layers else None
         A_q, s_a, z_a = quant_act(np.hstack([reals[k][0] for k in range(g0, g0 + P)]))
         B_q, s_w = quant_weights(np.vstack([reals[k][1] for k in range(g0, g0 + P)]))
         hw_bias = fold_bias(None, s_a, s_w, z_a, B_q)
         parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(P)]
         acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
         rq = requant_params(acc, s_a, s_w, "linear" if res else act_g, req_rng, zqs[g])
-        if res:
-            R, add, ra = _add_draw(np.random.RandomState(seed + 9000 + g0), requantize(acc, rq), rq["s_out"], rq["zp"], act_g,
-                                   cfg.get("zp_random", False), settings[g % 2] if cfg.get("add_layers") else None)
+        if res:  # redrawn until a quarter of the add set's final outputs are off the rails, in 16 codes or more
+            arng, q1 = np.random.RandomState(seed + 9000 + g0), requantize(acc, rq)
+            for _ in range(ADD_TRIES):
+                R, add, ra = _add_draw(arng, q1, rq["s_out"], rq["zp"], act_g, cfg.get("zp_random", False), setting.get(L),
+                                       act_g != "relu" and g % 2 == 1)
+                F = _golden_int8_residual(parts, hw_bias, rq, R, add, ra, cfg, act_g, set_dropout_seed(drop_seed, g0 + P))[4]
+                off, codes = _off_rails(F, ra)
+                if off >= 0.25 and codes >= min(16, F.size // 4):  # 16 codes, or a quarter of a small set's outputs (N = 8 pooled: 16)
+                    break
+            else:
+                raise ValueError(f"{cfg['name']}: group {g}'s add set: no draw in {ADD_TRIES} with a quarter of its outputs off the rails "
+                                 "and 16 codes")
+            if layers:
+                setting.setdefault(L, ra["setting"])
         for i in range(P):
             k, last = g0 + i, i == P - 1
             act_k, rq_k = ("linear" if res and last else act_g), (rq if last else _decoy_params(N))

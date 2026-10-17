@@ -2927,6 +2927,7 @@ Expected: each run FAILS its one test (`Sweep Aborted: FAIL` or `Sweep Aborted: 
 
 **Files:**
 - Modify: `src/sienna_top.sv`
+- Modify: `testbenches/TB_sienna_top.sv` (Task 2.5 review): the residual truth dumps that need this task's signals. An `R` line per hold beat: a FIFO of (set id, beat index) pushed on `wide_rd_valid && g_hold`, popped at `hold_wr_s`, writing the requantized hold word. A `Q` line per add beat: a FIFO pushed at `add_in_s`, popped on `fill_v && fill_add`, writing q1, q2 and the ADD result. Both use Task 2.5 Step 4.9's line formats. regression.py's residual truth path then gates them through `truth.gate_add` (add it in ArithmeticLibrary truth.py: bit-exact against ipu.tflite_add, Decision 1's stated exception), and `$J/cmds/t25_truth_syn.py` becomes a committed self-test of that path. The TB's guarded requantize pop (TB:1175) counts a fill with no requantize beat as a failure.
 
 **Interfaces:**
 - Consumes: Task 2.3's flags and words, Task 2.4's `add_lanes`.
@@ -2981,9 +2982,9 @@ with `a_real_has_bank`'s antecedent gaining `&& !set_hold[p_next_id]`.
     add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) addl (
         .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d),
         .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}),
-        .zp1_i(g_add_w[159:152]), .zp2_i(g_add_w[151:144]), .m1_i(g_add_w[143:112]), .s1_i(g_add_w[111:104]), .m2_i(g_add_w[103:72]),
-        .s2_i(g_add_w[71:64]), .mo_i(g_add_w[63:32]), .so_i(g_add_w[31:24]), .zpo_i(g_add_w[23:16]), .min_i(g_add_w[15:8]),
-        .max_i(g_add_w[7:0]),
+        .zp1_i(g_add_w.zp1), .zp2_i(g_add_w.zp2), .m1_i(g_add_w.m1), .s1_i(g_add_w.s1), .m2_i(g_add_w.m2),
+        .s2_i(g_add_w.s2), .mo_i(g_add_w.mo), .so_i(g_add_w.so), .zpo_i(g_add_w.zpo), .min_i(g_add_w.amin),
+        .max_i(g_add_w.amax),  // add_words_t fields by name (Task 2.4 review): no numeric slices
         .valid_o(add_v), .result_o(add_d), .tag_o(add_tag));
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) at_v <= '0;
@@ -3226,7 +3227,7 @@ $J/cmds/res_mkmut.sh m_par $S "if (g_accept) g_add_w <= s_add[g_next_id];" "if (
 $J/cmds/res_mkmut.sh m_bank $S "if (g_done && !g_hold) act_wr <= ~act_wr;" "if (g_done) act_wr <= ~act_wr;"
 $J/cmds/res_mkmut.sh m_hold_lane regression.py 'act_k, rq_k = ("linear" if res and last else act_g),' 'act_k, rq_k = (act_g),'
 $J/cmds/res_mkmut.sh m_hold_byp $S "assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];" "assign rq_out      = rq_v && !tg_add[RQL-1];"
-$J/cmds/res_mkmut.sh m_zp1 $S ".zp1_i(g_add_w[159:152])" ".zp1_i(g_zp[0])"
+$J/cmds/res_mkmut.sh m_zp1 $S ".zp1_i(g_add_w.zp1)" ".zp1_i(g_zp[0])"
 $J/cmds/res_mkmut.sh m_drop $S "p_zp[k] = pe_add ? pe_add_zpo : pe_zp[p_lane_ent[k]];" "p_zp[k] = pe_zp[p_lane_ent[k]];"
 $J/cmds/res_mkmut.sh m_zin $S ".gp_zin_i      (g_add ? g_add_zpo : g_zp[g])," ".gp_zin_i      (g_zp[g]),"
 for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp m_zp1 m_drop m_zin; do
@@ -4044,6 +4045,8 @@ git -C $T commit -m "Skills, README and report history for the int8 residual ADD
 ```
 
 ### Task 2.12: Check-in, then the one N = 64 sweep
+
+> **Superseded in part (Soham, 2026-10-17):** Task 2.12 is the check-in only (pre-check-in cleanup, Soham's OK, push innermost first, ls-remote). Its N = 32/64 sweep, the base-tree references at those sizes, the perf measurement and the new results report move to the very end of the project and run once there, in this order: the restructure (sienna-restructure) completes; the small regression (N = 8 and 16, every valid tile size, `SMALL=1`) passes in every repo; everything is checked in, merged and pushed, and every feature branch is deleted so only main exists (Soham, 2026-10-17); then the big sweep runs on main. Skip every step below that launches an N = 32 or N = 64 run.
 
 **Files:**
 - No source changes (unless the N = 64 sweep finds a defect, which then gets its own fix commit, test first, and is reported); `.claude/skills/sienna-report/history/<date>_sienna_int8_residual_n64.txt` (Step 4)

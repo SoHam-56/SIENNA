@@ -239,6 +239,13 @@ module sienna_top #(
 
   // L0 and L1: a host put is the set's start and goes to the mesh at once; a staging credit passes to the host while the entry admits.
   set_side_t side;
+  // add_words_t loads by name from side's flat add_* fields, and width warnings are off, so a width differing between the two fails elaboration
+  if ($bits(side.add_zp1) != $bits(g_add_w.zp1) || $bits(side.add_zp2) != $bits(g_add_w.zp2) || $bits(side.add_m1) != $bits(g_add_w.m1) ||
+      $bits(side.add_s1) != $bits(g_add_w.s1) || $bits(side.add_m2) != $bits(g_add_w.m2) || $bits(side.add_s2) != $bits(g_add_w.s2) ||
+      $bits(side.add_mo) != $bits(g_add_w.mo) || $bits(side.add_so) != $bits(g_add_w.so) || $bits(side.add_zpo) != $bits(g_add_w.zpo) ||
+      $bits(side.add_min) != $bits(g_add_w.amin) || $bits(side.add_max) != $bits(g_add_w.amax)) begin : G_BAD_ADD_W
+    $fatal(1, "sienna_top: set_side_t's add_* fields and add_words_t's fields differ in width");
+  end
   logic [1:0] l1_cnt;  // staging credits held here or passed to the host and not yet spent
   logic l0_grant;
   assign side = l0.data;

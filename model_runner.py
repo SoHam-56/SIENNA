@@ -981,8 +981,8 @@ class RtlLayer:
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0",
-                            f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
-                            "GEN_PKG=0"],  # the package write_build_pkg just wrote
+                            f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
+                            "GEN_PKG=0"],  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
@@ -1068,6 +1068,8 @@ class RtlSets:
         self.sets = 0
 
     def build(self):
+        if COLLAPSE_K == 0:
+            raise ValueError("TB_sienna_model builds collapse-k 1")
         write_build_pkg(self.N, self.T, self.lanes, "fp32")
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
                             "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
@@ -1416,7 +1418,10 @@ def model_main(argv=None):
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     ap.add_argument("--fault", default=None, help="TEST ONLY, to prove the gate fails: word:MODEL:LAYER:INDEX[:BIT] (flip a hardware output bit), "
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
     a = ap.parse_args(argv)
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8":
         ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
     if a.fmt_name != "fp32" and (a.emulate or a.engine == "sets"):
@@ -1441,7 +1446,7 @@ def model_main(argv=None):
             sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
         t0 = time.time()
         sim.build()
-        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
+        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} collapse-k {COLLAPSE_K} in {time.time() - t0:.0f} s")
     fault = parse_fault(a.fault)
     if fault:
         log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
@@ -1538,7 +1543,10 @@ def tflite_main(argv=None):
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--models", default=MODEL_DIR, help="<name>.tflite files, each with <name>.npz holding x_test and y_test")
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "int8"))
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds")
     a = ap.parse_args(argv)
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
     os.makedirs(a.work, exist_ok=True)
     rep = open(os.path.join(a.work, f"tflite_int8_N{a.n}_T{a.tile_size}.log"), "w")
 
@@ -1554,7 +1562,7 @@ def tflite_main(argv=None):
     sim = RtlLayer(a.n, a.lanes, a.work, "int8", a.tile_size)
     t0 = time.time()
     sim.build()
-    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
+    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} collapse-k {COLLAPSE_K}, in {time.time() - t0:.0f} s")
     bad, covered, hw_bad, task_bad = 0, False, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]

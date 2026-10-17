@@ -36,13 +36,13 @@ ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
-# COLLAPSE_K is 0 or 1; TB_sienna_top takes it from the package (make pkg, the guard checks it), sienna_layer's runs and make regression's points do not take it.
+# COLLAPSE_K is 0 or 1; TB_sienna_top and sienna_layer's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
-ifneq ($(filter model gemm tflite pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
-$(error COLLAPSE_K=0 reaches TB_sienna_top only (pipeline, pkg, verilator, sim, lint and the like): sienna_layer's model, gemm, tflite and pack runs build collapse-k 1, and make regression's points choose their own (<fmt>/N<n>_T<t>/pipeline-ck0))
+ifneq ($(filter pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
+$(error COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
 endif
 endif
 
@@ -274,7 +274,7 @@ help:
 	@echo "Precision (one variable for every build and run):"
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top and sm-verilator; sienna_layer's runs build 1"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top, sienna_layer's model, gemm and tflite runs, and sm-verilator"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"
@@ -585,6 +585,7 @@ model:
 		--tile-size $(TILE) \
 		--lanes $(LANES) \
 		--format $(FMT) \
+		--collapse-k $(COLLAPSE_K) \
 		--count $(MODEL_COUNT)
 
 # GEMM shape sweep on sienna_layer, built at N, TILE and LANES.
@@ -594,6 +595,7 @@ gemm:
 		--tile $(TILE) \
 		--lanes $(LANES) \
 		--format $(FMT) \
+		--collapse-k $(COLLAPSE_K) \
 		$(if $(filter 1,$(QUICK)),--quick)
 
 perf-analysis:
@@ -608,7 +610,8 @@ tflite:
 	$(PYTHON) model_runner.py --action tflite \
 		--n $(N) \
 		--tile-size $(TILE) \
-		--lanes $(LANES)
+		--lanes $(LANES) \
+		--collapse-k $(COLLAPSE_K)
 
 # Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:

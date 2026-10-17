@@ -973,12 +973,6 @@ module TB_sienna_top #(
       for (int i = 0; i < 12; i++) add_tab[k][i] = q[i];
     end
   endtask
-  function automatic bit is_hold(input int k);
-    return k_residual != 0 && add_tab[k][0][2];
-  endfunction
-  function automatic bit is_add(input int k);
-    return k_residual != 0 && add_tab[k][0][3];
-  endfunction
 
   // With k_accum_passes = P, sets come in groups of P: the first P-1 are partial sums, the last is activated; a residual test's flags say.
   function automatic bit is_partial(input int k);
@@ -1172,7 +1166,11 @@ module TB_sienna_top #(
         end
         if (int'(dut.g_state) == 0) rd_in = 0;
         else if (dut.wide_rd_valid) rd_in++;
-        if (dut.fill_v && rq_id.size() != 0) begin
+        if (dut.fill_v && dut.fill_add) begin  // add_lanes' beats, and any that came through it for a set not flagged add
+          res_add_beats++;
+          if (rq_add.size() == 0 || rq_add[0] == 0) res_add_stray++;
+        end
+        if (dut.fill_v && rq_id.size() != 0) begin  // guarded: an unmatched fill beat is left for Task 2.6's checks to fail
           void'(rq_id.pop_front());
           void'(rq_bank.pop_front());
           void'(rq_byp.pop_front());
@@ -1188,12 +1186,12 @@ module TB_sienna_top #(
     end
   end
 
-  // int8 residual (spec Risk 3): hold/add pairs, and the same-cycle crosses of a hold set's done with an L3 grant and with a bank done.
-  int res_pairs = 0, cross_rel_grant = 0, cross_hold_bank = 0;
+  // int8 residual (spec Risk 3): hold sets done, add_lanes' fill beats, and the same-cycle crosses of a hold set's done with an L3 grant and with a bank done.
+  int res_holds = 0, res_add_beats = 0, res_add_stray = 0, cross_rel_grant = 0, cross_hold_bank = 0;
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0 && stream_on && rstn_i) begin
-      res_pairs += int'(dut.hold_done);
+      res_holds += int'(dut.hold_done);
       cross_rel_grant += int'(dut.hold_done && dut.l3_grant);
       cross_hold_bank += int'(dut.hold_done && dut.bank_done);
     end
@@ -1247,7 +1245,7 @@ module TB_sienna_top #(
   int ref_bounds[$];
   task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill, input bit hold = 0);
     automatic longint t0 = $time;
-    automatic int hold_stalled = 0, hold_done = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
+    automatic int hold_stalled = 0, hold_completions = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
     automatic int hold_put0 = 0, hold_in0 = 0, hold_room = 0;  // sets put and in flight at the hold's start; sets the entry admits after it
     automatic int hold_extra = 0;  // cycles the hold ran on past HOLD_CYC until the host was blocked
     automatic bit hold_end_blocked = 0;  // the host was blocked with a set to put as the hold ended
@@ -1276,7 +1274,9 @@ module TB_sienna_top #(
     rq_null_wait = 0;
     rq_null_pass = 0;
     add_drain_hold = 0;
-    res_pairs = 0;
+    res_holds = 0;
+    res_add_beats = 0;
+    res_add_stray = 0;
     cross_rel_grant = 0;
     cross_hold_bank = 0;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
@@ -1363,28 +1363,28 @@ module TB_sienna_top #(
                 repeat (HOLD_CYC) begin
                   @(negedge clk_i);
                   if (out_put == '0) hold_stalled++;
-                  if (pipeline_complete_o) hold_done++;
+                  if (pipeline_complete_o) hold_completions++;
                   if (host_cnt == 0 && dut.entry_full) hold_full++;
                   if (host_cnt == 0 && !dut.entry_full && n_started < k_num_sets) hold_blocked++;  // a set to put, no staging credit
                   if (host_cnt == 0 && dut.entry_full && n_started < k_num_sets) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
                   if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
                 end
                 // With the output frozen no real set completes, so the entry admits SETS_IN_FLIGHT less those in flight at the start (plus any completion): more sets left must block the host.
-                hold_room = SETS_IN_FLIGHT - hold_in0 + hold_done;
+                hold_room = SETS_IN_FLIGHT - hold_in0 + hold_completions;
                 // Required, the host must still be blocked as the hold ends; one between a staging credit and its put gets one set's load to block again.
                 while (k_num_sets - hold_put0 > hold_room && !(host_cnt == 0 && n_started < k_num_sets) && hold_extra < HOST_SET_CYC + 8) begin
                   @(negedge clk_i);
-                  if (pipeline_complete_o) hold_done++;
+                  if (pipeline_complete_o) hold_completions++;
                   hold_extra++;
                 end
                 hold_end_blocked = (host_cnt == 0 && n_started < k_num_sets);
                 out_hold = 0;
                 $display("  [Hold] every L9 credit withheld %0d cycles from set %0d's first words: %0d words put, %0d cycles with no word, %0d completions, %0d sets most in flight, %0d cycles with the entry full, the host blocked with a set to put %0d cycles by staging credits and %0d by the entry, %0d sets put (%0d at the start, %0d in flight); %0d cycles more to the end, blocked at the end %0b",
-                         HOLD_CYC, hold_set, hold_puts, hold_stalled, hold_done, hold_inflight, hold_full, hold_blocked, hold_capped, n_started,
+                         HOLD_CYC, hold_set, hold_puts, hold_stalled, hold_completions, hold_inflight, hold_full, hold_blocked, hold_capped, n_started,
                          hold_put0, hold_in0, hold_extra, hold_end_blocked);
                 if (k_num_sets - hold_put0 <= hold_room)
                   $display("  [Hold] host blocking not reachable: %0d sets left to put at the hold's start, the entry admits %0d more (SETS_IN_FLIGHT %0d, %0d in flight, %0d completions)",
-                           k_num_sets - hold_put0, hold_room, SETS_IN_FLIGHT, hold_in0, hold_done);
+                           k_num_sets - hold_put0, hold_room, SETS_IN_FLIGHT, hold_in0, hold_completions);
                 else if (hold_blocked + hold_capped == 0) begin
                   failed++;
                   $display("  [FAIL] Hold: the host was never blocked with a set to put, so the stall never reached it");
@@ -1416,8 +1416,8 @@ module TB_sienna_top #(
     out_hold = 0;
     // An add set's last beat cannot meet the next accept: rq_room holds the grant until add_lanes drains (a_add_last_no_accept).
     if (k_residual != 0)
-      $display("[HOLD/ADD] hold/add pairs %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
-               res_pairs, cross_rel_grant, cross_hold_bank, add_drain_hold);
+      $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add beats of other sets %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
+               res_holds, res_add_beats, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", k_num_sets, ($time - t0) / 10);
     $display("  [Stream] lane-cycles with no L9 credit held: %0d", starved);

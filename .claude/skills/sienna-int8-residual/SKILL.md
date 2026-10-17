@@ -213,7 +213,7 @@ G_POST cycle, k moves into a 5-bit buffer written beside `x_buf`, still at no cy
 
 | Item | Count | Estimate |
 |---|---|---|
-| `tfliteAdd` | NUM_LANES: 32 at N <= 32, 128 at N = 64 | 2 x (9 x 32) + 1 x (30 x 32) multipliers (about 1,540 partial-product bits, against `tfliteRequant`'s 1,024) and 3 rounding shifters: about 1.5-2x one `tfliteRequant` |
+| `tfliteAdd` | NUM_LANES: 32 at N <= 32, 128 at N = 64 | 2 x (9 x 32) + 1 x (30 x 32) multipliers (about 1,540 partial-product bits, against `tfliteRequant`'s 1,024) and 3 rounding shifters: about 1.5-2x one `tfliteRequant` (estimate). Measured (Yosys dch, generic cells, rs2_yd_t24): `add_lanes` at 32 lanes 441,939 comb + 7,330 FF, about 1.46x `requant_lanes` (302,999 + 6,344 at N = 16), below the estimate; one `tfliteAdd` alone has 473 FF, so without Yosys merging the lanes' identical word registers it would be about 15.1k FF |
 | `hold_mem` | 1 | N^2 x 8 bits: 2 Kbit at N = 16, 8 Kbit at N = 32, 32 Kbit at N = 64 |
 | ADD constants | 16 ids + 1 copy | about 2.7 Kbit of flops; L0 widens by 162 bits per `LINK_STAGES` register |
 | Sigmoid ladder | per lane | 19 constant compares of 15 bits, a 19-to-5 count, an 8-bit subtract and a mux: a few hundred gates, small next to the lane's 16 x 16 and 24 x 24 multipliers |

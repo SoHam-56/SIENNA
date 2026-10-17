@@ -1661,8 +1661,18 @@ def _residual_pairs_bad(raw: str, per_lane: int) -> str:
 
 RESIDUAL_CROSSES = ("hold done with an L3 grant", "hold done with a bank done")  # spec Risk 3's same-cycle crosses, each counted on its own
 RESIDUAL_CROSS = re.compile(r"^\s*RESIDUAL CROSSES: hold done with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # a point's line
-RESIDUAL_CROSS_GATE = False  # Task 2.6 sets True once sienna_top drives hold_done: then the sweep needs each cross at some point, or a ruling
-RESIDUAL_CROSS_UNREACHABLE = {}  # cross (RESIDUAL_CROSSES) -> {point: the written ruling that the cross cannot occur there}
+RESIDUAL_CROSS_GATE = True  # the sweep needs each cross non-zero at some int8 pipeline point, or a ruling for every point where it is 0
+
+
+def _residual_cross_line(counts, ran: int) -> str:
+    """run_regression's RESIDUAL CROSSES line over a point's residual tests (RESIDUAL_CROSS parses it)."""
+    return (f"  RESIDUAL CROSSES: {RESIDUAL_CROSSES[0]} {counts[0]}, {RESIDUAL_CROSSES[1]} {counts[1]} over {ran} residual tests"
+            " (a 0: not reachable at this point)")
+RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point, or "*" for every point: the written ruling that it cannot occur there}
+    "hold done with a bank done": {"*": "unreachable by construction (Task 2.6): hold_done is a hold beat leaving requantize, which is then no "
+                                        "rq_out beat; no add_lanes beat is in flight (the hold set's grant waited on rq_room, so at_v was empty); and "
+                                        "a lane set's g_done needs its own beats through requantize after the hold's last (a_rq_one_set)"},
+}
 
 
 def _residual_cross_sweep_bad(counts: dict, ruling: dict) -> list:
@@ -1672,7 +1682,7 @@ def _residual_cross_sweep_bad(counts: dict, ruling: dict) -> list:
     for i, c in enumerate(RESIDUAL_CROSSES):
         if any(v[i] for v in counts.values()):
             continue
-        unruled = sorted(q for q in counts if q not in ruling.get(c, {}))
+        unruled = sorted(q for q in counts if not ruling.get(c, {}).get(q, "").strip() and not ruling.get(c, {}).get("*", "").strip())
         if unruled:
             bad.append(f"{c}: 0 at every point, and no unreachable ruling for {', '.join(unruled)}")
     return bad
@@ -1690,9 +1700,13 @@ def _residual_cross_report(results: str, points: list) -> tuple:
             counts[q] = tuple(int(x) for x in m[-1])
         lines.append(f"  {q}: " + (", ".join(f"{c} {v}" for c, v in zip(RESIDUAL_CROSSES, counts[q])) if m else "no RESIDUAL CROSSES line"))
     if not lines:
-        return ["RESIDUAL CROSSES: no int8 pipeline point in this sweep"], []
+        if not RESIDUAL_CROSS_GATE:
+            return ["RESIDUAL CROSSES: NOT CHECKED, the sweep gate is off (RESIDUAL_CROSS_GATE) and the sweep has no int8 pipeline point"], []
+        if "int8" not in {SPEC.parse(q)["fmt"] for q in points if q != "selftest"}:  # FMT=fp32 or bf16: nothing residual runs
+            return ["RESIDUAL CROSSES: NOT APPLICABLE, the sweep runs no int8 point"], []
+        return ["RESIDUAL CROSSES: FAIL: no int8 pipeline point in a sweep with int8 points"], ["no int8 pipeline point"]
     if not RESIDUAL_CROSS_GATE:
-        return ["RESIDUAL CROSSES per point:"] + lines + ["RESIDUAL CROSSES: NOT CHECKED, the sweep gate is off (RESIDUAL_CROSS_GATE) until Task 2.6"], []
+        return ["RESIDUAL CROSSES per point:"] + lines + ["RESIDUAL CROSSES: NOT CHECKED, the sweep gate is off (RESIDUAL_CROSS_GATE)"], []
     bad = _residual_cross_sweep_bad(counts, RESIDUAL_CROSS_UNREACHABLE)
     bad += [f"{q}: no RESIDUAL CROSSES line" for q in (ln.split(":")[0].strip() for ln in lines) if q not in counts]
     return ["RESIDUAL CROSSES per point:"] + lines + [f"RESIDUAL CROSSES: {'FAIL: ' + '; '.join(bad) if bad else 'PASS'}"], bad
@@ -1842,8 +1856,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
 
     print(f"\n  ╚══  Sweep Complete")
     if res_ran:  # characterization: a 0 is a cross not reachable at this point; the sweep gates them (summary_main)
-        print(f"  RESIDUAL CROSSES: {RESIDUAL_CROSSES[0]} {res_cross[0]}, {RESIDUAL_CROSSES[1]} {res_cross[1]} over {res_ran} residual tests"
-              " (a 0: not reachable at this point)")
+        print(_residual_cross_line(res_cross, res_ran))
 
     gated = [r for r in results if "truth" in r]
     names = sorted({k for r in gated for k in r["truth"] if not k.startswith("_")},
@@ -3522,7 +3535,7 @@ def test_residual_pairs_check():
 @selftest
 def test_residual_cross_sweep():
     """The sweep's residual-cross check on synthetic counts: a cross 0 at every point fails unless every such point is ruled unreachable,
-    a 0 at some points passes, and a point's line parses into its two counts."""
+    a 0 at some points passes, and run_regression's own line (_residual_cross_line) parses into its two counts."""
     g, b = RESIDUAL_CROSSES
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (0, 2)}, {}) == []  # both present, each at some point
     bad = _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {})
@@ -3530,8 +3543,48 @@ def test_residual_cross_sweep():
     assert _residual_cross_sweep_bad({"p1": (0, 0), "p2": (0, 0)}, {}) == [f"{x}: 0 at every point, and no unreachable ruling for p1, p2" for x in (g, b)]
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"p1": "ruled", "p2": "ruled"}}) == []  # ruled unreachable everywhere
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"p1": "ruled"}})  # p2 unruled
-    line = "  RESIDUAL CROSSES: hold done with an L3 grant 4, hold done with a bank done 0 over 8 residual tests (a 0: not reachable at this point)\n"
-    assert RESIDUAL_CROSS.findall(line) == [("4", "0")]
+    assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"*": "ruled"}}) == []  # ruled for every point
+    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ""}})  # a ruling needs its written reason
+    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": "ruled"}}) and RESIDUAL_CROSS_UNREACHABLE.get(g) is None  # the L3 grant cross has none
+    assert RESIDUAL_CROSS.findall(_residual_cross_line([4, 0], 8) + "\n") == [("4", "0")]
+    assert RESIDUAL_CROSS.findall(regress.ANSI.sub("", "\x1b[1m" + _residual_cross_line([12, 3], 8) + "\x1b[0m\n")) == [("12", "3")]
+
+
+@selftest
+def test_residual_cross_report():
+    """_residual_cross_report over a results directory: gate off is NOT CHECKED and never fails, gate on fails a point with no line and
+    a cross 0 everywhere unruled, passes both crosses present, fails a sweep with int8 points but no int8 pipeline point, and says a
+    sweep without int8 is not applicable."""
+    global RESIDUAL_CROSS_GATE, RESIDUAL_CROSS_UNREACHABLE
+    keep = (RESIDUAL_CROSS_GATE, RESIDUAL_CROSS_UNREACHABLE)
+    pts = ["selftest", "int8/N8_T2/pipeline", "int8/N8_T4/pipeline", "int8/N8_T2/gemm", "fp32/N8_T2/pipeline"]
+    with tempfile.TemporaryDirectory() as d:
+        def log(q, text):
+            os.makedirs(os.path.dirname(os.path.join(d, q)), exist_ok=True)
+            open(os.path.join(d, q + ".log"), "w").write(text)
+        log("fp32/N8_T2/pipeline", "no residual tests\n")
+        log("int8/N8_T2/pipeline", "x\n" + _residual_cross_line([2, 0], 8) + "\n")
+        try:
+            RESIDUAL_CROSS_GATE, RESIDUAL_CROSS_UNREACHABLE = False, {}
+            lines, bad = _residual_cross_report(d, pts)  # T4 has no log: no line
+            assert bad == [] and lines[-1].startswith("RESIDUAL CROSSES: NOT CHECKED"), lines
+            RESIDUAL_CROSS_GATE = True
+            lines, bad = _residual_cross_report(d, pts)
+            assert "int8/N8_T4/pipeline: no RESIDUAL CROSSES line" in bad and any(x.startswith(RESIDUAL_CROSSES[1]) for x in bad), bad
+            assert lines[-1].startswith("RESIDUAL CROSSES: FAIL") and "  int8/N8_T2/pipeline: hold done with an L3 grant 2, " in lines[1], lines
+            log("int8/N8_T4/pipeline", _residual_cross_line([0, 5], 8) + "\n")
+            lines, bad = _residual_cross_report(d, pts)
+            assert bad == [] and lines[-1] == "RESIDUAL CROSSES: PASS", (lines, bad)
+            log("int8/N8_T4/pipeline", _residual_cross_line([0, 0], 8) + "\n")
+            assert _residual_cross_report(d, pts)[1], "the bank done cross 0 everywhere and unruled"
+            RESIDUAL_CROSS_UNREACHABLE = {RESIDUAL_CROSSES[1]: {"int8/N8_T2/pipeline": "r", "int8/N8_T4/pipeline": "r"}}
+            assert _residual_cross_report(d, pts)[1] == []
+            lines, bad = _residual_cross_report(d, ["selftest", "int8/N8_T2/gemm", "fp32/N8_T2/pipeline"])
+            assert bad and lines[-1].startswith("RESIDUAL CROSSES: FAIL"), lines
+            lines, bad = _residual_cross_report(d, ["selftest", "fp32/N8_T2/pipeline"])
+            assert bad == [] and lines == ["RESIDUAL CROSSES: NOT APPLICABLE, the sweep runs no int8 point"], lines
+        finally:
+            RESIDUAL_CROSS_GATE, RESIDUAL_CROSS_UNREACHABLE = keep
 
 
 def _residual_syn_dump(name: str, fault=None) -> list:

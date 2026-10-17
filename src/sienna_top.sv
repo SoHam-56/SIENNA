@@ -886,7 +886,7 @@ module sienna_top #(
         s_shout[host_next_id] <= side.shout;
         s_zout[host_next_id]  <= side.zout;
         s_add[host_next_id]   <= '{zp1: side.add_zp1, zp2: side.add_zp2, m1: side.add_m1, s1: side.add_s1, m2: side.add_m2, s2: side.add_s2,
-                                   mo: side.add_mo, so: side.add_so, zpo: side.add_zpo, min: side.add_min, max: side.add_max};
+                                   mo: side.add_mo, so: side.add_so, zpo: side.add_zpo, amin: side.add_min, amax: side.add_max};
       end
       if (g_accept) begin
         g_mult   <= s_mult[g_next_id];

@@ -1668,23 +1668,26 @@ def _residual_cross_line(counts, ran: int) -> str:
     """run_regression's RESIDUAL CROSSES line over a point's residual tests (RESIDUAL_CROSS parses it)."""
     return (f"  RESIDUAL CROSSES: {RESIDUAL_CROSSES[0]} {counts[0]}, {RESIDUAL_CROSSES[1]} {counts[1]} over {ran} residual tests"
             " (a 0: not reachable at this point)")
-RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point, or "*" for every point: the written ruling that it cannot occur there}
-    "hold done with a bank done": {"*": "unreachable, checked every cycle by sienna_top's a_hold_done_no_bank (fires under m_t26_hdb_force): "
-                                        "hold_done is a hold beat leaving requantize, which is then no rq_out beat; no add_lanes beat is in flight "
-                                        "(the hold set's grant waited on rq_room, so at_v was empty); and a lane set's g_done needs its own beats "
-                                        "through requantize after the hold's last (a_rq_one_set)"},
+RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point: ruling text, or "*" (every point): (guard assertion, ruling text)}
+    "hold done with a bank done": {"*": ("a_hold_done_no_bank",
+                                         "unreachable, checked every cycle by sienna_top's a_hold_done_no_bank (fires under m_t26_hdb_force): "
+                                         "hold_done is a hold beat leaving requantize, which is then no rq_out beat; no add_lanes beat is in flight "
+                                         "(the hold set's grant waited on rq_room, so at_v was empty); and a lane set's g_done needs its own beats "
+                                         "through requantize after the hold's last (a_rq_one_set)")},
 }
 RTL_TOP = os.path.join(ROOT, "src", "sienna_top.sv")
 
 
-def _ruling_ok(point: str, text: str, rtl: str) -> bool:
-    """A point's ruling needs its text; a "*" ruling (every point) must also name an assertion that sienna_top.sv declares."""
-    if not text.strip():
-        return False
+def _ruling_ok(point: str, ruling, rtl: str) -> bool:
+    """A point's ruling is its text; a "*" ruling (every point) is (guard, text), and sienna_top.sv must declare that exact guard."""
     if point != "*":
-        return True
-    named = re.findall(r"\b(a_\w+)", text)
-    return any(re.search(rf"^\s*{n}\s*:\s*assert\s+property", rtl, re.M) for n in named)
+        return isinstance(ruling, str) and bool(ruling.strip())
+    if not (isinstance(ruling, tuple) and len(ruling) == 2 and all(isinstance(x, str) for x in ruling)):
+        return False
+    guard, text = ruling
+    if not text.strip() or not re.fullmatch(r"a_\w+", guard):
+        return False
+    return re.search(rf"^\s*{guard}\s*:\s*assert\s+property\b", rtl, re.M) is not None
 
 
 def _residual_cross_sweep_bad(counts: dict, ruling: dict, rtl: str = None) -> list:
@@ -3557,13 +3560,16 @@ def test_residual_cross_sweep():
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"p1": "ruled", "p2": "ruled"}}) == []  # ruled unreachable everywhere
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"p1": "ruled"}})  # p2 unruled
     rtl = "  a_x_never: assert property (@(posedge clk_i) 1'b1);\n"
-    assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"*": "ruled, a_x_never"}}, rtl) == []  # every point, on an assertion
-    assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": "ruled by prose"}}, rtl)  # "*" without an assertion is refused
-    assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": "ruled, a_x_gone"}}, rtl)  # nor one the RTL does not declare
+    assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"*": ("a_x_never", "ruled")}}, rtl) == []  # every point, on its guard
+    assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": "ruled, a_x_never"}}, rtl)  # "*" as text alone is refused, even naming an assertion
+    assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": ("a_x_gone", "ruled, a_x_never")}}, rtl)  # a guard the RTL does not declare, another named in the text
     assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"p1": "ruled by prose"}}, rtl) == []  # a single point's ruling needs text only
-    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ""}}, rtl)  # a ruling needs its written reason
-    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": "a_x_never"}}, rtl) and RESIDUAL_CROSS_UNREACHABLE.get(g) is None  # the L3 grant cross has none
+    assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": ("a_x", "ruled")}}, rtl + "  a_x_y: assert property (1'b1);\n")  # a prefix is no match
+    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ("a_x_never", " ")}}, rtl)  # a ruling needs its written reason
+    assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ("a_x_never", "ruled")}}, rtl) and RESIDUAL_CROSS_UNREACHABLE.get(g) is None  # the L3 grant cross has none
     assert _ruling_ok("*", RESIDUAL_CROSS_UNREACHABLE[b]["*"], open(RTL_TOP).read())  # the committed ruling's assertion is in sienna_top
+    gone = "".join(x for x in open(RTL_TOP).read().splitlines(True) if not re.match(r"^\s*a_hold_done_no_bank\s*:", x))
+    assert not _ruling_ok("*", RESIDUAL_CROSS_UNREACHABLE[b]["*"], gone)  # the guard deleted from the RTL: the ruling fails
     assert RESIDUAL_CROSS.findall(_residual_cross_line([4, 0], 8) + "\n") == [("4", "0")]
     assert RESIDUAL_CROSS.findall(regress.ANSI.sub("", "\x1b[1m" + _residual_cross_line([12, 3], 8) + "\x1b[0m\n")) == [("12", "3")]
 

@@ -3799,6 +3799,28 @@ def test_gpnae_target_model():
 
 
 @selftest
+def test_layer_mode_check():
+    line = "[LAYER] sets=4 outputs=64 cycles=99 a_rows=2/2 w_rows=2/2 epilogues=0/0 out_stall=0 in_stall=0"
+    tb = open(os.path.join(ROOT, "testbenches", "TB_model_run.sv")).read()  # the mode printed is the elaborated mesh's, not the package's
+    assert "in_stall=%0d collapse_k=%0d" in tb and "dut.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "TB_model_run's [LAYER] line lost the mesh's COLLAPSE_K"
+    old = mr.COLLAPSE_K
+    try:
+        for ck in (0, 1):
+            mr.COLLAPSE_K = ck
+            mr.check_layer_mode(f"{line} collapse_k={ck}\n", "t")
+            for text, want in ((f"{line} collapse_k={1 - ck}\n", f"t: the build's mesh runs collapse-k {1 - ck}, the run asked for {ck}"),
+                               (line + "\n", "t: the [LAYER] line has no collapse_k")):
+                try:
+                    mr.check_layer_mode(text, "t")
+                except RuntimeError as e:
+                    assert want in str(e), (want, str(e))
+                    continue
+                raise AssertionError(f"collapse-k {ck}: accepted {text!r}")
+    finally:
+        mr.COLLAPSE_K = old
+
+
+@selftest
 def test_layer_file_format():
     N, rng = 16, np.random.default_rng(5)
     req = dict(zp=3, amin=-128, amax=127, mx=0, shx=0, mout=0, shout=0, zout=0)

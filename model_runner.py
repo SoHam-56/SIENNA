@@ -970,6 +970,15 @@ def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
 
 # ── 6. Backends: build(), run_job(job, tag) -> (outputs, sets, cycles) ───────
 
+def check_layer_mode(text, tag):
+    """Raises unless TB_model_run's [LAYER] line gives the elaborated mesh's collapse_k and it is COLLAPSE_K."""
+    m = re.search(r"\[LAYER\] sets=.*\bcollapse_k=(\d+)", text)
+    if not m:
+        raise RuntimeError(f"{tag}: the [LAYER] line has no collapse_k: the mesh's mode is unknown")
+    if int(m.group(1)) != COLLAPSE_K:
+        raise RuntimeError(f"{tag}: the build's mesh runs collapse-k {m.group(1)}, the run asked for {COLLAPSE_K}")
+
+
 class RtlLayer:
     """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -1011,6 +1020,7 @@ class RtlLayer:
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: layer simulation failed")
+        check_layer_mode(r.stdout, tag)
         outs = read_outputs(of, self.fmt_name)
         os.remove(lf)
         os.remove(of)

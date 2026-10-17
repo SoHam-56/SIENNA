@@ -1016,18 +1016,19 @@ module sienna_top #(
     // int8 residual: hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
     localparam int QAL = sienna_fmt_pkg::qadd_lat();
     localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
+    localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
     logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
     logic hold_wr, add_in, rq_out, add_v;
-    logic [FCNT_W-1:0] hold_rd_idx;
+    logic [HMW-1:0] hold_rd_idx;
     logic [NUM_LANES-1:0][7:0] add_d;
     logic [ATW-1:0] add_tag;
     logic [QAL-1:0] at_v;  // an add beat at each add_lanes stage
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
-    assign hold_rd_idx = tg_idx[RQL-1];
+    assign hold_rd_idx = HMW'(tg_idx[RQL-1]);
     assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
-    always_ff @(posedge clk_i) if (hold_wr) hold_mem[tg_idx[RQL-1]] <= rq_d;
+    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_rd_idx] <= rq_d;  // the hold beat's own index, as an add beat reads it
     add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) addl (
         .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d),
         .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}),

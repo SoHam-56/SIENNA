@@ -868,7 +868,8 @@ module TB_sienna_top #(
     int pj[NUM_LANES];  // dropout inputs of the pooled set so far, per lane
     int q_id[$], q_i[$];
     bit q_pk[$];
-    int h_id[$], h_i[$];  // int8 residual: hold beats inside requantize, their set id and beat index
+    logic [$clog2(TR_IDS)-1:0] h_id[$];  // int8 residual: hold beats inside requantize, their set id and beat index
+    int h_i[$];
     logic [NUM_LANES-1:0][7:0] a_q1[$], a_q2[$];  // add beats inside add_lanes, their two inputs
     int seen;
     seen = 0;
@@ -898,7 +899,7 @@ module TB_sienna_top #(
             q_i.push_back(beat[int'(dut.g_set_id)]);
             q_pk.push_back(dut.g_pack);
           end else begin
-            h_id.push_back(int'(dut.g_set_id));
+            h_id.push_back(dut.g_set_id);
             h_i.push_back(beat[int'(dut.g_set_id)]);
           end
           beat[int'(dut.g_set_id)]++;
@@ -908,9 +909,10 @@ module TB_sienna_top #(
             failed++;
             $display("  [FAIL] truth dump: a hold_mem write with no hold beat in the requantize pipeline");
           end else begin
-            automatic int id = h_id.pop_front(), i = h_i.pop_front();
-            if (tr_on && tr_fd)
-              for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "R %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, 1'b0), dut.hold_d_s[k]);
+            automatic logic [$clog2(TR_IDS)-1:0] hid = h_id.pop_front();
+            automatic int i = h_i.pop_front();
+            if (tr_on && tr_fd != 0)
+              for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "R %s %0d %0d %h", tr_pass, tr_k[hid], tr_elem(k, i, 1'b0), dut.hold_d_s[k]);
           end
         end
         if (dut.fill_v && q_id.size() != 0) begin
@@ -921,7 +923,7 @@ module TB_sienna_top #(
             $display("  [FAIL] truth dump: an add_lanes beat filled with no add beat entering add_lanes before it");
           end else if (dut.fill_add) begin  // the ADD's inputs and output (Q)
             automatic logic [NUM_LANES-1:0][7:0] q1 = a_q1.pop_front(), q2 = a_q2.pop_front();
-            if (tr_on && tr_fd)
+            if (tr_on && tr_fd != 0)
               for (int k = 0; k < NUM_LANES; k++)
                 $fdisplay(tr_fd, "Q %s %0d %0d %h %h %h", tr_pass, tr_k[id], tr_elem(k, i, pk), q1[k], q2[k], dut.fill_d[k][7:0]);
           end

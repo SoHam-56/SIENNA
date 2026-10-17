@@ -152,6 +152,10 @@ module sienna_top #(
   logic [FCNT_W-1:0] byp_idx;  // its element within each lane's block
   logic hold_done;  // int8: a hold set's last beat is in hold_mem: its L6 reservation goes back, pooling may pass it
   logic fill_add;  // int8: the fill beat this cycle came through add_lanes
+`ifndef SYNTHESIS
+  logic add_in_s, hold_wr_s;
+  logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
+`endif
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
@@ -483,7 +487,7 @@ module sienna_top #(
           .control_word_i(gpnae_ctrl[g]),
           .gp_mx_i       (g_mx[g]),
           .gp_shx_i      (g_shx[g]),
-          .gp_zin_i      (g_zp[g]),  // int8: the lane's input is the requantize output, whose zero point is its entry's
+          .gp_zin_i      (g_add ? g_add_zpo : g_zp[g]),  // int8: the lane's input zero point: the ADD's zp_o after an ADD, else its requantize entry's (P-3)
           .gp_mout_i     (g_mout[g]),
           .gp_shout_i    (g_shout[g]),
           .gp_zout_i     (g_zout[g])
@@ -759,8 +763,8 @@ module sienna_top #(
   logic complete_q, p_null;
   logic set_complete;  // a set completes this cycle, with its last word into the output register
   logic [ID_W-1:0] set_done_id;
-  assign p_null = (p_state == P_IDLE) && (gp_sets != 0) && set_accum[p_next_id] && !complete_q;
-  assign p_accept = (p_state == P_IDLE) && (gp_sets != 0) && !set_accum[p_next_id] && act_full[act_rd];
+  assign p_null = (p_state == P_IDLE) && (gp_sets != 0) && (set_accum[p_next_id] || set_hold[p_next_id]) && !complete_q;
+  assign p_accept = (p_state == P_IDLE) && (gp_sets != 0) && !set_accum[p_next_id] && !set_hold[p_next_id] && act_full[act_rd];
   assign p_release = (p_state == P_DISPATCH) && disp_done;  // the bank is copied into FIFO2
   assign pool_done = (p_state == P_WAIT) && streaming_complete;
 
@@ -820,7 +824,7 @@ module sienna_top #(
       else if (g_accept) l3_armed <= 1'b0;
       if (g_state == G_IDLE) g_fed <= 1'b0;
       else if (wide_rd_valid) g_fed <= 1'b1;
-      l6_rsv  <= l6_rsv + 2'(l3_grant) - 2'(l6.put);
+      l6_rsv  <= l6_rsv + 2'(l3_grant) - 2'(l6.put) - 2'(hold_done);  // a hold set reserved a bank at its grant and fills none
       l6_owed <= l6_owed + 2'(p_release) - 2'(l6_credit);
       case (g_state)
         G_IDLE:     if (g_accept) g_state <= G_FEED;
@@ -836,12 +840,12 @@ module sienna_top #(
         default:    p_state <= P_IDLE;
       endcase
       if (l6.put) act_full[l6.data] <= 1'b1;  // pooling, the L6 consumer, owns the bank flags
-      if (g_done) act_wr <= ~act_wr;
+      if (g_done && !g_hold) act_wr <= ~act_wr;  // a hold set fills no bank
       if (p_release) begin
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
-      gp_sets <= gp_sets + CRW'(bank_done || g_null_done) - CRW'(set_complete);
+      gp_sets <= gp_sets + CRW'(bank_done || g_null_done) + CRW'(hold_done) - CRW'(set_complete);
       sets_out  <= sets_out + CRW'(host_accept) - CRW'(set_complete);
       l0_out    <= l0_out + CRW'(l0_grant) - CRW'(host_accept);
       mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept || g_null_done);
@@ -934,7 +938,7 @@ module sienna_top #(
         case (pe_act[p_lane_ent[k]])
           CONTROL_WIDTH'(3'b001): p_zp[k] = pe_zout[p_lane_ent[k]];  // SELU: its requantized output's zero point
           CONTROL_WIDTH'(3'b010): p_zp[k] = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
-          CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = pe_zp[p_lane_ent[k]];  // ReLU, linear: the requantize output's
+          CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = pe_add ? pe_add_zpo : pe_zp[p_lane_ent[k]];  // ReLU, linear: the ADD's or the requantize output's
           default: p_zp[k] = 8'h00;  // tanh: zero point 0
         endcase
     end
@@ -960,6 +964,8 @@ module sienna_top #(
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
   // int8: the lanes, the bypass write and every fill counter see requantized int8 beats, REQ_LAT cycles after the wide read.
   if (IS_INT) begin : G_REQ
+    logic rq_v;  // requantize's output beat
+    logic [NUM_LANES-1:0][7:0] rq_d;
     requant_lanes #(
         .NUM_LANES(NUM_LANES),
         .N        (N),
@@ -977,14 +983,14 @@ module sienna_top #(
         .zp_i    (g_zp),
         .min_i   (g_min),
         .max_i   (g_max),
-        .valid_o (fill_v),
-        .result_o(fill_d)
+        .valid_o (rq_v),
+        .result_o(rq_d)
     );
     // Each beat's destination rides beside tfliteRequant, which takes its own mult, shift, zp, min and max at stage 1.
     localparam int RQL = sienna_fmt_pkg::req_lat();
     logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
     logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
-    logic [RQL-1:0] tg_byp, tg_bank;
+    logic [RQL-1:0] tg_byp, tg_bank, tg_hold, tg_add;
     logic [RQL-1:0] tg_pack;
     logic [FCNT_W-1:0] tg_idx[RQL];
     always_ff @(posedge clk_i or negedge rstn_i) begin
@@ -1000,30 +1006,68 @@ module sienna_top #(
     always_ff @(posedge clk_i) begin  // no reset: read only beside tg_v / fill_v
       tg_byp  <= {tg_byp[RQL-2:0], act_bypass};
       tg_bank <= {tg_bank[RQL-2:0], act_wr};
+      tg_hold <= {tg_hold[RQL-2:0], g_hold};
+      tg_add  <= {tg_add[RQL-2:0], g_add};
       tg_pack <= {tg_pack[RQL-2:0], g_pack};
       tg_idx[0] <= rq_in;
       for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
     end
     assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last beat is in: the stage may leave while it drains
-    assign rq_drain   = |tg_v;
-    // Beats granted now arrive 2 or more cycles later (counter, then the mesh's registered read): grant once no beat would still be inside then.
+    // int8 residual: hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
+    localparam int QAL = sienna_fmt_pkg::qadd_lat();
+    localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
+    logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
+    logic hold_wr, add_in, rq_out, add_v;
+    logic [FCNT_W-1:0] hold_rd_idx;
+    logic [NUM_LANES-1:0][7:0] add_d;
+    logic [ATW-1:0] add_tag;
+    logic [QAL-1:0] at_v;  // an add beat at each add_lanes stage
+    assign hold_wr     = rq_v && tg_hold[RQL-1];
+    assign add_in      = rq_v && tg_add[RQL-1];
+    assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
+    assign hold_rd_idx = tg_idx[RQL-1];
+    assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
+    always_ff @(posedge clk_i) if (hold_wr) hold_mem[tg_idx[RQL-1]] <= rq_d;
+    add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) addl (
+        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d),
+        .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}),
+        .zp1_i(g_add_w.zp1), .zp2_i(g_add_w.zp2), .m1_i(g_add_w.m1), .s1_i(g_add_w.s1), .m2_i(g_add_w.m2),
+        .s2_i(g_add_w.s2), .mo_i(g_add_w.mo), .so_i(g_add_w.so), .zpo_i(g_add_w.zpo), .min_i(g_add_w.amin),
+        .max_i(g_add_w.amax),  // add_words_t fields by name (Task 2.4 review): no numeric slices
+        .valid_o(add_v), .result_o(add_d), .tag_o(add_tag));
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) at_v <= '0;
+      else at_v <= {at_v[QAL-2:0], add_in};
+    // The fill sees one source a cycle (a_fill_one_source): requantize's non-ADD beats, or add_lanes' beats with their own tags.
+    logic f_byp, f_bank, f_pack;
+    logic [FCNT_W-1:0] f_idx;
+    assign fill_v   = rq_out || add_v;
+    assign fill_d   = add_v ? add_d : rq_d;
+    assign fill_add = add_v;
+    assign {f_byp, f_bank, f_pack, f_idx} = add_v ? add_tag : {tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]};
+    assign rq_drain = |tg_v || |at_v;
+    // Beats granted now arrive 2 or more cycles later; after an add set, grant only once no add beat is in requantize or add_lanes.
     localparam int RQ_HOLD = (RQL > 2) ? RQL - 2 : 0;
     always_comb begin
-      rq_room = 1'b1;
+      rq_room = !(|(tg_v & tg_add)) && !(|at_v);
       for (int i = 0; i < RQ_HOLD; i++) if (tg_v[i]) rq_room = 1'b0;
     end
-    assign lane_v     = fill_v && !tg_byp[RQL-1];
-    assign byp_wr     = fill_v && tg_byp[RQL-1];
-    assign byp_bank   = tg_bank[RQL-1];
-    assign byp_pack   = tg_pack[RQL-1];
-    assign byp_idx    = tg_idx[RQL-1];
-    // The bank is full when a ReLU or linear set's last beat leaves the pipeline, or when the lanes return a set.
-    assign bank_done  = (byp_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1)) || (g_done && !act_bypass);
-    assign bank_sel   = byp_wr ? tg_bank[RQL-1] : act_wr;
-    assign hold_done  = 1'b0;  // Task 2.6 drives it from hold_mem
-    assign fill_add   = 1'b0;  // Task 2.6 drives it from add_lanes
+    assign lane_v     = fill_v && !f_byp;
+    assign byp_wr     = fill_v && f_byp;
+    assign byp_bank   = f_bank;
+    assign byp_pack   = f_pack;
+    assign byp_idx    = f_idx;
+    // The bank is full when a ReLU or linear set's last beat leaves (from requantize or add_lanes), or when the lanes return a set.
+    assign bank_done  = (byp_wr && (f_idx == PER_LANE[FCNT_W-1:0] - 1'b1)) || (g_done && !act_bypass && !g_hold);
+    assign bank_sel   = byp_wr ? f_bank : act_wr;
 `ifndef SYNTHESIS
-    a_rq_tag_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) fill_v == tg_v[RQL-1])
+    assign {add_in_s, hold_wr_s} = {add_in, hold_wr};
+    assign add_q1_s = hold_mem[hold_rd_idx];
+    assign add_q2_s = rq_d;
+    assign hold_d_s = rq_d;
+`endif
+`ifndef SYNTHESIS
+    a_rq_tag_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) rq_v == tg_v[RQL-1])
       else $error("sienna_top: the requantize sideband is out of step with requant_lanes");
     a_rq_bank_once: assert property (@(posedge clk_i) disable iff (!rstn_i) !(byp_wr && g_done && !act_bypass))
       else $error("sienna_top: a drained ReLU or linear set and a lane set completed banks in the same cycle");
@@ -1050,6 +1094,12 @@ module sienna_top #(
     assign rq_room    = 1'b1;
     assign bank_done  = g_done;
     assign bank_sel   = act_wr;
+`ifndef SYNTHESIS
+    assign {add_in_s, hold_wr_s} = '0;
+    assign add_q1_s = '0;
+    assign add_q2_s = '0;
+    assign hold_d_s = '0;
+`endif
   end
 
   always_comb begin
@@ -1296,7 +1346,7 @@ module sienna_top #(
   a_act_bank_full: assert property (@(posedge clk_i) disable iff (!rstn_i) p_release |-> act_full[act_rd])
     else $error("sienna_top: pooling released an empty bank");
   a_real_has_bank: assert property (@(posedge clk_i) disable iff (!rstn_i)
-                                    ((p_state == P_IDLE) && (gp_sets != 0) && !set_accum[p_next_id]) |-> act_full[act_rd])
+                                    ((p_state == P_IDLE) && (gp_sets != 0) && !set_accum[p_next_id] && !set_hold[p_next_id]) |-> act_full[act_rd])
     else $error("sienna_top: pooling's next set is a real result with no activation bank holding it");
   a_null_no_result: assert property (@(posedge clk_i) disable iff (!rstn_i) g_null_done |-> !g_accept)
     else $error("sienna_top: a partial set and a mesh result were taken in the same cycle");

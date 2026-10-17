@@ -1038,8 +1038,8 @@ module sienna_top #(
         .valid_o(add_v), .result_o(add_d), .tag_o(add_tag));
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) at_v <= '0;
-      else at_v <= {at_v[QAL-2:0], add_in};
-    // The fill sees one source a cycle (a_fill_one_source): requantize's non-ADD beats, or add_lanes' beats with their own tags.
+      else at_v <= QAL'({at_v, add_in});  // elaborates at any qadd_lat() >= 1
+    // The fill sees one source a cycle (Task 2.7's a_fill_one_source checks it): requantize's non-ADD beats, or add_lanes' beats with their own tags.
     logic f_byp, f_bank, f_pack;
     logic [FCNT_W-1:0] f_idx;
     assign fill_v   = rq_out || add_v;

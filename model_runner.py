@@ -226,6 +226,22 @@ def tflite_add_codes(q1, q2, add: dict) -> np.ndarray:
     return np.asarray(ipu.tflite_add(q1, q2, *[add[k] for k in ADD_FIELDS], ROUNDING), np.int64)
 
 
+def add_lane_params(add: dict, s_out: float, y) -> dict:
+    """The lane's words after an ADD: input zero point the ADD's zp_o, the rescale of s_out, SELU's output calibrated on the ADD's outputs y."""
+    mx, shx = gpnae_model.rescale_params(s_out)
+    x = (np.asarray(y, np.int64) - add["zpo"]) * s_out  # the lane's real inputs
+    _, s_selu, z_selu = quant_act(apply_activation(np.maximum(x, -16.0).astype(np.float32), "selu"))  # as requant_params calibrates SELU
+    mout, shout = gpnae_model.selu_out_params(s_out, mx, s_selu)
+    return dict(zp=add["zpo"], amin=add["amin"], amax=add["amax"], mx=mx, shx=shx, mout=int(mout), shout=int(shout), zout=z_selu,
+                s_out=s_out, s_selu=s_selu)
+
+
+def int8_residual_exact(A_q, B_q, hw_bias, rq: dict, R_q, add: dict, ra: dict, act: str) -> np.ndarray:
+    """sienna_layer's int8 residual output for one product: the conv's requantize (q1), TFLite's ADD with the residual codes R_q, the lane."""
+    acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
+    return activate_int8(tflite_add_codes(requantize(acc, rq), R_q, add), act, ra)
+
+
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
     """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
     assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
@@ -876,7 +892,7 @@ TB_DIR = os.path.join(ROOT, "testbenches")
 
 
 TB_KNOBS = ("ACTIVATION_CODE", "NUM_SETS", "HAS_BIAS", "WEIGHT_CACHE", "ACCUM_PASSES", "MIXED_LEN", "MIXED_ACTS", "PACKED", "TRAINING_MODE",
-            "DROPOUT_SEED")  # TB_sienna_top reads these at run time (test_knobs.mem), so one build runs every test that agrees on the rest
+            "DROPOUT_SEED", "RESIDUAL")  # TB_sienna_top reads these at run time (test_knobs.mem), so one build runs every test that agrees on the rest
 
 
 def write_test_config(path: str, items: list) -> None:
@@ -935,6 +951,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("PACKED", int(bool(cfg.get("packed", False))), "int"),
         ("TRAINING_MODE", int(bool(cfg.get("training", False))), "int"),
         ("DROPOUT_SEED", drop_seed, "int"),
+        ("RESIDUAL", int(bool(cfg.get("residual") or cfg.get("residual_every"))), "int"),  # int8 residual: add_<k>.mem gives each set's flags
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
         ("COLLAPSE_K", COLLAPSE_K, "int"),  # TB_sienna_top sets sienna_top's mesh mode from it: a build item, not a run-time knob
     ]

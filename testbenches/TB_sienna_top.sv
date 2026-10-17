@@ -109,6 +109,7 @@ module TB_sienna_top #(
   bit         wc_open_tb[2];  // per region: a fill is open (put, its last set not yet put)
   logic       drained;  // nothing in flight for a while: every credit must be home
   int         tb_inflight, quiet_cyc;  // sets put and not complete; cycles with none
+  int         tb_puts;  // sets put, counted on the same edge as tb_inflight
   localparam int QUIET_TB = 16 + 4 * LINK_STAGES;
   credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
                                               .has_credit_o(), .count_o(host_cnt));
@@ -125,10 +126,12 @@ module TB_sienna_top #(
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) begin
       tb_inflight <= 0;
+      tb_puts     <= 0;
       quiet_cyc   <= 0;
       sum_open    <= 1'b0;
     end else begin
       tb_inflight <= tb_inflight + int'(host_lnk.put) - int'(pipeline_complete_o);
+      tb_puts     <= tb_puts + int'(host_lnk.put);
       quiet_cyc   <= (tb_inflight != 0 || host_lnk.put || sum_open) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
       if (host_lnk.put) sum_open <= side_put.accumulate;
     end
@@ -865,6 +868,8 @@ module TB_sienna_top #(
     int pj[NUM_LANES];  // dropout inputs of the pooled set so far, per lane
     int q_id[$], q_i[$];
     bit q_pk[$];
+    int h_id[$], h_i[$];  // int8 residual: hold beats inside requantize, their set id and beat index
+    logic [NUM_LANES-1:0][7:0] a_q1[$], a_q2[$];  // add beats inside add_lanes, their two inputs
     int seen;
     seen = 0;
     forever begin
@@ -875,6 +880,10 @@ module TB_sienna_top #(
         q_id.delete();
         q_i.delete();
         q_pk.delete();
+        h_id.delete();
+        h_i.delete();
+        a_q1.delete();
+        a_q2.delete();
       end else begin
         for (int t = 0; t < TR_TPD * TR_TPD; t++)
           if (tr_we[t]) begin
@@ -888,14 +897,40 @@ module TB_sienna_top #(
             q_id.push_back(int'(dut.g_set_id));
             q_i.push_back(beat[int'(dut.g_set_id)]);
             q_pk.push_back(dut.g_pack);
+          end else begin
+            h_id.push_back(int'(dut.g_set_id));
+            h_i.push_back(beat[int'(dut.g_set_id)]);
           end
           beat[int'(dut.g_set_id)]++;
+        end
+        if (dut.hold_wr_s) begin  // a hold beat into hold_mem: its requantized codes (R)
+          if (h_id.size() == 0) begin
+            failed++;
+            $display("  [FAIL] truth dump: a hold_mem write with no hold beat in the requantize pipeline");
+          end else begin
+            automatic int id = h_id.pop_front(), i = h_i.pop_front();
+            if (tr_on && tr_fd)
+              for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "R %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, 1'b0), dut.hold_d_s[k]);
+          end
         end
         if (dut.fill_v && q_id.size() != 0) begin
           automatic int id = q_id.pop_front(), i = q_i.pop_front();
           automatic bit pk = q_pk.pop_front();
+          if (dut.fill_add && a_q1.size() == 0) begin
+            failed++;
+            $display("  [FAIL] truth dump: an add_lanes beat filled with no add beat entering add_lanes before it");
+          end else if (dut.fill_add) begin  // the ADD's inputs and output (Q)
+            automatic logic [NUM_LANES-1:0][7:0] q1 = a_q1.pop_front(), q2 = a_q2.pop_front();
+            if (tr_on && tr_fd)
+              for (int k = 0; k < NUM_LANES; k++)
+                $fdisplay(tr_fd, "Q %s %0d %0d %h %h %h", tr_pass, tr_k[id], tr_elem(k, i, pk), q1[k], q2[k], dut.fill_d[k][7:0]);
+          end
           if (tr_on && tr_fd)
             for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "X %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, pk), dut.fill_d[k]);
+        end
+        if (dut.add_in_s) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
+          a_q1.push_back(dut.add_q1_s);
+          a_q2.push_back(dut.add_q2_s);
         end
         if (dut.p_accept) begin
           for (int l = 0; l < NUM_LANES; l++) pj[l] = 0;
@@ -1166,11 +1201,16 @@ module TB_sienna_top #(
         end
         if (int'(dut.g_state) == 0) rd_in = 0;
         else if (dut.wide_rd_valid) rd_in++;
-        if (dut.fill_v && dut.fill_add) begin  // add_lanes' beats, and any that came through it for a set not flagged add
+        if (dut.fill_v && dut.fill_add) begin  // add_lanes' beats, per add set, and any that came through it for a set not flagged add
           res_add_beats++;
           if (rq_add.size() == 0 || rq_add[0] == 0) res_add_stray++;
+          else res_add_set[tr_k[rq_id[0]]]++;
         end
-        if (dut.fill_v && rq_id.size() != 0) begin  // guarded: an unmatched fill beat is left for Task 2.6's checks to fail
+        if (dut.fill_v && rq_id.size() == 0) begin  // a fill beat that no beat entering requantize accounts for
+          failed++;
+          $display("  [FAIL] a fill beat with no beat in the requantize pipeline or add_lanes");
+        end
+        if (dut.fill_v && rq_id.size() != 0) begin
           void'(rq_id.pop_front());
           void'(rq_bank.pop_front());
           void'(rq_byp.pop_front());
@@ -1188,6 +1228,7 @@ module TB_sienna_top #(
 
   // int8 residual (spec Risk 3): hold sets done, add_lanes' fill beats, and the same-cycle crosses of a hold set's done with an L3 grant and with a bank done.
   int res_holds = 0, res_add_beats = 0, res_add_stray = 0, cross_rel_grant = 0, cross_hold_bank = 0;
+  int res_add_set[int];  // add_lanes' fill beats per add set of the pass, by the set's number
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0 && stream_on && rstn_i) begin
@@ -1247,6 +1288,7 @@ module TB_sienna_top #(
     automatic longint t0 = $time;
     automatic int hold_stalled = 0, hold_completions = 0, hold_full = 0, hold_inflight = 0, hold_blocked = 0, hold_capped = 0;
     automatic int hold_put0 = 0, hold_in0 = 0, hold_room = 0;  // sets put and in flight at the hold's start; sets the entry admits after it
+    automatic int puts_s0 = 0;  // tb_puts at the pass's start
     automatic int hold_extra = 0;  // cycles the hold ran on past HOLD_CYC until the host was blocked
     automatic bit hold_end_blocked = 0;  // the host was blocked with a set to put as the hold ended
     $display("\n[STAGE] STREAMING: %0d sets through overlapped stages%s%s", k_num_sets,
@@ -1277,11 +1319,13 @@ module TB_sienna_top #(
     res_holds = 0;
     res_add_beats = 0;
     res_add_stray = 0;
+    res_add_set.delete();
     cross_rel_grant = 0;
     cross_hold_bank = 0;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
+    puts_s0 = tb_puts;
     tr_streams++;
     tr_pass = $sformatf("S%0d", tr_streams);
     tr_seq++;
@@ -1358,7 +1402,7 @@ module TB_sienna_top #(
               end else begin
                 out_hold  = 1;
                 hold_puts = 0;
-                hold_put0 = n_started;
+                hold_put0 = tb_puts - puts_s0;  // put as tb_inflight counts them: n_started lags a put in progress by a cycle
                 hold_in0  = tb_inflight;
                 repeat (HOLD_CYC) begin
                   @(negedge clk_i);
@@ -1415,9 +1459,12 @@ module TB_sienna_top #(
     tr_on = 0;
     out_hold = 0;
     // An add set's last beat cannot meet the next accept: rq_room holds the grant until add_lanes drains (a_add_last_no_accept).
-    if (k_residual != 0)
-      $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add beats of other sets %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
-               res_holds, res_add_beats, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
+    if (k_residual != 0) begin
+      automatic int whole = 0;  // add sets whose add_lanes beats are exactly PER_LANE
+      foreach (res_add_set[k]) whole += int'(res_add_set[k] == PER_LANE);
+      $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add sets of %0d beats %0d, add beats of other sets %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
+               res_holds, res_add_beats, PER_LANE, whole, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
+    end
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", k_num_sets, ($time - t0) / 10);
     $display("  [Stream] lane-cycles with no L9 credit held: %0d", starved);

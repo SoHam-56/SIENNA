@@ -1643,19 +1643,19 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-HOLD_ADD = re.compile(r"^\[HOLD/ADD\] hold sets done (\d+), add beats (\d+), add beats of other sets (\d+), hold release with an L3 grant (\d+), "
-                      r"hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass of a residual test
+HOLD_ADD = re.compile(r"^\[HOLD/ADD\] hold sets done (\d+), add beats (\d+), add sets of (\d+) beats (\d+), add beats of other sets (\d+), "
+                      r"hold release with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass
 
 
 def _residual_pairs_bad(raw: str, per_lane: int) -> str:
     """A residual test's '[FAIL] residual: ...' line, or '': each stream pass's [HOLD/ADD] line must count a hold set done per add set,
-    per_lane add_lanes beats per add set and none for another set."""
+    each add set with exactly per_lane add_lanes beats (want * per_lane in all), and none for another set."""
     k_sets = _tb_knobs()["num_sets"]  # the files past num_sets may be a longer earlier test's
     want = sum(int(open(os.path.join(TB_DIR, f"add_{k}.mem")).readline(), 16) >> 3 & 1 for k in range(k_sets))
-    got = [tuple(int(x) for x in m[:3]) for m in HOLD_ADD.findall(raw)]
-    if not got or any(g != (want, want * per_lane, 0) for g in got):
-        return (f"[FAIL] residual: {'; '.join('%d hold sets done, %d add beats, %d of other sets' % g for g in got) or 'no [HOLD/ADD] line'}, "
-                f"expected {want}, {want * per_lane} and 0 in each stream pass")
+    got = [tuple(int(x) for x in m[:5]) for m in HOLD_ADD.findall(raw)]
+    if not got or any(g != (want, want * per_lane, per_lane, want, 0) for g in got):
+        return (f"[FAIL] residual: {'; '.join('%d hold sets done, %d add beats, %d add sets of %d beats, %d of other sets' % (g[0], g[1], g[3], g[2], g[4]) for g in got) or 'no [HOLD/ADD] line'}, "
+                f"expected {want}, {want * per_lane}, {want} of {per_lane} and 0 in each stream pass")
     return ""
 
 
@@ -1802,7 +1802,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             bad = _residual_pairs_bad(raw_log, N * N // lanes)
             res_ran += 1
             for m in HOLD_ADD.findall(raw_log):
-                res_cross[0], res_cross[1] = res_cross[0] + int(m[3]), res_cross[1] + int(m[4])
+                res_cross[0], res_cross[1] = res_cross[0] + int(m[5]), res_cross[1] + int(m[6])
             if bad:
                 print(f"      {err(bad)}")
                 r.update(status="FAIL" if r["status"] == "PASS" else r["status"], failed=max(r["failed"], 1))
@@ -3494,20 +3494,29 @@ def test_residual_stimulus():
     assert all(n == 18 for k, (n, _, _) in layouts.items() if k != "int8_residual_sigmoid_selu_nopool"), layouts
 
 
+def _tb_hold_add_line(*v) -> str:
+    """TB_sienna_top's [HOLD/ADD] $display with the values v put in its %0d fields, from the TB's own source."""
+    src = open(os.path.join(ROOT, "testbenches", "TB_sienna_top.sv")).read()
+    fmt = re.search(r'\$display\("(\[HOLD/ADD\][^"]*)"', src).group(1)
+    assert fmt.count("%0d") == len(v), (fmt, v)
+    return fmt.replace("%0d", "{}").format(*v) + "\n"
+
+
 @selftest
 def test_residual_pairs_check():
-    """run_regression's residual counts: per stream pass a hold set done per add set below num_sets, per_lane add beats each, none for
-    another set, a missing line fails."""
+    """run_regression's residual counts on lines built from TB_sienna_top's own $display: per stream pass a hold set done per add set
+    below num_sets, every add set with exactly per_lane add beats, none for another set; a missing line fails."""
     with _scratch_tb_dir() as d:
         open(os.path.join(d, "test_knobs.mem"), "w").write("num_sets 4\n")
         for k, f in enumerate((0x54, 0x58, 0x54, 0x58, 0x58)):  # add_4.mem lies past num_sets: a longer earlier test's
             _write_w32(os.path.join(d, f"add_{k}.mem"), [f] + [0] * 11)
-        line = lambda h, b, o=0: (f"[HOLD/ADD] hold sets done {h}, add beats {b}, add beats of other sets {o}, hold release with an L3 grant 0, "
-                                  "hold done with a bank done 0, grants held for an add drain 0\n")
-        assert _residual_pairs_bad(line(2, 16) * 4, 8) == ""
-        assert "expected 2, 16 and 0" in _residual_pairs_bad(line(0, 0) * 4, 8)
-        assert _residual_pairs_bad(line(2, 16) * 3 + line(1, 16), 8) and _residual_pairs_bad(line(2, 15) * 4, 8)
-        assert _residual_pairs_bad(line(2, 16, 1) * 4, 8) and "no [HOLD/ADD] line" in _residual_pairs_bad("RESULT: PASSED\n", 8)
+        line = lambda h, b, w, o=0, x=(0, 0): _tb_hold_add_line(h, b, 8, w, o, *x, 0)
+        assert HOLD_ADD.findall(line(2, 16, 2, 0, (3, 4)))[0] == ("2", "16", "8", "2", "0", "3", "4")  # the regex reads the TB's line
+        assert _residual_pairs_bad(line(2, 16, 2) * 4, 8) == ""
+        assert "expected 2, 16, 2 of 8 and 0" in _residual_pairs_bad(line(0, 0, 0) * 4, 8)
+        assert _residual_pairs_bad(line(2, 16, 2) * 3 + line(1, 16, 2), 8) and _residual_pairs_bad(line(2, 15, 1) * 4, 8)
+        assert _residual_pairs_bad(line(2, 16, 1) * 4, 8)  # 16 beats in all, but one set 9 and one 7: counted per add set
+        assert _residual_pairs_bad(line(2, 16, 2, 1) * 4, 8) and "no [HOLD/ADD] line" in _residual_pairs_bad("RESULT: PASSED\n", 8)
 
 
 @selftest
@@ -3523,6 +3532,97 @@ def test_residual_cross_sweep():
     assert _residual_cross_sweep_bad({"p1": (1, 0), "p2": (3, 0)}, {b: {"p1": "ruled"}})  # p2 unruled
     line = "  RESIDUAL CROSSES: hold done with an L3 grant 4, hold done with a bank done 0 over 8 residual tests (a 0: not reachable at this point)\n"
     assert RESIDUAL_CROSS.findall(line) == [("4", "0")]
+
+
+def _residual_syn_dump(name: str, fault=None) -> list:
+    """The truth gates' misses on a dump of residual test name (N = 8, tile 2) built from its golden stages; fault (pass, set, f(q1, y))
+    plants an error in one add set's hold_mem beat q1 or ADD output y."""
+    global TRUTH_DUMP
+    t, N, lanes = next(x for x in PIPELINE_TESTS if x["name"] == name), 8, 32
+    keep = TRUTH_DUMP
+    with _scratch_tb_dir() as d:
+        TRUTH_DUMP = os.path.join(d, "truth_dump.txt")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                generate_vectors({"n": N, "tile_size": 2, "lanes": lanes, "host_words": N, "fmt_name": "int8", **t})
+            kn, pkg = _tb_knobs(), _pkg_fields(os.path.join(d, "test_config_pkg.sv"))
+            K = kn["num_sets"]
+            fl = {k: _res_flags_of(k) for k in range(K)}
+            ph, pw, pad, p = pkg["POOL_H"], pkg["POOL_W"], pkg["PADDING"], pkg["DROPOUT_P_PERCENT"] / 100
+            sx = lambda f, b: _sx(_tb_words(f), b)
+            def rq_of(k):
+                w = _set_words(k, kn, N, "int8")
+                return dict(w["ents"][0], mult=w["mult"], shift=w["shift"])
+            out = ["H b2b 1"]
+            def emit(tag, ridx, k, C, X, Aout, act_rq, act, q12=None, Rh=None):
+                Cf = np.asarray(C, np.int64).ravel()
+                out.extend(f"M {tag} {ridx} {e} {int(Cf[e]) & 0xFFFFFFFF:08x} {int(Cf[e]) & 0xFFFFFFFF:08x}" for e in range(N * N))
+                if Rh is not None:  # a hold set: its beats into hold_mem, nothing after
+                    out.extend(f"R {tag} {k} {e} {int(Rh[e]) & 0xFF:02x}" for e in range(N * N))
+                    return
+                if q12 is not None:
+                    out.extend(f"Q {tag} {k} {e} {int(q12[0][e]) & 0xFF:02x} {int(q12[1][e]) & 0xFF:02x} {int(X[e]) & 0xFF:02x}" for e in range(N * N))
+                out.extend(f"X {tag} {k} {e} {int(X[e]) & 0xFF:02x}" for e in range(N * N))
+                out.extend(f"A {tag} {k} {e} {int(Aout[e]) & 0xFF:02x}" for e in range(N * N))
+                Pl = _maxpool_int(np.asarray(Aout).reshape(N, N), ph, pw, pad).ravel()
+                W = Pl.size
+                kp = dropout_keep(W, p, set_dropout_seed(kn["dropout_seed"], k), lanes) if kn["training_mode"] else np.ones(W, bool)
+                Dv = np.where(kp, Pl, drop_zp(act, act_rq))
+                out.extend(f"P {tag} {k} {w % lanes} {w // lanes} {int(Pl[w]) & 0xFF:02x} {int(kp[w])}" for w in range(W))
+                out.extend(f"D {tag} {k} {i} {int(Dv[i]) & 0xFF:02x}" for i in range(W))
+            def alone(tag, k, fw, fn):
+                A, B = sx(fw, 8).reshape(N, N), sx(fn, 8).reshape(N, N)
+                hb = sx(f"bias_{k}.mem", 32) if fl[k]["bias"] else np.zeros(N, np.int64)
+                C = wrap32(imatmul(A, B) + hb[None, :])
+                rq = rq_of(k)
+                q = requantize(C, rq)
+                emit(tag, 0, k, C, q.ravel(), activate_int8(q, fl[k]["act"], rq).ravel(), rq, fl[k]["act"])
+            alone("P0", 0, "matrix_west.mem", "matrix_north.mem")
+            alone("B2B", 1, "matrix_west_1.mem", "matrix_north_1.mem")
+            for tag in TRUTH_STREAMS:
+                ridx, g0, held = 0, 0, None
+                for k in range(K):
+                    if fl[k]["partial"]:
+                        continue
+                    ks, g0 = range(g0, k + 1), k + 1
+                    hb = sx(f"bias_{ks[0]}.mem", 32) if fl[ks[0]]["bias"] else np.zeros(N, np.int64)
+                    C = wrap32(sum(imatmul(sx(f"matrix_west_{j}.mem", 8).reshape(N, N), sx(f"matrix_north_{j}.mem", 8).reshape(N, N)) for j in ks)
+                               + hb[None, :])
+                    rq = rq_of(k)
+                    q = requantize(C, rq).ravel()
+                    if fl[k]["hold"]:
+                        held = q.copy()
+                        emit(tag, ridx, k, C, None, None, None, None, Rh=q)
+                    elif fl[k]["add"]:
+                        w = fl[k]["words"]
+                        y, q1 = mr.tflite_add_codes(held, q, w), held.copy()
+                        ra = dict(rq, zp=w["zpo"], amin=w["amin"], amax=w["amax"])
+                        if fault and fault[:2] == (tag, k):
+                            fault[2](q1, y)
+                        emit(tag, ridx, k, C, y, activate_int8(y.reshape(N, N), fl[k]["act"], ra).ravel(), ra, fl[k]["act"], q12=(q1, q))
+                    else:
+                        emit(tag, ridx, k, C, q, activate_int8(q.reshape(N, N), fl[k]["act"], rq).ravel(), rq, fl[k]["act"])
+                    ridx += 1
+            open(TRUTH_DUMP, "w").write("\n".join(out) + "\n")
+            return truth_report(truth_test(N, "int8", lanes))[1]
+        finally:
+            TRUTH_DUMP = keep
+
+
+@selftest
+def test_residual_truth_path():
+    """The residual truth path (R and Q lines, truth.gate_add) on dumps built from the golden stages: clean dumps of four residual tests
+    pass every gate; one hold_mem beat off fails transfer, one ADD output off fails add."""
+    for name in ("int8_residual_tanh", "int8_residual_accum2_mixed_nopool", "int8_residual_train", "int8_residual_sigmoid_selu_nopool"):
+        assert _residual_syn_dump(name) == [], name
+    def q1_off(q1, y):
+        q1[3] += 1 if q1[3] < 127 else -1
+    def y_off(q1, y):
+        y[5] += 1 if y[5] < 127 else -1
+    bad = _residual_syn_dump("int8_residual_tanh", ("S2", 5, q1_off))
+    assert any(x.startswith("[FAIL] truth: transfer") for x in bad), bad
+    bad = _residual_syn_dump("int8_residual_tanh", ("S3", 8, y_off))
+    assert len(bad) == 1 and bad[0].startswith("[FAIL] truth: add ") and "passes S3" in bad[0], bad
 
 
 @selftest

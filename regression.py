@@ -334,6 +334,38 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
     return C, R, A, P, np.where(keep, P.flatten(), drop_zp(act, rq)).reshape(P.shape)
 
 
+def _golden_int8_residual(parts, hw_bias, rq: dict, R, add: dict, ra: dict, cfg: dict, act: str, drop_seed: int) -> tuple:
+    """Bit-exact int8 residual set: the depth passes' sums, the conv's requantize (q1), TFLite's ADD with R, the lane with the ADD's words, pooling, dropout (D-5: zp_o)."""
+    N = cfg.get("n", 16)
+    C = mesh_model.matmul_int([(_pad_square(a, N), _pad_square(b, N)) for a, b in parts], N, hw_bias)
+    Y = mr.tflite_add_codes(requantize(C, rq), R, add)
+    A = activate_int8(Y, act, ra)
+    P = _maxpool_int(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1))
+    if not cfg.get("training", False):
+        return C, Y, A, P, P.copy()
+    keep = dropout_keep(P.size, cfg.get("dropout_p", 0.5), drop_seed, cfg.get("lanes", 32))
+    return C, Y, A, P, np.where(keep, P.flatten(), drop_zp(act, ra)).reshape(P.shape)
+
+
+def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=None) -> tuple:
+    """An add set's inputs for a conv output q1 (scale s1, zero point z1): the residual codes, the ADD's words and the lane's; setting fixes (s2 / s1, z2, s_out factor)."""
+    N = q1.shape[0]
+    f2, z2, fo = setting or (2.0 ** rng.uniform(-3.0, 3.0), int(rng.randint(-100, 101)) if zp_random else 0, 2.0 ** rng.uniform(-1.0, 1.0))
+    s2 = s1 * f2
+    R = rng.randint(-128, 128, (N, N)).astype(np.int64)
+    y = s1 * (q1 - z1) + s2 * (R - z2)
+    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if act == "relu" else y)
+    s_out *= fo if zp_random else 1.0  # random ADD scales: the output scale off its calibration, so some outputs clamp
+    add = mr.add_words(s1, z1, s2, z2, s_out, z_out, act)
+    return R, add, mr.add_lane_params(add, s_out, mr.tflite_add_codes(q1, R, add))
+
+
+def _identity_requant(N: int, ra: dict) -> dict:
+    """An add set's requantize words: identity (mult 2^30, shift +1, zp 0, full clamp), with the lane's words after the ADD."""
+    return dict(mult=np.full(N, 1 << 30, np.int64), shift=np.full(N, 1, np.int64), zp=0, amin=-128, amax=127,
+                mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])
+
+
 def _decoy_params(N: int) -> dict:
     """A partial pass's requantize words: the activated pass's are the ones used, so these must never show in a result."""
     return dict(mult=np.full(N, 1 << 30, np.int64), shift=np.full(N, -1, np.int64), zp=5, amin=-100, amax=100,
@@ -350,6 +382,11 @@ def _write_w32(path: str, v) -> None:
         fh.write("".join(f"{int(x) & 0xFFFFFFFF:08x}\n" for x in np.asarray(v).flatten()))
 
 
+def _res_flags(partial=False, bias=False, hold=False, add=False, act="linear") -> int:
+    """add_<k>.mem's first word: bit 0 partial, 1 bias, 2 hold, 3 add, bits 7:4 the set's activation code."""
+    return int(partial) | int(bias) << 1 | int(hold) << 2 | int(add) << 3 | activation_to_code(act) << 4
+
+
 def _requant_words(rq: dict) -> list:
     """requant_<k>.mem's words: the REQ_HEAD layer-wide words, then N multipliers, then N shifts."""
     return [rq["zp"], rq["amin"], rq["amax"], rq["mx"], rq["shx"], rq["mout"], rq["shout"], rq["zout"]] + \
@@ -364,6 +401,81 @@ def _zp_draws(rng, groups: int, acts: list) -> list:
         z = int(z)
         out.append((z, z if act == "relu" else int(rng.randint(-128, z)), int(rng.randint(z + 1, 128))))
     return out
+
+
+def _residual_layout(cfg: dict, passes: int, mixed: list, credits: int, act: str) -> list:
+    """A residual test's groups as (first set, depth passes, residual, activation): a residual group takes one more set, its add set."""
+    every, want, out, k = 1 if cfg.get("residual") else cfg["residual_every"], cfg.get("num_sets"), [], 0
+    while True:
+        g = len(out)
+        res = g % every == 0
+        out.append((k, passes, res, mixed[g % len(mixed)] if mixed else act))
+        k += passes + res
+        if want is not None and k >= want:
+            if k > want:
+                raise ValueError(f"{cfg['name']}: {want} sets is not a whole number of this test's groups")
+            return out
+        if want is None and k > credits + 2 and len(out) >= len(mixed):
+            return out
+
+
+def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_rng, drop_seed: int) -> tuple:
+    """Every set's files of a residual test (operands, bias, requantize words, expected outputs, add_<k>.mem, set 1 alone); returns set 0's
+    (A, B, bias, words, act) and the truth gate's lane scales."""
+    N = cfg.get("n", 16)
+    zqs = (_zp_draws(np.random.RandomState(seed + 8000), len(groups), ["linear" if r else a for _, _, r, a in groups])
+           if cfg.get("zp_random") else [None] * len(groups))
+    srng = np.random.RandomState(seed + 9500)
+    settings = [(2.0 ** srng.uniform(-3.0, 3.0), int(srng.randint(-100, 101)), 2.0 ** srng.uniform(-1.0, 1.0)) for _ in range(2)]
+    w = lambda name, k: os.path.join(TB_DIR, f"{name}_{k}.mem")
+    first, scales = None, {}
+
+    def alone(k, a, b, bias, rq_k, act_k):  # the back-to-back pass: set 1 alone, not partial, no hold or add, its own flags' bias and act
+        if k == 1:
+            Fb = _golden_int8([(a, b)], bias, rq_k, cfg, act_k, set_dropout_seed(drop_seed, 1))[4]
+            _write_s8(os.path.join(TB_DIR, "expected_b2b.mem"), Fb)
+            _write_s8(os.path.join(TB_DIR, "bound_b2b.mem"), np.zeros_like(Fb))
+
+    for g, (g0, P, res, act_g) in enumerate(groups):
+        A_q, s_a, z_a = quant_act(np.hstack([reals[k][0] for k in range(g0, g0 + P)]))
+        B_q, s_w = quant_weights(np.vstack([reals[k][1] for k in range(g0, g0 + P)]))
+        hw_bias = fold_bias(None, s_a, s_w, z_a, B_q)
+        parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(P)]
+        acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
+        rq = requant_params(acc, s_a, s_w, "linear" if res else act_g, req_rng, zqs[g])
+        if res:
+            R, add, ra = _add_draw(np.random.RandomState(seed + 9000 + g0), requantize(acc, rq), rq["s_out"], rq["zp"], act_g,
+                                   cfg.get("zp_random", False), settings[g % 2] if cfg.get("add_layers") else None)
+        for i in range(P):
+            k, last = g0 + i, i == P - 1
+            act_k, rq_k = ("linear" if res and last else act_g), (rq if last else _decoy_params(N))
+            bias_k = hw_bias if i == 0 else np.zeros(N, np.int64)
+            write_op_mem(w("matrix_west", k), parts[i][0], "int8")
+            write_op_mem(w("matrix_north", k), parts[i][1], "int8")
+            _write_w32(w("bias", k), bias_k)
+            _write_w32(w("requant", k), _requant_words(rq_k))
+            F = _golden_int8(parts, hw_bias, rq, cfg, act_g, set_dropout_seed(drop_seed, k))[4] if last and not res else np.zeros(0, np.int64)
+            _write_s8(w("expected_output", k), F)  # empty for a partial or hold set
+            _write_s8(w("bound_output", k), np.zeros_like(F))
+            _write_w32(w("add", k), [_res_flags(partial=not last, bias=i == 0, hold=res and last, act=act_k)] + [0] * 11)
+            if last:
+                scales[str(k)] = {"ratio": rq["ratio"]} | ({} if res else {"0": [float(rq["s_out"]), float(rq["s_selu"])]})
+            first = first or (parts[0][0], parts[0][1], hw_bias, rq_k, act_k)
+            alone(k, parts[i][0], parts[i][1], bias_k, rq_k, act_k)
+        if res:
+            k = g0 + P
+            rq_i = _identity_requant(N, ra)
+            write_op_mem(w("matrix_west", k), R, "int8")
+            write_op_mem(w("matrix_north", k), np.eye(N, dtype=np.int64), "int8")  # the identity pass: int8 code 1 on the diagonal
+            _write_w32(w("bias", k), np.zeros(N, np.int64))
+            _write_w32(w("requant", k), _requant_words(rq_i))
+            F = _golden_int8_residual(parts, hw_bias, rq, R, add, ra, cfg, act_g, set_dropout_seed(drop_seed, k))[4]
+            _write_s8(w("expected_output", k), F)
+            _write_s8(w("bound_output", k), np.zeros_like(F))
+            _write_w32(w("add", k), [_res_flags(add=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS])
+            scales[str(k)] = {"0": [float(ra["s_out"]), float(ra["s_selu"])], "ratio": None}
+            alone(k, R, np.eye(N, dtype=np.int64), np.zeros(N, np.int64), rq_i, act_g)
+    return first, scales
 
 
 def _generate_vectors_int8(cfg: dict) -> None:
@@ -398,8 +510,10 @@ def _generate_vectors_int8(cfg: dict) -> None:
     mixed = cfg.get("mixed_acts", [])
     assert not mixed or mixed[0] == act_type, (test_name, "mixed_acts[0] must be the test's act")
     credits = cfg.get("credits", SETS_IN_FLIGHT)
-    num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
-    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+    residual = bool(cfg.get("residual") or cfg.get("residual_every"))
+    groups = _residual_layout(cfg, passes, mixed, credits, act_type) if residual else None
+    num_sets = groups[-1][0] + passes + groups[-1][2] if residual else cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
+    if not residual and num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
         raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     use_bias = bool(cfg.get("bias", False))
     req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
@@ -407,11 +521,14 @@ def _generate_vectors_int8(cfg: dict) -> None:
     for k in range(1, num_sets):
         rng = np.random.RandomState(seed + 1000 + k)
         reals.append((rng.uniform(lo, hi, (N, N)) * scale, rng.uniform(-1.0, 1.0, (N, N)) * scale))
-    first = None
-    starts = list(range(0, num_sets, passes))
+    if residual:
+        first, scales = _write_residual_groups(cfg, groups, reals, seed, req_rng, drop_seed)
+        starts = []  # the residual writer wrote every set: the group loop below runs none
+    else:
+        first, scales = None, {}  # scales: per activated set its lane's real input scale and SELU output scale, for the truth gate
+        starts = list(range(0, num_sets, passes))
     acts_g = [mixed[(min(g0 + passes, num_sets) - 1) % len(mixed)] if mixed else act_type for g0 in starts]  # the activated pass's activation
     zqs = _zp_draws(np.random.RandomState(seed + 8000), len(starts), acts_g) if cfg.get("zp_random") else [None] * len(starts)
-    scales = {}  # per activated set: its lane's real input scale and SELU output scale, for the truth gate
     for g, g0 in enumerate(starts):
         ks = list(range(g0, min(g0 + passes, num_sets)))
         act_g = acts_g[g]
@@ -437,15 +554,15 @@ def _generate_vectors_int8(cfg: dict) -> None:
             _write_s8(os.path.join(TB_DIR, f"expected_output_{k}.mem"), F)  # empty for a partial set
             _write_s8(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(F))
             if k == 0:
-                first = (parts[0][0], parts[0][1], hw_bias, rq_k)
+                first = (parts[0][0], parts[0][1], hw_bias, rq_k, act_type)
             if k == 1:  # the back-to-back pass: set 1 alone, not partial, with its own bias, requantize words and activation
                 Fb = _golden_int8([parts[i]], hw_bias if i == 0 else np.zeros(N, np.int64), rq_k, cfg,
                                   mixed[1 % len(mixed)] if mixed else act_type, set_dropout_seed(drop_seed, 1))[4]
                 _write_s8(os.path.join(TB_DIR, "expected_b2b.mem"), Fb)
                 _write_s8(os.path.join(TB_DIR, "bound_b2b.mem"), np.zeros_like(Fb))
     # The single-set pass starts set 0 alone, not partial, with set 0's bias and requantize words.
-    a0, b0, hb0, rq0 = first
-    C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act_type, drop_seed)
+    a0, b0, hb0, rq0, act0 = first  # residual: set 0's flags give its activation (linear for a hold set), and the TB clears its hold and add
+    C0, _, A0q, P0, F0 = _golden_int8([(a0, b0)], hb0, rq0, cfg, act0, drop_seed)
     write_op_mem(os.path.join(TB_DIR, "matrix_west.mem"), a0, "int8")
     write_op_mem(os.path.join(TB_DIR, "matrix_north.mem"), b0, "int8")
     _write_s8(os.path.join(TB_DIR, "expected_output.mem"), F0)
@@ -455,18 +572,19 @@ def _generate_vectors_int8(cfg: dict) -> None:
         json.dump(scales, fh)
     mr.write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
                          _config_items(cfg, "int8", act_type, num_sets, credits, passes, mixed, True, drop_seed))
-    _check_mem_widths("int8", num_sets)
+    _check_mem_widths("int8", num_sets, residual)
 
 
-def _check_mem_widths(fmt: str, num_sets: int) -> None:
+def _check_mem_widths(fmt: str, num_sets: int, residual: bool = False) -> None:
     """Every operand, bias and expected word the TB reads must be the format's width: a stale fp32 file would be truncated."""
-    d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4  # int8: operands and results 2 digits; int32 bias and requantize words 8
-    per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ())
+    d = 2 if fmt == "int8" else (fpu.FORMATS[fmt].w + 3) // 4  # int8: operands and results 2 digits; int32 bias, requantize and ADD words 8
+    per_set = ("matrix_west", "matrix_north", "bias", "expected_output", "bound_output") + (("requant",) if fmt == "int8" else ()) + \
+        (("add",) if residual else ())
     names = [f"{b}.mem" for b in ("matrix_west", "matrix_north", "expected_output", "bound_output", "expected_b2b", "bound_b2b")]
     names += [f"{b}_{k}.mem" for k in range(num_sets) for b in per_set]
     names += [] if fmt == "int8" else ["expected_accum.mem"]  # int8's accumulate pass reads its group's own golden
     for fn in names:
-        want = 8 if fmt == "int8" and fn.startswith(("bias_", "requant_")) else d
+        want = 8 if fmt == "int8" and fn.startswith(("bias_", "requant_", "add_")) else d
         if os.path.exists(os.path.join(TB_DIR, fn)):
             for i, ln in enumerate(open(os.path.join(TB_DIR, fn))):
                 if ln.strip() and len(ln.strip()) != want:
@@ -984,7 +1102,7 @@ TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
 INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
-TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "multiplier", "relu", "activation", "maxpool", "dropout")
+TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "add", "multiplier", "relu", "activation", "maxpool", "dropout")
 TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
 
@@ -1004,7 +1122,8 @@ def _tb_knobs() -> dict:
 
 
 def read_truth_dump(path: str, lanes: int) -> dict:
-    """{pass: {"M": {r: {e: (sum, word)}}, "X"/"A": {k: {e: word}}, "P": {k: {window: (word, keep)}}, "D": {k: {i: word}}}}."""
+    """{pass: {"M": {r: {e: (sum, word)}}, "X"/"A"/"R": {k: {e: word}}, "Q": {k: {e: (q1, q2, y)}}, "P": {k: {window: (word, keep)}},
+    "D": {k: {i: word}}}}; R: a hold set's beats into hold_mem, Q: an add set's ADD inputs and output."""
     d = {}
     with open(path) as fh:
         for ln in fh:
@@ -1014,10 +1133,12 @@ def read_truth_dump(path: str, lanes: int) -> dict:
             if t[0] == "H":  # the build's passes
                 d.setdefault("_hdr", {})[t[1]] = int(t[2])
                 continue
-            g = d.setdefault(t[1], {"M": {}, "X": {}, "A": {}, "P": {}, "D": {}})
+            g = d.setdefault(t[1], {"M": {}, "X": {}, "A": {}, "P": {}, "D": {}, "Q": {}, "R": {}})
             if t[0] == "M":
                 g["M"].setdefault(int(t[2]), {})[int(t[3])] = (int(t[4], 16), int(t[5], 16))
-            elif t[0] in ("X", "A", "D"):
+            elif t[0] == "Q":
+                g["Q"].setdefault(int(t[2]), {})[int(t[3])] = (int(t[4], 16), int(t[5], 16), int(t[6], 16))
+            elif t[0] in ("X", "A", "D", "R"):
                 g[t[0]].setdefault(int(t[2]), {})[int(t[3])] = int(t[4], 16)
             elif t[0] == "P":
                 g["P"].setdefault(int(t[2]), {})[int(t[4]) * lanes + int(t[3])] = (int(t[5], 16), int(t[6]))
@@ -1033,9 +1154,20 @@ def _full(m: dict, n: int, what: str) -> list:
     return [m[i] for i in range(n)]
 
 
+def _res_flags_of(k: int) -> dict:
+    """A residual test's set k as add_<k>.mem gives it: partial, bias, hold and add flags, its activation, and the ADD's words (signed)."""
+    w = _tb_words(f"add_{k}.mem")
+    f = int(w[0])
+    words = {n: int(_sx(v, 32 if n in ("m1", "m2", "mo") else 8)) for n, v in zip(mr.ADD_FIELDS, w[1:])}
+    return {"partial": bool(f & 1), "bias": bool(f & 2), "hold": bool(f & 4), "add": bool(f & 8), "act": ACT_NAMES[(f >> 4) & 15],
+            "words": words}
+
+
 def _set_words(k: int, knobs: dict, N: int, fmt: str) -> dict:
     """Set k as the TB drives it: each column's pack entry, each entry's activation and (int8) requantize and lane words."""
     code0 = (knobs["mixed_acts"] >> (4 * (k % knobs["mixed_len"]))) & 15 if knobs["mixed_len"] else knobs["activation_code"]
+    if knobs.get("residual"):  # TB_sienna_top's act_of(k): a residual test's flags
+        code0 = (int(_tb_words(f"add_{k}.mem")[0]) >> 4) & 15
     ents = {0: {"act": ACT_NAMES[code0]}}
     col_ent = np.zeros(N, dtype=np.int64)
     sh = 0
@@ -1104,7 +1236,8 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
     hdr = dump.pop("_hdr", {})
     if "b2b" not in hdr:
         raise RuntimeError("truth dump: no 'H b2b' line")
-    want = {"P0"} | set(TRUTH_STREAMS) | ({"B2B"} if hdr["b2b"] else set()) | (set() if knobs["packed"] else {"A"})  # no A for packed sets
+    res_t = bool(knobs.get("residual"))  # a residual test: each set's flags from add_<k>.mem, and no accumulate pass
+    want = {"P0"} | set(TRUTH_STREAMS) | ({"B2B"} if hdr["b2b"] else set()) | (set() if knobs["packed"] or res_t else {"A"})  # no A for packed sets
     if set(dump) != want:
         raise RuntimeError(f"truth dump: passes {sorted(dump)}, the TB runs {sorted(want)}")
     scales = json.load(open(TRUTH_SCALES)) if fmt == "int8" else {}
@@ -1117,12 +1250,27 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
         res.setdefault(name, []).append(r)
         if not r.ok:
             res.setdefault("_passes", {}).setdefault(name, set()).add(tag)
+    def multipliers(k, sw):  # the host's multipliers, once per set: within their own quantization of s_a s_w / s_out
+        ratio = scales.get(str(k), {}).get("ratio") or []
+        cs = [c for c in range(min(N, len(ratio))) if ratio[c] is not None]
+        if cs and k not in mult_seen:
+            mult_seen.add(k)
+            add("multiplier", truth.gate_multiplier(sw["mult"][cs], sw["shift"][cs], [ratio[c] for c in cs]))
     alone = {"P0": 0, "B2B": 1}  # the single-set and back-to-back passes put set 0 and set 1 alone, from their own files
+    fl = {k: _res_flags_of(k) for k in range(K)} if res_t else {}
     for tag, g in sorted(dump.items()):
-        acts = [k for k in range(K) if k % P == P - 1] if tag.startswith("S") else [alone[tag]] if tag in alone else [P - 1]
+        if tag.startswith("S"):  # the sets with a mesh result: a residual test's hold and add sets too
+            acts = [k for k in range(K) if not fl[k]["partial"]] if res_t else [k for k in range(K) if k % P == P - 1]
+        else:
+            acts = [alone[tag]] if tag in alone else [P - 1]
         M = _full(g["M"], len(acts), f"pass {tag}'s results")
+        held = {}  # per hold set of the pass: its requantized beats, which hold_mem gives its add set
         for r, k in enumerate(acts):
             sw = _set_words(k, knobs, N, fmt)
+            hold, addk = (fl[k]["hold"], fl[k]["add"]) if res_t and tag.startswith("S") else (False, False)
+            g0 = k  # the first pass of k's group
+            while res_t and tag.startswith("S") and g0 > 0 and fl[g0 - 1]["partial"]:
+                g0 -= 1
             ce = sw["col_ent"]
             pairs = _full(M[r], N * N, f"pass {tag} result {r}")
             pre = np.array([a for a, _ in pairs], dtype=np.int64)
@@ -1134,7 +1282,7 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
             elif tag == "B2B":
                 files = [("matrix_west_1.mem", "matrix_north_1.mem")]
             else:
-                files = [(f"matrix_west_{j}.mem", f"matrix_north_{j}.mem") for j in range(k - P + 1, k + 1)]
+                files = [(f"matrix_west_{j}.mem", f"matrix_north_{j}.mem") for j in range(g0 if res_t else k - P + 1, k + 1)]
             for fw, fn in files:
                 A, B = _tb_words(fw).reshape(N, N), _tb_words(fn).reshape(N, N)
                 if sw["sh"]:
@@ -1142,25 +1290,38 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
                     B = np.where(np.kron(np.eye(N // b), np.ones((b, b))).astype(bool), B, 0)
                 passes.append((A, B))
             bias = None
-            first = k if tag in alone else k - P + 1  # apply_bias: the bias rides on a set k with k % P == 0
-            if knobs["has_bias"] and first % P == 0:
+            first = k if tag in alone else g0 if res_t else k - P + 1  # apply_bias: the bias rides on a set k with k % P == 0
+            if fl[first]["bias"] if res_t else knobs["has_bias"] and first % P == 0:
                 bw = _tb_words(f"bias_{first}.mem")[:N]
                 bias = bw if fmt != "bf16" else truth.encode("fp32", truth.values("bf16", bw))  # the TB widens the row exactly
             add("matmul", truth.gate_matmul(fmt, passes, pre.reshape(N, N), bias))
             if fmt == "bf16":
                 add("narrow", truth.gate_narrow("bf16", pre, post))
-            X = np.array(_full(g["X"].get(k, {}), N * N, f"pass {tag} set {k}'s activation inputs"), dtype=np.int64)
-            Aw = np.array(_full(g["A"].get(k, {}), N * N, f"pass {tag} set {k}'s activation bank"), dtype=np.int64)
             cols = np.arange(N * N) % N
             ent = ce[cols]
+            if hold:  # a hold set's requantized beats go to hold_mem: requantize gated on them; no activation, pooling or dropout
+                Rh = np.array(_full(g["R"].get(k, {}), N * N, f"pass {tag} set {k}'s hold beats"), dtype=np.int64)
+                zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
+                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, Rh))
+                multipliers(k, sw)
+                held[k] = Rh
+                continue
+            if addk:  # an add set: requantize (the identity) gives q2, hold_mem q1, TFLite's ADD y, the activation stage's input
+                Q = _full(g["Q"].get(k, {}), N * N, f"pass {tag} set {k}'s ADD outputs")
+                q1, q2, y = (np.array([v[i] for v in Q], dtype=np.int64) for i in range(3))
+                if k - 1 not in held:
+                    raise RuntimeError(f"truth dump: pass {tag} add set {k} has no hold set before it")
+                add("transfer", _transfer("int8", held[k - 1], q1))  # hold_mem: each element its hold set's own beat
+                add("add", truth.gate_add(q1, q2, fl[k]["words"], y, mr.ROUNDING))
+            X = np.array(_full(g["X"].get(k, {}), N * N, f"pass {tag} set {k}'s activation inputs"), dtype=np.int64)
+            Aw = np.array(_full(g["A"].get(k, {}), N * N, f"pass {tag} set {k}'s activation bank"), dtype=np.int64)
             if fmt == "int8":
                 zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
-                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, X))
-                ratio = scales.get(str(k), {}).get("ratio") or []
-                cs = [c for c in range(min(N, len(ratio))) if ratio[c] is not None]
-                if cs and k not in mult_seen:  # the host's multipliers, once per set: within their own quantization of s_a s_w / s_out
-                    mult_seen.add(k)
-                    add("multiplier", truth.gate_multiplier(sw["mult"][cs], sw["shift"][cs], [ratio[c] for c in cs]))
+                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, q2 if addk else X))
+                if addk:  # the lanes after an ADD: input zero point zp_o, the ADD's clamp, the drop value zp_o (P-3, D-5)
+                    aw = fl[k]["words"]
+                    sw["ents"] = {e: dict(w, zp=aw["zpo"], amin=aw["amin"], amax=aw["amax"]) for e, w in sw["ents"].items()}
+                multipliers(k, sw)
             else:
                 add("transfer", _transfer(fmt, post, X))
             # activation: each element through its column's entry, on the word the stage received
@@ -1174,8 +1335,8 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
                     if func == "relu":  # sienna_top runs int8 ReLU as the requantize clamp: its activation stage is the identity
                         w = sw["ents"][e]
                         add("activation relu", truth.gate("int8", "linear", X[m], Aw[m], quant=(1.0, w["zp"], 1.0, w["zp"]))._replace(func="relu"))
-                        if str(e) in scales.get(str(k), {}):  # a calibrated ReLU entry: its clamp must start at its zero point
-                            add("relu clamp", _relu_clamp(w, k, e))
+                        if str(e) in scales.get(str(k), {}) and not (res_t and fl[k]["add"] and not addk):  # a calibrated ReLU entry: its
+                            add("relu clamp", _relu_clamp(w, k, e))  # clamp must start at its zero point; an add set alone has the identity's
                         continue
                     add(f"activation {func}", truth.gate("int8", func, X[m], Aw[m], quant=q8[e]))
                 else:
@@ -1317,6 +1478,25 @@ PIPELINE_TESTS = [
     {"name": "int8_packed_zp_random_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "pool_h": 1,
      "pool_w": 1, "padding": 0, "packed": True, "req_random": True, "zp_random": True, "formats": ("int8",),
      "pack_acts": ["linear", "relu", "tanh", "selu", "sigmoid", "linear", "relu", "tanh"]},
+    # int8 residual ADD (sienna-int8-residual): a residual group's last depth pass is a hold set, then an add set (the identity pass) meets it in add_lanes.
+    {"name": "int8_residual_relu", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True,
+     "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "residual": True,
+     "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "residual": True, "accum_passes": 2,
+     "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_sigmoid_selu_nopool", "mode": "matmul", "matrix_type": "random", "act": "sigmoid", "residual": True,
+     "mixed_acts": ["sigmoid", "selu"], "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "zp_random": True, "num_sets": 16,
+     "formats": ("int8",)},
+    {"name": "int8_residual_train", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True, "training": True,
+     "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_then_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual_every": 2,
+     "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_two_layers_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "residual": True,
+     "add_layers": 2, "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "zp_random": True, "formats": ("int8",)},
+    {"name": "int8_residual_accum2_mixed_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "accum_passes": 2,
+     "residual_every": 2, "mixed_acts": ["relu", "tanh", "linear", "selu", "sigmoid"], "pool_h": 1, "pool_w": 1, "padding": 0,
+     "req_random": True, "zp_random": True, "formats": ("int8",)},
 ]
 
 
@@ -1416,6 +1596,16 @@ def _parse_log(raw: str) -> dict:
     }
 
 
+def _residual_pairs_bad(raw: str) -> str:
+    """A residual test's '[FAIL] residual: ...' line, or '': every stream pass's [HOLD/ADD] line must count the test's hold/add pairs."""
+    k_sets = _tb_knobs()["num_sets"]  # the files past num_sets may be a longer earlier test's
+    want = sum(int(open(os.path.join(TB_DIR, f"add_{k}.mem")).readline(), 16) >> 3 & 1 for k in range(k_sets))
+    got = [int(x) for x in re.findall(r"^\[HOLD/ADD\] hold/add pairs (\d+)", raw, re.M)]
+    if not got or any(p != want for p in got):
+        return f"[FAIL] residual: {', '.join(map(str, got)) or 'no'} hold/add pairs, expected {want} in each stream pass"
+    return ""
+
+
 PKG_DEFAULT_TEST = "matmul_relu_nopool"  # in every format, so make pkg works with any FMT
 
 
@@ -1495,6 +1685,11 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             "wall": wall,
             **_parse_log(raw_log),
         }
+        if t.get("residual") or t.get("residual_every"):  # the hold/add pairs each stream pass counted
+            bad = _residual_pairs_bad(raw_log)
+            if bad:
+                print(f"      {err(bad)}")
+                r.update(status="FAIL" if r["status"] == "PASS" else r["status"], failed=max(r["failed"], 1))
         results.append(r)
 
         # 4. Dump Formatted HW Matrix Trace
@@ -2233,7 +2428,8 @@ def header(args) -> list:
             f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
             " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
             " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
-            " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.", ""]
+            " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.",
+            " residual tests (int8 ADD) are not modelled and not run here", ""]
 
 
 def footer(args, summary: list) -> list:
@@ -2274,6 +2470,8 @@ def perf_main(argv=None) -> None:
     FMT = args.fmt_name
     fmts = {t["name"]: t.get("formats", tuple(UNIT_LAT)) for t in PIPELINE_TESTS}
     args.configs = [c for c in args.configs if args.fmt_name in fmts[c]]  # int8-only tests run only in int8
+    cfgs = {t["name"]: t for t in PIPELINE_TESTS}
+    args.configs = [c for c in args.configs if not (cfgs[c].get("residual") or cfgs[c].get("residual_every"))]  # P-9: not modelled yet
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
     os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
     if args.merge:
@@ -3024,6 +3222,85 @@ def test_int8_relu_is_the_clamp():
     # int8 ReLU: the requantize clamp from the zero point, then an identity activation stage
     assert _relu_clamp({"amin": 5, "zp": 5}, 0, 0).ok and _relu_clamp({"amin": -128, "zp": -128}, 0, 0).ok
     assert not _relu_clamp({"amin": -100, "zp": 5}, 3, 2).ok and _relu_clamp({"amin": -100, "zp": 5}, 3, 2).first == [(3, 2, -100, 5)]
+
+
+@selftest
+def test_residual_golden():
+    """_golden_int8_residual against an element-by-element composition (scalar ipu on each code), and it moves with zp1, the ADD and zp_o."""
+    rng = np.random.RandomState(3)
+    N = 8
+    A = rng.randint(-128, 128, (N, N)).astype(np.int64)
+    B = rng.randint(-127, 128, (N, N)).astype(np.int64)
+    bias = rng.randint(-500, 500, N).astype(np.int64)
+    acc = wrap32(imatmul(A, B) + bias[None, :])
+    rq = requant_params(acc, 0.02, np.full(N, 0.01), "linear", np.random.RandomState(4), (-9, -128, 127))
+    q1 = requantize(acc, rq)
+    R, add, ra = _add_draw(rng, q1, rq["s_out"], rq["zp"], "tanh", True)
+    assert add["zpo"] != 0, "the fixture needs zp_o != 0, or the lane's zero point cannot show; pick another seed"
+    cfg = {"n": N, "pool_h": 1, "pool_w": 1, "padding": 0}
+    Y = _golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[1]
+    for i in range(N):
+        for j in range(N):
+            assert int(Y[i, j]) == int(ipu.tflite_add(int(q1[i, j]), int(R[i, j]), *[add[k] for k in mr.ADD_FIELDS], mr.ROUNDING))
+    for k, v in (("zp1", 0), ("zpo", add["zpo"] + 7)):
+        assert np.any(_golden_int8_residual([(A, B)], bias, rq, R, dict(add, **{k: v}), ra, cfg, "tanh", 1)[1] != Y), k
+    assert np.any(_golden_int8_residual([(A, B)], bias, rq, R, add, dict(ra, zp=0), cfg, "tanh", 1)[2] !=
+                  _golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[2]), "the lane must see zp_o"
+    assert np.array_equal(_golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[2],
+                          mr.int8_residual_exact(A, B, bias, rq, R, add, ra, "tanh"))  # the layer engine's helper agrees
+
+
+@contextlib.contextmanager
+def _scratch_tb_dir():
+    """TB_DIR, RESULTS_DIR and TRUTH_SCALES pointed at a temporary directory while a stimulus writer runs, then restored: a self-test never writes testbenches/."""
+    global TB_DIR, RESULTS_DIR, TRUTH_SCALES
+    old = TB_DIR, RESULTS_DIR, TRUTH_SCALES
+    with tempfile.TemporaryDirectory() as d:
+        TB_DIR, RESULTS_DIR, TRUTH_SCALES = d, os.path.join(d, "results"), os.path.join(d, "truth_scales.json")
+        try:
+            yield d
+        finally:
+            TB_DIR, RESULTS_DIR, TRUTH_SCALES = old
+
+
+@selftest
+def test_residual_stimulus():
+    """A residual test writes add_<k>.mem for every set: per group its partial and hold flags, then the add set; hold and partial sets expect no output."""
+    cfg = dict(next(t for t in PIPELINE_TESTS if t["name"] == "int8_residual_tanh"), n=8, lanes=32)
+    with _scratch_tb_dir() as d:
+        with contextlib.redirect_stdout(io.StringIO()):
+            _generate_vectors_int8(cfg)
+        knobs = dict(x.split() for x in open(os.path.join(d, "test_knobs.mem")).read().splitlines())
+        flags = [int(open(os.path.join(d, f"add_{k}.mem")).readline(), 16) for k in range(int(knobs["num_sets"]))]
+        assert knobs["residual"] == "1" and len(flags) == 18, (knobs, len(flags))  # 6 groups of 2 depth passes and an add set
+        assert flags[:3] == [0x33, 0x54, 0x38], [hex(f) for f in flags[:3]]  # partial with bias (tanh), hold (linear), add (tanh)
+        assert [f & 0xF for f in flags] == [0x3, 0x4, 0x8] * 6, [hex(f) for f in flags]
+        assert all(os.path.getsize(os.path.join(d, f"expected_output_{k}.mem")) == 0 for k in (0, 1))
+        assert os.path.getsize(os.path.join(d, "expected_output_2.mem")) > 0
+    with _scratch_tb_dir() as d:  # a plain test writes the knob as 0 and no add_<k>.mem
+        with contextlib.redirect_stdout(io.StringIO()):
+            _generate_vectors_int8(dict(next(t for t in PIPELINE_TESTS if t["name"] == "int8_perchannel_random_linear_nopool"), n=8, lanes=32))
+        assert "residual 0" in open(os.path.join(d, "test_knobs.mem")).read() and not os.path.exists(os.path.join(d, "add_0.mem"))
+    layouts = {}  # every residual test's group layout on the default credits (brief Step 3.1)
+    for t in [x for x in PIPELINE_TESTS if x.get("residual") or x.get("residual_every")]:
+        gs = _residual_layout(t, t.get("accum_passes", 1), t.get("mixed_acts", []), SETS_IN_FLIGHT, t["act"])
+        layouts[t["name"]] = (gs[-1][0] + gs[-1][1] + gs[-1][2], [a for _, _, r, a in gs if r], [a for _, _, r, a in gs if not r])
+    assert layouts["int8_residual_sigmoid_selu_nopool"] == (16, ["sigmoid", "selu"] * 4, []), layouts
+    assert layouts["int8_residual_accum2_mixed_nopool"] == (18, ["relu", "linear", "sigmoid", "tanh"], ["tanh", "selu", "relu"]), layouts
+    assert all(n == 18 for k, (n, _, _) in layouts.items() if k != "int8_residual_sigmoid_selu_nopool"), layouts
+
+
+@selftest
+def test_residual_pairs_check():
+    """run_regression's hold/add pair check: every stream pass's count must equal the add sets below num_sets; a missing line fails."""
+    with _scratch_tb_dir() as d:
+        open(os.path.join(d, "test_knobs.mem"), "w").write("num_sets 4\n")
+        for k, f in enumerate((0x54, 0x58, 0x54, 0x58, 0x58)):  # add_4.mem lies past num_sets: a longer earlier test's
+            _write_w32(os.path.join(d, f"add_{k}.mem"), [f] + [0] * 11)
+        line = lambda p: f"[HOLD/ADD] hold/add pairs {p}, hold release with an L3 grant 0, hold done with a bank done 0, grants held for an add drain 0\n"
+        assert _residual_pairs_bad(line(2) * 4) == ""
+        assert "0 hold/add pairs, expected 2" in _residual_pairs_bad(line(0) * 4)
+        assert _residual_pairs_bad(line(2) * 3 + line(1)) and _residual_pairs_bad("RESULT: PASSED\n").startswith("[FAIL] residual: no")
 
 
 @selftest

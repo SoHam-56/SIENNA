@@ -416,7 +416,7 @@ pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
 # Verilator — SIENNA Top
 # ─────────────────────────────────────────────────────────────────────────────
 # TB_sienna_top reads these package items at run time from test_knobs.mem, so a build serves every test that agrees on the rest.
-TB_KNOBS = ACTIVATION_CODE NUM_SETS HAS_BIAS WEIGHT_CACHE ACCUM_PASSES MIXED_LEN MIXED_ACTS PACKED TRAINING_MODE DROPOUT_SEED
+TB_KNOBS = ACTIVATION_CODE NUM_SETS HAS_BIAS WEIGHT_CACHE ACCUM_PASSES MIXED_LEN MIXED_ACTS PACKED TRAINING_MODE DROPOUT_SEED RESIDUAL
 # What a build depends on: each Verilator input but the package by checksum, the package without TB_KNOBS, and the flags.
 BUILD_KEY = { for f in $$(sed -e 's/^[^:]*://' -e 's/\\$$//' $(VERILATOR_DIR)/V$(TOP_MODULE)__ver.d | tr ' ' '\n' | sort -u); do \
 	  [ -z "$$f" ] || [ "$$f" = "$(PKG_FILE)" ] || md5sum "$$f"; done; \

@@ -59,10 +59,14 @@ module TB_sienna_top #(
   logic                     wc_last_i;  // this set is the last of its cache region's fill
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
+  logic res_hold_i, res_add_i;  // int8 residual: the set's hold and add flags and its ADD's words (apply_add)
+  logic [7:0] add_zp1_i, add_zp2_i, add_s1_i, add_s2_i, add_so_i, add_zpo_i, add_min_i, add_max_i;
+  logic [31:0] add_m1_i, add_m2_i, add_mo_i;
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;  // result beats per set
 
   // The test's TB-only settings, read from test_knobs.mem at time 0 (written with its stimulus): no build depends on them, so one build runs every test of its group.
   int k_activation_code, k_num_sets, k_has_bias, k_weight_cache, k_accum_passes, k_mixed_len, k_mixed_acts, k_packed, k_training_mode, k_dropout_seed;
+  int k_residual;  // int8 residual: each set's partial, bias, hold, add and activation come from add_<k>.mem
   int hold_set;  // the hold pass's set: SETS_IN_FLIGHT+4 sets to put after it where k_num_sets allows, else set 0
   task automatic read_knobs();
     int fd, v, seen, i;
@@ -82,13 +86,14 @@ module TB_sienna_top #(
         "packed":          begin i = 7; k_packed = v;          end
         "training_mode":   begin i = 8; k_training_mode = v;   end
         "dropout_seed":    begin i = 9; k_dropout_seed = v;    end
+        "residual":        begin i = 10; k_residual = v;       end
         default: $fatal(1, "TB_sienna_top: test_knobs.mem names an unknown setting '%s'", key);
       endcase
       if (seen[i]) $fatal(1, "TB_sienna_top: test_knobs.mem sets '%s' twice", key);
       seen[i] = 1'b1;
     end
     $fclose(fd);
-    if (seen != 10'h3FF) $fatal(1, "TB_sienna_top: test_knobs.mem lacks settings (mask %b of 10)", seen[9:0]);
+    if (seen != 11'h7FF) $fatal(1, "TB_sienna_top: test_knobs.mem lacks settings (mask %b of 11)", seen[10:0]);
     if (k_num_sets < 1 || k_accum_passes < 1) $fatal(1, "TB_sienna_top: test_knobs.mem: num_sets %0d, accum_passes %0d", k_num_sets, k_accum_passes);
     hold_set = (k_num_sets / 2 < k_num_sets - SETS_IN_FLIGHT - 4) ? k_num_sets / 2
              : ((k_num_sets - SETS_IN_FLIGHT - 4 > 0) ? k_num_sets - SETS_IN_FLIGHT - 4 : 0);
@@ -380,6 +385,19 @@ module TB_sienna_top #(
     s.zout          = {pack_zout_i, gp_zout_i};
     s.mult          = req_mult_i;
     s.shift         = req_shift_i;
+    s.res_hold      = res_hold_i;
+    s.res_add       = res_add_i;
+    s.add_zp1       = add_zp1_i;
+    s.add_zp2       = add_zp2_i;
+    s.add_m1        = add_m1_i;
+    s.add_s1        = add_s1_i;
+    s.add_m2        = add_m2_i;
+    s.add_s2        = add_s2_i;
+    s.add_mo        = add_mo_i;
+    s.add_so        = add_so_i;
+    s.add_zpo       = add_zpo_i;
+    s.add_min       = add_min_i;
+    s.add_max       = add_max_i;
 `ifdef TB_FLOAT_ADD
     s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a float build fires a_float_no_add
 `endif
@@ -600,6 +618,7 @@ module TB_sienna_top #(
     pack_shift_i = '0;
     pack_map_i = '0;
     {pack_act_i, pack_zp_i, pack_min_i, pack_max_i, pack_shout_i, pack_zout_i, pack_mx_i, pack_shx_i, pack_mout_i} = '0;
+    apply_add(0, 1);
     weight_cached_i = 1'b0;
     weight_tile_i = '0;
     wc_write_enable_i = 1'b0;
@@ -865,9 +884,11 @@ module TB_sienna_top #(
           end
         if (dut.g_accept) beat[int'(dut.g_next_id)] = 0;
         if (dut.wide_rd_valid) begin  // a beat leaves the mesh; floats fill with it, int8 after the requantize pipeline
-          q_id.push_back(int'(dut.g_set_id));
-          q_i.push_back(beat[int'(dut.g_set_id)]);
-          q_pk.push_back(dut.g_pack);
+          if (!dut.g_hold) begin  // a hold set's beats go to hold_mem and never fill
+            q_id.push_back(int'(dut.g_set_id));
+            q_i.push_back(beat[int'(dut.g_set_id)]);
+            q_pk.push_back(dut.g_pack);
+          end
           beat[int'(dut.g_set_id)]++;
         end
         if (dut.fill_v && q_id.size() != 0) begin
@@ -941,20 +962,60 @@ module TB_sienna_top #(
     end
   end
 
-  // With k_accum_passes = P, sets come in groups of P: the first P-1 are partial sums, the last is activated.
+  // A residual test's add_<k>.mem: flags (partial, bias, hold, add, activation in 7:4), then the ADD's words; other tests leave the table empty.
+  logic [31:0] add_tab[int][12];
+  task automatic read_add_tables();
+    logic [31:0] q[$];
+    if (k_residual == 0) return;
+    for (int k = 0; k < k_num_sets; k++) begin
+      read_word_file($sformatf("add_%0d.mem", k), q);
+      if (q.size() != 12) $fatal(1, "TB_sienna_top: add_%0d.mem holds %0d words, not 12", k, q.size());
+      for (int i = 0; i < 12; i++) add_tab[k][i] = q[i];
+    end
+  endtask
+  function automatic bit is_hold(input int k);
+    return k_residual != 0 && add_tab[k][0][2];
+  endfunction
+  function automatic bit is_add(input int k);
+    return k_residual != 0 && add_tab[k][0][3];
+  endfunction
+
+  // With k_accum_passes = P, sets come in groups of P: the first P-1 are partial sums, the last is activated; a residual test's flags say.
   function automatic bit is_partial(input int k);
+    if (k_residual != 0) return add_tab[k][0][0];
     return (k_accum_passes > 1) && ((k % k_accum_passes) != k_accum_passes - 1);
   endfunction
 
-  // Set k's activation: with k_mixed_len > 0 the codes cycle through k_mixed_acts, 4 bits per set.
+  // Set k's activation: with k_mixed_len > 0 the codes cycle through k_mixed_acts, 4 bits per set; a residual test's from its flags.
   function automatic logic [CONTROL_WIDTH-1:0] act_of(input int k);
+    if (k_residual != 0) return CONTROL_WIDTH'(add_tab[k][0][7:4]);  // hold sets linear, each group's activation from the generator
     return (k_mixed_len > 0) ? CONTROL_WIDTH'((k_mixed_acts >> (4 * (k % k_mixed_len))) & 15) : CONTROL_WIDTH'(k_activation_code);
   endfunction
 
-  // Set k's bias: with k_has_bias, the first pass of each group reads bias_<k>.mem.
+  // Set k's hold and add flags and ADD words (add_<k>.mem); zeros outside a residual test and in a pass that puts the set alone.
+  task automatic apply_add(input int k, input bit single = 0);
+    {res_hold_i, res_add_i, add_zp1_i, add_zp2_i, add_m1_i, add_s1_i, add_m2_i, add_s2_i, add_mo_i, add_so_i, add_zpo_i, add_min_i,
+     add_max_i} = '0;
+    if (k_residual == 0 || single) return;
+    res_hold_i = add_tab[k][0][2];
+    res_add_i  = add_tab[k][0][3];
+    add_zp1_i  = add_tab[k][1][7:0];
+    add_zp2_i  = add_tab[k][2][7:0];
+    add_m1_i   = add_tab[k][3];
+    add_s1_i   = add_tab[k][4][7:0];
+    add_m2_i   = add_tab[k][5];
+    add_s2_i   = add_tab[k][6][7:0];
+    add_mo_i   = add_tab[k][7];
+    add_so_i   = add_tab[k][8][7:0];
+    add_zpo_i  = add_tab[k][9][7:0];
+    add_min_i  = add_tab[k][10][7:0];
+    add_max_i  = add_tab[k][11][7:0];
+  endtask
+
+  // Set k's bias: with k_has_bias, the first pass of each group reads bias_<k>.mem; a residual test's flags say.
   task automatic apply_bias(input int k);
     logic [31:0] q[$];
-    bias_valid_i = (k_has_bias != 0) && ((k % k_accum_passes) == 0);
+    bias_valid_i = (k_residual != 0) ? add_tab[k][0][1] : ((k_has_bias != 0) && ((k % k_accum_passes) == 0));
     bias_i = '0;
     if (bias_valid_i) begin
       read_word_file($sformatf("bias_%0d.mem", k), q);
@@ -1073,8 +1134,9 @@ module TB_sienna_top #(
     end
   end
 
-  // int8: set id, activation bank and bypass flag of each beat inside the requantize pipeline, oldest first.
-  int rq_id[$], rq_bank[$], rq_byp[$];
+  // int8: set id, activation bank, bypass and add flags of each beat inside the requantize pipeline (and add_lanes), oldest first.
+  int rq_id[$], rq_bank[$], rq_byp[$], rq_add[$];
+  int add_drain_hold = 0;  // cycles an add set's drain held the next grant, which it does by design
   int ov_rq = 0, rq_wait = 0;
   int ov_lane = 0, rq_hold = 0, rq_null_wait = 0, rq_null_pass = 0, rd_in = 0;  // rd_in: wide reads of the stage's set so far
   wire next_ready = res_ready && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id];  // the next set's result is ready to push
@@ -1085,6 +1147,7 @@ module TB_sienna_top #(
         rq_id.delete();
         rq_bank.delete();
         rq_byp.delete();
+        rq_add.delete();
         rd_in = 0;
       end else begin
         if (stream_on && rq_id.size() != 0) begin
@@ -1094,11 +1157,13 @@ module TB_sienna_top #(
             if (rq_byp[0] != 0 && int'(dut.g_state) != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
           end
           // A ReLU or linear set's beats are all in, the next result is ready with a free bank, yet no beats granted: the drain holds it.
-          else if (rq_byp[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready &&
+          else if (rq_add[0] == 0 && rq_byp[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready &&
                    !dut.act_full[rq_bank[0] == 0])
             rq_wait++;
+          else if (rq_add[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready && !dut.act_full[rq_bank[0] == 0])
+            add_drain_hold++;  // an add drain holds the next grant by design
           // The draining ReLU or linear set still holds the stage, not leaving this cycle, though the next set could start.
-          if (int'(dut.g_state) != 0 && rq_id[0] == int'(dut.g_set_id) && rq_byp[0] != 0 && dut.act_bypass &&
+          if (rq_add[0] == 0 && int'(dut.g_state) != 0 && rq_id[0] == int'(dut.g_set_id) && rq_byp[0] != 0 && dut.act_bypass &&
               rd_in == SRAM_DEPTH / NUM_LANES && !dut.g_done && next_ready && !dut.act_full[!dut.act_wr])
             rq_hold++;
           // A partial set that could pass the stage but for the drain, and one that passed during it.
@@ -1107,17 +1172,30 @@ module TB_sienna_top #(
         end
         if (int'(dut.g_state) == 0) rd_in = 0;
         else if (dut.wide_rd_valid) rd_in++;
-        if (dut.fill_v) begin
+        if (dut.fill_v && rq_id.size() != 0) begin
           void'(rq_id.pop_front());
           void'(rq_bank.pop_front());
           void'(rq_byp.pop_front());
+          void'(rq_add.pop_front());
         end
-        if (dut.wide_rd_valid) begin
+        if (dut.wide_rd_valid && !dut.g_hold) begin  // hold beats go to hold_mem and never reach fill_v
           rq_id.push_back(int'(dut.g_set_id));
           rq_bank.push_back(int'(dut.act_wr));
           rq_byp.push_back(int'(dut.act_bypass));
+          rq_add.push_back(int'(dut.g_add));
         end
       end
+    end
+  end
+
+  // int8 residual (spec Risk 3): hold/add pairs, and the same-cycle crosses of a hold set's done with an L3 grant and with a bank done.
+  int res_pairs = 0, cross_rel_grant = 0, cross_hold_bank = 0;
+  initial forever begin
+    @(negedge clk_i);
+    if (EXP_W == 0 && stream_on && rstn_i) begin
+      res_pairs += int'(dut.hold_done);
+      cross_rel_grant += int'(dut.hold_done && dut.l3_grant);
+      cross_hold_bank += int'(dut.hold_done && dut.bank_done);
     end
   end
 
@@ -1197,6 +1275,10 @@ module TB_sienna_top #(
     rq_hold = 0;
     rq_null_wait = 0;
     rq_null_pass = 0;
+    add_drain_hold = 0;
+    res_pairs = 0;
+    cross_rel_grant = 0;
+    cross_hold_bank = 0;
     while (pipeline_complete_o) @(posedge clk_i);  // the previous pass's pulse is not a set boundary
     @(posedge clk_i);
     stream_on = 1;
@@ -1218,6 +1300,7 @@ module TB_sienna_top #(
               accumulate_i = is_partial(k);
               activation_function_i = act_of(k);
               apply_bias(k);
+              apply_add(k);
               apply_requant(k);
               apply_pack(k);
               apply_weight(k);
@@ -1331,6 +1414,10 @@ module TB_sienna_top #(
     stream_on = 0;
     tr_on = 0;
     out_hold = 0;
+    // An add set's last beat cannot meet the next accept: rq_room holds the grant until add_lanes drains (a_add_last_no_accept).
+    if (k_residual != 0)
+      $display("[HOLD/ADD] hold/add pairs %0d, hold release with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
+               res_pairs, cross_rel_grant, cross_hold_bank, add_drain_hold);
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", k_num_sets, ($time - t0) / 10);
     $display("  [Stream] lane-cycles with no L9 credit held: %0d", starved);
@@ -1425,6 +1512,7 @@ module TB_sienna_top #(
           accumulate_i = is_partial(k);
           activation_function_i = act_of(k);
           apply_bias(k);
+          apply_add(k);
           apply_requant(k);
           apply_pack(k);
           apply_weight(k);
@@ -1522,6 +1610,7 @@ module TB_sienna_top #(
       activation_function_i = act_of(G);
       dropout_seed_i = set_seed(G);
       apply_bias(0);  // the sum's bias rides its first pass only
+      apply_add(0, 1);
       if (j != 0) begin
         bias_valid_i = 1'b0;
         bias_i = '0;
@@ -1643,6 +1732,7 @@ module TB_sienna_top #(
   // ── Top-level stimulus ────────────────────────────────────────────────
   initial begin
     read_knobs();
+    read_add_tables();
 
     $display("==============================================");
     $display(" SIENNA PIPELINE VERIFICATION");
@@ -1679,6 +1769,7 @@ module TB_sienna_top #(
     $display("\n[STAGE] Starting pipeline");
     activation_function_i = act_of(0);
     apply_bias(0);
+    apply_add(0, 1);  // set 0 alone: no hold, no add
     apply_requant(0);
     apply_pack(0);
     training_mode_i       = k_training_mode[0];
@@ -1715,6 +1806,7 @@ module TB_sienna_top #(
       dropout_seed_i = set_seed(1);
       activation_function_i = act_of(1);
       apply_bias(1);
+      apply_add(1, 1);  // set 1 alone: no hold, no add
       apply_requant(1);
       apply_pack(1);
       apply_weight(1);
@@ -1766,7 +1858,8 @@ module TB_sienna_top #(
       stream_all_sets(ids_used + k_num_sets, 1, 0);
     end
     reset_mid_stream();
-    accum_null_pass();
+    if (k_residual != 0) $display("[SKIP] accumulate pass: the residual stream's groups come from add_<k>.mem");
+    else accum_null_pass();
     // sienna_top's own link checkers judge only when it is drained: it must drain after the last set.
     for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.drained; w++) @(posedge clk_i);
     if (!dut.drained) begin

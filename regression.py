@@ -1983,7 +1983,7 @@ def run_int8(a, sim, shapes) -> None:
     peak = a.n * a.n
     head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
             f"{'slot use':>8} {'mism':>6} {'q err':>8} {'wall s':>6}")
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n} collapse-k {mr.COLLAPSE_K}, {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
@@ -2051,7 +2051,9 @@ def gemm_main(argv=None):
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(mr.FORMATS),
                     help="format of A and B on the layer engine; int8 sums in int32 and requantizes")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the float goldens follow")
     a = ap.parse_args(argv)
+    mr.COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8" and (a.emulate or a.engine != "layer"):
         ap.error("int8 runs on the layer engine only")
     os.makedirs(a.work, exist_ok=True)
@@ -2071,7 +2073,7 @@ def gemm_main(argv=None):
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and results, fp32 sums; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n} collapse-k {mr.COLLAPSE_K}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and results, fp32 sums; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
@@ -3496,9 +3498,12 @@ def test_guard_missing_file():
 def test_parse_time_rejections():
     r = make_n("pipeline", "FMT=fp16")
     assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
-    for t in ("regression", "pack", "gemm", "model", "tflite", "perf-analysis"):
+    for t in ("regression", "pack", "perf-analysis"):
         r = make_n(t, "COLLAPSE_K=0")
-        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top only" in r.stderr, (t, r.stderr)
+        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
+    for t in ("gemm", "model", "tflite"):  # sienna_layer's runs build the mesh mode they are given
+        r = make_n(t, "COLLAPSE_K=0", "MODEL_DIR=/m", "FMT=int8" if t == "tflite" else "FMT=fp32", "PYTHON=py")
+        assert r.returncode == 0 and "--collapse-k 0" in r.stdout, (t, r.stdout + r.stderr)
     for t in ("pipeline", "verilator", "lint", "pkg", "sim", "build-key"):  # TB_sienna_top sets sienna_top's COLLAPSE_K from the package
         r = make_n(t, "COLLAPSE_K=0")
         assert "COLLAPSE_K=0 reaches" not in r.stderr, (t, r.stderr)
@@ -3524,12 +3529,14 @@ def test_regression_points():
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 21 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 == 313, (len(small), len(full))
+    assert len(small) == len(set(small)) == 1 + 7 * 27 == 190 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 == 421, (len(small), len(full))
+    layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
-        for n, t in sweep(full):  # back-to-back at every N, collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
-            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:]
+        for n, t in sweep(full):  # back-to-back and sienna_layer's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
+            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f]
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
+    assert SPEC.parse("fp32/N32_T8/gemm-ck0")["ck"] == 0
     assert [(SPEC.parse(f"int8/N8_T2/{k}")["ck"], SPEC.parse(f"int8/N8_T2/{k}")["b2b"]) for k in ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b")] \
         == [(1, False), (0, False), (1, True), (0, True)]
     assert [SPEC.parse(p)[x] for p in ("fp32/N64_T64/pipeline-b2b",) for x in ("ck", "b2b", "lanes")] == [1, True, 128]
@@ -3537,7 +3544,7 @@ def test_regression_points():
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
-                "fp32/N8_T2/pack-ck0", "int8/N8_T2/tflite-ck0", "fp32/N8_T2/model-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
+                "fp32/N8_T2/pack-ck0", "int8/N8_T2/model-ck0", "fp32/N8_T2/tflite-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
                 "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0"):
         try:
             SPEC.parse(bad)
@@ -3558,6 +3565,8 @@ def test_point_commands():
     assert SPEC.argv("bf16/N16_T4/pipeline-ck0", opts) == ["make", "pipeline", *at("bf16", 16, 4, 32), "COLLAPSE_K=0"]
     assert SPEC.argv("int8/N8_T2/pipeline-b2b", opts) == ["make", "pipeline", *at("int8", 8, 2, 32), "EXTRA_FLAGS=-DBACK_TO_BACK"]
     assert SPEC.argv("fp32/N16_T8/pipeline-ck0-b2b", opts) == ["make", "pipeline", *at("fp32", 16, 8, 32), "COLLAPSE_K=0", "EXTRA_FLAGS=-DBACK_TO_BACK"]
+    assert SPEC.argv("int8/N8_T2/tflite-ck0", opts) == ["make", "tflite", *at("int8", 8, 2, 32), "COLLAPSE_K=0"]
+    assert SPEC.argv("bf16/N64_T8/model-ck0", opts) == ["make", "model", *at("bf16", 64, 8, 128), "MODEL_DIR=/m", "MODEL_COUNT=3", "COLLAPSE_K=0"]
     with tempfile.TemporaryDirectory() as d:  # a -b2b point's make pipeline passes the define to the Verilator flags of the make regression.py starts
         fake = os.path.join(d, "py")
         open(fake, "w").write(f"#!/bin/sh\nexec make -s -n -C {ROOT} lint GEN_PKG=0 FMT=int8 N=8 TILE=2\n")
@@ -3750,7 +3759,8 @@ def test_regression_target():
         assert "--action summary" in lines[-1] and "--run " in lines[-1] and ("--small" in lines[-1]) == ("SMALL=1" in args), lines[-1]
         assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
     small = [x.split("--name ")[1].split()[0] for x in recipe("regression", "SMALL=1", "MODEL_DIR=/m") if "--action point " in x]
-    assert [p for p in small if p.endswith("-ck0")] == [f"{f}/N{n}_T{t}/pipeline-ck0" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)]
+    assert [p for p in small if p.endswith("-ck0")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
+                                                       for k in ["pipeline-ck0"] + (["gemm-ck0", "tflite-ck0"] if f == "int8" else ["model-ck0", "gemm-ck0"])]
     assert [p for p in small if p.endswith("-b2b")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
                                                        for k in ("pipeline-b2b", "pipeline-ck0-b2b")]
     full = [x.split("--name ")[1].split()[0] for x in recipe("regression", "MODEL_DIR=/m") if "--action point " in x]
@@ -3766,6 +3776,8 @@ def test_regression_target():
     assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
     assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
     assert make_n("check").returncode != 0  # the gate's old name is gone
+    r = make_n("gemm", "COLLAPSE_K=0", "FMT=fp32", "PYTHON=py")
+    assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr
     h = subprocess.run(["make", "-s", "help"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
     assert "make sim " in h and "make build-key " in h and "sienna_ck0" not in open(os.path.join(ROOT, "Makefile")).read(), h[-300:]
     with tempfile.TemporaryDirectory() as d:  # a relative MODEL_DIR reaches the points absolute: they run in a private copy
@@ -4431,9 +4443,10 @@ def _engine():
 
 
 regress = _engine()
-KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
+KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite", "model-ck0", "gemm-ck0", "tflite-ck0")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
 PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
+LAYER_CK0 = KINDS[-3:]  # sienna_layer's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
@@ -4457,8 +4470,9 @@ class SiennaSpec(regress.Spec):
 
     @staticmethod
     def _offered(f, n, k):
-        """model in fp32 and bf16, tflite in int8, the -ck0 kinds at CK0_SIZES, the -b2b kinds at B2B_SIZES."""
-        return ((k != "model" or f != "int8") and (k != "tflite" or f == "int8") and ("-ck0" not in k or n in CK0_SIZES)
+        """model in fp32 and bf16, tflite in int8 (-ck0 too), the pipeline's -ck0 kinds at CK0_SIZES, LAYER_CK0 at every N, the -b2b kinds at B2B_SIZES."""
+        b = k.removesuffix("-ck0")
+        return ((b != "model" or f != "int8") and (b != "tflite" or f == "int8") and ("-ck0" not in k or k in LAYER_CK0 or n in CK0_SIZES)
                 and (not k.endswith("-b2b") or n in B2B_SIZES))
 
     def parse(self, name):
@@ -4471,12 +4485,12 @@ class SiennaSpec(regress.Spec):
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
         if not self._offered(f, n, k):
-            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, the -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
+            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, the pipeline's -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
                              f" and the -b2b kinds at N = {', '.join(map(str, B2B_SIZES))}")
         return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if "-ck0" in k else 1, "b2b": k.endswith("-b2b")}
 
     def env(self, name, env):
-        if self.parse(name)["kind"] in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
+        if self.parse(name)["kind"].removesuffix("-ck0") in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
             env = dict(env, OPT_FAST="-O0")
         return env
 
@@ -4484,13 +4498,14 @@ class SiennaSpec(regress.Spec):
         p, py = self.parse(name), sys.executable
         if p["kind"] == "selftest":
             return [py, "regression.py", "--action", "selftest"]
-        k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"]
+        k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"].removesuffix("-ck0")
         mk = ["make", k, f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
         return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(k, []) \
             + (["COLLAPSE_K=0"] if p["ck"] == 0 else []) + (["EXTRA_FLAGS=-DBACK_TO_BACK"] if p["b2b"] else [])
 
     def verdict(self, name, text, rc):
         k = self.parse(name)["kind"]
+        k = k if k in PIPELINE_KINDS else k.removesuffix("-ck0")  # a LAYER_CK0 point is judged as its base kind
         v = regress.common_verdict(text, rc)
         if v:
             return v
@@ -4532,7 +4547,7 @@ class SiennaSpec(regress.Spec):
         return regress.marker_verdict(text, rc, [r"^grid_\d+x\d+x\d+ "] + need, (r"^FAIL ",))
 
     def not_run(self, name, opts):
-        if self.parse(name)["kind"] != "model":
+        if self.parse(name)["kind"].removesuffix("-ck0") != "model":
             return None
         d, need = getattr(opts, "model_dir", ""), list(mr.MODELS.values())
         how = f"make regression MODEL_DIR=<directory with {', '.join(need)}>"

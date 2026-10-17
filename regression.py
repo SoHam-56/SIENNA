@@ -1643,13 +1643,27 @@ def _parse_log(raw: str) -> dict:
     }
 
 
-def _residual_pairs_bad(raw: str) -> str:
-    """A residual test's '[FAIL] residual: ...' line, or '': every stream pass's [HOLD/ADD] line must count the test's hold/add pairs."""
+HOLD_ADD = re.compile(r"^\[HOLD/ADD\] hold sets done (\d+), add beats (\d+), add beats of other sets (\d+), hold release with an L3 grant (\d+), "
+                      r"hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass of a residual test
+
+
+def _residual_pairs_bad(raw: str, per_lane: int) -> str:
+    """A residual test's '[FAIL] residual: ...' line, or '': each stream pass's [HOLD/ADD] line must count a hold set done per add set,
+    per_lane add_lanes beats per add set and none for another set."""
     k_sets = _tb_knobs()["num_sets"]  # the files past num_sets may be a longer earlier test's
     want = sum(int(open(os.path.join(TB_DIR, f"add_{k}.mem")).readline(), 16) >> 3 & 1 for k in range(k_sets))
-    got = [int(x) for x in re.findall(r"^\[HOLD/ADD\] hold/add pairs (\d+)", raw, re.M)]
-    if not got or any(p != want for p in got):
-        return f"[FAIL] residual: {', '.join(map(str, got)) or 'no'} hold/add pairs, expected {want} in each stream pass"
+    got = [tuple(int(x) for x in m[:3]) for m in HOLD_ADD.findall(raw)]
+    if not got or any(g != (want, want * per_lane, 0) for g in got):
+        return (f"[FAIL] residual: {'; '.join('%d hold sets done, %d add beats, %d of other sets' % g for g in got) or 'no [HOLD/ADD] line'}, "
+                f"expected {want}, {want * per_lane} and 0 in each stream pass")
+    return ""
+
+
+def _residual_cross_bad(ran: list, crosses: int, every=None) -> str:
+    """'[FAIL] residual: ...' when every residual test (every: names, default PIPELINE_TESTS') ran and no hold done met an L3 grant or a bank done in any (spec Risk 3)."""
+    every = set(_residual_tests() if every is None else every)
+    if crosses == 0 and every and every <= set(ran):
+        return "[FAIL] residual: in no residual test did a hold set's done meet an L3 grant or a bank done, so neither cross was exercised"
     return ""
 
 
@@ -1705,6 +1719,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     results = []
     tests_to_run = build_order(tests_to_run, N, T, lanes, fmt_name)
     built = None  # the build key of the TB_sienna_top binary on disk, None until this run builds one
+    res_cross = 0  # residual tests' same-cycle crosses, summed: gated once every residual test has run
 
     for idx, t in enumerate(tests_to_run):
         print(
@@ -1732,8 +1747,9 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             "wall": wall,
             **_parse_log(raw_log),
         }
-        if t.get("residual") or t.get("residual_every"):  # the hold/add pairs each stream pass counted
-            bad = _residual_pairs_bad(raw_log)
+        if t.get("residual") or t.get("residual_every"):  # the hold sets and add beats each stream pass counted
+            bad = _residual_pairs_bad(raw_log, N * N // lanes)
+            res_cross += sum(int(m[3]) + int(m[4]) for m in HOLD_ADD.findall(raw_log))
             if bad:
                 print(f"      {err(bad)}")
                 r.update(status="FAIL" if r["status"] == "PASS" else r["status"], failed=max(r["failed"], 1))
@@ -1772,6 +1788,10 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             sys.exit(1)
 
     print(f"\n  ╚══  Sweep Complete")
+    cross_bad = _residual_cross_bad([r["name"] for r in results], res_cross)
+    if cross_bad:
+        print(f"  {err(cross_bad)}")
+        sys.exit(1)
 
     gated = [r for r in results if "truth" in r]
     names = sorted({k for r in gated for k in r["truth"] if not k.startswith("_")},
@@ -3424,15 +3444,21 @@ def test_residual_stimulus():
 
 @selftest
 def test_residual_pairs_check():
-    """run_regression's hold/add pair check: every stream pass's count must equal the add sets below num_sets; a missing line fails."""
+    """run_regression's residual counts: per stream pass a hold set done per add set below num_sets, per_lane add beats each, none for
+    another set, a missing line fails; and once every residual test ran, some hold done must have met an L3 grant or a bank done."""
     with _scratch_tb_dir() as d:
         open(os.path.join(d, "test_knobs.mem"), "w").write("num_sets 4\n")
         for k, f in enumerate((0x54, 0x58, 0x54, 0x58, 0x58)):  # add_4.mem lies past num_sets: a longer earlier test's
             _write_w32(os.path.join(d, f"add_{k}.mem"), [f] + [0] * 11)
-        line = lambda p: f"[HOLD/ADD] hold/add pairs {p}, hold release with an L3 grant 0, hold done with a bank done 0, grants held for an add drain 0\n"
-        assert _residual_pairs_bad(line(2) * 4) == ""
-        assert "0 hold/add pairs, expected 2" in _residual_pairs_bad(line(0) * 4)
-        assert _residual_pairs_bad(line(2) * 3 + line(1)) and _residual_pairs_bad("RESULT: PASSED\n").startswith("[FAIL] residual: no")
+        line = lambda h, b, o=0: (f"[HOLD/ADD] hold sets done {h}, add beats {b}, add beats of other sets {o}, hold release with an L3 grant 0, "
+                                  "hold done with a bank done 0, grants held for an add drain 0\n")
+        assert _residual_pairs_bad(line(2, 16) * 4, 8) == ""
+        assert "expected 2, 16 and 0" in _residual_pairs_bad(line(0, 0) * 4, 8)
+        assert _residual_pairs_bad(line(2, 16) * 3 + line(1, 16), 8) and _residual_pairs_bad(line(2, 15) * 4, 8)
+        assert _residual_pairs_bad(line(2, 16, 1) * 4, 8) and "no [HOLD/ADD] line" in _residual_pairs_bad("RESULT: PASSED\n", 8)
+    every = _residual_tests()
+    assert _residual_cross_bad(every, 0).startswith("[FAIL]") and _residual_cross_bad(every, 1) == "" and _residual_cross_bad(every[:-1], 0) == ""
+    assert _residual_cross_bad(["matmul_relu_nopool"], 0, every=[]) == ""  # no residual test defined: nothing to gate
 
 
 @selftest

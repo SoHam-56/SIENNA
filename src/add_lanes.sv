@@ -43,6 +43,13 @@ module add_lanes #(
 `ifndef SYNTHESIS
   a_lanes_in_step: assert property (@(posedge clk_i) disable iff (!rstn_i) done == {NUM_LANES{done[0]}})
     else $error("add_lanes: the lanes' tfliteAdd units are out of step");
+
+  logic [QAL-1:0] vq;  // valid_i delayed QAL cycles, beside the tag line
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) vq <= '0;
+    else vq <= QAL'({vq, valid_i});
+  a_tag_lat: assert property (@(posedge clk_i) disable iff (!rstn_i) done[0] == vq[QAL-1])
+    else $error("add_lanes: tfliteAdd's latency is not qadd_lat() = %0d, so tag_o is off its beat", QAL);
 `endif
 
 endmodule

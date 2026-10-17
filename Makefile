@@ -614,7 +614,7 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# add_lanes against ipu.tflite_add (regression.py --action add-vectors); fails unless the log has RESULT: PASSED and no error or failed assertion
+# add_lanes against ipu.tflite_add (regression.py --action add-vectors); fails unless the log has RESULT: PASSED and no error or failed assertion; its patterns are bracketed, so make's echo of the recipe does not read as a firing
 ADDL_DIR = $(VERILATOR_DIR)/add_lanes
 add-lanes:
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem
@@ -622,7 +622,7 @@ add-lanes:
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Add/src/tfliteAdd.sv $(SRC_DIR)/add_lanes.sv $(TB_DIR)/TB_add_lanes.sv -o sim
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
-	  ! command grep -qE '%Error|%Fatal|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
+	  ! command grep -qE '%[E]rror|%[F]atal|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
 
 # make regression: SIENNA's points, each its own target (make -jN runs N side by side), then the table; FMT=<f> narrows it to one format.
 comma := ,

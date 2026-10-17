@@ -2953,10 +2953,25 @@ def rq_vectors_main(argv=None) -> None:
 # ── add-vectors: TB_add_lanes' vectors ────────────────────────────────────────
 
 ADD_LANES, ADD_SETS, ADD_PER = 32, 6, 8  # TB_add_lanes' geometry: lanes, sets, beats per set
+ADD_TIE = 3  # the set of halves: s1 = s2 = 2^e, s_out = 2^(e+1), so its odd sums are ties that DOUBLE and SINGLE round apart
+ADD_EXP = {"none": (-8, 1), "relu": (-8, 1), "relu6": (-7, -5)}  # input scales' log2 range: relu6's 6.0 within a few input codes' sums
+ADD_ZIN = {"none": 128, "relu": -32, "relu6": -32}  # input zero points below this: a ReLU set's inputs mostly positive, off its zp_o rail
+ADD_ZOUT = {"none": 128, "relu": 1, "relu6": -63}  # zp_o below this, so 127 stays above a ReLU's or ReLU6's outputs
+
+
+def _add_set_draw(rng, s: int) -> tuple:
+    """Set s's activation, scales (s1, s2, s_out) and zero points (zp1, zp2, zp_o): s_out is 2 max(s1, s2) 2^U(-2, 1), ADD_TIE's are halves."""
+    if s == ADD_TIE:
+        e = int(rng.integers(-8, 1))
+        return "none", [2.0 ** e, 2.0 ** e, 2.0 ** (e + 1)], [int(v) for v in rng.integers(-20, 21, 3)]
+    act = ("none", "relu", "relu6")[s % 3]
+    s1, s2 = (float(np.float32(2.0 ** x)) for x in rng.uniform(*ADD_EXP[act], 2))
+    s_out = float(np.float32(2.0 * max(s1, s2) * 2.0 ** rng.uniform(-2, 1)))
+    return act, [s1, s2, s_out], [int(v) for v in rng.integers(-128, ADD_ZIN[act], 2)] + [int(rng.integers(-128, ADD_ZOUT[act]))]
 
 
 def add_vectors_main(argv=None) -> None:
-    """Vectors for TB_add_lanes: per set its ADD words, then per beat a tag and each lane's q1, q2 and expected code; arg: output .mem path."""
+    """Vectors for TB_add_lanes: per set its ADD words, then per beat a random tag and each lane's q1, q2 and expected code; arg: output .mem path."""
     ap = argparse.ArgumentParser(description=add_vectors_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="add-vectors")
     ap.add_argument("out")
@@ -2964,15 +2979,16 @@ def add_vectors_main(argv=None) -> None:
     rng = np.random.default_rng(29)
     lines = []
     for s in range(ADD_SETS):
-        sc = [float(np.float32(2.0 ** e)) for e in rng.uniform(-8, 1, 3)]
-        z = [int(v) for v in rng.integers(-128, 128, 3)]
-        add = mr.add_words(sc[0], z[0], sc[1], z[1], sc[2], z[2], ("none", "relu", "relu6")[s % 3])
+        act, sc, z = _add_set_draw(rng, s)
+        add = mr.add_words(sc[0], z[0], sc[1], z[1], sc[2], z[2], act)
         lines.append(" ".join(f"{add[k] & 0xFFFFFFFF:08x}" for k in mr.ADD_FIELDS))
+        q1, q2 = rng.integers(-128, 128, (2, ADD_PER, ADD_LANES))
+        want = mr.tflite_add_codes(q1, q2, add)
+        off = np.mean((want != add["amin"]) & (want != add["amax"]))
+        assert off >= 0.5, f"add-vectors: set {s} ({act}) has {off:.0%} of its outputs off the clamp rails, under half"
         for b in range(ADD_PER):
-            q1, q2 = rng.integers(-128, 128, ADD_LANES), rng.integers(-128, 128, ADD_LANES)
-            want = mr.tflite_add_codes(q1, q2, add)
-            lines.append(f"{(s * ADD_PER + b) & 0xFFFF:04x} " + " ".join(f"{int(x) & 0xFF:02x}{int(y) & 0xFF:02x}{int(w) & 0xFF:02x}"
-                                                                     for x, y, w in zip(q1, q2, want)))
+            lines.append(f"{int(rng.integers(0, 1 << 16)):04x} " + " ".join(f"{int(x) & 0xFF:02x}{int(y) & 0xFF:02x}{int(w) & 0xFF:02x}"
+                                                                         for x, y, w in zip(q1[b], q2[b], want[b])))
     with open(a.out, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, rounding {mr.ROUNDING}")

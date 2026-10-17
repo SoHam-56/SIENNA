@@ -353,9 +353,9 @@ LANE_ACTS = ("tanh", "sigmoid", "selu")  # a lane activation after the ADD: its 
 ADD_SPAN = {"tanh": 2.0, "sigmoid": 4.0}  # tanh and sigmoid: R mostly cancels the conv, so the real sums lie in an uneven part of +-span
 
 
-def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=None, tight=False) -> tuple:
+def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=None, out_q=None, tight=False) -> tuple:
     """An add set's inputs for a conv output q1 (scale s1, zero point z1): the residual codes, the ADD's words and the lane's.
-    setting fixes (s2 / s1, z2, s_out factor), a layer's; tight clamps zp_o +- ADD_TIGHT codes.
+    setting fixes (s2 / s1, z2, s_out factor) and out_q (s_out, zp_o, amin, amax), a layer's words; tight clamps zp_o +- ADD_TIGHT codes.
     A lane activation takes s2 within 2^+-1 of s1 (tanh, sigmoid: 2^0..1, R cancelling the conv to ADD_SPAN) and s_out at or above its calibration;
     zp_random ReLU calibrates on the unclamped sums, so zp_o is interior and its clamp cuts the negative sums."""
     N = q1.shape[0]
@@ -368,10 +368,15 @@ def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=No
         lo, hi = -span * rng.uniform(0.2, 1.0), span * rng.uniform(0.2, 1.0)  # uneven, so zp_o is off 0
         R = np.clip(np.rint(z2 + (rng.uniform(lo, hi, (N, N)) - s1 * (q1 - z1)) / s2), -128, 127).astype(np.int64)
     y = s1 * (q1 - z1) + s2 * (R - z2)
-    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if act == "relu" and not zp_random else y)
-    s_out *= fo if zp_random else 1.0  # random ADD scales: the output scale off its calibration, so some outputs clamp
+    if out_q:
+        s_out, z_out = out_q[:2]
+    else:
+        _, s_out, z_out = quant_act(np.maximum(y, 0.0) if act == "relu" and not zp_random else y)
+        s_out *= fo if zp_random else 1.0  # random ADD scales: the output scale off its calibration, so some outputs clamp
     add = mr.add_words(s1, z1, s2, z2, s_out, z_out, act)
-    if tight:
+    if out_q:
+        add.update(amin=out_q[2], amax=out_q[3])
+    elif tight:
         add.update(amin=max(-128, z_out - int(rng.randint(*ADD_TIGHT))), amax=min(127, z_out + int(rng.randint(*ADD_TIGHT))))
     return R, add, dict(mr.add_lane_params(add, s_out, mr.tflite_add_codes(q1, R, add)), setting=(f2, z2, fo))
 
@@ -447,8 +452,8 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
     N = cfg.get("n", 16)
     zqs = (_zp_draws(np.random.RandomState(seed + 8000), len(groups), ["linear" if r else a for _, _, r, a in groups])
            if cfg.get("zp_random") else [None] * len(groups))
-    layers = cfg.get("add_layers", 0)  # add_layers L: groups g and g + L share a layer's (s2 / s1, z2, s_out factor)
-    setting = {}  # layer -> its first group's
+    layers = cfg.get("add_layers", 0)  # add_layers L: groups g and g + L are one layer, with the same conv quantization and ADD words
+    layer = {}  # layer -> (s_a, z_a, s_w, rq, out_q, add, setting): its first group's
     w = lambda name, k: os.path.join(TB_DIR, f"{name}_{k}.mem")
     first, scales = None, {}
 
@@ -460,16 +465,23 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
 
     for g, (g0, P, res, act_g) in enumerate(groups):
         L = g % layers if layers else None
-        A_q, s_a, z_a = quant_act(np.hstack([reals[k][0] for k in range(g0, g0 + P)]))
-        B_q, s_w = quant_weights(np.vstack([reals[k][1] for k in range(g0, g0 + P)]))
+        A_r, B_r = np.hstack([reals[k][0] for k in range(g0, g0 + P)]), np.vstack([reals[k][1] for k in range(g0, g0 + P)])
+        if L in layer:  # a later group of a layer: its first group's scales and zero points
+            s_a, z_a, s_w, rq = layer[L][:4]
+            A_q = np.clip(np.rint(A_r / s_a) + z_a, -128, 127).astype(np.int64)
+            B_q = np.clip(np.rint(B_r / s_w[None, :]), -127, 127).astype(np.int64)
+        else:
+            (A_q, s_a, z_a), (B_q, s_w) = quant_act(A_r), quant_weights(B_r)
         hw_bias = fold_bias(None, s_a, s_w, z_a, B_q)
         parts = [(A_q[:, i * N:(i + 1) * N], B_q[i * N:(i + 1) * N, :]) for i in range(P)]
         acc = wrap32(sum(imatmul(a, b) for a, b in parts) + hw_bias[None, :])
-        rq = requant_params(acc, s_a, s_w, "linear" if res else act_g, req_rng, zqs[g])
+        if L not in layer:
+            rq = requant_params(acc, s_a, s_w, "linear" if res else act_g, req_rng, zqs[g])
         if res:  # redrawn until a quarter of the add set's final outputs are off the rails, in 16 codes or more
             arng, q1 = np.random.RandomState(seed + 9000 + g0), requantize(acc, rq)
             for _ in range(ADD_TRIES):
-                R, add, ra = _add_draw(arng, q1, rq["s_out"], rq["zp"], act_g, cfg.get("zp_random", False), setting.get(L),
+                fixed = layer.get(L, (None,) * 7)  # a later group of a layer: its (s2 / s1, z2, s_out factor) and output words
+                R, add, ra = _add_draw(arng, q1, rq["s_out"], rq["zp"], act_g, cfg.get("zp_random", False), fixed[6], fixed[4],
                                        act_g != "relu" and g % 2 == 1)
                 F = _golden_int8_residual(parts, hw_bias, rq, R, add, ra, cfg, act_g, set_dropout_seed(drop_seed, g0 + P))[4]
                 off, codes = _off_rails(F, ra)
@@ -479,7 +491,8 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
                 raise ValueError(f"{cfg['name']}: group {g}'s add set: no draw in {ADD_TRIES} with a quarter of its outputs off the rails "
                                  "and 16 codes")
             if layers:
-                setting.setdefault(L, ra["setting"])
+                layer.setdefault(L, (s_a, z_a, s_w, rq, (ra["s_out"], add["zpo"], add["amin"], add["amax"]), add, ra["setting"]))
+                assert add == layer[L][5] and rq is layer[L][3], f"{cfg['name']}: group {g}'s words are not layer {L}'s"
         for i in range(P):
             k, last = g0 + i, i == P - 1
             act_k, rq_k = ("linear" if res and last else act_g), (rq if last else _decoy_params(N))

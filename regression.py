@@ -334,11 +334,11 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
     return C, R, A, P, np.where(keep, P.flatten(), drop_zp(act, rq)).reshape(P.shape)
 
 
-def _golden_int8_residual(parts, hw_bias, rq: dict, R, add: dict, ra: dict, cfg: dict, act: str, drop_seed: int) -> tuple:
-    """Bit-exact int8 residual set: the depth passes' sums, the conv's requantize (q1), TFLite's ADD with R, the lane with the ADD's words, pooling, dropout (D-5: zp_o)."""
+def _golden_int8_residual(parts, hw_bias, rq: dict, R, add: dict, ra: dict, cfg: dict, act: str, drop_seed: int, q1=None) -> tuple:
+    """Bit-exact int8 residual set: the depth passes' sums, the conv's requantize (q1, unless given), TFLite's ADD with R, the lane with the ADD's words, pooling, dropout (D-5: zp_o)."""
     N = cfg.get("n", 16)
     C = mesh_model.matmul_int([(_pad_square(a, N), _pad_square(b, N)) for a, b in parts], N, hw_bias)
-    Y = mr.tflite_add_codes(requantize(C, rq), R, add)
+    Y = mr.tflite_add_codes(requantize(C, rq) if q1 is None else q1, R, add)
     A = activate_int8(Y, act, ra)
     P = _maxpool_int(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1))
     if not cfg.get("training", False):
@@ -3311,6 +3311,75 @@ def test_residual_golden():
                   _golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[2]), "the lane must see zp_o"
     assert np.array_equal(_golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[2],
                           mr.int8_residual_exact(A, B, bias, rq, R, add, ra, "tanh"))  # the layer engine's helper agrees
+
+
+def _residual_tests() -> list:
+    """The int8 residual pipeline tests' names."""
+    return [t["name"] for t in PIPELINE_TESTS if t.get("residual") or t.get("residual_every")]
+
+
+def _residual_add_sets(name: str, N: int = 16, T: int = 4) -> list:
+    """A residual test's add sets as the golden's arguments (the last call per set, the one written), from its writer in a scratch directory."""
+    t = next(x for x in PIPELINE_TESTS if x["name"] == name)
+    rec, orig, g = {}, _golden_int8_residual, globals()
+
+    def spy(*a, **k):
+        if not k:
+            rec[a[8]] = a
+        return orig(*a, **k)
+
+    with _scratch_tb_dir():
+        g["_golden_int8_residual"] = spy
+        try:
+            generate_vectors({"n": N, "tile_size": T, "lanes": 32, "host_words": N, "fmt_name": "int8", **t})
+        finally:
+            g["_golden_int8_residual"] = orig
+    return list(rec.values())
+
+
+@selftest
+def test_residual_clamp_bites():
+    """Each residual test has an add set whose golden moves with the ADD's clamp forced to -128..127, so a DUT that drops add_min / add_max, or the ReLU after an ADD, fails."""
+    for name in _residual_tests():
+        moved = 0
+        for a in _residual_add_sets(name):
+            add, ra = a[4], a[5]
+            F = _golden_int8_residual(*a)[4]
+            moved += bool(np.any(_golden_int8_residual(*a[:4], dict(add, amin=-128, amax=127), dict(ra, amin=-128, amax=127), *a[6:])[4] != F))
+        assert moved, f"{name}: no add set's outputs move with the ADD's clamp forced to the rails"
+
+
+@selftest
+def test_residual_add_discriminates():
+    """Each add set's golden differs in 10% or more of its outputs from each wrong DUT: zp1 dropped, the lane's z_in 0 (lane activations),
+    q1 and q2 swapped, q1 a beat late, the previous add set's q1."""
+    for name in _residual_tests():
+        prev = None
+        for a in _residual_add_sets(name):
+            parts, hw_bias, rq, R, add, ra, cfg, act = a[:8]
+            N, lanes = cfg.get("n", 16), cfg.get("lanes", 32)
+            q1 = requantize(mesh_model.matmul_int([(_pad_square(x, N), _pad_square(y, N)) for x, y in parts], N, hw_bias), rq)
+            F = np.asarray(_golden_int8_residual(*a)[4])
+            alt = {"zp1 dropped": _golden_int8_residual(*a[:4], dict(add, zp1=0), *a[5:])[4],
+                   "q1 and q2 swapped": _golden_int8_residual(*a[:3], q1, *a[4:], q1=R)[4],
+                   "q1 a beat late": _golden_int8_residual(*a, q1=np.roll(q1.reshape(lanes, -1), 1, axis=1).reshape(q1.shape))[4]}
+            if act in LANE_ACTS:
+                alt["the lane's z_in 0"] = _golden_int8_residual(*a[:5], dict(ra, zp=0), *a[6:])[4]
+            if prev is not None:
+                alt["the previous add set's q1"] = _golden_int8_residual(*a, q1=prev)[4]
+            for k, v in alt.items():
+                d = float(np.mean(np.asarray(v) != F))
+                assert d >= 0.10, f"{name}: an add set ({act}) differs from '{k}' in {d:.0%} of its outputs, under 10%"
+            prev = q1
+
+
+@selftest
+def test_residual_layers_repeat():
+    """An add_layers test's add sets take its layers' ADD words in turn (A, B, A, B), each layer its own."""
+    for t in (x for x in PIPELINE_TESTS if x.get("add_layers")):
+        L, words = t["add_layers"], [tuple(a[4][k] for k in mr.ADD_FIELDS) for a in _residual_add_sets(t["name"])]
+        assert len(words) > L and all(w == words[i % L] for i, w in enumerate(words)) and len(set(words[:L])) == L, \
+            f"{t['name']}: its add sets' words do not repeat {L} layers' in turn"
 
 
 @contextlib.contextmanager

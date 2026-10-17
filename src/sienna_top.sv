@@ -1076,6 +1076,9 @@ module sienna_top #(
       else $error("sienna_top: a set completed into a full activation bank");
     a_rq_one_set: assert property (@(posedge clk_i) disable iff (!rstn_i) (wide_rd_valid && rq_in == '0) |-> !rq_drain)
       else $error("sienna_top: a set's first beat entered the requantize pipeline while an earlier beat was still in it");
+    // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
+    a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
+      else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");
 `endif
   end else begin : G_NO_REQ
     if ($bits(fill_d[0]) != OUT_W) begin : G_BAD_FILL  // float lanes take the mesh's result words as they are

@@ -46,6 +46,6 @@ typedef struct packed {
   logic [31:0] mo;
   logic [7:0]  so;
   logic [7:0]  zpo;
-  logic [7:0]  min;
-  logic [7:0]  max;
+  logic [7:0]  amin;
+  logic [7:0]  amax;
 } add_words_t;

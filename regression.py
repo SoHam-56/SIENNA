@@ -1983,7 +1983,7 @@ def run_int8(a, sim, shapes) -> None:
     peak = a.n * a.n
     head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
             f"{'slot use':>8} {'mism':>6} {'q err':>8} {'wall s':>6}")
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n} collapse-k {mr.COLLAPSE_K}, {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n} for collapse-k {mr.COLLAPSE_K} (each layer checks the mesh's), {a.lanes} lanes, int8 operands, int32 sums, requantized output; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
@@ -2053,6 +2053,8 @@ def gemm_main(argv=None):
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the float goldens follow")
     a = ap.parse_args(argv)
+    if a.engine == "sets" and a.collapse_k == 0:
+        ap.error("--engine sets builds collapse-k 1 (TB_sienna_model); use --engine layer")
     mr.COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8" and (a.emulate or a.engine != "layer"):
         ap.error("int8 runs on the layer engine only")
@@ -2073,7 +2075,7 @@ def gemm_main(argv=None):
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n  # collapse-k mesh: N^2 PEs, one product per PE per cycle at best
     head = f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} {'slot use':>8} {'max err':>8} {'wall s':>6}"
-    for line in (f"GEMM sweep on the RTL, mesh N={a.n} collapse-k {mr.COLLAPSE_K}, {a.lanes} lanes, linear activation, {a.fmt_name} operands and results, fp32 sums; "
+    for line in (f"GEMM sweep on the RTL, mesh N={a.n} for collapse-k {mr.COLLAPSE_K} (each layer checks the mesh's), {a.lanes} lanes, linear activation, {a.fmt_name} operands and results, fp32 sums; "
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
@@ -3567,6 +3569,20 @@ def test_point_commands():
     assert SPEC.argv("fp32/N16_T8/pipeline-ck0-b2b", opts) == ["make", "pipeline", *at("fp32", 16, 8, 32), "COLLAPSE_K=0", "EXTRA_FLAGS=-DBACK_TO_BACK"]
     assert SPEC.argv("int8/N8_T2/tflite-ck0", opts) == ["make", "tflite", *at("int8", 8, 2, 32), "COLLAPSE_K=0"]
     assert SPEC.argv("bf16/N64_T8/model-ck0", opts) == ["make", "model", *at("bf16", 64, 8, 128), "MODEL_DIR=/m", "MODEL_COUNT=3", "COLLAPSE_K=0"]
+    assert SPEC.argv("fp32/N16_T4/gemm-ck0", opts) == ["make", "gemm", *at("fp32", 16, 4, 32), "QUICK=1", "COLLAPSE_K=0"]
+    assert SPEC.env("int8/N8_T2/gemm-ck0", {}) == {"OPT_FAST": "-O0"} and SPEC.env("int8/N8_T2/tflite-ck0", {}) == {}
+    old = mr.COLLAPSE_K
+    try:
+        for main, args in ((mr.model_main, ["--model-dir", "/m"]), (gemm_main, [])):  # the sets engine builds collapse-k 1: a usage error, before any file
+            try:
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    main(args + ["--engine", "sets", "--collapse-k", "0", "--work", "/nonexistent/lck0"])
+            except SystemExit as e:
+                assert e.code == 2 and "--engine sets builds collapse-k 1" in err.getvalue(), (main.__name__, e.code, err.getvalue())
+                continue
+            raise AssertionError(f"{main.__name__} accepted --engine sets --collapse-k 0")
+    finally:
+        mr.COLLAPSE_K = old
     with tempfile.TemporaryDirectory() as d:  # a -b2b point's make pipeline passes the define to the Verilator flags of the make regression.py starts
         fake = os.path.join(d, "py")
         open(fake, "w").write(f"#!/bin/sh\nexec make -s -n -C {ROOT} lint GEN_PKG=0 FMT=int8 N=8 TILE=2\n")

@@ -1430,6 +1430,8 @@ def model_main(argv=None):
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
     a = ap.parse_args(argv)
+    if a.engine == "sets" and a.collapse_k == 0:
+        ap.error("--engine sets builds collapse-k 1 (TB_sienna_model); use --engine layer")
     global COLLAPSE_K
     COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8":
@@ -1456,7 +1458,7 @@ def model_main(argv=None):
             sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
         t0 = time.time()
         sim.build()
-        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} collapse-k {COLLAPSE_K} in {time.time() - t0:.0f} s")
+        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's) in {time.time() - t0:.0f} s")
     fault = parse_fault(a.fault)
     if fault:
         log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
@@ -1572,7 +1574,7 @@ def tflite_main(argv=None):
     sim = RtlLayer(a.n, a.lanes, a.work, "int8", a.tile_size)
     t0 = time.time()
     sim.build()
-    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} collapse-k {COLLAPSE_K}, in {time.time() - t0:.0f} s")
+    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's), in {time.time() - t0:.0f} s")
     bad, covered, hw_bad, task_bad = 0, False, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]

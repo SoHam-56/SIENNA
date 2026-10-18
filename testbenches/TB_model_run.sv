@@ -168,10 +168,19 @@ module TB_model_run #(
   always_ff @(posedge clk_i) cycle <= cycle + 1;
   longint t0 = 0;  // the pass's configure: +mid_reset and first_hold count from it
   bit streaming = 0;
+  bit meas_clr = 0;  // set over each pass's configure edge: the measurements below restart with the pass
   longint first_hold = -1;  // cycles from t0 to the first hold set's last beat into hold_mem
-  always @(posedge clk_i) if (IS_INT != 0 && streaming && dut.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
+  always @(posedge clk_i)
+    if (meas_clr) first_hold <= -1;
+    else if (IS_INT != 0 && streaming && dut.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
   longint first_free = -1;  // cycles from t0 to the first cycle after first_hold with hold_mem read out: the first hold window has closed
-  always @(posedge clk_i) if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.pipe.hm_any) first_free <= cycle - t0;
+  always @(posedge clk_i)
+    if (meas_clr) first_free <= -1;
+    else if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.pipe.hm_any) first_free <= cycle - t0;
+  int hb_wr = 0, hb_rd = 0;  // this pass's hold beats written into and read from hold_mem
+  always @(posedge clk_i)
+    if (meas_clr) {hb_wr, hb_rd} <= '0;
+    else if (streaming) {hb_wr, hb_rd} <= {hb_wr + int'(dut.pipe.hold_wr_s), hb_rd + int'(dut.pipe.add_in_s)};
 
   // int8 per-stage dump: each set's number in issue order by its id, beats in order from the mesh, requantize and add_lanes.
   localparam int PER_LANE = N * N / NUM_LANES;
@@ -518,8 +527,10 @@ module TB_model_run #(
       cfg_add_amax_i = 8'(aamax);
       if (dump_fd != 0) $fdisplay(dump_fd, "H pass %0d", pass);  // the reader keeps the lines after the last H
       cfg_load_i = 1;
+      meas_clr = 1;
       @(posedge clk_i);
       #1 cfg_load_i = 0;
+      meas_clr = 0;
       t0 = cycle;
       streaming = 1;
 
@@ -552,7 +563,9 @@ module TB_model_run #(
         end
         $display("  [Reset] mid-stream, %0d cycles into the layer: %0d/%0d A rows, %0d/%0d W rows, %0d sets done, A %0d and W %0d credits held",
                  cycle - t0, ai, na, wi, nw, bounds.size(), a_cnt, w_cnt);
-        if (IS_INT != 0) $display("[RES] reset %0d cycles into the layer, %0s the hold window", cycle - t0, dut.pipe.hm_any ? "inside" : "outside");
+        if (IS_INT != 0)
+          $display("[RES] reset %0d cycles into the layer, %0s the hold window, %0d of %0d hold beats unread", cycle - t0,
+                   dut.pipe.hm_any ? "inside" : "outside", hb_wr - hb_rd, PER_LANE);
         if (hold_check != 0 && !dut.pipe.hm_any) begin
           $display("[FAIL] +hold_check: the mid-stream reset at %0d cycles is outside the hold window", cycle - t0);
           $finish;

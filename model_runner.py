@@ -12,6 +12,7 @@
 #   8. CLI              model_main, tflite_main, tflite_pack_main, main
 
 import argparse
+from dataclasses import dataclass
 import glob
 import json
 import math
@@ -225,14 +226,22 @@ def drop_zp(act: str, rq: dict) -> int:
 ADD_FIELDS = ("zp1", "zp2", "m1", "m2", "shift", "zpo", "amin", "amax")  # a layer's ADD words, add_words_t's order (add_<k>.mem)
 
 
-def add_words(s1, z1, s2, z2, s_out, z_out, act: str) -> dict:
-    """A layer's ADD words from its inputs' and output's real scales and zero points (ipu.encode_add) and the fused activation's clamp
-    (ipu.activation_clamp); ratios keeps s1 / s_out and s2 / s_out for the true-function gate."""
-    amin, amax = ipu.activation_clamp(act if act in ("relu", "relu6") else "none", s_out, int(z_out))
-    r1, r2 = float(s1) / float(s_out), float(s2) / float(s_out)
-    m1, m2, e = ipu.encode_add(r1, r2)
-    return dict(zp1=int(z1), zp2=int(z2), m1=int(m1), m2=int(m2), shift=int(e), zpo=int(z_out), amin=int(amin), amax=int(amax),
-                ratios=(r1, r2))
+def add_words(s1, z1, s2, z2, s_out, z_out, act: str, name: str = "") -> dict:
+    """A layer's ADD words from its inputs' and output's real scales and zero points and the fused activation's clamp: the AddRecord of
+    the generator's numbers through add_record_words."""
+    lo, hi = ipu.activation_clamp(act if act in ("relu", "relu6") else "none", s_out, int(z_out))
+    return add_record_words(AddRecord(float(s1), int(z1), float(s2), int(z2), float(s_out), int(z_out), int(lo), int(hi), name))
+
+
+def add_record_words(rec: "AddRecord") -> dict:
+    """int8QuantizedAdder's words for an ADD record (ipu.encode_add over s1 / s_out and s2 / s_out); ratios keeps those two for the
+    true-function gate. A ratio outside the adder's domain raises ValueError naming the layer."""
+    r1, r2 = rec.s1 / rec.s_out, rec.s2 / rec.s_out
+    try:
+        m1, m2, e = ipu.encode_add(r1, r2)
+    except ValueError as x:
+        raise ValueError(f"ADD layer {rec.name or '(unnamed)'}: {x}") from x
+    return dict(zp1=rec.z1, zp2=rec.z2, m1=int(m1), m2=int(m2), shift=int(e), zpo=rec.z_out, amin=rec.lo, amax=rec.hi, ratios=(r1, r2))
 
 
 def qadd_codes(q1, q2, add: dict) -> np.ndarray:
@@ -350,6 +359,168 @@ def conv2d_acc(x_q, w_q, b_q, in_zp, folded=False) -> np.ndarray:
 
 
 # ── 2. Frontend: each op becomes Y = sum_i X_i @ W_i + b, then an activation ─
+
+@dataclass
+class LayerRecord:
+    """The neutral int8 conv / fully connected layer every importer produces: symmetric int8 weights, an int32 bias in units of
+    s_in s_w[c], each output channel's real scale S[c] = s_in s_w[c] / s_out, the zero points and the fused activation's clamp."""
+    kind: str  # "conv" or "fc"
+    w_q: np.ndarray  # int8 codes: conv (cout, kh, kw, cin), fc (cout, cin)
+    b_q: np.ndarray  # int32 bias per output channel, zeros where the layer has none
+    scale: np.ndarray  # S[c], float64
+    zp_in: int
+    zp_out: int
+    lo: int
+    hi: int
+    stride: tuple = (1, 1)
+    same: bool = True
+    name: str = ""
+
+
+@dataclass
+class AddRecord:
+    """The neutral int8 ADD: y = (s1 (q1 - z1) + s2 (q2 - z2)) / s_out + z_out, clamped to [lo, hi]."""
+    s1: float
+    z1: int
+    s2: float
+    z2: int
+    s_out: float
+    z_out: int
+    lo: int
+    hi: int
+    name: str = ""
+
+
+def clamp_codes(lo_real, hi_real, s_out: float, zp: int) -> tuple:
+    """A real-valued clamp (None: unbounded) as int8 codes on an output of scale s_out and zero point zp, ties rounded up."""
+    code = lambda v: zp + math.floor(v / s_out + 0.5)
+    lo = -128 if lo_real is None else max(-128, code(lo_real))
+    hi = 127 if hi_real is None else min(127, code(hi_real))
+    return int(lo), int(hi)
+
+
+def as_int8(codes, zps=None, unsigned=False):
+    """Codes and zero points of an int8 or uint8 tensor as int8 ones: uint8 subtracts 128 from both (exact)."""
+    shift = 128 if unsigned else 0
+    c = np.asarray(codes, np.int64) - shift
+    return c if zps is None else (c, np.asarray(zps, np.int64) - shift)
+
+
+def _symmetric(w_zp, name):
+    if np.any(np.asarray(w_zp) != 0):
+        raise ValueError(f"layer {name or '(unnamed)'}: a non-zero weight zero point is not supported (SIENNA folds only the input zero point)")
+
+
+def record_of_tflite(layer: dict, name: str = "") -> LayerRecord:
+    """The TFLite importer's record: load_layer's tensors, scales from the stored float32 scales in float64 (layer_scales)."""
+    inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
+    _symmetric(flt["zp"], name)
+    w = flt["data"].astype(np.int64)
+    cout = w.shape[0]
+    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
+    bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
+    lo, hi = layer["act_range"]
+    return LayerRecord(kind, w, bq, layer_scales(flt["scale"], inp["scale"][0], out["scale"][0], cout), int(inp["zp"][0]),
+                       int(out["zp"][0]), int(lo), int(hi), tuple(layer.get("stride", (1, 1))), bool(layer.get("same", True)), name)
+
+
+def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias=None, strides=(1, 1), pads=None, relu=False,
+                   clip=None, x_unsigned=False, y_unsigned=False, w_unsigned=False, name: str = "") -> LayerRecord:
+    """The ONNX importer's record for QLinearConv (w OIHW) or QLinearMatMul (w (K, N)), or their QDQ folding, from the initializers as
+    numpy arrays: uint8 tensors become int8 by subtracting 128; a following Relu or Clip(min, max) is the clamp; pads are SAME or zero."""
+    w, w_zp = as_int8(w, w_zp, w_unsigned)
+    _symmetric(w_zp, name)
+    _, zin = as_int8(0, x_zp, x_unsigned)
+    _, zout = as_int8(0, y_zp, y_unsigned)
+    zin, zout = int(np.ravel(zin)[0]), int(np.ravel(zout)[0])
+    if op == "QLinearConv":
+        w = np.transpose(w, (0, 2, 3, 1))  # OIHW to OHWI
+        kh, kw = w.shape[1:3]
+        if pads is None or not any(pads):
+            same = False
+        elif list(pads) == [(kh - 1) // 2, (kw - 1) // 2, kh - 1 - (kh - 1) // 2, kw - 1 - (kw - 1) // 2]:
+            same = True
+        else:
+            raise ValueError(f"layer {name or '(unnamed)'}: pads {list(pads)} are neither SAME nor zero")
+        kind = "conv"
+    elif op == "QLinearMatMul":
+        w, kind, same = w.T, "fc", False
+    else:
+        raise ValueError(f"layer {name or '(unnamed)'}: {op} is not QLinearConv or QLinearMatMul")
+    cout = w.shape[0]
+    s_out = float(np.ravel(y_scale)[0])
+    scale = np.asarray(layer_scales(np.atleast_1d(w_scale), float(np.ravel(x_scale)[0]), s_out, cout), np.float64)
+    lo, hi = clamp_codes(0.0 if relu else (None if clip is None else clip[0]), None if clip is None else clip[1], s_out, zout)
+    if relu and clip is not None:
+        lo = max(lo, zout)
+    bq = np.zeros(cout, np.int64) if bias is None else np.asarray(bias, np.int64)
+    return LayerRecord(kind, w, bq, scale, zin, zout, lo, hi, tuple(strides), same, name)
+
+
+def record_of_torch(kind: str, in_scale, in_zp, w_int, w_scales, w_zps, bias, out_scale, out_zp, relu=False, stride=(1, 1),
+                    padding=(0, 0), unsigned=True, name: str = "") -> LayerRecord:
+    """The PyTorch importer's record for a quantized Conv2d / Linear (torch.ao, FX or PT2E): input q_scale and q_zero_point, the
+    weight's int_repr (conv OIHW, linear (out, in)) with q_per_channel_scales of a symmetric qint8 weight, the float bias quantized to
+    int32 at s_in s_w[c], the module's output scale and zero point; ConvReLU2d / LinearReLU clamp at the zero point; quint8 is shifted."""
+    _symmetric(w_zps, name)
+    w = np.asarray(w_int, np.int64)
+    if kind == "conv":
+        w = np.transpose(w, (0, 2, 3, 1))
+        kh, kw = w.shape[1:3]
+        same = tuple(padding) == ((kh - 1) // 2, (kw - 1) // 2) and kh % 2 == 1 and kw % 2 == 1
+        if not same and any(padding):
+            raise ValueError(f"layer {name or '(unnamed)'}: padding {tuple(padding)} is neither SAME nor zero")
+    elif kind == "linear":
+        same, kind = False, "fc"
+    else:
+        raise ValueError(f"layer {name or '(unnamed)'}: kind {kind} is not conv or linear")
+    cout = w.shape[0]
+    ws = np.broadcast_to(np.asarray(w_scales, np.float64), (cout,))
+    zin = int(np.asarray(in_zp)) - (128 if unsigned else 0)
+    zout = int(np.asarray(out_zp)) - (128 if unsigned else 0)
+    bq = np.zeros(cout, np.int64) if bias is None else np.floor(np.asarray(bias, np.float64) / (float(in_scale) * ws) + 0.5).astype(np.int64)
+    lo, hi = (zout, 127) if relu else (-128, 127)
+    return LayerRecord(kind, w, bq, layer_scales(ws, float(in_scale), float(out_scale), cout), zin, zout, max(-128, lo), hi,
+                       tuple(stride), same, name)
+
+
+def add_record_of_onnx(a_scale, a_zp, b_scale, b_zp, c_scale, c_zp, relu=False, clip=None, unsigned=False, name: str = "") -> AddRecord:
+    """The ONNX importer's ADD record: QLinearAdd (com.microsoft) or the QDQ Add pattern, a following Relu or Clip as the clamp."""
+    sh = 128 if unsigned else 0
+    z1, z2, zo = (int(np.ravel(z)[0]) - sh for z in (a_zp, b_zp, c_zp))
+    so = float(np.ravel(c_scale)[0])
+    lo, hi = clamp_codes(0.0 if relu else (None if clip is None else clip[0]), None if clip is None else clip[1], so, zo)
+    return AddRecord(float(np.ravel(a_scale)[0]), z1, float(np.ravel(b_scale)[0]), z2, so, zo, lo, hi, name)
+
+
+def add_record_of_torch(a_scale, a_zp, b_scale, b_zp, out_scale, out_zp, relu=False, unsigned=True, name: str = "") -> AddRecord:
+    """The PyTorch importer's ADD record: QFunctional.add / add_relu with the inputs' and the module's scale and zero point."""
+    sh = 128 if unsigned else 0
+    zo = int(out_zp) - sh
+    return AddRecord(float(a_scale), int(a_zp) - sh, float(b_scale), int(b_zp) - sh, float(out_scale), zo, zo if relu else -128, 127, name)
+
+
+def job_of_record(rec: LayerRecord, x) -> tuple:
+    """(int8 job for RtlLayer, output shape) of a layer record on input codes x (images NHWC for conv, rows for fc); req holds each
+    channel's real scale ('ratio') for the true-function gate."""
+    w = np.asarray(rec.w_q, np.int64)
+    cout = w.shape[0]
+    mult, shift = encode_scales(rec.scale)
+    if rec.kind == "conv":
+        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], rec.stride, rec.same,
+                       pad_value=float(rec.zp_in)) for xi in x]  # every input image; rows in (image, y, x) order
+        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
+        W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
+        shape = (len(x), oh, ow, cout)
+    else:
+        W = w.T
+        X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
+        shape = (X.shape[0], cout)
+    hw_bias = wrap32(np.asarray(rec.b_q, np.int64) - rec.zp_in * W.sum(axis=0))
+    req = dict(mult=mult, shift=shift, zp=rec.zp_out, amin=rec.lo, amax=rec.hi, mx=0, shx=0, mout=0, shout=0, zout=0,
+               ratio=[float(v) for v in rec.scale])
+    return {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape, "req": req}, shape
+
 
 def load_tflite(path: str) -> dict:
     import tflite
@@ -557,32 +728,11 @@ def load_layer(path: str) -> dict:
 
 
 def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
-    """(int8 job for RtlLayer, output shape) of one layer on the saved input codes x; req holds each channel's real scale ('ratio')."""
-    inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
-    z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
-    w = flt["data"].astype(np.int64)
-    cout = w.shape[0]
-    ratio = layer_scales(flt["scale"], inp["scale"][0], out["scale"][0], cout)
-    mult, shift = encode_scales(ratio)
-    if max(abs(int(a) - int(saved[k])) for a, k in zip(layer["act_range"], ("act_min", "act_max"))) > 1:  # rounding may move a bound one code
-        raise ValueError(f"clamp {layer['act_range']} is not the npz's ({int(saved['act_min'])}, {int(saved['act_max'])}): the model and the npz do not belong together")
-    if layer["kind"] == "CONV_2D":
-        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
-                          pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
-        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
-        W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
-        shape = (len(x), oh, ow, cout)
-    else:
-        W = w.T
-        X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
-        shape = (X.shape[0], cout)
-    bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
-    hw_bias = wrap32(bq - z_in * W.sum(axis=0))
-    amin, amax = layer["act_range"]
-    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0, ratio=[float(v) for v in ratio])
-    job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
-           "req": req}
-    return job, shape
+    """(int8 job for RtlLayer, output shape) of one TFLite layer on the saved input codes x, through its neutral record."""
+    rec = record_of_tflite(layer)
+    if max(abs(a - int(saved[k])) for a, k in zip((rec.lo, rec.hi), ("act_min", "act_max"))) > 1:  # rounding may move a bound one code
+        raise ValueError(f"clamp ({rec.lo}, {rec.hi}) is not the npz's ({int(saved['act_min'])}, {int(saved['act_max'])}): the model and the npz do not belong together")
+    return job_of_record(rec, x)
 
 
 # ── 3. Middle end: jobs become N x N sets or a layer's streams; packing ───────

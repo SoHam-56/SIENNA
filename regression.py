@@ -4575,6 +4575,102 @@ def test_layer_ref():
     assert fails == 0, f"{fails} of {checks} checks failed"
 
 
+def _float_layer(kind, x_real, w_real, b_real, stride, same):
+    """An independent float64 reference of a conv (NHWC x, OHWI w, explicit loops, zero padding in real values) or an fc layer."""
+    if kind == "fc":
+        return x_real @ w_real.T + b_real[None, :]
+    n, h, wd, _ = x_real.shape
+    co, kh, kw, _ = w_real.shape
+    ph, pw = ((kh - 1) // 2, (kw - 1) // 2) if same else (0, 0)
+    oh, ow = (h + 2 * ph - kh) // stride[0] + 1, (wd + 2 * pw - kw) // stride[1] + 1
+    y = np.zeros((n, oh, ow, co))
+    for b in range(n):
+        for i in range(oh):
+            for j in range(ow):
+                for dy in range(kh):
+                    for dx in range(kw):
+                        yy, xx = i * stride[0] + dy - ph, j * stride[1] + dx - pw
+                        if 0 <= yy < h and 0 <= xx < wd:
+                            y[b, i, j] += w_real[:, dy, dx, :] @ x_real[b, yy, xx, :]
+    return y + b_real
+
+
+def _record_check(rec, x_codes, x_real, w_real, b_real, s_out, out_zp, lo_real=None, hi_real=None):
+    """The record's job through the bit-exact host model, against the float reference of the layer's real numbers: every output
+    within max(1% |t|, one step) of t, t clamped to the output range and the activation's real bounds; returns the over-count."""
+    job, shape = mr.job_of_record(rec, x_codes)
+    (X, W), req = job["terms"][0], job["req"]
+    y = mr.int8_layer_exact(X.astype(np.int64), W.astype(np.int64), job["bias"], req, "linear").reshape(shape)
+    t = _float_layer(rec.kind, x_real, w_real, b_real, rec.stride, rec.same)
+    t = np.clip(t, -np.inf if lo_real is None else lo_real, np.inf if hi_real is None else hi_real)
+    tc = np.clip(t / s_out + out_zp, -128, 127)
+    over = int(np.sum(np.abs(y - tc) > np.maximum(0.01 * np.abs(tc - out_zp), 1.0)))
+    return over, y.size
+
+
+@selftest
+def test_importer_records():
+    """The neutral layer and ADD records from hand-built TFLite, ONNX (QLinearConv, QLinearMatMul + Clip, QLinearAdd, uint8) and
+    PyTorch (Conv2d + ReLU with a float bias, Linear, add_relu, quint8) tensors, each run through job_of_record or add_record_words and
+    the bit-exact host models and judged against an independent float reference; and the refusals (a weight zero point, odd pads,
+    an ADD outside the adder's domain naming its layer)."""
+    rng = np.random.default_rng(11)
+    # ONNX QLinearConv, uint8 activations, per-channel int8 weights (OIHW), int32 bias, SAME pads, a following Relu
+    x_u8, xs, xz = rng.integers(0, 256, (2, 5, 5, 3)), 0.02, 131
+    w = rng.integers(-127, 128, (4, 3, 3, 3)); ws = rng.uniform(0.002, 0.01, 4)
+    b = rng.integers(-300, 300, 4); ys, yz = 0.05, 140
+    rec = mr.record_of_onnx("QLinearConv", xs, xz, w, ws, np.zeros(4), ys, yz, b, pads=[1, 1, 1, 1], relu=True, x_unsigned=True,
+                            y_unsigned=True, name="c1")
+    assert (rec.kind, rec.zp_in, rec.zp_out, rec.lo, rec.hi, rec.same) == ("conv", 3, 12, 12, 127, True), rec
+    w_real = np.transpose(w, (0, 2, 3, 1)) * ws[:, None, None, None]
+    over, n = _record_check(rec, x_u8 - 128, xs * (x_u8 - xz), w_real, b * xs * ws, ys, yz - 128, lo_real=0.0)
+    assert over == 0 and n == 200, (over, n)
+    # ONNX QLinearMatMul (w (K, N)), int8, Clip(-1, 2)
+    x, w2, ws2 = rng.integers(-128, 128, (6, 8)), rng.integers(-127, 128, (8, 5)), np.full(5, 0.004)
+    rec = mr.record_of_onnx("QLinearMatMul", 0.03, -7, w2, ws2, np.zeros(1), 0.02, 9, clip=(-1.0, 2.0), name="m1")
+    assert (rec.kind, rec.lo, rec.hi) == ("fc", -41, 109), (rec.lo, rec.hi)
+    over, n = _record_check(rec, x, 0.03 * (x + 7), w2.T * ws2[:, None], np.zeros(5), 0.02, 9, lo_real=-1.0, hi_real=2.0)
+    assert over == 0 and n == 30, (over, n)
+    # PyTorch quantized Conv2d + ReLU (ConvReLU2d), quint8 input and output, symmetric qint8 weight, float bias, stride 2, no padding
+    xq, w3, ws3 = rng.integers(0, 256, (1, 7, 7, 2)), rng.integers(-127, 128, (3, 2, 3, 3)), rng.uniform(0.003, 0.006, 3)
+    bias = rng.uniform(-0.5, 0.5, 3)
+    rec = mr.record_of_torch("conv", 0.015, 120, w3, ws3, np.zeros(3), bias, 0.04, 100, relu=True, stride=(2, 2), padding=(0, 0),
+                             name="t1")
+    assert (rec.zp_in, rec.zp_out, rec.lo, rec.same) == (-8, -28, -28, False), rec
+    over, n = _record_check(rec, xq - 128, 0.015 * (xq - 120), np.transpose(w3, (0, 2, 3, 1)) * ws3[:, None, None, None],
+                            rec.b_q * 0.015 * ws3, 0.04, -28, lo_real=0.0)  # the bias as PyTorch quantizes it, round(b / (s_in s_w))
+    assert over == 0 and n == 27, (over, n)
+    assert np.all(np.abs(rec.b_q * 0.015 * ws3 - bias) <= 0.5 * 0.015 * ws3), "the bias is quantized to the nearest step"
+    # PyTorch Linear, quint8
+    rec = mr.record_of_torch("linear", 0.01, 128, rng.integers(-127, 128, (4, 6)), 0.005, 0, None, 0.02, 128, name="t2")
+    assert (rec.kind, rec.zp_in, rec.zp_out, rec.lo, rec.hi) == ("fc", 0, 0, -128, 127)
+    # TFLite through its record: load_layer's dict shape, per-tensor weight scale broadcast, the clamp as given
+    t = {"kind": "FULLY_CONNECTED", "act_range": (-5, 127), "input": {"scale": np.float32([0.1]), "zp": np.array([-5])},
+         "filter": {"data": rng.integers(-127, 128, (3, 4)).astype(np.int8), "scale": np.float32([0.25]), "zp": np.array([0])},
+         "bias": None, "output": {"scale": np.float32([0.5]), "zp": np.array([-5])}}
+    rec = mr.record_of_tflite(t, "f1")
+    assert np.allclose(rec.scale, 0.05, rtol=1e-7) and (rec.zp_in, rec.lo, rec.hi, rec.b_q.tolist()) == (-5, -5, 127, [0, 0, 0])
+    # ADD records: ONNX QLinearAdd (uint8, Relu) and PyTorch add_relu, through add_record_words and ipu.qadd against the float sum
+    for a in (mr.add_record_of_onnx(0.05, 140, 0.03, 120, 0.06, 128, relu=True, unsigned=True, name="a1"),
+              mr.add_record_of_torch(0.05, 140, 0.03, 120, 0.06, 128, relu=True, name="a2")):
+        wds = mr.add_record_words(a)
+        q1, q2 = (v.ravel() for v in np.meshgrid(np.arange(-128, 128), np.arange(-128, 128)))
+        y = mr.qadd_codes(q1, q2, wds)
+        tc = np.clip(np.maximum(a.s1 * (q1 - a.z1) + a.s2 * (q2 - a.z2), 0.0) / a.s_out + a.z_out, -128, 127)
+        assert (a.z1, a.z2, a.z_out, a.lo) == (12, -8, 0, 0) and not np.any(np.abs(y - tc) > np.maximum(0.01 * np.abs(tc - a.z_out), 1.0))
+    # refusals
+    for bad, why in ((lambda: mr.record_of_onnx("QLinearMatMul", 0.1, 0, np.ones((2, 2)), 0.1, 3, 0.1, 0), "weight zero point"),
+                     (lambda: mr.record_of_onnx("QLinearConv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, 0.1, 0, pads=[0, 1, 0, 1]), "pads"),
+                     (lambda: mr.record_of_torch("conv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, None, 0.1, 0, padding=(2, 2)), "padding"),
+                     (lambda: mr.add_record_words(mr.AddRecord(2.0 ** 24, 0, 1.0, 0, 1.0, 0, -128, 127, "res3")), "ADD layer res3")):
+        try:
+            bad()
+        except ValueError as e:
+            assert why in str(e), (why, str(e))
+        else:
+            raise AssertionError(f"no refusal: {why}")
+
+
 # ── gpnae-tflite's gate (no TensorFlow: GPNAE's own case scales stand in for the converter's) ──
 
 def gptfl_rows(ladder=True, tfl=None):

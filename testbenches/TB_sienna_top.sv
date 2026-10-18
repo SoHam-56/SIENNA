@@ -1455,6 +1455,10 @@ module TB_sienna_top #(
       foreach (res_add_set[k]) whole += int'(res_add_set[k] == PER_LANE);
       $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add sets of %0d beats %0d, add beats of other sets %0d, hold done with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
                res_holds, res_add_beats, PER_LANE, whole, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
+      if (dut.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
+        failed++;
+        $display("  [FAIL] Stream: hold_mem still holds unread hold beats after the last set: a hold set without its add set");
+      end
     end
     // $time is in the 1 ns timeunit, so a 10 ns clock is 10 units per cycle.
     $display("  [%s] %0d sets in %0d cycles", hold ? "Hold" : "Stream", k_num_sets, ($time - t0) / 10);

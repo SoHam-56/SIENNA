@@ -1113,6 +1113,118 @@ def check_layer_mode(text, tag):
         raise RuntimeError(f"{tag}: the build's mesh runs collapse-k {m.group(1)}, the run asked for {COLLAPSE_K}")
 
 
+def read_stage_dump(path, N, rt, ct, np_):
+    """TB_model_run's int8 stage dump (the lines after the last H) as tile grids (rt N x ct N) per pass p of each output tile: {"X": {p: grid},
+    "R": {p: grid}, "Q": {p: (q1, q2, y)}, "np": np_}; set k is tile (c, r)'s pass k % np_ with k // np_ = c rt + r. Raises on a duplicate or missing element."""
+    lines = open(path).read().splitlines()
+    last = max((i for i, l in enumerate(lines) if l.startswith("H ")), default=-1)
+    got = {}
+    for l in lines[last + 1:]:
+        f = l.split()
+        k, e = int(f[1]), int(f[2])
+        t, p = divmod(k, np_)
+        c, r = divmod(t, rt)
+        key = (f[0], p)
+        if key not in got:
+            got[key] = np.full((rt * N, ct * N, 3 if f[0] == "Q" else 1), np.iinfo(np.int64).min, np.int64)
+        g = got[key][r * N + e // N, c * N + e % N]
+        if g[0] != np.iinfo(np.int64).min:
+            raise RuntimeError(f"stage dump: set {k} element {e} has two {f[0]} lines")
+        g[:] = [int(v) for v in f[3:]]
+    out = {"np": np_}
+    for (kind, p), g in got.items():
+        if (g == np.iinfo(np.int64).min).any():
+            raise RuntimeError(f"stage dump: pass {p}'s {kind} lines miss {int((g[..., 0] == np.iinfo(np.int64).min).sum())} of {g.shape[0] * g.shape[1]} elements")
+        out.setdefault(kind, {})[p] = tuple(g[..., i] for i in range(3)) if kind == "Q" else g[..., 0]
+    return out
+
+
+INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # the converters' fixed output quantization (a convention)
+
+
+def lane_quant(act, s_in, z_in, rq) -> tuple:
+    """(s_in, z_in, s_out, z_out) the int8 lane's true function is judged on: SELU's calibrated output, tanh's and sigmoid's fixed one, ReLU and
+    linear the input's own."""
+    if act == "selu":
+        return s_in, z_in, rq["s_selu"], rq["zout"]
+    return (s_in, z_in) + INT8_FIXED_OUT.get(act, (s_in, z_in))
+
+
+def _columns(job, C):
+    """Per output column: its activation, requantize words (ratio, zp, amin, amax) and lane scales, from job['req'] or a packed layer's entries."""
+    req, pk = job["req"], job.get("pack")
+    ratio = req.get("ratio")
+    ratio = code_scales(req["mult"], req["shift"]) if ratio is None else np.asarray(ratio, np.float64)
+    if ratio.size < C:
+        raise ValueError(f"the requantize gate needs a real scale per column: {ratio.size} for {C} columns")
+    cols = []
+    for c in range(C):
+        act, q = job["act"], req
+        if pk:
+            act, q = pk["ents"][int(pk["map"][c // (C >> pk["shift"])])]
+            q = q or req
+        cols.append((act, float(ratio[c]), q))
+    return cols
+
+
+def gate_transfer(name, want, got) -> "truth.Result":
+    """An exact stage (a buffer or a mux): every code must arrive unchanged."""
+    want, got = (np.asarray(v, np.int64).ravel() for v in (want, got))
+    bad = np.flatnonzero(want != got)
+    return truth.Result(bad.size == 0 and want.size > 0, "int8", name, int(want.size), float(bad.size), 0.0, int(bad[0]) if bad.size else 0,
+                        int(bad.size), int(bad.size), 0, 0, 0, [(int(i), int(got[i]), int(want[i])) for i in bad[:truth.FIRST]])
+
+
+def layer_stage_gates(job, Y, stages, N) -> list:
+    """[(stage, truth.Result)] of an int8 layer from TB_model_run's stage dump: the conv's requantize on each exact int32 sum and its column's real
+    scale; for a residual layer the identity requantize of the residual codes, hold_mem's transfer, the ADD on its real ratios and the fill; the lane
+    from the activation stage's input X to the output Y (ReLU and linear at truth.TARGET, the others at truth.BOUND)."""
+    res = [X for X, W in job["terms"] if W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))]
+    dense = [(X, W) for X, W in job["terms"] if not any(X is r for r in res)]
+    A_q = np.hstack([np.asarray(x, np.int64) for x, _ in dense])
+    W_q = np.vstack([np.asarray(w, np.int64) for _, w in dense])
+    acc = wrap32(imatmul(A_q, W_q) + np.asarray(job["bias"], np.int64)[None, :])
+    M, C = acc.shape
+    cols = _columns(job, C)
+    S = np.array([s for _, s, _ in cols])[None, :]
+    zp, lo, hi = (np.array([q[k] for _, _, q in cols])[None, :] for k in ("zp", "amin", "amax"))
+    relu = np.array([a == "relu" for a, _, _ in cols])[None, :]
+    if not res:
+        lo = np.where(relu, np.maximum(lo, zp), lo)  # ReLU's true clamp starts at its zero point
+    np_ = stages["np"]
+    crop = lambda g: g[:M, :C]
+    out, Y = [], np.asarray(Y, np.int64)
+    if res:  # the hold set (pass np_ - 2) and the add set (pass np_ - 1)
+        add, R_q = job["add"], np.asarray(res[0], np.int64)[:M, :C]
+        if "R" not in stages or "Q" not in stages:
+            raise RuntimeError("stage dump: a residual layer without its hold (R) or ADD (Q) lines")
+        Rh = crop(stages["R"][np_ - 2])
+        q1, q2, y = (crop(g) for g in stages["Q"][np_ - 1])
+        out.append(("requant", truth.gate_requantize(acc, S, zp, lo, hi, Rh)))
+        out.append(("requant identity", truth.gate_requantize(R_q, 1.0, 0, -128, 127, q2)))
+        out.append(("hold_mem", gate_transfer("hold_mem", Rh, q1)))  # each element its own hold beat
+        r1, r2 = add["ratios"]
+        a_lo = np.where(relu, max(add["amin"], add["zpo"]), add["amin"])  # a ReLU after the ADD is its clamp
+        out.append(("add", truth.gate_quantized_add(q1, q2, r1, add["zp1"], r2, add["zp2"], 1.0, add["zpo"], a_lo, add["amax"], y)))
+        X = crop(stages["X"][np_ - 1])
+        out.append(("fill", gate_transfer("fill", y, X)))
+        lane = job["lane"]
+        quants = [lane_quant(a, lane["s_out"], add["zpo"], lane) for a, _, _ in cols]
+    else:
+        X = crop(stages["X"][np_ - 1])
+        out.append(("requant", truth.gate_requantize(acc, S, zp, lo, hi, X)))
+        quants = [lane_quant(a, q.get("s_out", 1.0), q["zp"], q) for a, _, q in cols]
+    acts = np.array([a for a, _, _ in cols])
+    for a in sorted(set(acts.tolist())):
+        m = np.broadcast_to(acts[None, :] == a, X.shape)
+        qa = np.array([quants[c] for c in range(C)], np.float64)[None, :, :].repeat(M, 0)[m]
+        quant = tuple(qa[:, i] for i in range(4))
+        bound = truth.TARGET if a in ("relu", "linear") else truth.BOUND
+        r = truth.gate("int8", "linear" if a == "relu" else a, X[m], Y[m], quant=quant, bound=bound)
+        out.append((f"activation {a}", r._replace(func=a)))
+    return out
+
+
 class RtlLayer:
     """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -1120,7 +1232,7 @@ class RtlLayer:
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
         self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
-        self.first_hold = self.last_log = None
+        self.first_hold = self.last_log = self.last_stages = None
 
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
@@ -1134,7 +1246,7 @@ class RtlLayer:
 
     def run_job(self, job, tag, plusargs=()):
         """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run (with plusargs
-        and $SIM_ARGS), reads the results; keeps the run's log and its first hold_done cycle."""
+        and $SIM_ARGS), reads the results; int8 keeps the per-stage dump in last_stages, and every run its log and first hold_done cycle."""
         N = self.N
         int8 = self.fmt_name == "int8"
         if int8 and job.get("req") is None:
@@ -1146,10 +1258,12 @@ class RtlLayer:
             pack_precheck(pk, cfg, (M, C, rt), N, self.lanes, tag)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
+        df = os.path.join(self.work, f"{tag}.stages")
         write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None, job.get("bias_words"), add=job.get("add"))
-        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *plusargs, *os.environ.get("SIM_ARGS", "").split()],
+        dump = [f"+dump={df}"] if int8 else []
+        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *dump, *plusargs, *os.environ.get("SIM_ARGS", "").split()],
                            cwd=os.path.dirname(self.bin), capture_output=True, text=True)
-        self.last_log = r.stdout
+        self.last_log, self.last_stages = r.stdout, None
         h = re.search(r"\[RES\] first hold_done (\d+) cycles into the layer", r.stdout)
         self.first_hold = int(h.group(1)) if h else None
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
@@ -1162,6 +1276,9 @@ class RtlLayer:
             raise RuntimeError(f"{tag}: layer simulation failed")
         check_layer_mode(r.stdout, tag)
         outs = read_outputs(of, self.fmt_name)
+        if int8:
+            self.last_stages = read_stage_dump(df, N, rt, ct, -(-cfg["kb"] // N) + cfg["residual"])
+            os.remove(df)
         os.remove(lf)
         os.remove(of)
         if len(outs) != rt * ct:

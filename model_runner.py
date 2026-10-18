@@ -725,6 +725,20 @@ def job_reference(job):
     return y, (np.maximum(y, 0) if job["act"] == "relu" else y)
 
 
+def check_int8_add(op: dict, where: str) -> None:
+    """Refuses an ADD the residual path cannot run: not int8, broadcast, a constant input, or per-axis scales or zero points."""
+    a, b, out = op["a"], op["b"], op["output"]
+    if any(v["type"] != 9 for v in (a, b, out)):  # 9 is INT8
+        raise ValueError(f"{where}: inputs and output must be int8")
+    if tuple(a["shape"]) != tuple(out["shape"]) or tuple(b["shape"]) != tuple(out["shape"]):
+        raise ValueError(f"{where}: input shapes {tuple(a['shape'])} and {tuple(b['shape'])} differ from the output's {tuple(out['shape'])}; "
+                         "a broadcast ADD is not supported")
+    if a["data"] is not None or b["data"] is not None:
+        raise ValueError(f"{where}: a constant input is not supported; both inputs must be activations")
+    if any(np.size(v["scale"]) != 1 or np.size(v["zp"]) != 1 for v in (a, b, out)):
+        raise ValueError(f"{where}: per-axis scales or zero points are not supported; the ADD takes one per tensor")
+
+
 def load_int8_graph(path: str) -> dict:
     """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD ops in order with their tensors (and indices), fused kinds and clamps."""
     import tflite
@@ -761,8 +775,7 @@ def load_int8_graph(path: str) -> dict:
         out = tensor(op.Outputs(0))
         if kind == "ADD":
             d = dict(kind=kind, inputs=ins[:2], a=tensor(ins[0]), b=tensor(ins[1]), output=out)
-            if any(v["type"] != 9 for v in (d["a"], d["b"], out)):  # 9 is INT8
-                raise ValueError(f"{path}: operator {k} ADD: inputs and output must be int8")
+            check_int8_add(d, f"{path}: operator {k} ADD")
         else:
             inp, flt = tensor(ins[0]), tensor(ins[1])
             bias = tensor(ins[2]) if len(ins) > 2 else None

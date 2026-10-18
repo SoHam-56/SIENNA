@@ -14,6 +14,7 @@ import test_config_pkg::*;
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
 // FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many.
 // +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
+// int8 +hold_wait: the reset waits, from C, for a cycle at which hold_mem holds unread hold beats; +hold_check: a reset outside that window fails.
 // -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
 module TB_model_run #(
     parameter int FAULT       = 0,
@@ -169,6 +170,8 @@ module TB_model_run #(
   bit streaming = 0;
   longint first_hold = -1;  // cycles from t0 to the first hold set's last beat into hold_mem
   always @(posedge clk_i) if (IS_INT != 0 && streaming && dut.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
+  longint first_free = -1;  // cycles from t0 to the first cycle after first_hold with hold_mem read out: the first hold window has closed
+  always @(posedge clk_i) if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.pipe.hm_any) first_free <= cycle - t0;
 
   // int8 per-stage dump: each set's number in issue order by its id, beats in order from the mesh, requantize and add_lanes.
   localparam int PER_LANE = N * N / NUM_LANES;
@@ -388,11 +391,14 @@ module TB_model_run #(
     logic [31:0] w32;
     bit finished;
     int failed = 0, osp, mid_reset = 0, msp;
+    int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
 
     void'($value$plusargs("out_slots=%d", out_slots));
     void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
     void'($value$plusargs("in_stall_pct=%d", in_stall_pct));
     void'($value$plusargs("mid_reset=%d", mid_reset));
+    hold_wait = $test$plusargs("hold_wait");
+    hold_check = $test$plusargs("hold_check");
     if (out_slots < 1 || out_slots > OUT_CAP || out_stall_pct < 0 || out_stall_pct > 90 || in_stall_pct < 0 || in_stall_pct > 90) begin
       $display("[FATAL] +out_slots=%0d must be 1..%0d and +out_stall_pct=%0d, +in_stall_pct=%0d 0..90", out_slots, OUT_CAP, out_stall_pct,
                in_stall_pct);
@@ -531,7 +537,7 @@ module TB_model_run #(
         last_ai = ai;
         last_wi = wi;
         last_sets = bounds.size();
-        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0) break;  // mid-stream, with A credits held
+        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.pipe.hm_any)) break;  // mid-stream, A credits held (+hold_wait: hold_mem waiting)
         if (idle > STALL_CYCLES) begin
           $display("[FATAL] nothing moved for %0d cycles: %0d/%0d activation rows, %0d/%0d weight rows, %0d sets done", idle, ai, na, wi,
                    nw, bounds.size());
@@ -546,6 +552,11 @@ module TB_model_run #(
         end
         $display("  [Reset] mid-stream, %0d cycles into the layer: %0d/%0d A rows, %0d/%0d W rows, %0d sets done, A %0d and W %0d credits held",
                  cycle - t0, ai, na, wi, nw, bounds.size(), a_cnt, w_cnt);
+        if (IS_INT != 0) $display("[RES] reset %0d cycles into the layer, %0s the hold window", cycle - t0, dut.pipe.hm_any ? "inside" : "outside");
+        if (hold_check != 0 && !dut.pipe.hm_any) begin
+          $display("[FAIL] +hold_check: the mid-stream reset at %0d cycles is outside the hold window", cycle - t0);
+          $finish;
+        end
         rstn_i = 0;
         repeat (5) @(posedge clk_i);
         msp = out_stall_pct;
@@ -587,6 +598,10 @@ module TB_model_run #(
       $display("[FAIL] sienna_top never drained after the layer's last set (%0d drains in the run): its link checkers never judged it",
                dut.pipe.drain_n);
     end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.pipe.drain_n);
+    if (dut.pipe.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
+      failed++;
+      $display("[FAIL] hold_mem still holds unread hold beats after the layer's last set: a hold set without its add set");
+    end
     @(negedge clk_i);
     drain_chk = 1'b1;
     @(negedge clk_i);
@@ -605,6 +620,7 @@ module TB_model_run #(
                bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct,
                dut.pipe.systolic_array_inst.COLLAPSE_K);  // the elaborated mesh's mode, not the package's: run_job checks it
     if (first_hold >= 0) $display("[RES] first hold_done %0d cycles into the layer", first_hold);
+    if (first_free >= 0) $display("[RES] first hold window closed %0d cycles into the layer", first_free);
     if (dump_fd != 0) $fclose(dump_fd);
 `ifdef PERF
     $display("[PERF] rows=%0d stalls: mid-set=%0d credits=%0d staging=%0d bias=%0d tile=%0d other=%0d", st_rows, st_input,

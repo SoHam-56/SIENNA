@@ -373,7 +373,7 @@ class LayerRecord:
     lo: int
     hi: int
     stride: tuple = (1, 1)
-    same: bool = True
+    pads: tuple = (0, 0, 0, 0)  # zero-point padding (top, bottom, left, right), explicit: each importer resolves its framework's rule
     name: str = ""
 
 
@@ -420,14 +420,25 @@ def record_of_tflite(layer: dict, name: str = "") -> LayerRecord:
     kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
     bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
     lo, hi = layer["act_range"]
+    stride, pads = (1, 1), (0, 0, 0, 0)
+    if kind == "conv":
+        if layer.get("stride") is None or layer.get("same") is None:
+            raise ValueError(f"layer {name or '(unnamed)'}: stride and padding are missing from the conv layer")
+        stride = tuple(int(v) for v in layer["stride"])
+        if layer["same"]:  # TFLite SAME: out = ceil(n / s), the odd pad at the end
+            _, pt, pb = _same_pad(int(inp["shape"][1]), w.shape[1], stride[0])
+            _, pl, pr = _same_pad(int(inp["shape"][2]), w.shape[2], stride[1])
+            pads = (pt, pb, pl, pr)
     return LayerRecord(kind, w, bq, layer_scales(flt["scale"], inp["scale"][0], out["scale"][0], cout), int(inp["zp"][0]),
-                       int(out["zp"][0]), int(lo), int(hi), tuple(layer.get("stride", (1, 1))), bool(layer.get("same", True)), name)
+                       int(out["zp"][0]), int(lo), int(hi), stride, pads, name)
 
 
 def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias=None, strides=(1, 1), pads=None, relu=False,
-                   clip=None, x_unsigned=False, y_unsigned=False, w_unsigned=False, name: str = "") -> LayerRecord:
+                   clip=None, x_unsigned=False, y_unsigned=False, w_unsigned=False, group=1, dilations=(1, 1), auto_pad="NOTSET",
+                   name: str = "") -> LayerRecord:
     """The ONNX importer's record for QLinearConv (w OIHW) or QLinearMatMul (w (K, N)), or their QDQ folding, from the initializers as
-    numpy arrays: uint8 tensors become int8 by subtracting 128; a following Relu or Clip(min, max) is the clamp; pads are SAME or zero."""
+    numpy arrays: uint8 tensors become int8 by subtracting 128; a following Relu or Clip(min, max) is the clamp; pads [top, left, bottom,
+    right] pass through as given; group, dilation and auto_pad SAME_* (resolve them to pads first) are refused."""
     w, w_zp = as_int8(w, w_zp, w_unsigned)
     _symmetric(w_zp, name)
     _, zin = as_int8(0, x_zp, x_unsigned)
@@ -435,16 +446,15 @@ def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias
     zin, zout = int(np.ravel(zin)[0]), int(np.ravel(zout)[0])
     if op == "QLinearConv":
         w = np.transpose(w, (0, 2, 3, 1))  # OIHW to OHWI
-        kh, kw = w.shape[1:3]
-        if pads is None or not any(pads):
-            same = False
-        elif list(pads) == [(kh - 1) // 2, (kw - 1) // 2, kh - 1 - (kh - 1) // 2, kw - 1 - (kw - 1) // 2]:
-            same = True
-        else:
-            raise ValueError(f"layer {name or '(unnamed)'}: pads {list(pads)} are neither SAME nor zero")
-        kind = "conv"
+        if group != 1 or tuple(dilations) != (1, 1) or auto_pad not in ("NOTSET", "VALID"):
+            raise ValueError(f"layer {name or '(unnamed)'}: group {group}, dilations {tuple(dilations)}, auto_pad {auto_pad}: only group 1, "
+                             "dilation 1 and explicit pads are supported")
+        p = [0, 0, 0, 0] if pads is None or auto_pad == "VALID" else [int(v) for v in pads]
+        if len(p) != 4 or min(p) < 0:
+            raise ValueError(f"layer {name or '(unnamed)'}: pads {list(pads)} are not four non-negative values")
+        pads, kind = (p[0], p[2], p[1], p[3]), "conv"  # ONNX [top, left, bottom, right] to (top, bottom, left, right)
     elif op == "QLinearMatMul":
-        w, kind, same = w.T, "fc", False
+        w, kind, pads = w.T, "fc", (0, 0, 0, 0)
     else:
         raise ValueError(f"layer {name or '(unnamed)'}: {op} is not QLinearConv or QLinearMatMul")
     cout = w.shape[0]
@@ -454,24 +464,28 @@ def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias
     if relu and clip is not None:
         lo = max(lo, zout)
     bq = np.zeros(cout, np.int64) if bias is None else np.asarray(bias, np.int64)
-    return LayerRecord(kind, w, bq, scale, zin, zout, lo, hi, tuple(strides), same, name)
+    return LayerRecord(kind, w, bq, scale, zin, zout, lo, hi, tuple(int(v) for v in strides), pads, name)
 
 
 def record_of_torch(kind: str, in_scale, in_zp, w_int, w_scales, w_zps, bias, out_scale, out_zp, relu=False, stride=(1, 1),
-                    padding=(0, 0), unsigned=True, name: str = "") -> LayerRecord:
+                    padding=(0, 0), unsigned=True, groups=1, dilation=(1, 1), padding_mode="zeros", name: str = "") -> LayerRecord:
     """The PyTorch importer's record for a quantized Conv2d / Linear (torch.ao, FX or PT2E): input q_scale and q_zero_point, the
     weight's int_repr (conv OIHW, linear (out, in)) with q_per_channel_scales of a symmetric qint8 weight, the float bias quantized to
-    int32 at s_in s_w[c], the module's output scale and zero point; ConvReLU2d / LinearReLU clamp at the zero point; quint8 is shifted."""
+    int32 at s_in s_w[c], the module's output scale and zero point; ConvReLU2d / LinearReLU clamp at the zero point; quint8 is shifted;
+    padding (ph, pw) pads both sides of each axis; groups, dilation, padding_mode other than zeros and string padding are refused."""
     _symmetric(w_zps, name)
     w = np.asarray(w_int, np.int64)
     if kind == "conv":
         w = np.transpose(w, (0, 2, 3, 1))
-        kh, kw = w.shape[1:3]
-        same = tuple(padding) == ((kh - 1) // 2, (kw - 1) // 2) and kh % 2 == 1 and kw % 2 == 1
-        if not same and any(padding):
-            raise ValueError(f"layer {name or '(unnamed)'}: padding {tuple(padding)} is neither SAME nor zero")
+        if groups != 1 or tuple(np.broadcast_to(dilation, 2)) != (1, 1) or padding_mode != "zeros" or isinstance(padding, str):
+            raise ValueError(f"layer {name or '(unnamed)'}: groups {groups}, dilation {dilation}, padding {padding!r} ({padding_mode}): "
+                             "only groups 1, dilation 1 and numeric zero padding are supported")
+        ph, pw = (int(v) for v in np.broadcast_to(padding, 2))
+        if min(ph, pw) < 0:
+            raise ValueError(f"layer {name or '(unnamed)'}: padding {padding} is negative")
+        pads = (ph, ph, pw, pw)
     elif kind == "linear":
-        same, kind = False, "fc"
+        pads, kind = (0, 0, 0, 0), "fc"
     else:
         raise ValueError(f"layer {name or '(unnamed)'}: kind {kind} is not conv or linear")
     cout = w.shape[0]
@@ -481,7 +495,7 @@ def record_of_torch(kind: str, in_scale, in_zp, w_int, w_scales, w_zps, bias, ou
     bq = np.zeros(cout, np.int64) if bias is None else np.floor(np.asarray(bias, np.float64) / (float(in_scale) * ws) + 0.5).astype(np.int64)
     lo, hi = (zout, 127) if relu else (-128, 127)
     return LayerRecord(kind, w, bq, layer_scales(ws, float(in_scale), float(out_scale), cout), zin, zout, max(-128, lo), hi,
-                       tuple(stride), same, name)
+                       tuple(int(v) for v in np.broadcast_to(stride, 2)), pads, name)
 
 
 def add_record_of_onnx(a_scale, a_zp, b_scale, b_zp, c_scale, c_zp, relu=False, clip=None, unsigned=False, name: str = "") -> AddRecord:
@@ -507,7 +521,7 @@ def job_of_record(rec: LayerRecord, x) -> tuple:
     cout = w.shape[0]
     mult, shift = encode_scales(rec.scale)
     if rec.kind == "conv":
-        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], rec.stride, rec.same,
+        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], rec.stride, rec.pads,
                        pad_value=float(rec.zp_in)) for xi in x]  # every input image; rows in (image, y, x) order
         X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
         W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
@@ -595,14 +609,17 @@ def _same_pad(n, k, s):
 
 
 def im2col(x, kh, kw, stride, same, channel_major=False, pad_value=0.0):
-    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major; SAME pads with pad_value."""
+    """x is H x W x C; rows are output pixels, depth is (ky, kx, c), or (c, ky, kx) when channel_major; same is True (TFLite SAME),
+    False (no padding) or explicit pads (top, bottom, left, right), filled with pad_value."""
     H, W, C = x.shape
     sh, sw = stride
-    if same:
+    flag = isinstance(same, (bool, np.bool_))
+    if flag and same:
         oh, pt, pb = _same_pad(H, kh, sh)
         ow, pl, pr = _same_pad(W, kw, sw)
     else:
-        oh, ow, pt, pb, pl, pr = (H - kh) // sh + 1, (W - kw) // sw + 1, 0, 0, 0, 0
+        pt, pb, pl, pr = (0, 0, 0, 0) if flag else (int(v) for v in same)
+        oh, ow = (H + pt + pb - kh) // sh + 1, (W + pl + pr - kw) // sw + 1
     xp = np.pad(x, ((pt, pb), (pl, pr), (0, 0)), constant_values=pad_value)
     cols = np.empty((oh, ow, kh, kw, C), dtype=np.float32)
     for ky in range(kh):
@@ -727,9 +744,9 @@ def load_layer(path: str) -> dict:
     return d
 
 
-def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
-    """(int8 job for RtlLayer, output shape) of one TFLite layer on the saved input codes x, through its neutral record."""
-    rec = record_of_tflite(layer)
+def job_of(layer: dict, x: np.ndarray, saved, name: str = "") -> tuple:
+    """(int8 job for RtlLayer, output shape) of one TFLite layer on the saved input codes x, through its neutral record named name."""
+    rec = record_of_tflite(layer, name)
     if max(abs(a - int(saved[k])) for a, k in zip((rec.lo, rec.hi), ("act_min", "act_max"))) > 1:  # rounding may move a bound one code
         raise ValueError(f"clamp ({rec.lo}, {rec.hi}) is not the npz's ({int(saved['act_min'])}, {int(saved['act_max'])}): the model and the npz do not belong together")
     return job_of_record(rec, x)
@@ -1674,7 +1691,7 @@ def tflite_main(argv=None):
         ref = np.load(path[:-len(".tflite")] + ".npz")
         x, y = ref["x_test"], ref["y_test"].astype(np.int64)
         layer = load_layer(path)
-        job, shape = job_of(layer, x, ref)
+        job, shape = job_of(layer, x, ref, name)
         got, sets, cyc = sim.run_job(job, name)
         r, low, acc = layer_truth(job, got)
         got, low, want = got.reshape(shape), low.reshape(shape), y.reshape(shape)
@@ -1710,7 +1727,7 @@ def model_of(path):
     """(pack_jobs model, output shape, interpreter's outputs) of one saved .tflite with its npz."""
     ref = np.load(path[:-len(".tflite")] + ".npz")
     layer = load_layer(path)
-    job, shape = job_of(layer, ref["x_test"], ref)
+    job, shape = job_of(layer, ref["x_test"], ref, os.path.basename(path)[:-len(".tflite")])
     (X, W), = job["terms"]
     return {"W": W, "bias": job["bias"], "act": "linear", "req": job["req"], "inputs": [X]}, shape, ref["y_test"].astype(np.int64)
 

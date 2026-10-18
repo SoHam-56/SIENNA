@@ -5039,6 +5039,17 @@ def test_importer_records():
         y = mr.qadd_codes(q1, q2, wds)
         tc = np.clip(np.maximum(a.s1 * (q1 - a.z1) + a.s2 * (q2 - a.z2), 0.0) / a.s_out + a.z_out, -128, 127)
         assert (a.z1, a.z2, a.z_out, a.lo) == (12, -8, 0, 0) and not np.any(np.abs(y - tc) > np.maximum(0.01 * np.abs(tc - a.z_out), 1.0))
+    # TFLite ADD through its record (load_int8_graph's op): the host picks input 1, the other is input 2; a tensor not an input is refused
+    tadd = {"kind": "ADD", "inputs": [5, 9], "fused": "relu", "act_range": (-3, 127), "a": {"index": 5, "scale": np.float32([0.05]), "zp": np.array([12])},
+            "b": {"index": 9, "scale": np.float32([0.03]), "zp": np.array([-8])}, "output": {"index": 11, "scale": np.float32([0.06]), "zp": np.array([-3])}}
+    r0, r1 = mr.add_record_of_tflite(tadd, name="t5"), mr.add_record_of_tflite(tadd, 9, "t6")
+    assert (r0.z1, r0.z2, r0.z_out, r0.lo, r0.hi) == (12, -8, -3, -3, 127) and (r1.z1, r1.z2) == (-8, 12), (r0, r1)
+    assert (r0.s1, r0.s2) == (r1.s2, r1.s1) == (float(np.float32(0.05)), float(np.float32(0.03)))
+    for a in (r0, r1):
+        q1, q2 = (v.ravel() for v in np.meshgrid(np.arange(-128, 128), np.arange(-128, 128)))
+        y = mr.qadd_codes(q1, q2, mr.add_record_words(a))
+        tc = np.clip(np.maximum(a.s1 * (q1 - a.z1) + a.s2 * (q2 - a.z2), 0.0) / a.s_out + a.z_out, -128, 127)
+        assert not np.any(np.abs(y - tc) > np.maximum(0.01 * np.abs(tc - a.z_out), 1.0)), a.name
     # refusals
     for bad, why in ((lambda: mr.record_of_onnx("QLinearMatMul", 0.1, 0, np.ones((2, 2)), 0.1, 3, 0.1, 0), "weight zero point"),
                      (lambda: mr.record_of_onnx("QLinearConv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, 0.1, 0, pads=[0, 1, 0]), "pads"),
@@ -5049,6 +5060,7 @@ def test_importer_records():
                      (lambda: mr.record_of_torch("conv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, None, 0.1, 0, groups=2), "groups"),
                      (lambda: mr.record_of_torch("conv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, None, 0.1, 0, dilation=(2, 2)), "dilation"),
                      (lambda: mr.record_of_tflite(dict(tcv, stride=None), "c4"), "layer c4: stride"),
+                     (lambda: mr.add_record_of_tflite(tadd, 11, "t7"), "ADD layer t7: tensor 11"),
                      (lambda: mr.add_record_words(mr.AddRecord(2.0 ** 24, 0, 1.0, 0, 1.0, 0, -128, 127, "res3")), "ADD layer res3")):
         try:
             bad()

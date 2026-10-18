@@ -3,7 +3,7 @@
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
-#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_layer, job_of
+#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
 #   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
@@ -691,21 +691,19 @@ def job_reference(job):
     return y, (np.maximum(y, 0) if job["act"] == "relu" else y)
 
 
-def load_layer(path: str) -> dict:
-    """The one CONV_2D or FULLY_CONNECTED operator of an int8 .tflite, with its tensors' codes and quantization."""
+def load_int8_graph(path: str) -> dict:
+    """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD operators in graph order, each with its tensors' codes and quantization (each tensor
+    keeps its index): a conv or fc has input, filter, bias and output, an ADD its inputs a and b and output; every op has its fused activation's
+    kind (fused) and clamp in codes (act_range). {"ops": [...], "input": index, "output": index}."""
     import tflite
     from tflite.ActivationFunctionType import ActivationFunctionType as AF
     from tflite.BuiltinOperator import BuiltinOperator as BO
 
     names = {v: k for k, v in BO.__dict__.items() if not k.startswith("_")}
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6", AF.RELU_N1_TO_1: "relu_n1_to_1"}  # ipu.activation_clamp's kinds
+    opts = {"CONV_2D": tflite.Conv2DOptions, "FULLY_CONNECTED": tflite.FullyConnectedOptions, "ADD": tflite.AddOptions}
     m = tflite.Model.GetRootAsModel(open(path, "rb").read(), 0)
     g = m.Subgraphs(0)
-    code = lambda op: m.OperatorCodes(op.OpcodeIndex())
-    kinds = [names[max(code(g.Operators(i)).BuiltinCode(), code(g.Operators(i)).DeprecatedBuiltinCode())]
-             for i in range(g.OperatorsLength())]
-    if kinds not in (["CONV_2D"], ["FULLY_CONNECTED"]):
-        raise ValueError(f"{path}: operators {kinds}; expected one CONV_2D or FULLY_CONNECTED with int8 input and output")
-    op = g.Operators(0)
 
     def tensor(i):
         if i < 0:
@@ -716,32 +714,67 @@ def load_layer(path: str) -> dict:
         data = None
         if not isinstance(buf, int) and buf is not None and len(buf):
             data = np.frombuffer(buf.tobytes(), dtype={9: np.int8, 2: np.int32}[t.Type()]).reshape(tuple(t.ShapeAsNumpy()))
-        return dict(type=t.Type(), shape=tuple(t.ShapeAsNumpy()), data=data,
+        return dict(index=i, type=t.Type(), shape=tuple(t.ShapeAsNumpy()), data=data,
                     scale=np.atleast_1d(q.ScaleAsNumpy()).astype(np.float32),
                     zp=np.atleast_1d(q.ZeroPointAsNumpy()).astype(np.int64))
 
-    ins = [op.Inputs(j) for j in range(op.InputsLength())]
-    inp, flt = tensor(ins[0]), tensor(ins[1])
-    bias = tensor(ins[2]) if len(ins) > 2 else None
-    out = tensor(op.Outputs(0))
-    if inp["type"] != 9 or flt["type"] != 9 or out["type"] != 9:  # 9 is INT8
-        raise ValueError(f"{path}: input, filter and output must be int8")
-    if np.any(flt["zp"] != 0):
-        raise ValueError(f"{path}: TFLite's int8 filters are symmetric; a non-zero filter zero point is not supported")
-    opt = (tflite.Conv2DOptions if kinds[0] == "CONV_2D" else tflite.FullyConnectedOptions)()
-    t = op.BuiltinOptions()
-    opt.Init(t.Bytes, t.Pos)
-    d = dict(kind=kinds[0], input=inp, filter=flt, bias=bias, output=out)
-    if kinds[0] == "CONV_2D":
-        if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
-            raise ValueError(f"{path}: dilation is not supported")
-        d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
-    fa = opt.FusedActivationFunction()
-    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6", AF.RELU_N1_TO_1: "relu_n1_to_1"}  # ipu.activation_clamp's kinds
-    if fa not in acts:
-        raise ValueError(f"{path}: fused activation {fa} is not supported")
-    d["act_range"] = ipu.activation_clamp(acts[fa], float(out["scale"][0]), int(out["zp"][0]))
-    return d
+    ops = []
+    for k in range(g.OperatorsLength()):
+        op = g.Operators(k)
+        c = m.OperatorCodes(op.OpcodeIndex())
+        kind = names[max(c.BuiltinCode(), c.DeprecatedBuiltinCode())]
+        if kind not in opts:
+            raise ValueError(f"{path}: operator {k} is {kind}; the int8 importer takes CONV_2D, FULLY_CONNECTED and ADD")
+        ins = [op.Inputs(j) for j in range(op.InputsLength())]
+        out = tensor(op.Outputs(0))
+        if kind == "ADD":
+            d = dict(kind=kind, inputs=ins[:2], a=tensor(ins[0]), b=tensor(ins[1]), output=out)
+            if any(v["type"] != 9 for v in (d["a"], d["b"], out)):  # 9 is INT8
+                raise ValueError(f"{path}: operator {k} ADD: inputs and output must be int8")
+        else:
+            inp, flt = tensor(ins[0]), tensor(ins[1])
+            bias = tensor(ins[2]) if len(ins) > 2 else None
+            if inp["type"] != 9 or flt["type"] != 9 or out["type"] != 9:
+                raise ValueError(f"{path}: input, filter and output must be int8")
+            if np.any(flt["zp"] != 0):
+                raise ValueError(f"{path}: TFLite's int8 filters are symmetric; a non-zero filter zero point is not supported")
+            d = dict(kind=kind, input=inp, filter=flt, bias=bias, output=out)
+        opt = opts[kind]()
+        t = op.BuiltinOptions()
+        opt.Init(t.Bytes, t.Pos)
+        if kind == "CONV_2D":
+            if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
+                raise ValueError(f"{path}: dilation is not supported")
+            d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
+        fa = opt.FusedActivationFunction()
+        if fa not in acts:
+            raise ValueError(f"{path}: fused activation {fa} is not supported")
+        d["fused"] = acts[fa]
+        d["act_range"] = ipu.activation_clamp(acts[fa], float(out["scale"][0]), int(out["zp"][0]))
+        ops.append(d)
+    return {"ops": ops, "input": g.Inputs(0), "output": g.Outputs(0)}
+
+
+def load_layer(path: str) -> dict:
+    """The one CONV_2D or FULLY_CONNECTED operator of an int8 .tflite, with its tensors' codes and quantization."""
+    ops = load_int8_graph(path)["ops"]  # refuses any other operator
+    kinds = [o["kind"] for o in ops]
+    if kinds not in (["CONV_2D"], ["FULLY_CONNECTED"]):
+        raise ValueError(f"{path}: operators {kinds}; expected one CONV_2D or FULLY_CONNECTED with int8 input and output")
+    return ops[0]
+
+
+def add_record_of_tflite(op: dict, first: int = None, name: str = "") -> AddRecord:
+    """The TFLite importer's ADD record from load_int8_graph's op: input first (a tensor index, default the op's first input) becomes (s1, z1);
+    the ADD is symmetric, so the order is the host's choice. Scales are the stored float32 ones in float64."""
+    first = op["inputs"][0] if first is None else first
+    if first not in op["inputs"]:
+        raise ValueError(f"ADD layer {name or '(unnamed)'}: tensor {first} is not one of its inputs {op['inputs']}")
+    one, two = (op["a"], op["b"]) if first == op["inputs"][0] else (op["b"], op["a"])
+    out = op["output"]
+    lo, hi = op["act_range"]
+    return AddRecord(float(one["scale"][0]), int(one["zp"][0]), float(two["scale"][0]), int(two["zp"][0]), float(out["scale"][0]),
+                     int(out["zp"][0]), int(lo), int(hi), name)
 
 
 def job_of(layer: dict, x: np.ndarray, saved, name: str = "") -> tuple:

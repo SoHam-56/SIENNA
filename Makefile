@@ -311,6 +311,7 @@ help:
 	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
+	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
 	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
 	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
 	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
@@ -638,6 +639,17 @@ add-lanes:
 	  ! command grep -qE '%[E]rror|%[F]atal|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
 	$(PYTHON) regression.py --action add-vectors --check $(TB_DIR)/add_lanes_out.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 
+# requant_lanes on regression.py --action rq-vectors: fails unless the log has RESULT: PASSED and no error or failed assertion (patterns bracketed against make's echo), then gates its outputs on the true function
+RQL_DIR = $(VERILATOR_DIR)/rq_lanes
+rq-lanes:
+	mkdir -p $(RQL_DIR)
+	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
+	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
+	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv -o sim
+	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
+	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }
+	$(PYTHON) regression.py --action rq-vectors --check $(TB_DIR)/rq_lanes_out.mem --truth $(RQL_DIR)/rq_lanes_truth.json
+
 # make regression: SIENNA's points, each its own target (make -jN runs N side by side), then the table; FMT=<f> narrows it to one format.
 comma := ,
 empty :=
@@ -682,4 +694,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite residual pack add-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite residual pack add-lanes rq-lanes regression regression-summary sim build-key

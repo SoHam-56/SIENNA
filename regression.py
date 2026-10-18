@@ -1723,7 +1723,7 @@ def _residual_cross_report(results: str, points: list) -> tuple:
     """(lines, failures) of the residual crosses over a sweep's int8 pipeline points, from each point's log under results."""
     counts, lines = {}, []
     for q in points:
-        if q == "selftest" or SPEC.parse(q)["fmt"] != "int8" or SPEC.parse(q)["kind"] not in PIPELINE_KINDS:
+        if "fmt" not in SPEC.parse(q) or SPEC.parse(q)["fmt"] != "int8" or SPEC.parse(q)["kind"] not in PIPELINE_KINDS:  # selftest and the unit points have none
             continue
         log = os.path.join(results, q + ".log")
         m = RESIDUAL_CROSS.findall(regress.ANSI.sub("", open(log, errors="replace").read())) if os.path.exists(log) else []
@@ -1733,7 +1733,7 @@ def _residual_cross_report(results: str, points: list) -> tuple:
     if not lines:
         if not RESIDUAL_CROSS_GATE:
             return ["RESIDUAL CROSSES: NOT CHECKED, the sweep gate is off (RESIDUAL_CROSS_GATE) and the sweep has no int8 pipeline point"], []
-        if "int8" not in {SPEC.parse(q)["fmt"] for q in points if q != "selftest"}:  # FMT=fp32 or bf16: nothing residual runs
+        if "int8" not in {SPEC.parse(q).get("fmt") for q in points}:  # FMT=fp32 or bf16: nothing residual runs
             return ["RESIDUAL CROSSES: NOT APPLICABLE, the sweep runs no int8 point"], []
         return ["RESIDUAL CROSSES: FAIL: no int8 pipeline point in a sweep with int8 points"], ["no int8 pipeline point"]
     if not RESIDUAL_CROSS_GATE:
@@ -4143,11 +4143,12 @@ def test_pack_target():
 @selftest
 def test_regression_points():
     small, full = SPEC.points(True, list(FORMATS)), SPEC.points(False, list(FORMATS))
-    sweep = lambda pts: sorted({(SPEC.parse(p)["n"], SPEC.parse(p)["tile"]) for p in pts if p != "selftest"})
+    sweep = lambda pts: sorted({(SPEC.parse(p)["n"], SPEC.parse(p)["tile"]) for p in pts if SPEC.parse(p)["n"]})
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 28 == 197 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 == 439, (len(small), len(full))
+    assert small[1:3] == full[1:3] == ["add-lanes", "rq-lanes"] and not set(UNIT_POINTS) & set(small[3:])  # int8's unit benches: once
+    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 == 199 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 == 441, (len(small), len(full))
     layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
         for n, t in sweep(full):  # back-to-back and sienna_layer's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
@@ -4158,7 +4159,8 @@ def test_regression_points():
     assert [(SPEC.parse(f"int8/N8_T2/{k}")["ck"], SPEC.parse(f"int8/N8_T2/{k}")["b2b"]) for k in ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b")] \
         == [(1, False), (0, False), (1, True), (0, True)]
     assert [SPEC.parse(p)[x] for p in ("fp32/N64_T64/pipeline-b2b",) for x in ("ck", "b2b", "lanes")] == [1, True, 128]
-    assert SPEC.points(True, ["int8"]) == ["selftest"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
+    assert SPEC.points(True, ["int8"]) == ["selftest", "add-lanes", "rq-lanes"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
+    assert SPEC.points(True, ["fp32", "bf16"]) == ["selftest"] + [p for p in small if p[:4] in ("fp32", "bf16")]
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
@@ -4315,6 +4317,30 @@ def test_residual_points():
     v = lambda text, rc=0: SPEC.verdict("int8/N8_T2/residual", text, rc)
     assert v("RESIDUAL: PASS\n") == "PASS" and v("RESIDUAL: PASS\n", 1) == "FAIL (exit 1)" and v("residual tiles ...\n") == "FAIL (no 'RESIDUAL: PASS')"
     assert v("RESIDUAL: FAIL tiles\n").startswith("FAIL (log: RESIDUAL: FAIL") and v("RESIDUAL: PASS\n[x] Assertion failed in t\n").startswith("FAIL (log:")
+
+
+@selftest
+def test_unit_points():
+    """The int8 unit benches are points run once when int8 is selected: make add-lanes and make rq-lanes, each passing only on its bench's lines and its true-function gate."""
+    assert SPEC.points(True, ["int8"])[:3] == ["selftest", "add-lanes", "rq-lanes"] and "add-lanes" not in SPEC.points(True, ["fp32", "bf16"])
+    py = sys.executable
+    assert SPEC.argv("add-lanes", None) == ["make", "add-lanes", f"PYTHON={py}"] and SPEC.argv("rq-lanes", None) == ["make", "rq-lanes", f"PYTHON={py}"]
+    ok = ("add_lanes: 48 beats, 0 errors, 0 latency errors, 0 tag errors, 0 busy errors (64 busy cycles); 3 outputs differ from the bit-exact model (reported)\n"
+          "RESULT: PASSED\nTRUTH int8 qadd: PASS  n 1536\nADD LANES: PASS (1536 outputs, 0 over the bound)\n")
+    av = lambda text, rc=0: SPEC.verdict("add-lanes", text, rc)
+    assert av(ok) == "PASS" and av(ok, 2) == "FAIL (exit 2)"
+    assert av(ok.replace("0 tag errors", "3 tag errors").replace("PASSED", "FAILED")).startswith("FAIL")
+    assert av(ok.replace("0 busy errors", "1 busy errors")).startswith("FAIL") and av(ok.replace("ADD LANES: PASS (1536", "ADD LANES: FAIL (1536")).startswith("FAIL")
+    assert av(ok.replace("ADD LANES: PASS (1536 outputs, 0 over the bound)\n", "")) == "FAIL (no 'ADD LANES: PASS')"  # the bench alone is not the gate
+    rok = ("TB_requant_lanes: 48 beats, 0 errors, 0 latency errors; 0 outputs differ from the bit-exact model (reported)\nRESULT: PASSED\n"
+           "REQUANT LANES: PASS (1536 outputs, 0 over the bound)\n")
+    rv = lambda text, rc=0: SPEC.verdict("rq-lanes", text, rc)
+    assert rv(rok) == "PASS" and rv("RESULT: PASSED\n") == "FAIL (no 'TB_requant_lanes: \\d+ beats, 0 errors, 0 latency errors;')" and rv("built\n").startswith("FAIL (no")
+    assert rv(rok.replace("REQUANT LANES: PASS", "REQUANT LANES: FAIL")).startswith("FAIL (log: REQUANT LANES: FAIL")
+    assert SPEC.parse("rq-lanes") == {"n": 0, "kind": "rq-lanes"} and regress.point_env(SPEC, "add-lanes", "s", 8)["TRACE"] == "0"
+    r = make_n("rq-lanes", f"PYTHON={py}")
+    assert r.returncode == 0 and "--action rq-vectors" in r.stdout and "--top-module TB_requant_lanes" in r.stdout and "--check" in r.stdout, r.stdout[-300:]
+    assert "Requantizer/src/int8Requantizer.sv" in r.stdout and "tfliteRequant" not in r.stdout, r.stdout[-300:]
 
 
 @selftest
@@ -5511,6 +5537,7 @@ CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at t
 LAYER_CK0 = KINDS[-4:-1]  # sienna_layer's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
+UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected
 
 
 def reg_lanes(n: int) -> int:
@@ -5527,7 +5554,7 @@ class SiennaSpec(regress.Spec):
     def points(self, small, formats):
         if not formats:
             return []
-        return ["selftest"] + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
+        return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
                                for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)]
 
     @staticmethod
@@ -5539,11 +5566,11 @@ class SiennaSpec(regress.Spec):
                 and (not k.endswith("-b2b") or n in B2B_SIZES))
 
     def parse(self, name):
-        if name == "selftest":
-            return {"n": 0, "kind": "selftest"}
+        if name == "selftest" or name in UNIT_POINTS:
+            return {"n": 0, "kind": name}
         m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z0-9-]+)", name)
         if not m or m.group(1) not in FORMATS or m.group(4) not in KINDS:
-            raise ValueError(f"{name}: points are selftest and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
+            raise ValueError(f"{name}: points are selftest, {', '.join(UNIT_POINTS)} and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
         f, n, t, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
@@ -5561,6 +5588,8 @@ class SiennaSpec(regress.Spec):
         p, py = self.parse(name), sys.executable
         if p["kind"] == "selftest":
             return [py, "regression.py", "--action", "selftest"]
+        if p["kind"] in UNIT_POINTS:
+            return ["make", p["kind"], f"PYTHON={py}"]
         k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"].removesuffix("-ck0")
         mk = ["make", k, f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
         return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(k, []) \
@@ -5575,6 +5604,12 @@ class SiennaSpec(regress.Spec):
         text = regress.ANSI.sub("", text)
         if k == "selftest":
             return regress.marker_verdict(text, rc, (r"^ALL \d+ PASSED$",))
+        if k == "add-lanes":  # the bench's beats, latency, tags and busy_o, then its outputs on the true function
+            return regress.marker_verdict(text, rc, (r"^add_lanes: \d+ beats, 0 errors, 0 latency errors, 0 tag errors, 0 busy errors \(\d+ busy cycles\);",
+                                                     r"^RESULT: PASSED", r"^ADD LANES: PASS"), (r"RESULT: FAILED", r"^ADD LANES: FAIL"))
+        if k == "rq-lanes":
+            return regress.marker_verdict(text, rc, (r"^TB_requant_lanes: \d+ beats, 0 errors, 0 latency errors;", r"^RESULT: PASSED", r"^REQUANT LANES: PASS"),
+                                          (r"RESULT: FAILED", r"^REQUANT LANES: FAIL"))
         if k in PIPELINE_KINDS:
             m = re.findall(r"^\s*Passed\s*:\s*(\d+)\s*/\s*(\d+)\s*$", text, re.M)
             g = re.findall(r"^\s*TRUTH: (\d+) tests gated, (\d+) with misses$", text, re.M)

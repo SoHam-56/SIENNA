@@ -1144,7 +1144,10 @@ INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # the conve
 
 def lane_quant(act, s_in, z_in, rq) -> tuple:
     """(s_in, z_in, s_out, z_out) the int8 lane's true function is judged on: SELU's calibrated output, tanh's and sigmoid's fixed one, ReLU and
-    linear the input's own."""
+    linear the input's own (their gate is the identity, so s_in may be None there)."""
+    if s_in is None and act not in ("relu", "linear"):
+        raise ValueError(f"the {act} lane's gate needs the requantize output scale (s_out)")
+    s_in = 1.0 if s_in is None else s_in
     if act == "selu":
         return s_in, z_in, rq["s_selu"], rq["zout"]
     return (s_in, z_in) + INT8_FIXED_OUT.get(act, (s_in, z_in))
@@ -1167,6 +1170,20 @@ def _columns(job, C):
     return cols
 
 
+def true_clamp(kind, s_out, zp) -> tuple:
+    """(lo, hi) in output codes, unrounded, of a fused activation's real range [0, inf) or [0, 6] on an output of scale s_out and zero point zp."""
+    lo, hi = {"none": (None, None), "relu": (0.0, None), "relu6": (0.0, 6.0)}[kind]
+    code = lambda v, d: d if v is None else min(127.0, max(-128.0, zp + v / s_out))
+    return code(lo, -128.0), code(hi, 127.0)
+
+
+def _stage(stages, kind, p):
+    """One pass's grid of one kind from read_stage_dump; a missing one is a RuntimeError, as a missing element is."""
+    if p not in stages.get(kind, {}):
+        raise RuntimeError(f"stage dump: no {kind} lines for pass {p}")
+    return stages[kind][p]
+
+
 def gate_transfer(name, want, got) -> "truth.Result":
     """An exact stage (a buffer or a mux): every code must arrive unchanged."""
     want, got = (np.asarray(v, np.int64).ravel() for v in (want, got))
@@ -1177,9 +1194,13 @@ def gate_transfer(name, want, got) -> "truth.Result":
 
 def layer_stage_gates(job, Y, stages, N) -> list:
     """[(stage, truth.Result)] of an int8 layer from TB_model_run's stage dump: the conv's requantize on each exact int32 sum and its column's real
-    scale; for a residual layer the identity requantize of the residual codes, hold_mem's transfer, the ADD on its real ratios and the fill; the lane
-    from the activation stage's input X to the output Y (ReLU and linear at truth.TARGET, the others at truth.BOUND)."""
-    res = [X for X, W in job["terms"] if W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))]
+    scale; for a residual layer (job['add']) the identity requantize of the residual codes, hold_mem's transfer and the ADD on its real ratios, with
+    the true clamps of job['clamps'] when given; the lane from the activation stage's input X to the output Y (ReLU and linear at truth.TARGET, the
+    others at truth.BOUND)."""
+    eye = lambda W: W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))
+    res = [X for X, W in job["terms"] if eye(W)] if job.get("add") is not None else []  # the residual term only in a layer with an ADD
+    if job.get("add") is not None and len(res) != 1:
+        raise ValueError(f"a residual layer needs one identity term, not {len(res)}")
     dense = [(X, W) for X, W in job["terms"] if not any(X is r for r in res)]
     A_q = np.hstack([np.asarray(x, np.int64) for x, _ in dense])
     W_q = np.vstack([np.asarray(w, np.int64) for _, w in dense])
@@ -1196,24 +1217,26 @@ def layer_stage_gates(job, Y, stages, N) -> list:
     out, Y = [], np.asarray(Y, np.int64)
     if res:  # the hold set (pass np_ - 2) and the add set (pass np_ - 1)
         add, R_q = job["add"], np.asarray(res[0], np.int64)[:M, :C]
-        if "R" not in stages or "Q" not in stages:
-            raise RuntimeError("stage dump: a residual layer without its hold (R) or ADD (Q) lines")
-        Rh = crop(stages["R"][np_ - 2])
-        q1, q2, y = (crop(g) for g in stages["Q"][np_ - 1])
+        Rh = crop(_stage(stages, "R", np_ - 2))
+        q1, q2, y = (crop(g) for g in _stage(stages, "Q", np_ - 1))
+        lane = job["lane"]
+        if job.get("clamps"):  # the conv's and the ADD's true clamps from their kinds, scales and zero points
+            lo, hi = true_clamp(job["clamps"][0], job["req"]["s_out"], job["req"]["zp"])
+            a_lo, a_hi = true_clamp(job["clamps"][1], lane["s_out"], add["zpo"])
+        else:
+            a_lo, a_hi = add["amin"], add["amax"]
         out.append(("requant", truth.gate_requantize(acc, S, zp, lo, hi, Rh)))
         out.append(("requant identity", truth.gate_requantize(R_q, 1.0, 0, -128, 127, q2)))
         out.append(("hold_mem", gate_transfer("hold_mem", Rh, q1)))  # each element its own hold beat
         r1, r2 = add["ratios"]
-        a_lo = np.where(relu, max(add["amin"], add["zpo"]), add["amin"])  # a ReLU after the ADD is its clamp
-        out.append(("add", truth.gate_quantized_add(q1, q2, r1, add["zp1"], r2, add["zp2"], 1.0, add["zpo"], a_lo, add["amax"], y)))
-        X = crop(stages["X"][np_ - 1])
-        out.append(("fill", gate_transfer("fill", y, X)))
-        lane = job["lane"]
+        a_lo = np.where(relu, np.maximum(a_lo, add["zpo"]), a_lo)  # a ReLU after the ADD is its clamp
+        out.append(("add", truth.gate_quantized_add(q1, q2, r1, add["zp1"], r2, add["zp2"], 1.0, add["zpo"], a_lo, a_hi, y)))
+        X = crop(_stage(stages, "X", np_ - 1))  # the ADD's output as the activation stage takes it (fill_d, the Q line's y too)
         quants = [lane_quant(a, lane["s_out"], add["zpo"], lane) for a, _, _ in cols]
     else:
-        X = crop(stages["X"][np_ - 1])
+        X = crop(_stage(stages, "X", np_ - 1))
         out.append(("requant", truth.gate_requantize(acc, S, zp, lo, hi, X)))
-        quants = [lane_quant(a, q.get("s_out", 1.0), q["zp"], q) for a, _, q in cols]
+        quants = [lane_quant(a, q.get("s_out"), q["zp"], q) for a, _, q in cols]
     acts = np.array([a for a, _, _ in cols])
     for a in sorted(set(acts.tolist())):
         m = np.broadcast_to(acts[None, :] == a, X.shape)

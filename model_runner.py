@@ -1288,7 +1288,7 @@ class RtlLayer:
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
         self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
-        self.first_hold = self.last_log = self.last_stages = None
+        self.first_hold = self.first_free = self.last_log = self.last_stages = None
         self.retries = 0  # Verilator internal-error rebuilds
 
     def build(self):
@@ -1308,7 +1308,7 @@ class RtlLayer:
 
     def run_job(self, job, tag, plusargs=()):
         """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run (with plusargs
-        and $SIM_ARGS), reads the results; int8 keeps the per-stage dump in last_stages, and every run its log and first hold_done cycle."""
+        and $SIM_ARGS), reads the results; int8 keeps the per-stage dump in last_stages, and every run its log, first hold_done cycle and the cycle its hold window closed."""
         N = self.N
         int8 = self.fmt_name == "int8"
         if int8 and job.get("req") is None:
@@ -1328,6 +1328,8 @@ class RtlLayer:
         self.last_log, self.last_stages = r.stdout, None
         h = re.search(r"\[RES\] first hold_done (\d+) cycles into the layer", r.stdout)
         self.first_hold = int(h.group(1)) if h else None
+        f = re.search(r"\[RES\] first hold window closed (\d+) cycles into the layer", r.stdout)
+        self.first_free = int(f.group(1)) if f else None
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")

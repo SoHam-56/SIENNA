@@ -1539,6 +1539,8 @@ PIPELINE_TESTS = [
      "pool_w": 1, "padding": 0, "packed": True, "req_random": True, "zp_random": True, "formats": ("int8",),
      "pack_acts": ["linear", "relu", "tanh", "selu", "sigmoid", "linear", "relu", "tanh"]},
     # int8 residual ADD (sienna-int8-residual): a residual group's last depth pass is a hold set, then an add set (the identity pass) meets it in add_lanes.
+    {"name": "int8_residual_one_pair", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True, "num_sets": 2,
+     "formats": ("int8",)},  # one hold/add pair per pass, the first residual test run: the end-of-pass hold check sees a stale hold first
     {"name": "int8_residual_relu", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True,
      "req_random": True, "zp_random": True, "formats": ("int8",)},
     {"name": "int8_residual_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "residual": True,

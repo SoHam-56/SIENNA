@@ -1590,7 +1590,24 @@ def tflite_pack_main(argv=None):
     sim = RtlLayer(a.n, a.lanes, work, "int8", a.tile_size)
     sim.build()
     bad = 0
-    for g, names in enumerate(GROUPS):
+
+    def fits(names):  # the group, or its halves until each part packs at this N (three blocks of 8 need N = 32)
+        try:
+            pack_jobs([model_of(os.path.join(a.models, f"{n}.tflite"))[0] for n in names], a.n, int8=True)
+            return [names]
+        except ValueError as e:
+            if len(names) == 1:  # a model wider than N / 2 cannot pack at this N: reported, not run
+                line = f"SKIP {names[0]}: {e}"
+                print(line, flush=True)
+                rep.write(line + "\n")
+                return []
+            return fits(names[:len(names) // 2]) + fits(names[len(names) // 2:])
+
+    parts = [part for grp in GROUPS for part in fits(grp)]
+    if not parts:
+        rep.write(f"TFLITE_PACK: no model packs at N = {a.n}\nRESULT: FAILED\n")
+        sys.exit(f"TFLITE_PACK: no model packs at N = {a.n}")
+    for g, names in enumerate(parts):
         got = [model_of(os.path.join(a.models, f"{n}.tflite")) for n in names]
         job, recipe = pack_jobs([m for m, _, _ in got], a.n, int8=True)
         Y, sets, cyc = sim.run_job(job, f"tflp{g}")
@@ -1603,7 +1620,7 @@ def tflite_pack_main(argv=None):
                     f"from the interpreter; {sets} sets, {cyc} cycles")
             print(line, flush=True)
             rep.write(line + "\n")
-    tail = f"TFLITE_PACK: {sum(len(x) for x in GROUPS)} models in {len(GROUPS)} packed layers, {bad} failing"
+    tail = f"TFLITE_PACK: {sum(len(x) for x in parts)} of {sum(len(x) for x in GROUPS)} models in {len(parts)} packed layers at N = {a.n}, {bad} failing"
     print(tail)
     rep.write(tail + "\nRESULT: " + ("PASSED" if bad == 0 else "FAILED") + "\n")
     sys.exit(1 if bad else 0)

@@ -308,9 +308,10 @@ help:
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
+	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
-	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
+	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
 	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
 	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
 	@echo "  make regression-summary           - The table of the results in REG_DIR (default testbenches/results/regression)"
@@ -616,6 +617,11 @@ tflite:
 	@# the packed TFLite layers too, where a block of 8 fits N / 2 (N >= 16); the collapse-k 0 mesh refuses packed sets
 	$(if $(shell [ $(N) -ge 16 ] && [ $(COLLAPSE_K) = 1 ] && echo y),$(PYTHON) model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
 
+# int8 residual layers and the residual-block TFLite models on TB_model_run (regression.py --action residual); int8 only
+residual:
+	@[ "$(FMT)" = int8 ] || { echo "ERROR: make residual runs the int8 residual layers only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
+	$(PYTHON) regression.py --action residual --n $(N) --tile $(TILE) --lanes $(LANES) --tflite --mid-reset
+
 # Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
@@ -676,4 +682,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite pack add-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite residual pack add-lanes regression regression-summary sim build-key

@@ -1,9 +1,11 @@
 ---
 name: sienna-int8
-description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the TFLite-exact requantize stage, fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 matches TFLite, why GPNAE is fixed point in int8, or what 2a covers against 2b.
+description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the generic affine requantize stage (int8Requantizer), fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 matches TFLite, why GPNAE is fixed point in int8, or what 2a covers against 2b.
 ---
 
 # SIENNA: the int8 build (sub-project 2a)
+
+**Since 2026-10-17 (Soham; sienna-int8-residual Task 2.6b): the requantize is the generic `int8Requantizer` (24-bit mantissa, 6-bit right shift, round half up, 4 stages), gated on the true function; the TFLite-exact `tfliteRequant`, the G0 rounding pin and `REQ_ROUNDING` are gone, and the TFLite models are test vehicles whose interpreter agreement is reported. The text below records 2a as built.**
 
 **Status: 2a implemented and verified 2026-09-30 on the `int8` branch of all four repos, at N = 8-32; N = 64 is
 deferred to one final sweep after check-in (Soham 2026-09-29); 2b not started.**

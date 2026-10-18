@@ -1145,7 +1145,7 @@ def dump_hardware_trace(
 TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
-INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # the converters' fixed output quantization (a convention)
+INT8_FIXED_OUT = mr.INT8_FIXED_OUT  # the converters' fixed output quantization (a convention), one owner
 TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "add", "scale", "relu", "activation", "maxpool", "dropout")
 TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
@@ -2080,9 +2080,9 @@ TRANSFORMER = [
 
 
 def run_int8(a, sim, shapes) -> None:
-    """int8 on the layer engine, affinely quantized products: a linear case's outputs are gated on the true requantize of each exact int32 sum
-    (mr.layer_truth), a lane case's against the bit-exact model until TB_model_run dumps per stage (F3, Task 2.8); the quantization error against
-    the float product is reported, not gated."""
+    """int8 on the layer engine, affinely quantized products: every case per stage on the true function from TB_model_run's dump
+    (mr.layer_stage_gates: the requantize of each exact int32 sum, then the lane); the bit-exact model and the quantization error against the
+    float product are reported, not gated."""
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n
     head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
@@ -2093,7 +2093,7 @@ def run_int8(a, sim, shapes) -> None:
         rep.write(line + "\n")
     cases = [(name, m, k, n, "linear") for name, m, k, n in shapes]
     cases += [(f"layer_{act}_bias", 64, 48, 40, act) for act in ("tanh", "sigmoid", "selu")]
-    rows, bad, over, lin_mism = [], 0, 0, 0
+    rows, bad, over, all_mism = [], 0, 0, 0
     for name, m, k, n, act in cases:
         rng = np.random.RandomState(m * 7 + k * 13 + n)
         A, B = rng.uniform(-1, 1, (m, k)), rng.uniform(-1, 1, (k, n))
@@ -2130,17 +2130,19 @@ def run_int8(a, sim, shapes) -> None:
         rep.write(line + "\n")
         rep.flush()
         json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
-        if act == "linear":
-            tr = mr.layer_truth(job, y)[0]
-            over, lin_mism = over + tr.over, lin_mism + mism
-            if not tr.ok:
-                print(f"FAIL {name}: {truth.stage_line(tr)}", flush=True)
-                bad += 1
-        elif mism:
-            print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
-            bad += 1
-    line = (f"GEMM int8: {len(rows)} cases, {bad} failing (linear cases on the true function, {over} outputs over the rule; lane cases on the "
-            f"bit-exact model); reported: {lin_mism} linear outputs differ from the bit-exact model")
+        all_mism += mism
+        gates = mr.layer_stage_gates(job, y, sim.last_stages, a.n)
+        over += sum(r.over for _, r in gates)
+        fails = [(st, r) for st, r in gates if not r.ok]
+        for st, r in gates:  # each stage's worst
+            sl = f"    {st}: {truth.line(r, bound=_act_bound(r.func)) if st.startswith('activation') else truth.stage_line(r)}"
+            print(sl, flush=True)
+            rep.write(sl + "\n")
+        for st, r in fails:
+            print(f"FAIL {name}: {st}: {truth.stage_line(r)}", flush=True)
+        bad += int(bool(fails))
+    line = (f"GEMM int8: {len(rows)} cases, {bad} failing (every case per stage on the true function, requantize and lane, {over} outputs "
+            f"over the rule); reported: {all_mism} outputs differ from the bit-exact model")
     print(line, flush=True)
     rep.write(line + "\n")
     if bad:
@@ -3969,7 +3971,7 @@ def test_point_verdicts():
             ("int8/N16_T4/tflite-ck0", "MODEL GATE: PASS int8\n", 0, "PASS"),  # collapse-k 0 runs no packed layers
             ("int8/N16_T4/tflite-ck0", "MODEL GATE: FAIL int8\n", 0, "FAIL (log: MODEL GATE: FAIL int8)"),
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
-            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (linear cases on the true function)\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (every case per stage on the true function)\n", 0, "PASS"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu")), 0, "PASS"),
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\nlayer_tanh_bias  64 max err 9.3e-04 of the output range\n", 0, "FAIL (no 'layer_sigmoid_bias .* max err ')"),

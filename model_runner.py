@@ -1099,6 +1099,15 @@ def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
 
 # ── 6. Backends: build(), run_job(job, tag) -> (outputs, sets, cycles) ───────
 
+def check_layer_mode(text, tag):
+    """Raises unless TB_model_run's [LAYER] line gives the elaborated mesh's collapse_k and it is COLLAPSE_K."""
+    m = re.search(r"\[LAYER\] sets=.*\bcollapse_k=(\d+)", text)
+    if not m:
+        raise RuntimeError(f"{tag}: the [LAYER] line has no collapse_k: the mesh's mode is unknown")
+    if int(m.group(1)) != COLLAPSE_K:
+        raise RuntimeError(f"{tag}: the build's mesh runs collapse-k {m.group(1)}, the run asked for {COLLAPSE_K}")
+
+
 class RtlLayer:
     """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -1110,8 +1119,8 @@ class RtlLayer:
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0",
-                            f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
-                            "GEN_PKG=0"],  # the package write_build_pkg just wrote
+                            f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
+                            "GEN_PKG=0"],  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
@@ -1140,6 +1149,7 @@ class RtlLayer:
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: layer simulation failed")
+        check_layer_mode(r.stdout, tag)
         outs = read_outputs(of, self.fmt_name)
         os.remove(lf)
         os.remove(of)
@@ -1197,6 +1207,8 @@ class RtlSets:
         self.sets = 0
 
     def build(self):
+        if COLLAPSE_K == 0:
+            raise ValueError("TB_sienna_model builds collapse-k 1")
         write_build_pkg(self.N, self.T, self.lanes, "fp32")
         r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
                             "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
@@ -1545,7 +1557,12 @@ def model_main(argv=None):
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     ap.add_argument("--fault", default=None, help="TEST ONLY, to prove the gate fails: word:MODEL:LAYER:INDEX[:BIT] (flip a hardware output bit), "
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
     a = ap.parse_args(argv)
+    if a.engine == "sets" and a.collapse_k == 0:
+        ap.error("--engine sets builds collapse-k 1 (TB_sienna_model); use --engine layer")
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8":
         ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
     if a.fmt_name != "fp32" and (a.emulate or a.engine == "sets"):
@@ -1570,7 +1587,7 @@ def model_main(argv=None):
             sim = RtlSets(a.n, a.lanes, a.work, a.host_gaps, a.tile_size)
         t0 = time.time()
         sim.build()
-        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} in {time.time() - t0:.0f} s")
+        log(f"built {os.path.basename(sim.bin)[:-4] if hasattr(sim, 'bin') else 'emulator'} N={a.n} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's) in {time.time() - t0:.0f} s")
     fault = parse_fault(a.fault)
     if fault:
         log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
@@ -1668,7 +1685,10 @@ def tflite_main(argv=None):
     ap.add_argument("--lanes", type=int, default=32)
     ap.add_argument("--models", default=MODEL_DIR, help="<name>.tflite files, each with <name>.npz holding x_test and y_test")
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "int8"))
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds")
     a = ap.parse_args(argv)
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
     os.makedirs(a.work, exist_ok=True)
     rep = open(os.path.join(a.work, f"tflite_int8_N{a.n}_T{a.tile_size}.log"), "w")
 
@@ -1684,7 +1704,7 @@ def tflite_main(argv=None):
     sim = RtlLayer(a.n, a.lanes, a.work, "int8", a.tile_size)
     t0 = time.time()
     sim.build()
-    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
+    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's), in {time.time() - t0:.0f} s")
     bad, covered, hw_bad, n_interp, n_exact, n_words = 0, False, 0, 0, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]

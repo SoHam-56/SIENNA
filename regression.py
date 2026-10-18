@@ -1940,6 +1940,18 @@ def layer(N, sh, R, rng, fmt, zero_rows=False):
     return A, B, bias, mp, b
 
 
+def float_layer_over(A_q, z_a, s_a, B_q, s_w, bias, s_out, zp, relu, Y) -> tuple:
+    """(over, n) of int8 outputs Y against a float64 reference of the whole layer from its real numbers (s_a (A_q - z_a), s_w B_q and the
+    bias rounded to s_a s_w), independent of fold_bias: |Y - t| <= max(1% |t|, one step), t in codes clamped to -128..127."""
+    s_w = np.asarray(s_w, np.float64)
+    b_real = np.rint(np.asarray(bias, np.float64) / (s_a * s_w)) * s_a * s_w
+    t = (s_a * (np.asarray(A_q, np.float64) - z_a)) @ (s_w[None, :] * np.asarray(B_q, np.float64)) + b_real[None, :]
+    if relu:
+        t = np.maximum(t, 0.0)
+    tc = np.clip(t / s_out + zp, -128, 127)
+    return int(np.sum(np.abs(np.asarray(Y, np.float64) - tc) > np.maximum(truth.TARGET * np.abs(tc - zp), 1.0))), int(tc.size)
+
+
 def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
     rng = np.random.RandomState(seed)
     A, B, bias, mp, b = layer(N, sh, R, rng, a.fmt, zero_rows)
@@ -1950,23 +1962,29 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
         B_q, s_w = mr.quant_weights(B)
         hw = mr.fold_bias(bias, s_a, s_w, z_a, B_q)
         acc = mr.wrap32(mr.imatmul(A_q, B_q) + hw[None, :])
-        mult, shift = np.zeros(N, np.int64), np.zeros(N, np.int64)
+        mult, shift, ratio = np.zeros(N, np.int64), np.zeros(N, np.int64), np.zeros(N)
         for e in sorted(set(col_ent)):
             cols = np.array(col_ent) == e
             act = "linear" if a.acts[e] == "selu" else a.acts[e]  # SELU's int8 saturation is pack_jobs' to refuse (Task 7)
             rq = mr.requant_params(acc[:, cols], s_a, s_w[cols], act)
-            mult[cols], shift[cols] = rq["mult"], rq["shift"]
+            mult[cols], shift[cols], ratio[cols] = rq["mult"], rq["shift"], rq["ratio"]
             ents[e] = (act, rq)
         head = ents[0][1] or mr.requant_params(acc, s_a, s_w, "linear")
         job = {"terms": [(A_q.astype(np.float32), B_q.astype(np.float32))], "bias": hw, "act": ents[0][0], "shape": (R * N, N),
-               "req": dict(head, mult=mult, shift=shift), "pack": {"shift": sh, "map": mp, "ents": ents}}
+               "req": dict(head, mult=mult, shift=shift, ratio=list(ratio)), "pack": {"shift": sh, "map": mp, "ents": ents}}
     else:
         A, B, bias = (mr.op_round(v, a.fmt) for v in (A, B, bias))
         job = {"terms": [(A, B)], "bias": bias, "act": a.acts[0], "shape": (R * N, N), "pack": {"shift": sh, "map": mp, "ents": ents}}
     t0 = time.time()
     Yp, sets_p, cyc_p = sim.run_job(job, f"pk_s{sh}")
     bad = cyc_a = 0
-    gated = over = 0  # int8 linear and ReLU outputs on the true function, and those over the rule
+    gated = over = f_over = n_exact = 0  # int8: outputs gated per stage on the true function, those over the rule, over the float64 layer, off the bit-exact model
+    if a.fmt == "int8":  # every entry per stage (requantize, then its lane) from the packed layer's dump
+        for st, r in mr.layer_stage_gates(job, Yp, sim.last_stages, N):
+            gated, over = gated + (r.n if st.startswith("activation") else 0), over + r.over
+            bad += r.over + int(r.n == 0)
+            if not r.ok:
+                print(f"  FAIL {st}: {truth.stage_line(r)}", flush=True)
     for c in range(N // b):
         cols = slice(c * b, (c + 1) * b)
         e = mp[c]
@@ -1974,14 +1992,14 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             rq = dict(ents[e][1], mult=mult[cols], shift=shift[cols])
             alone = {"terms": [(A_q[:, cols].astype(np.float32), B_q[cols, cols].astype(np.float32))], "bias": hw[cols],
                      "act": ents[e][0], "shape": (R * N, b), "req": rq}
-            gold = mr.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])
-            if ents[e][0] in ("linear", "relu"):  # the true requantize of each exact sum; lane activations wait for Task 2.8's dumps
-                real = dict(rq, ratio=[float(v) for v in s_a * s_w[cols] / rq["s_out"]])
-                tr = mr.layer_truth({"terms": [(A_q[:, cols], B_q[cols, cols])], "bias": hw[cols], "req": real}, Yp[:, cols])[0]
-                gated, over = gated + tr.n, over + tr.over
-                bad += tr.over + int(tr.n == 0)
-                if not tr.ok:
-                    print(f"  FAIL block {c} ({ents[e][0]}): {truth.stage_line(tr)}", flush=True)
+            n_exact += int(np.sum(Yp[:, cols] != mr.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])))  # reported
+            gold = None
+            if ents[e][0] in ("linear", "relu"):  # the whole layer from its real numbers: a zero-point fold bug shared by host and golden shows here
+                fo, fn = float_layer_over(A_q[:, cols], z_a, s_a, B_q[cols, cols], s_w[cols], bias[cols], rq["s_out"], rq["zp"],
+                                          ents[e][0] == "relu", Yp[:, cols])
+                f_over, bad = f_over + fo, bad + fo + int(fn == 0)
+                if fo:
+                    print(f"  FAIL block {c} ({ents[e][0]}): {fo} of {fn} outputs off the float64 layer", flush=True)
         else:
             alone = {"terms": [(A[:, cols], B[cols, cols])], "bias": bias[cols], "act": a.acts[e], "shape": (R * N, b)}
             gold = exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, a.acts[e], N, a.fmt, a.tile) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
@@ -1993,7 +2011,8 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             bad += int(np.sum(bits(Yp[:, cols]) != gold))
     line = (f"{a.fmt} N={N} T={a.tile} b={b:<3} rows={R * N:<4} {'zero rows ' if zero_rows else ''}packed: {sets_p} sets "
             f"{cyc_p} cycles | {N // b} jobs alone: {cyc_a} cycles | speedup {cyc_a / cyc_p:5.2f}x | mismatches {bad} | "
-            + (f"true function: {gated} linear/ReLU outputs, {over} over the rule | " if a.fmt == "int8" else "")
+            + (f"true function per stage: {gated} outputs, {over} over the rule; float64 layer (linear/ReLU): {f_over} over; "
+               f"reported: {n_exact} off the bit-exact model | " if a.fmt == "int8" else "")
             + f"wall {time.time() - t0:.0f}s")
     print(line, flush=True)
     log.write(line + "\n")
@@ -4869,6 +4888,25 @@ def test_stage_dump_gates():
     X2 = X.copy()
     X2[0, 0] += 2 if X2[0, 0] < 120 else -2
     assert not run(X2)["requant"]
+
+
+@selftest
+def test_pack_float_reference():
+    """float_layer_over passes a layer whose int32 bias folds the input zero point (fold_bias) and fails one that drops the fold, a bug the host,
+    the golden and the per-stage requantize gate would share; ReLU's reference clamps at 0."""
+    rng = np.random.RandomState(9)
+    A, B, bias = rng.uniform(-0.2, 1, (16, 8)), rng.uniform(-1, 1, (8, 8)), rng.uniform(-0.5, 0.5, 8)
+    A_q, s_a, z_a = mr.quant_act(A)
+    B_q, s_w = mr.quant_weights(B)
+    assert z_a != 0, z_a
+    for act in ("linear", "relu"):
+        for fold_zp, want in ((z_a, 0), (0, None)):
+            hw = mr.fold_bias(bias, s_a, s_w, fold_zp, B_q)
+            acc = mr.wrap32(mr.imatmul(A_q, B_q) + hw[None, :])
+            rq = mr.requant_params(mr.wrap32(mr.imatmul(A_q, B_q) + mr.fold_bias(bias, s_a, s_w, z_a, B_q)[None, :]), s_a, s_w, act)
+            Y = mr.activate_int8(mr.requantize(acc, rq), act, rq)
+            over, n = float_layer_over(A_q, z_a, s_a, B_q, s_w, bias, rq["s_out"], rq["zp"], act == "relu", Y)
+            assert n == Y.size and (over == 0 if want == 0 else over > 0), (act, fold_zp, over, n)
 
 
 @selftest

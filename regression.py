@@ -2338,10 +2338,183 @@ def residual_rejects(job, q1, R_q, wrong) -> tuple:
     return tuple(not g(y).ok for y in wrong)
 
 
+def _stage_gates_bad(label: str, gates: list) -> list:
+    """Prints each stage gate's line under label; returns the failing stages' names."""
+    bad = []
+    for stage, r in gates:
+        print(f"    {stage}: {truth.line(r, bound=_act_bound(r.func)) if stage.startswith('activation') else truth.stage_line(r)}", flush=True)
+        if not r.ok:
+            bad.append(f"{label} ({stage})")
+    return bad
+
+
+def _res_block_models(seed: int) -> dict:
+    """Two int8 residual blocks on 8x8x16 from the converter (test vehicles): conv 3x3 + ADD(x) + ReLU, and conv 3x3 / 2 + ADD(conv 1x1 / 2) + ReLU."""
+    rng = np.random.default_rng(seed)
+    w3 = tf.constant((rng.standard_normal((3, 3, 16, 16)) * 0.08).astype(np.float32))
+    w1 = tf.constant((rng.standard_normal((1, 1, 16, 16)) * 0.25).astype(np.float32))
+    b3 = tf.constant((rng.standard_normal(16) * 0.1).astype(np.float32))
+    b1 = tf.constant((rng.standard_normal(16) * 0.1).astype(np.float32))
+    spec = [tf.TensorSpec((1, 8, 8, 16), tf.float32)]
+
+    @tf.function(input_signature=spec)
+    def block(x):
+        return tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(x, w3, 1, "SAME"), b3) + x)
+
+    @tf.function(input_signature=spec)
+    def block_s2(x):
+        return tf.nn.relu(tf.nn.bias_add(tf.nn.conv2d(x, w3, 2, "SAME"), b3) + tf.nn.bias_add(tf.nn.conv2d(x, w1, 2, "VALID"), b1))
+
+    rep = np.random.default_rng(seed + 1)
+    out = {}
+    for name, fn in (("block", block), ("block_s2", block_s2)):
+        holder = tf.Module()
+        holder.f = fn
+        conv = tf.lite.TFLiteConverter.from_concrete_functions([fn.get_concrete_function()], holder)
+        conv.optimizations = [tf.lite.Optimize.DEFAULT]
+        conv.representative_dataset = lambda: ([rep.uniform(-1.0, 2.0, (1, 8, 8, 16)).astype(np.float32)] for _ in range(100))
+        conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        conv.inference_input_type = tf.int8
+        conv.inference_output_type = tf.int8
+        out[name] = conv.convert()
+    return out
+
+
+def _interp_tensors(model: bytes, x) -> tuple:
+    """The interpreter's (BUILTIN_REF) output codes per image and every tensor it kept, as {index: (images, ...) codes}; for reported agreement only."""
+    it = tf.lite.Interpreter(model_content=model, experimental_op_resolver_type=REF, experimental_preserve_all_tensors=True)
+    it.allocate_tensors()
+    i_in, i_out = it.get_input_details()[0]["index"], it.get_output_details()[0]["index"]
+    keep = [int(o["outputs"][0]) for o in it._get_ops_details()]
+    ys, tens = [], {k: [] for k in keep}
+    for img in x:
+        it.set_tensor(i_in, img[None].astype(np.int8))
+        it.invoke()
+        ys.append(it.get_tensor(i_out)[0].astype(np.int64))
+        for k in keep:
+            tens[k].append(it.get_tensor(k)[0].astype(np.int64))
+    return np.stack(ys), {k: np.stack(v) for k, v in tens.items()}
+
+
+def _res_add_job(conv_job: dict, conv_op: dict, add_op: dict, R, name: str) -> dict:
+    """An int8 residual layer job from the importer's conv job and records: the conv's terms and words, the residual codes R on an identity,
+    the ADD words with the conv's output as input 1 (zp_1 is the requantize zp), the lane after the ADD and both true clamps."""
+    (X, W), = conv_job["terms"]
+    C = W.shape[1]
+    rec = mr.add_record_of_tflite(add_op, conv_op["output"]["index"], name)
+    add = mr.add_record_words(rec)
+    req = dict(conv_job["req"], s_out=float(conv_op["output"]["scale"][0]))
+    acc = wrap32(imatmul(X.astype(np.int64), W.astype(np.int64)) + np.asarray(conv_job["bias"], np.int64)[None, :])
+    ra = mr.add_lane_params(add, rec.s_out, mr.qadd_codes(requantize(acc, req), np.asarray(R, np.int64), add))
+    req.update(mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])
+    act = "relu" if add_op["fused"] == "relu" else "linear"
+    return {"terms": [(X, W), (np.asarray(R, np.float32), np.eye(C, dtype=np.float32))], "bias": conv_job["bias"], "act": act,
+            "shape": (X.shape[0], C), "req": req, "add": add, "lane": ra, "clamps": (conv_op["fused"], add_op["fused"])}
+
+
+def residual_tflite(sim, seed: int, work: str) -> list:
+    """The converter-made residual blocks (test vehicles) through the neutral TFLite importer and TB_model_run, every stage gated on the true
+    function (layer_stage_gates); block_s2's 1x1 shortcut runs as its own layer and its output codes are the ADD's residual. Agreement with the
+    interpreter (BUILTIN_REF) is a reported count. Returns the failures."""
+    _tf_imports()
+    bad = []
+    x = np.random.default_rng(seed + 2).integers(-128, 128, (4, 8, 8, 16)).astype(np.int64)
+    for name, model in _res_block_models(seed).items():
+        path = os.path.join(work, f"{name}.tflite")
+        with open(path, "wb") as f:
+            f.write(model)
+        g = mr.load_int8_graph(path)
+        kinds = sorted(o["kind"] for o in g["ops"])
+        if kinds != (["ADD", "CONV_2D"] if name == "block" else ["ADD", "CONV_2D", "CONV_2D"]):
+            print(f"tflite {name}: FAIL: the converter made {kinds}", flush=True)
+            bad.append(f"{name}: the converter made {kinds}")
+            continue
+        try:
+            ys, tens = _interp_tensors(model, x)
+            add_op = next(o for o in g["ops"] if o["kind"] == "ADD")
+            convs = {o["output"]["index"]: o for o in g["ops"] if o["kind"] == "CONV_2D"}
+            a1, a2 = add_op["inputs"]
+            if name == "block":
+                main = convs[a1] if a1 in convs else convs[a2]
+                res_i, R = (a2 if a1 in convs else a1), x.reshape(-1, 16)
+                if res_i != g["input"]:
+                    raise ValueError(f"the ADD's other input is tensor {res_i}, not the graph's input {g['input']}")
+            else:
+                short = next(o for o in convs.values() if o["filter"]["shape"][1] == 1)
+                main = next(o for o in convs.values() if o is not short)
+                if {a1, a2} != {short["output"]["index"], main["output"]["index"]}:
+                    raise ValueError(f"the ADD's inputs {a1, a2} are not the two convs' outputs")
+                sjob, _ = mr.job_of_record(mr.record_of_tflite(short, f"{name}_short"), x)
+                S, sets, cyc = sim.run_job(sjob, f"{name}_short")
+                ws = tens[short["output"]["index"]].reshape(-1, 16)
+                print(f"tflite {name} shortcut layer: {S.size} outputs, sets {sets}, cycles {cyc}; reported: {int(np.sum(S != ws))} differ from the "
+                      f"interpreter's tensor", flush=True)
+                bad += _stage_gates_bad(f"{name} shortcut", mr.layer_stage_gates(sjob, S, sim.last_stages, sim.N))
+                res_i, R = short["output"]["index"], S
+            cjob, _ = mr.job_of_record(mr.record_of_tflite(main, f"{name}_conv"), x)
+            job = _res_add_job(cjob, main, add_op, R, name)
+            Y, sets, cyc = sim.run_job(job, name)
+            gates = mr.layer_stage_gates(job, Y, sim.last_stages, sim.N)
+        except (RuntimeError, ValueError) as e:
+            print(f"tflite {name}: FAIL: {e}", flush=True)
+            bad.append(f"tflite {name}")
+            continue
+        M, C = job["shape"]
+        np_ = sim.last_stages["np"]
+        q1 = sim.last_stages["R"][np_ - 2][:M, :C]  # the hold beats: the conv's own codes
+        rt, ct, dt = -(-M // sim.N), -(-C // sim.N), -(-job["terms"][0][0].shape[1] // sim.N)
+        print(f"tflite {name}: {Y.size} outputs, sets {sets} (expected {rt * ct * (dt + 1)}), cycles {cyc}; ADD input 1 is the residual: "
+              f"{'yes' if a1 == res_i else 'no'}; reported: {int(np.sum(Y != ys.reshape(-1, C)))} differ from the interpreter (BUILTIN_REF), "
+              f"the conv's codes (hold beats) {int(np.sum(q1 != tens[main['output']['index']].reshape(-1, C)))} differ from its tensor", flush=True)
+        bad += _stage_gates_bad(f"tflite {name}", gates)
+        if sets != rt * ct * (dt + 1):
+            bad.append(f"tflite {name} (sets)")
+    return bad
+
+
+def residual_mid_reset(sim, job, Y0, want) -> list:
+    """A reset with hold_mem full: a control (+mid_reset=1 +hold_check, before any hold set) must fail the check; then two resets with +hold_wait
+    +hold_check, one from a cycle after the first hold set's last beat (first hold_done + 1) and one from the cycle the first hold window closed,
+    which must wait for a later window (it lands after that cycle). Each must land inside a window, give the plain run's outputs Y0 and pass every
+    stage gate; the bit-exact model want is reported. Returns the failures."""
+    first, free = sim.first_hold, sim.first_free  # the plain run's: the runs below overwrite them
+    if first is None or free is None:
+        return [f"mid-reset: the plain run printed no first hold_done ({first}) or hold window close ({free})"]
+    bad = []
+    try:
+        sim.run_job(job, "tiles_mid_reset_ctl", plusargs=("+mid_reset=1", "+hold_check"))
+        bad.append("mid-reset control: a reset outside the hold window passed +hold_check")
+    except RuntimeError:
+        if "+hold_check: the mid-stream reset" not in (sim.last_log or ""):
+            bad.append("mid-reset control: the run failed, but not on +hold_check")
+    print(f"residual tiles mid-reset control (+mid_reset=1 +hold_check): {'FAIL ' + bad[0] if bad else 'the check fires outside the hold window'}",
+          flush=True)
+    for label, c, after in (("full", first + 1, False), ("waiting", free, True)):  # after: it must land after c, past the closed window
+        try:
+            Y, _, _ = sim.run_job(job, f"tiles_mid_reset_{label}", plusargs=(f"+mid_reset={c}", "+hold_wait", "+hold_check"))
+            gates = mr.layer_stage_gates(job, Y, sim.last_stages, sim.N)
+        except (RuntimeError, ValueError) as e:
+            print(f"residual tiles mid-reset ({label}) from {c}: FAIL: {e}", flush=True)
+            bad.append(f"mid-reset {label}")
+            continue
+        r = re.search(r"\[RES\] reset (\d+) cycles into the layer, inside the hold window", sim.last_log or "")
+        at = int(r.group(1)) if r else None
+        n = int(np.sum(Y != Y0))
+        print(f"residual tiles mid-reset ({label}) asked from {c} cycles (first hold_done {first}, first window closed {free}), landed at {at}, "
+              f"inside the hold window: {Y.size} outputs, {n} differ from the run without it; reported: {int(np.sum(Y != want))} differ from the "
+              f"bit-exact model", flush=True)
+        if at is None or at < c or (after and at <= c):
+            bad.append(f"mid-reset {label} (landed at {at}, not {'after' if after else 'at or after'} {c} cycles inside the hold window)")
+        if n:
+            bad.append(f"mid-reset {label} (outputs differ from the run without it)")
+        bad += _stage_gates_bad(f"mid-reset {label}", gates)
+    return bad
+
+
 def residual_main(argv=None) -> None:
     """int8 residual layers on sienna_layer (TB_model_run), each stage gated on the true function (the conv's requantize, the identity
-    requantize, hold_mem, the ADD, the fill, the lane); int8_residual_exact is a diagnostic. --tflite adds the residual-block TFLite models,
-    --mid-reset a reset with hold_mem full (Task 2.9)."""
+    requantize, hold_mem, the ADD, the fill, the lane); int8_residual_exact is a diagnostic. --tflite adds the converter-made residual blocks
+    through the TFLite importer, --mid-reset a reset of the tiles case with hold_mem full."""
     ap = argparse.ArgumentParser(description=residual_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="residual")
     ap.add_argument("--n", type=int, default=16)
@@ -2354,8 +2527,8 @@ def residual_main(argv=None) -> None:
     ap.add_argument("--seed", type=int, default=5)
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "residual"))
     a = ap.parse_args(argv)
-    if a.tflite or a.mid_reset:
-        ap.error("--tflite and --mid-reset come with Task 2.9")
+    if a.mid_reset and "tiles" not in a.cases:
+        ap.error("--mid-reset resets the tiles case: add it to --cases")
     mr.COLLAPSE_K = a.collapse_k
     os.makedirs(a.work, exist_ok=True)
     print(f"residual: N={a.n} T={a.tile} lanes={a.lanes} collapse-k {a.collapse_k} sim args '{os.environ.get('SIM_ARGS', '')}'", flush=True)
@@ -2377,14 +2550,15 @@ def residual_main(argv=None) -> None:
         w1, w2 = residual_rejects(job, q1, R_q, wrong)
         print(f"residual {name} N={a.n} T={a.tile}: {M} x {K} x {C}, {Y.size} outputs, sets {sets} (expected {rt * ct * (dt + 1)}), "
               f"cycles {cyc}; reported: {mism} outputs differ from the bit-exact model; the ADD gate rejects zp_1 = 0: {w1}, no ADD: {w2}", flush=True)
-        for stage, r in gates:
-            print(f"    {stage}: {truth.line(r, bound=_act_bound(r.func)) if stage.startswith('activation') else truth.stage_line(r)}", flush=True)
-            if not r.ok:
-                bad.append(f"{name} ({stage})")
+        bad += _stage_gates_bad(name, gates)
         if sets != rt * ct * (dt + 1):
             bad.append(f"{name} (sets)")
         if (job["add"]["zp1"] != 0 and not w1) or not w2:
             bad.append(f"{name} (its gate cannot tell a wrong ADD)")
+        if a.mid_reset and name == "tiles":  # right after its plain run, whose first hold_done sim.first_hold holds
+            bad += residual_mid_reset(sim, job, Y, want)
+    if a.tflite:
+        bad += residual_tflite(sim, a.seed, a.work)
     print(f"RESIDUAL: {'PASS' if not bad else 'FAIL ' + ', '.join(bad)}")
     sys.exit(1 if bad else 0)
 
@@ -4907,6 +5081,48 @@ def test_stage_dump_gates():
     except ValueError:
         pass
     assert mr.true_clamp("relu6", 0.05, -10) == (-10.0, 110.0) and mr.true_clamp("none", 0.05, 3) == (-128.0, 127.0)
+
+
+@selftest
+def test_residual_mid_reset():
+    """residual_mid_reset on a stub layer engine: passes when the control fails on +hold_check and both resets land inside a hold window (the
+    full one at or after first_hold + 1, the waiting one after the closed window's cycle) with the plain run's outputs and every stage gate
+    passing; fails with no first hold_done or window close, a control that passes or fails on something else, a reset landing early or outside
+    the window, a waiting reset that does not wait, outputs that differ, or a stage gate failing."""
+    Y0 = np.arange(12).reshape(3, 4)
+    ok = truth.Result(True, "int8", "requantize", 1, 0.0, 0, 0, 0, 0, 0, 0, 0, [])
+
+    class Stub:
+        def __init__(self, ctl="check", at=(101, 160), inside=True, Y=Y0, first=100, free=150):
+            self.N, self.first_hold, self.first_free, self.last_log, self.last_stages = 8, first, free, None, {}
+            self.ctl, self.at, self.inside, self.Y = ctl, at, inside, Y
+
+        def run_job(self, job, tag, plusargs=()):
+            self.first_hold = self.first_free = -5  # a later run overwrites them
+            if "+mid_reset=1" in plusargs:
+                self.last_log = {"check": "[FAIL] +hold_check: the mid-stream reset at 3 cycles is outside the hold window",
+                                 "other": "[FATAL] nothing moved", "pass": ""}[self.ctl]
+                if self.ctl != "pass":
+                    raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")
+                return Y0, 1, 1
+            k = int("waiting" in tag)
+            assert plusargs == (f"+mid_reset={(101, 150)[k]}", "+hold_wait", "+hold_check"), plusargs
+            self.last_log = f"[RES] reset {self.at[k]} cycles into the layer, {'inside' if self.inside else 'outside'} the hold window"
+            return self.Y, 1, 1
+
+    real = mr.layer_stage_gates
+    try:
+        for stub, gate_ok, want in ((Stub(), True, None), (Stub(at=(250, 151)), True, None), (Stub(first=None), True, "no first hold_done"),
+                                    (Stub(free=None), True, "window close (None)"), (Stub(ctl="pass"), True, "control: a reset outside"),
+                                    (Stub(ctl="other"), True, "not on +hold_check"), (Stub(at=(100, 160)), True, "full (landed at 100"),
+                                    (Stub(at=(101, 150)), True, "waiting (landed at 150, not after"), (Stub(inside=False), True, "landed at None"),
+                                    (Stub(Y=Y0 + 1), True, "outputs differ"), (Stub(), False, "mid-reset full (add)")):
+            mr.layer_stage_gates = lambda *a, g=gate_ok: [("add", ok._replace(ok=g))]
+            with contextlib.redirect_stdout(io.StringIO()):
+                bad = residual_mid_reset(stub, {}, Y0, Y0)
+            assert (not bad) if want is None else any(want in b for b in bad), (want, bad)
+    finally:
+        mr.layer_stage_gates = real
 
 
 @selftest

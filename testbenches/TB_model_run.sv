@@ -177,7 +177,22 @@ module TB_model_run #(
   function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
     return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
   endfunction
-  initial begin : stage_dump
+  // The dump's inputs, taken at the rising edge as the DUT's flops take them, so its order against the edge-driven producer cannot matter.
+  localparam int SDW = $clog2(TR_IDS);
+  logic sd_rst = 1'b1, sd_hacc = 1'b0, sd_gacc = 1'b0, sd_rd = 1'b0, sd_ghold = 1'b0, sd_gpack = 1'b0, sd_hwr = 1'b0, sd_fv = 1'b0;
+  logic sd_fadd = 1'b0, sd_ain = 1'b0;
+  logic [SDW-1:0] sd_hid = '0, sd_gnid = '0, sd_gsid = '0;
+  logic [NUM_LANES-1:0][7:0] sd_hd = '0, sd_fd = '0, sd_q1 = '0, sd_q2 = '0;
+  always_ff @(posedge clk_i) begin
+    sd_rst <= !rstn_i;
+    {sd_hacc, sd_gacc, sd_rd, sd_ghold, sd_gpack, sd_hwr, sd_fv, sd_fadd, sd_ain} <=
+        {dut.pipe.host_accept, dut.pipe.g_accept, dut.pipe.wide_rd_valid, dut.pipe.g_hold, dut.pipe.g_pack, dut.pipe.hold_wr_s,
+         dut.pipe.fill_v, dut.pipe.fill_add, dut.pipe.add_in_s};
+    {sd_hid, sd_gnid, sd_gsid} <= {dut.pipe.host_next_id, dut.pipe.g_next_id, dut.pipe.g_set_id};
+    for (int k = 0; k < NUM_LANES; k++) sd_fd[k] <= dut.pipe.fill_d[k][7:0];
+    {sd_hd, sd_q1, sd_q2} <= {dut.pipe.hold_d_s, dut.pipe.add_q1_s, dut.pipe.add_q2_s};
+  end
+  initial begin : stage_dump  // reads the rising edge's copies at the falling edge, one cycle behind the DUT, in order
     int tr_k[TR_IDS];  // per set id: the set's number in issue order
     int beat[TR_IDS];  // beats of each set id read from the mesh so far
     int put_seq;
@@ -188,7 +203,7 @@ module TB_model_run #(
     put_seq = 0;
     forever begin
       @(negedge clk_i);
-      if (!rstn_i) begin  // the cut pass's beats are dropped; its lines stay before the next H line
+      if (sd_rst) begin  // the cut pass's beats are dropped; its lines stay before the next H line
         put_seq = 0;
         q_id.delete();
         q_i.delete();
@@ -198,46 +213,46 @@ module TB_model_run #(
         a_q1.delete();
         a_q2.delete();
       end else if (IS_INT != 0 && dump_fd != 0) begin
-        if (dut.pipe.host_accept) tr_k[int'(dut.pipe.host_next_id)] = put_seq++;
-        if (dut.pipe.g_accept) beat[int'(dut.pipe.g_next_id)] = 0;
-        if (dut.pipe.wide_rd_valid) begin  // a beat leaves the mesh into requantize
-          if (!dut.pipe.g_hold) begin
-            q_id.push_back(dut.pipe.g_set_id);
-            q_i.push_back(beat[int'(dut.pipe.g_set_id)]);
-            q_pk.push_back(dut.pipe.g_pack);
+        if (sd_hacc) tr_k[int'(sd_hid)] = put_seq++;
+        if (sd_gacc) beat[int'(sd_gnid)] = 0;
+        if (sd_rd) begin  // a beat leaves the mesh into requantize
+          if (!sd_ghold) begin
+            q_id.push_back(sd_gsid);
+            q_i.push_back(beat[int'(sd_gsid)]);
+            q_pk.push_back(sd_gpack);
           end else begin
-            h_id.push_back(dut.pipe.g_set_id);
-            h_i.push_back(beat[int'(dut.pipe.g_set_id)]);
+            h_id.push_back(sd_gsid);
+            h_i.push_back(beat[int'(sd_gsid)]);
           end
-          beat[int'(dut.pipe.g_set_id)]++;
+          beat[int'(sd_gsid)]++;
         end
-        if (dut.pipe.hold_wr_s) begin  // a hold beat into hold_mem: the conv's requantized codes
+        if (sd_hwr) begin  // a hold beat into hold_mem: the conv's requantized codes
           if (h_id.size() == 0) $display("[FAIL] stage dump: a hold_mem write with no hold beat in the requantize pipeline");
           else begin
             automatic logic [$clog2(TR_IDS)-1:0] id = h_id.pop_front();
             automatic int i = h_i.pop_front();
-            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "R %0d %0d %0d", tr_k[id], tr_elem(k, i, 1'b0), $signed(dut.pipe.hold_d_s[k]));
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "R %0d %0d %0d", tr_k[id], tr_elem(k, i, 1'b0), $signed(sd_hd[k]));
           end
         end
-        if (dut.pipe.fill_v) begin  // a beat into the activation stage, from requantize or add_lanes
+        if (sd_fv) begin  // a beat into the activation stage, from requantize or add_lanes
           if (q_id.size() == 0) $display("[FAIL] stage dump: a fill beat no requantize or add_lanes beat accounts for");
           else begin
             automatic logic [$clog2(TR_IDS)-1:0] id = q_id.pop_front();
             automatic int i = q_i.pop_front();
             automatic bit pk = q_pk.pop_front();
-            if (dut.pipe.fill_add && a_q1.size() == 0) $display("[FAIL] stage dump: an add_lanes fill with no add beat before it");
-            else if (dut.pipe.fill_add) begin
+            if (sd_fadd && a_q1.size() == 0) $display("[FAIL] stage dump: an add_lanes fill with no add beat before it");
+            else if (sd_fadd) begin
               automatic logic [NUM_LANES-1:0][7:0] q1 = a_q1.pop_front(), q2 = a_q2.pop_front();
               for (int k = 0; k < NUM_LANES; k++)
                 $fdisplay(dump_fd, "Q %0d %0d %0d %0d %0d", tr_k[id], tr_elem(k, i, pk), $signed(q1[k]), $signed(q2[k]),
-                          $signed(dut.pipe.fill_d[k][7:0]));
+                          $signed(sd_fd[k]));
             end
-            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "X %0d %0d %0d", tr_k[id], tr_elem(k, i, pk), $signed(dut.pipe.fill_d[k][7:0]));
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "X %0d %0d %0d", tr_k[id], tr_elem(k, i, pk), $signed(sd_fd[k]));
           end
         end
-        if (dut.pipe.add_in_s) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
-          a_q1.push_back(dut.pipe.add_q1_s);
-          a_q2.push_back(dut.pipe.add_q2_s);
+        if (sd_ain) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
+          a_q1.push_back(sd_q1);
+          a_q2.push_back(sd_q2);
         end
       end
     end

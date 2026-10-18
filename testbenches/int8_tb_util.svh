@@ -19,6 +19,10 @@
 
   // One set's 8 + 2N words onto the D-2 signals: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout, N multipliers, N shifts.
   task automatic unpack_requant(input logic [31:0] q[$]);
+    if (q[5][31:24] != 0 || q[6][31:6] != 0) $fatal(1, "int8_tb_util: SELU words %h %h exceed a 24-bit mantissa and a 6-bit shift", q[5], q[6]);
+    for (int c = 0; c < N; c++)
+      if (q[8+c][31:24] != 0 || q[8+N+c][31:6] != 0)
+        $fatal(1, "int8_tb_util: channel %0d's words %h %h exceed a 24-bit mantissa and a 6-bit shift", c, q[8+c], q[8+N+c]);
     req_zp_i   = q[0][7:0];
     req_min_i  = q[1][7:0];
     req_max_i  = q[2][7:0];

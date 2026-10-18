@@ -263,6 +263,8 @@ module TB_model_run #(
       end
       for (int c = 0; c < N; c++) begin
         w_bias_i[c]      = (ei < ne) ? ACC_W'(ep[(3*ei)*N+c]) : '0;
+        if (ei < ne && (ep[(3*ei+1)*N+c][31:24] != 0 || ep[(3*ei+2)*N+c][31:6] != 0))
+          $fatal(1, "TB_model_run: channel %0d's requantize words %h %h are too wide", c, ep[(3*ei+1)*N+c], ep[(3*ei+2)*N+c]);
         w_req_mult_i[c]  = (ei < ne) ? ep[(3*ei+1)*N+c][23:0] : '0;
         w_req_shift_i[c] = (ei < ne) ? ep[(3*ei+2)*N+c][5:0] : '0;
       end
@@ -336,6 +338,7 @@ module TB_model_run #(
         cfg_pack_max_i[e] = 8'(ev[3]);
         cfg_pack_mx_i[e] = 16'(ev[4]);
         cfg_pack_shx_i[e] = 5'(ev[5]);
+        if (ev[6] >= (1 << 24) || ev[6] < 0 || ev[7] >= 64 || ev[7] < 0) $fatal(1, "TB_model_run: pack entry %0d's SELU words %0d %0d are out of range", e, ev[6], ev[7]);
         cfg_pack_mout_i[e] = 24'(ev[6]);
         cfg_pack_shout_i[e] = 6'(ev[7]);
         cfg_pack_zout_i[e] = 8'(ev[8]);
@@ -374,6 +377,7 @@ module TB_model_run #(
       cfg_req_max_i = 8'(qmax);
       cfg_gp_mx_i = 16'(qmx);
       cfg_gp_shx_i = 5'(qshx);
+      if (qmout >= (1 << 24) || qmout < 0 || qshout >= 64 || qshout < 0) $fatal(1, "TB_model_run: SELU words %0d %0d are out of range", qmout, qshout);
       cfg_gp_mout_i = 24'(qmout);
       cfg_gp_shout_i = 6'(qshout);
       cfg_gp_zout_i = 8'(qzout);

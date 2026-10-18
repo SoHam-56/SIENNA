@@ -4,6 +4,8 @@
 
 **Goal:** int8 residual layers bit-exact against TFLite's int8 ADD (reference kernels), so ResNet-8's three ADDs run on SIENNA, and the int8 GPNAE sigmoid within GPNAE's tolerance (rel <= 6.25% or <= 1 LSB) at every input; fp32, bf16 and every non-ADD int8 set unchanged.
 
+**Superseded in part (Soham 2026-10-17, Task 2.6b):** everything generic, in logic and names. `tfliteRequant` and `tfliteAdd` are replaced by `int8Requantizer` and `int8QuantizedAdder`, gated on the true function (|hw - t| <= max(1% |t|, one step)), not bit-exact against TFLite. G0, G0b, the rounding pin, `ROUNDING`, `REQ_ROUNDING` and every common.cc transcription are dropped; agreement with the TFLite interpreter becomes a reported count. Where the text below says TFLite-exact, read the Task 2.6b section and each later task's re-scope block.
+
 **Architecture:** Bottom up in gated levels. G0b pins TFLite's int8 ADD against the interpreter (BUILTIN_REF) with `ipu.tflite_add` on `ipu.add_params` before any RTL exists. G1 verifies ArithmeticLibrary's new 6-stage `tfliteAdd` (constants per beat, as `tfliteRequant`). G2 adds the exact 19-breakpoint sigmoid ladder for |x| >= 2.5 to GPNAE's int8 lane (no state, no cycle) and makes sigmoid accuracy a hard gate. G3 is a diff: the mesh does not change. G4: `sienna_layer` turns each int8 residual output tile into a hold set (the last depth pass, conv requantize, beats into an N^2-byte `hold_mem`) and an add set (the identity pass, identity requantize, then `add_lanes`, then the normal bypass or lane path); `sienna_top` routes them without a new credit link; the regression, layer-level cases and residual-block TFLite models gate bit-exact. Phase 1 (Tasks 1.0 to 1.14: ArithmeticLibrary, GPNAE, models, oracle, and the bf16 sigmoid fix) runs now; Phase 2 (Tasks 2.0 to 2.12: every SIENNA file) starts only after the `regression_sweep` branch is merged.
 
 **Tech Stack:** SystemVerilog, Verilator 5.035 on the slurm farm (`cr_launch.sh`), Python 3 with numpy, TensorFlow 2.18.1 (TFLite converter and interpreter) in `/proj/work/spramanik/sienna_jobs/venv`, Yosys/ABC for the logic-depth probe.
@@ -56,6 +58,7 @@ Five inputs or conditions the spec implies but no test in its Verification secti
 - **P-11 (rounding):** if G0b's winner is not DOUBLE (the conv's pin), stop before Task 1.5 and ask Soham: the ADD would need its own pin (`ADD_ROUNDING` in `sienna_fmt_pkg` and `ipu`).
 - **P-12 (hold_mem):** a register array in RTL (`[PER_LANE][NUM_LANES] x 8`); its occupancy bits `hm_v` exist only under `ifndef SYNTHESIS`, for `a_hold_push_empty` and `a_add_pop_full`.
 - **P-13 (G0b's evidence):** TFLite's DOUBLE and SINGLE roundings almost never differ on an ADD with realistic random scales (a numpy estimate on the existing primitives: 2 differing outputs over 60 models x 65,536 pairs), so random-scale models alone cannot pin the rounding. G0b adds 16 tie models per activation (s1 = s2 = 2^e, s_out = 2^(e+1) or 2^(e+2): outputs on exact halves), and G1's discriminator vectors draw from tie-structured constants.
+- **P-14 (generic int8, Task 2.6b):** the forks F1-F5 of `sienna_report/int8_generic_design.log`, accepted by Soham 2026-10-17; `add_words_t` lives in `src/sienna_add_pkg.sv` so `set_side_t`, `sienna_top` and `add_lanes`' one port share the type, and its shift field is spelled `shift` (the design's `e`).
 
 ## Ordering, branches and the merge point
 
@@ -2931,7 +2934,7 @@ Expected: each run FAILS its one test (`Sweep Aborted: FAIL` or `Sweep Aborted: 
 
 **Interfaces:**
 - Consumes: Task 2.3's flags and words, Task 2.4's `add_lanes`.
-- Produces (module level, read by `TB_sienna_top` and Task 2.7's assertions): `hold_done` (a hold set's last beat is in `hold_mem`), `fill_add` (this cycle's fill beat came from `add_lanes`); in `G_REQ`: `rq_v`, `rq_d` (requantize's output), `tg_hold`, `tg_add`, `hold_mem`, `hold_wr`, `add_in`, `hold_rd_idx`, `at_v`, `add_v`, `add_d`, `add_tag`, `rq_out`.
+- Produces (module level, read by `TB_sienna_top` and Task 2.7's assertions): `hold_done` (a hold set's last beat is in `hold_mem`), `fill_add` (this cycle's fill beat came from `add_lanes`); in `G_REQ`: `rq_v`, `rq_d` (requantize's output), `tg_hold`, `tg_add`, `hold_mem`, `hold_wr`, `add_in`, `hold_idx`, `at_v`, `add_v`, `add_d`, `add_tag`, `rq_out`.
 
 - [ ] **Step 1: Drop the tie-offs** — remove Task 2.3's `assign hold_done = 1'b0;` and `assign fill_add = 1'b0;` from `G_REQ` (Step 4 drives them; `G_NO_REQ` keeps its tie-offs).
 
@@ -2969,18 +2972,18 @@ with `a_real_has_bank`'s antecedent gaining `&& !set_hold[p_next_id]`.
     localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
     logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
     logic hold_wr, add_in, rq_out, add_v;
-    logic [FCNT_W-1:0] hold_rd_idx;
+    logic [FCNT_W-1:0] hold_idx;
     logic [NUM_LANES-1:0][7:0] add_d;
     logic [ATW-1:0] add_tag;
     logic [QAL-1:0] at_v;  // an add beat at each add_lanes stage
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
-    assign hold_rd_idx = tg_idx[RQL-1];
+    assign hold_idx = tg_idx[RQL-1];
     assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
     always_ff @(posedge clk_i) if (hold_wr) hold_mem[tg_idx[RQL-1]] <= rq_d;
     add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) addl (
-        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d),
+        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_idx]), .q2_i(rq_d),
         .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}),
         .zp1_i(g_add_w.zp1), .zp2_i(g_add_w.zp2), .m1_i(g_add_w.m1), .s1_i(g_add_w.s1), .m2_i(g_add_w.m2),
         .s2_i(g_add_w.s2), .mo_i(g_add_w.mo), .so_i(g_add_w.so), .zpo_i(g_add_w.zpo), .min_i(g_add_w.amin),
@@ -3015,7 +3018,7 @@ with `a_real_has_bank`'s antecedent gaining `&& !set_hold[p_next_id]`.
 
 (Delete the old `rq_drain`, `RQ_HOLD`/`rq_room`, `lane_v` .. `bank_sel` lines this replaces; `a_rq_tag_aligned` now compares `rq_v == tg_v[RQL-1]`.)
 
-For the truth dump (Task 2.5 Step 4.9), at module level under `ifndef SYNTHESIS` beside `hm_any`: `logic add_in_s, hold_wr_s; logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump`; in `G_REQ` under `ifndef SYNTHESIS`: `assign {add_in_s, hold_wr_s} = {add_in, hold_wr}; assign add_q1_s = hold_mem[hold_rd_idx]; assign add_q2_s = rq_d; assign hold_d_s = rq_d;` (with fallback (a) of Step 6, `add_q1_s = hold_q`); in `G_NO_REQ` under `ifndef SYNTHESIS`: all five `'0`.
+For the truth dump (Task 2.5 Step 4.9), at module level under `ifndef SYNTHESIS` beside `hm_any`: `logic add_in_s, hold_wr_s; logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump`; in `G_REQ` under `ifndef SYNTHESIS`: `assign {add_in_s, hold_wr_s} = {add_in, hold_wr}; assign add_q1_s = hold_mem[hold_idx]; assign add_q2_s = rq_d; assign hold_d_s = rq_d;` (with fallback (a) of Step 6, `add_q1_s = hold_q`); in `G_NO_REQ` under `ifndef SYNTHESIS`: all five `'0`.
 
 - [ ] **Step 5: Run the residual tests and the existing ones**
 
@@ -3071,9 +3074,9 @@ def gate_add(q1, q2, w: dict, out, rounding: str = "DOUBLE") -> Result:
 `test_truth.py` gains a test, registered as its others are, that 100 random `add_params` word sets (scales 2^-10 to 2^2, every zero point drawn, NONE, RELU and RELU6 clamps) times 256 random pairs agree with `ipu.tflite_add` in both roundings (two independent implementations), and that `gate_add` fails a result with one code off by one. Run (login node): `cd $T/$A/Common && python3 -B models/test_truth.py` → its pass line; `python3 -B models/truth.py --selftest` (or the file's own self-test entry) → pass. Commit in ArithmeticLibrary (`truth: gate_add, the int8 ADD stage bit-exact against TFLite's reference kernel on Python integers (spec Decision 1, the exception to the float64 rule); test_truth checks it against ipu.tflite_add in both roundings.`), fast-forward GPNAE's copy, bump GPNAE and SystolicMesh (`Bump ArithmeticLibrary: truth.gate_add.`), and stage SIENNA's pointers with Step 7's commits. Then the mutant (the ADD's inputs swapped, which only the add gate and the outputs can see):
 
 ```bash
-$J/cmds/res_mkmut.sh m_addswap $S ".q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d)," ".q1_i(rq_d), .q2_i(hold_mem[hold_rd_idx]),"
+$J/cmds/res_mkmut.sh m_addswap $S ".q1_i(hold_mem[hold_idx]), .q2_i(rq_d)," ".q1_i(rq_d), .q2_i(hold_mem[hold_idx]),"
 L rs2_mut_m_addswap 64 6 $J/cmds/res_mut.sh $J/res_mut/m_addswap.patch $J/cmds/mk.sh pipeline FMT=int8 N=16 TILE=4 TEST=int8_residual PYTHON=$J/venv/bin/python
-command grep -l '\[FAIL\] truth: add' $J/runs/rs2_mut_m_addswap/results/pipeline/*.log | wc -l
+command grep -c '\[FAIL\] truth: add' $J/runs/rs2_mut_m_addswap/stdout.log  # run_regression prints the truth lines to stdout, not the per-test logs
 ```
 
 Expected: the run fails (`Sweep Aborted: FAIL`, exit 1) and the count is at least `1` (the first residual test's `[FAIL] truth: add ...` line). With fallback (a), the patch's strings are `.q1_i(hold_q), .q2_i(rq_d),` and `.q1_i(rq_d), .q2_i(hold_q),`. Step 5's runs then show `TRUTH: <n> tests gated` with every residual test's `add` stage passing.
@@ -3133,12 +3136,12 @@ L rs2_yd_addl_dchr 32 8 bash $J/cmds/yosys_depth.sh add_lanes_drv - dchr
 
 Expected: each run leaves `results/yd/<tag>/depth.txt` (one line per register group) and `ltp.txt`. Read from `depth.txt`: `tfliteRequant`'s worst register group in each rounding (the yardstick), `tfliteAdd`'s stage-1 groups alone (the control: about 51), and `add_lanes_drv`'s `u.LANE[*].u` stage-1 groups (q1's path through `hold_mem[rd_idx]`, PER_LANE = 32 entries at N = 32, and q2's from `rq_d`; the probe stays at N = 32 although simulation stops at 16, because the mux's depth grows with PER_LANE, 32 at N = 32 and 64, 8 at N = 16, and a Yosys run takes minutes). Record all of them in the ledger. Pass: `add_lanes_drv`'s stage-1 groups are no deeper than `tfliteRequant`'s `dchr` worst. If they are deeper, apply the fallbacks in order (controller ruling Q3; neither costs beat rate):
 
-(a) Read `hold_mem` one stage early: the add beat's index is known at requantize's stage `RQL-2`, a beat ahead. In Step 4's block replace `assign hold_rd_idx = tg_idx[RQL-1];` and the `.q1_i(hold_mem[hold_rd_idx])` connection with
+(a) Read `hold_mem` one stage early: the add beat's index is known at requantize's stage `RQL-2`, a beat ahead. In Step 4's block replace `assign hold_idx = tg_idx[RQL-1];` and the `.q1_i(hold_mem[hold_idx])` connection with
 
 ```systemverilog
     logic [NUM_LANES-1:0][7:0] hold_q;  // hold_mem's beat for the add beat entering add_lanes next cycle, read a stage early off the mux's path
     always_ff @(posedge clk_i) if (tg_v[RQL-2] && tg_add[RQL-2]) hold_q <= hold_mem[tg_idx[RQL-2]];  // no reset: read only beside add_in
-    assign hold_rd_idx = tg_idx[RQL-1];  // the beat whose hold_q add_lanes takes (Task 2.7's occupancy checks)
+    assign hold_idx = tg_idx[RQL-1];  // the beat whose hold_q add_lanes takes (Task 2.7's occupancy checks)
 ```
 
 and `.q1_i(hold_q)`. Hold beat j is written before add beat j reaches stage `RQL-2` (set order, `a_rq_one_set`; a hold beat being written at `RQL-1` in that cycle has a higher index), so the early read never meets its own write. In the wrapper, `.q1_i(hold_q)` with `always_ff @(posedge clk_i) if (add_in_i) hold_q <= hold_mem[rd_idx_i];`. Rerun `rs2_yd_addl_dchr` (as `rs2_yd_addl_dchr_a`) and Step 5's runs (as `rs2_res_n<n>_t<t>_a` over `NT` and `rs2_r_<f>_n<n>_a`), with the same Expected lines; Task 2.7's `m_off` then patches `hold_mem[tg_idx[RQL-2]]` to `hold_mem[tg_idx[RQL-2] + 1'b1]`.
@@ -3160,7 +3163,18 @@ git -C $T commit -m "Eight int8 residual pipeline tests (relu, linear_nopool, ta
 
 Record the Step 6 depth numbers in the RTL commit's message (`add_lanes with its drivers: stage 1 <d> levels (dchr), tfliteRequant's worst <r>; runs rs2_yd_*`).
 
+### Task 2.6b: Generic int8 units replace tfliteRequant and tfliteAdd (Soham 2026-10-17: everything generic, logic and names)
+
+Design of record: `/proj/work/spramanik/sienna_report/int8_generic_design.log`; brief `.superpowers/sdd/implementation-plan/task-2.6b-brief.md`; report `task-2.6b-report.md`. Done before Task 2.7, innermost repo first.
+
+- **ArithmeticLibrary:** `Requantizer/int8Requantizer` (24-bit mantissa M, 6-bit right shift e: y = clamp(sat10(round half up of acc M 2^-e) + zp, lo, hi), 4 stages) and `QuantizedAdder/int8QuantizedAdder` (M1, M2 unsigned 32-bit on one shared shift, 6 stages), each with a bench against a C reference through DPI and a true-function check; `ipu.encode_scale`, `encode_add` (refuses max(s1, s2) / s_out >= 2^23), `activation_clamp`, and the bit-exact diagnostics `ipu.requantize` and `ipu.qadd`; `truth.requant_true`, `add_true`, `gate_requantize`, `gate_quantized_add` (the decimal rule, an empty set fails) and `gate_scale`. `Requant/`, `Add/`, the TFLite transcriptions and `REQ_ROUNDING` are gone.
+- **GPNAE:** POSTQ is `int8Requantizer`; `gp_mout_i [23:0]`, `gp_shout_i [5:0]`; `selu_out_params` is `encode_scale` (no left-shift special case).
+- **SIENNA:** `requant_lanes` and `add_lanes` take the new units; `add_lanes` has one `words_i` port of `sienna_add_pkg::add_words_t` (zp1, zp2, m1, m2, shift, zpo, amin, amax: 110 bits) and a `busy_o` output, and `sienna_top`'s `rq_room` and `rq_drain` read `busy_o` (`at_v` is gone); `hold_rd_idx` is `hold_idx`. `set_side_t` carries `mult [N][23:0]`, `shift [N][5:0]`, `mout [23:0]`, `shout [5:0]` and `add`. `add_<k>.mem` holds the flags and the 8 ADD words; `truth_scales.json` holds each add set's real ratios (`add`). The stage gates are `gate_requantize` on each channel's real scale, `gate_quantized_add` on the real ratios, and `gate_scale`; the tflite and tflite-pack actions gate each output on the true function and report agreement with the interpreter; `--action oracle` generates the test vehicles and reports TFLite's misses (no rounding pin). `rounding.txt` and `_check_rounding` are gone. Cycles are unchanged (req_lat 4, qadd_lat 6, busy_o equal to the old at_v).
+
 ### Task 2.7: The new assertions, and every mutant the spec names
+
+**Re-scope (Task 2.6b):** unchanged in substance (integration properties, not arithmetic). The text below uses `hold_idx`, `add_busy` and `add_words_t`'s 110 bits. The unit mutants moved to Task 2.6b and became generic (rounding half down, the 10-bit saturation removed, the shift off by one, the mantissa's top bit dropped, zp1 ignored, the clamp before + zp; `$J/res_mut/g6b_rq_*`, `g6b_qa_*`); "the rounding variant swapped" and "left_shift 19" are gone.
+
 
 **Files:**
 - Modify: `src/sienna_top.sv` (assertions in `G_REQ`'s `ifndef SYNTHESIS` block and in the accept-term section)
@@ -3176,18 +3190,18 @@ Record the Step 6 depth numbers in the RTL commit's message (`add_lanes with its
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) hm_v <= '0;
       else begin
-        if (hold_wr) hm_v[tg_idx[RQL-1]] <= 1'b1;
-        if (add_in && int'(hold_rd_idx) < PER_LANE) hm_v[hold_rd_idx] <= 1'b0;
+        if (hold_wr) hm_v[hold_idx] <= 1'b1;
+        if (add_in) hm_v[hold_idx] <= 1'b0;
       end
     assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window
-    a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[tg_idx[RQL-1]])
+    a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
       else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
-    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i) add_in |-> (int'(hold_rd_idx) < PER_LANE) && hm_v[hold_rd_idx])
-      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem where no hold beat waits", hold_rd_idx);
+    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i) add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[hold_idx])
+      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem where no hold beat waits", tg_idx[RQL-1]);
     a_fill_one_source: assert property (@(posedge clk_i) disable iff (!rstn_i) !(rq_out && add_v))
       else $error("sienna_top: a_fill_one_source: a requantized beat and an add beat reached the fill in the same cycle");
     logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
-    logic [159:0] g_add_w_q;  // the ADD words before the last edge
+    sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge (110 bits since Task 2.6b)
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
       else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
@@ -3197,11 +3211,11 @@ Record the Step 6 depth numbers in the RTL commit's message (`add_lanes with its
       else $error("sienna_top: a_hold_no_bank: a hold set runs a lane activation, writes a bank or toggles act_wr");
     a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
       else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
-    a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!(|at_v) && !(|(tg_v & tg_add))))
+    a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))
       else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
 ```
 
-(`add_v` and `add_tag` are `add_lanes`' registered outputs and `g_accept` a function of the stage's registers, so every term is internal: spec Risk 3's add-set coincidence is closed by design, `rq_room`, and this assertion pins it.)
+(`hold_idx` is HMW = $clog2(PER_LANE) bits and PER_LANE is a power of two at every build, so a range check on `hold_idx` itself would be vacuous; `a_add_pop_full` checks the FCNT_W-bit `tg_idx`, where a beat index past the set is visible. `add_v`, `add_tag` and `add_busy` (`add_lanes`' `busy_o`, the OR of its registered valid line, since Task 2.6b) are `add_lanes`' registered outputs and `g_accept` a function of the stage's registers, so every term is internal: spec Risk 3's add-set coincidence is closed by design, `rq_room`, and this assertion pins it.)
 
 At module level, under `ifndef SYNTHESIS` right after `logic fill_add;` (Task 2.3, after line 152, so it is declared before `G_REQ` uses it): `logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_model_run's +hold_check)`, and in `G_NO_REQ`, under `ifndef SYNTHESIS`, `assign hm_any = 1'b0;`. In the accept-term section (`ifndef SYNTHESIS` near line 1170), beside `last_accum`: `logic acc_prev_hold_q, last_hold;  // the accept before this one was a hold set`, reset with the others, `acc_prev_hold_q <= last_hold;` in the registered tuple and `if (host_accept) last_hold <= side.res_hold;`, then:
 
@@ -3220,20 +3234,20 @@ At module level, under `ifndef SYNTHESIS` right after `logic fill_add;` (Task 2.
 S=src/sienna_top.sv
 $J/cmds/res_mkmut.sh m_pair regression.py "[_res_flags(add=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS]" "[_res_flags(hold=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS]"
 $J/cmds/res_mkmut.sh m_push $S "assign hold_wr     = rq_v && tg_hold[RQL-1];" "assign hold_wr     = rq_v && (tg_hold[RQL-1] || tg_add[RQL-1]);"
-$J/cmds/res_mkmut.sh m_off $S "assign hold_rd_idx = tg_idx[RQL-1];" "assign hold_rd_idx = tg_idx[RQL-1] + 1'b1;"
-$J/cmds/res_mkmut.sh m_room $S "rq_room = !(|(tg_v & tg_add)) && !(|at_v);" "rq_room = 1'b1;" "assign rq_drain = |tg_v || |at_v;" "assign rq_drain = |tg_v;"
-$J/cmds/res_mkmut.sh m_roomonly $S "rq_room = !(|(tg_v & tg_add)) && !(|at_v);" "rq_room = 1'b1;"
+$J/cmds/res_mkmut.sh m_off $S "assign hold_idx    = HMW'(tg_idx[RQL-1]);" "assign hold_idx    = HMW'(tg_idx[RQL-1] + 1'b1);"
+$J/cmds/res_mkmut.sh m_room $S "rq_room = !(|(tg_v & tg_add)) && !add_busy;" "rq_room = 1'b1;" "assign rq_drain = |tg_v || add_busy;" "assign rq_drain = |tg_v;"
+$J/cmds/res_mkmut.sh m_roomonly $S "rq_room = !(|(tg_v & tg_add)) && !add_busy;" "rq_room = 1'b1;"
 $J/cmds/res_mkmut.sh m_par $S "if (g_accept) g_add_w <= s_add[g_next_id];" "if (g_accept || wide_rd_valid) g_add_w <= s_add[g_next_id];"
 $J/cmds/res_mkmut.sh m_bank $S "if (g_done && !g_hold) act_wr <= ~act_wr;" "if (g_done) act_wr <= ~act_wr;"
 $J/cmds/res_mkmut.sh m_hold_lane regression.py 'act_k, rq_k = ("linear" if res and last else act_g),' 'act_k, rq_k = (act_g),'
 $J/cmds/res_mkmut.sh m_hold_byp $S "assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];" "assign rq_out      = rq_v && !tg_add[RQL-1];"
-$J/cmds/res_mkmut.sh m_zp1 $S ".zp1_i(g_add_w.zp1)" ".zp1_i(g_zp[0])"
+$J/cmds/res_mkmut.sh m_zp1 $S ".words_i(g_add_w)," ".words_i('{zp1: g_zp[0], zp2: g_add_w.zp2, m1: g_add_w.m1, m2: g_add_w.m2, shift: g_add_w.shift, zpo: g_add_w.zpo, amin: g_add_w.amin, amax: g_add_w.amax}),"
 $J/cmds/res_mkmut.sh m_drop $S "p_zp[k] = pe_add ? pe_add_zpo : pe_zp[p_lane_ent[k]];" "p_zp[k] = pe_zp[p_lane_ent[k]];"
 $J/cmds/res_mkmut.sh m_zin $S ".gp_zin_i      (g_add ? g_add_zpo : g_zp[g])," ".gp_zin_i      (g_zp[g]),"
 for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp m_zp1 m_drop m_zin; do
   L rs2_mut_$m 64 6 $J/cmds/res_mut.sh $J/res_mut/$m.patch $J/cmds/mk.sh pipeline FMT=int8 N=16 TILE=4 TEST=int8_residual PYTHON=$J/venv/bin/python SIM_ARGS=+verilator+error+limit+1000
 done
-for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp; do echo "$m: $(command grep -ho 'a_[a-z_]*: ' $J/runs/rs2_mut_$m/results/pipeline/*.log | sort -u | tr -d '\n')"; done
+for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp; do echo "$m: $(command grep -ho 'a_[a-z_]*: ' $J/runs/rs2_mut_$m/stdout.log $J/runs/rs2_mut_$m/results/pipeline/*.log | sort -u | tr -d '\n')"; done
 ```
 
 (`m_pair`'s OLD string is Task 2.5 Step 3's add-set flags expression, and `m_par`'s is Task 2.3's one-line `g_add_w` load, written on its own line after the `if (g_accept) begin ... end` block for this patch; `res_mkmut.sh` exits 1 if either is missing. `run_regression` stops at the first failing test (`Sweep Aborted`), so each mutant's verdict is its first failing residual test, in `build_order`.)
@@ -3244,7 +3258,7 @@ for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_b
 |---|---|
 | `m_pair` | `a_hold_then_add` in `Assertion failed`, the test FAILED |
 | `m_push` | `a_hold_push_empty` |
-| `m_off` | `a_add_pop_full`, and `[FAIL]` output lines in the same log (the raised error limit lets the run finish) |
+| `m_off` | `a_add_pop_full`, and `[FAIL]` output lines in the same log (the raised error limit lets the run finish); at the set's last beat the +1 wraps to beat 0, already read, which `hm_v[0]` catches |
 | `m_room` | `a_fill_one_source` (in `int8_residual_then_relu_nopool` or `_accum2_mixed_nopool`; `a_rq_one_set` may fire too) |
 | `m_roomonly` | `a_add_last_no_accept` (controller ruling 1; `a_rq_one_set` may fire first, since `rq_drain` still covers `add_lanes`) |
 | `m_par` | `a_add_par_stable`, and `[FAIL]` output lines |
@@ -3269,6 +3283,9 @@ git -C $T commit -m "sienna_top: simulation assertions for the int8 residual pat
 ```
 
 ### Task 2.8: `sienna_layer`, the `A` line, and the layer-level cases
+
+**Re-scope (Task 2.6b):** the `A` line is `A zp1 zp2 m1 m2 shift zpo amin amax` and `cfg_add_*` follow `add_words_t` (no s1, s2, mo, so; m1 and m2 unsigned). `mr.tflite_add_codes` is `mr.qadd_codes`, `mr.activation_range` is `ipu.activation_clamp`. The layer cases (resnet_relu, deep_cached, deep_uncached, tiles, relu6_conv_linear_add, tanh_after_add) gate on the true function per stage (fork F3): `TB_model_run` dumps each hold beat's requantized codes and each add beat's (q1, q2, y) as `TB_sienna_top`'s R and Q lines do, and the conv's requantize is gated with `truth.gate_requantize` on its real scales, the ADD with `truth.gate_quantized_add` on its real ratios, the lane with `truth.gate`; `int8_residual_exact` stays as a diagnostic (it still tells zp_1 = 0 or a missing ADD apart). The same dumps let gemm's and pack's lane cases gate per stage; until then they gate on the bit-exact model (Task 2.6b kept that, and gates their linear cases on the true function). Step 5 (collapse-k 0) is unaffected.
+
 
 **Files:**
 - Modify: `src/sienna_layer.sv`, `testbenches/TB_model_run.sv`, `model_runner.py` (Device protocol: `write_layer`; Backends: `RtlLayer.run_job`), `regression.py` (`--action residual`, self-tests)
@@ -3536,6 +3553,9 @@ git -C $T add model_runner.py regression.py Makefile && git -C $T commit -m "sie
 
 ### Task 2.9: Residual-block TFLite models, and a reset with `hold_mem` full
 
+**Re-scope (Task 2.6b):** the converter-made blocks stay as test vehicles through the TFLite importer; each stage is gated on the true function (as Task 2.8); "0 differ from the interpreter (BUILTIN_REF)" becomes a reported agreement count, not a gate (nonzero by design: rounding at ties, and TFLite's own misses near cancellation). `mr.layer_multipliers` and `mr.ROUNDING` are gone: the scales are `mr.layer_scales` (float64 from the stored float32 scales) and `mr.encode_scales`. "ADD input 1 is the residual" stays (an importer check). The mid-stream reset part is unchanged.
+
+
 **Files:**
 - Modify: `regression.py` (`residual_tflite`, `residual_mid_reset`), `testbenches/TB_model_run.sv` (`+hold_wait`, `+hold_check`)
 
@@ -3712,6 +3732,9 @@ git -C $T commit -m "regression.py --action residual --tflite: two converter-mad
 
 ### Task 2.10: `make residual` and the `residual` regression point
 
+**Re-scope (Task 2.6b):** structure unchanged. rq-vectors no longer has the DOUBLE/SINGLE separating accumulators and add-vectors no longer has the tie set (both done in Task 2.6b; add-vectors redraws a set until half its outputs are off the rails). The rq-lanes and add-lanes points build `int8Requantizer` / `int8QuantizedAdder` (with `src/sienna_add_pkg.sv` for add_lanes) and gate on the true function with the bit-exact model as a diagnostic; `TB_add_lanes` already checks `busy_o`.
+
+
 **Files:**
 - Modify: `Makefile` (targets `residual` and `rq-lanes`, `.PHONY`, help), `regression.py` (`KINDS`, `UNIT_POINTS`, `SiennaSpec.points`, `parse`, `argv`, `verdict`; the self-tests `test_regression_points`, `test_point_commands`, `test_point_verdicts`, and the new `test_residual_points` and `test_unit_points`)
 
@@ -3817,6 +3840,9 @@ git -C $T commit -m "make regression runs the int8 unit benches once (add-lanes,
 ```
 
 ### Task 2.10b: The performance model: the bf16 and int8 lane fixes and the residual ADD, validated against measured cycles
+
+**Re-scope (Task 2.6b):** no change: req_lat() is 4 and qadd_lat() is 6 as before.
+
 
 (Soham, 2026-10-11; plan-review finding M15.) Runs after Task 2.10 (the ADD RTL and the residual point are in) and before G4 (Task 2.11). It starts only once Tasks 1.14bc and 1.16 are complete (Phase 2 waits for them; their reports, `.superpowers/sdd/implementation-plan/task-1.14bc-report.md` and `task-1.16-report.md` in n8_fix, give their measured lane cycles).
 
@@ -3950,6 +3976,9 @@ Expected: `PERF MODEL: FAIL`, with `OUT` on the activation of the bf16 tests wit
 
 ### Task 2.11: Gate G4, the reports and the docs
 
+**Re-scope (Task 2.6b):** G4's criterion is fork F4: cycles identical to the base; every int8 word gated on the true function; the count of changed int8 words reported per test (replacing "identical words except sigmoid tests"); fp32 and bf16 identical in results, cycles and words. G0 and G0b leave the G4 report (no rounding pin, no ADD oracle). The docs say "generic int8 requantizer and quantized adder, gated on the true function", and SKILL.md records Decision 1's reversal and Soham's 2026-10-17 decision. The report history keeps the old G0 / G0b / G1 records as written. The `$A/README.md` commit names `int8Requantizer` and `int8QuantizedAdder`, not `tfliteAdd`.
+
+
 **Files:**
 - Create (local): `$J/cmds/res_ri.sh`, `$J/cmds/res_ck0_res.sh`, `$J/runs/rs2_g4/g4_residual_gate.log` (`res_cmp_points.py` and `res_g4_pts.sh` come from Task 2.0)
 - Create: `.claude/skills/sienna-report/history/2026-10-DD_g0b_add_oracle_int8.txt`, `..._g1_tfliteadd_int8.txt`, `..._g2_sigmoid_ladder_int8.txt`, `..._sienna_int8_residual_g4.txt` (DD: each report's date; the history directory's existing naming)
@@ -4045,6 +4074,9 @@ git -C $T commit -m "Skills, README and report history for the int8 residual ADD
 ```
 
 ### Task 2.12: Check-in, then the one N = 64 sweep
+
+**Re-scope (Task 2.6b):** the base-against-new int8 comparisons compare verdicts and cycles, not words; otherwise unchanged.
+
 
 > **Superseded in part (Soham, 2026-10-17):** Task 2.12 is the check-in only (pre-check-in cleanup, Soham's OK, push innermost first, ls-remote). Its N = 32/64 sweep, the base-tree references at those sizes, the perf measurement and the new results report move to the very end of the project and run once there, in this order: the restructure (sienna-restructure) completes; the small regression (N = 8 and 16, every valid tile size, `SMALL=1`) passes in every repo; everything is checked in, merged and pushed, and every feature branch is deleted so only main exists (Soham, 2026-10-17); then the big sweep runs on main. Skip every step below that launches an N = 32 or N = 64 run.
 

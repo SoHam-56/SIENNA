@@ -1,6 +1,6 @@
 ---
 name: sienna-int8-residual
-description: Use when designing, building or verifying SIENNA's int8 residual ADD (TFLite int8 ADD bit-exact - the tfliteAdd unit, add_lanes, the hold/add set pair through the identity pass, hold_mem, the ADD constants and the G0b ADD oracle) or the int8 GPNAE sigmoid breakpoint ladder for |x| >= 2.5; the pre-synthesis RTL part of int8 sub-project 2b.
+description: Use when designing, building or verifying SIENNA's int8 residual ADD (the generic affine int8QuantizedAdder gated on the true function - add_lanes, the hold/add set pair through the identity pass, hold_mem, the ADD words add_words_t) or the int8 GPNAE sigmoid breakpoint ladder for |x| >= 2.5; the pre-synthesis RTL part of int8 sub-project 2b.
 ---
 
 # int8 pre-synthesis RTL: residual ADD and the sigmoid ladder (spec; decisions approved by Soham 2026-10-10)
@@ -8,6 +8,8 @@ description: Use when designing, building or verifying SIENNA's int8 residual AD
 Read from SIENNA main fce13e8 (clean clone `/proj/scratch/spramanik/n8_fix`), GPNAE afd786b, ArithmeticLibrary 1d04a26,
 TensorFlow 2.18.1 in `sienna_jobs/venv`. Nothing was built or simulated. The sigmoid numbers below come from evaluating
 `gpnae_model` (numpy, bit-exact with the RTL per G2) in this investigation, not from RTL runs.
+
+**Status (Soham 2026-10-17, Task 2.6b): everything generic, in logic and names.** Decision 1's TFLite bit-exactness is reversed: the ADD is `int8QuantizedAdder` (ArithmeticLibrary `QuantizedAdder/`: y = clamp(sat10(round half up of ((q1 - zp1) m1 + (q2 - zp2) m2) 2^-shift) + zpo), m1 and m2 unsigned 32-bit on one shared shift, 6 stages, qadd_lat() 6) and the requantize is `int8Requantizer` (`Requantizer/`: 24-bit mantissa, 6-bit right shift, 4 stages), both gated on the true function (|hw - t| <= max(1% |t|, one step)); the host encodes real scales with `ipu.encode_scale` and `ipu.encode_add` (which refuses max(s1, s2) / s_out >= 2^23). `add_lanes` takes one `add_words_t` (`src/sienna_add_pkg.sv`: zp1, zp2, m1, m2, shift, zpo, amin, amax; 110 bits) and has `busy_o`, which `sienna_top`'s `rq_room` and `rq_drain` read. G0b, D1's left shift and Prepare, P-11 and P-13 are history; agreement with the TFLite interpreter is a reported count, not a gate. Design: `sienna_report/int8_generic_design.log`; the plan's Task 2.6b and its re-scoped Tasks 2.7-2.12.
 
 ## Goal
 
@@ -23,7 +25,7 @@ the mesh, `tfliteRequant`, and GPNAE's Taylor lane `gpnae.sv`.
 
 ## Decisions
 
-**D1, ADD semantics** (TFLite `kernels/add.cc` Prepare, `reference/integer_ops/add.h`). left_shift = 20.
+**D1, ADD semantics (reversed 2026-10-17: the ADD is the generic int8QuantizedAdder; this is the record)** (TFLite `kernels/add.cc` Prepare, `reference/integer_ops/add.h`). left_shift = 20.
 d_i = q_i - zp_i; scaled_i = MBQMSmallerThanOneExp(d_i << 20, m_i, s_i); out = clamp(MBQMSmallerThanOneExp(scaled_1 +
 scaled_2, m_o, s_o) + zp_o). Prepare computes twice_max = 2 max(s1, s2), m_1 = s1/twice_max, m_2 = s2/twice_max and
 m_o = twice_max/(2^20 s_out), each through QuantizeMultiplierSmallerThanOneExp (shift <= 0). The clamp is the fused

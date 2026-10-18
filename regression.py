@@ -2322,7 +2322,7 @@ def residual_case(name: str, N: int, rng) -> tuple:
     wrong = (mr.qadd_codes(q1, R_q, dict(add, zp1=0)), q1)  # the ADD's outputs with zp_1 taken as the add set's 0, and with no ADD
     req = dict(rq, mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])  # Q: the conv's zp and clamp, the lane's words
     job = {"terms": [(A_q.astype(np.float32), W_q.astype(np.float32)), (R_q.astype(np.float32), np.eye(C, dtype=np.float32))],
-           "bias": hw_bias, "act": lane_act, "shape": (M, C), "req": req, "add": add, "lane": ra}
+           "bias": hw_bias, "act": lane_act, "shape": (M, C), "req": req, "add": add, "lane": ra, "clamps": (conv_act, add_act)}
     return job, want, wrong, q1, R_q
 
 
@@ -4856,7 +4856,7 @@ def test_stage_dump_gates():
         return {s: r.ok for s, r in mr.layer_stage_gates(job, out, st, N)}
 
     ok = gates()
-    assert all(ok.values()) and set(ok) == {"requant", "requant identity", "hold_mem", "add", "fill", "activation relu"}, ok
+    assert all(ok.values()) and set(ok) == {"requant", "requant identity", "hold_mem", "add", "activation relu"}, ok
     off = q1.copy()
     off[1, 2] += 1 if off[1, 2] < 127 else -1
     assert not gates(Q1=off)["hold_mem"]
@@ -4888,6 +4888,21 @@ def test_stage_dump_gates():
     X2 = X.copy()
     X2[0, 0] += 2 if X2[0, 0] < 120 else -2
     assert not run(X2)["requant"]
+    for st, kind in (({"np": 2}, "X"), ({"np": 2, "X": {0: X}}, "X")):  # no X lines for the output pass: a RuntimeError, not a KeyError
+        try:
+            mr.layer_stage_gates(plain, Yt, st, N)
+            raise AssertionError("a dump without the output pass's X lines was gated")
+        except RuntimeError as e:
+            assert f"no {kind} lines for pass 1" in str(e), e
+    eye = dict(plain, terms=[(A_q[:, :N].astype(np.float32), np.eye(N, dtype=np.float32))], bias=np.zeros(N, np.int64))
+    Xe = requantize(wrap32(A_q[:, :N]), rq)  # an identity dense term in a layer with no ADD is the product, not a residual
+    assert [s for s, _ in mr.layer_stage_gates(eye, activate_int8(Xe, "tanh", rq), {"np": 1, "X": {0: Xe}}, N)] == ["requant", "activation tanh"]
+    try:
+        mr.lane_quant("tanh", None, 0, rq)
+        raise AssertionError("a tanh lane was judged without its input scale")
+    except ValueError:
+        pass
+    assert mr.true_clamp("relu6", 0.05, -10) == (-10.0, 110.0) and mr.true_clamp("none", 0.05, 3) == (-128.0, 127.0)
 
 
 @selftest

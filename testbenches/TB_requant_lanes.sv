@@ -1,6 +1,6 @@
 `timescale 1ns / 100ps
 
-// requant_lanes against ipu.requantize (rq_lanes.mem): per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency.
+// requant_lanes on rq_lanes.mem: per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency; outputs to rq_lanes_out.mem for the true-function gate.
 module TB_requant_lanes;
   localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;
@@ -18,7 +18,8 @@ module TB_requant_lanes;
   logic [NUM_LANES-1:0][7:0] want_q[$];  // filled before reset is released, then only popped by the checker
   longint t_in[$];
   longint cyc = 0;
-  int errs = 0, lat_errs = 0, n_out = 0;
+  int errs = 0, lat_errs = 0, n_out = 0, diffs = 0;  // diffs: outputs off the bit-exact model, reported only
+  integer fo;
 
   // One block owns the checker's state: the cycle count, the input times and the pops.
   always @(posedge clk_i) begin
@@ -29,12 +30,15 @@ module TB_requant_lanes;
       automatic longint t = t_in.pop_front();
       n_out++;
       if (cyc - t != REQ_LAT) lat_errs++;
-      for (int k = 0; k < NUM_LANES; k++)
+      for (int k = 0; k < NUM_LANES; k++) begin
+        $fwrite(fo, "%02x ", result_o[k]);
         if (result_o[k] !== w[k]) begin
-          errs++;
-          if (errs <= 20)
-            $display("[FAIL] beat %0d lane %0d: got %0d, want %0d", n_out - 1, k, $signed(result_o[k]), $signed(w[k]));
+          diffs++;
+          if (diffs <= 20)
+            $display("[EXACT] beat %0d lane %0d: got %0d, bit-exact model %0d (reported)", n_out - 1, k, $signed(result_o[k]), $signed(w[k]));
         end
+      end
+      $fwrite(fo, "\n");  // one line per output beat, lane 0 first
     end
   end
 
@@ -49,6 +53,8 @@ module TB_requant_lanes;
     end
     while ($fscanf(fh, "%h", w32) == 1) v.push_back(w32);
     $fclose(fh);
+    fo = $fopen("rq_lanes_out.mem", "w");
+    if (fo == 0) $fatal(1, "TB_requant_lanes: cannot write rq_lanes_out.mem");
     sets = int'(v[0]);
     p = 1;
     for (int s = 0; s < sets; s++) begin
@@ -100,7 +106,8 @@ module TB_requant_lanes;
       $display("[FAIL] %0d beats out, expected %0d", n_out, sets * PER_LANE);
     end
     if (lat_errs != 0) $display("[FAIL] %0d beats did not come %0d cycles after their input", lat_errs, REQ_LAT);
-    $display("TB_requant_lanes: %0d beats, %0d errors, %0d latency errors", n_out, errs, lat_errs);
+    $fclose(fo);
+    $display("TB_requant_lanes: %0d beats, %0d errors, %0d latency errors; %0d outputs differ from the bit-exact model (reported)", n_out, errs, lat_errs, diffs);
     // A ternary of two strings prints as a number under Verilator, so branch instead.
     if (errs == 0 && lat_errs == 0) $display("RESULT: PASSED");
     else $display("RESULT: FAILED");

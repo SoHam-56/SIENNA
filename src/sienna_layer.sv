@@ -56,8 +56,8 @@ module sienna_layer #(
     input logic [7:0]               cfg_req_max_i,
     input logic [15:0]              cfg_gp_mx_i,
     input logic [4:0]               cfg_gp_shx_i,
-    input logic [31:0]              cfg_gp_mout_i,
-    input logic [7:0]               cfg_gp_shout_i,
+    input logic [23:0]              cfg_gp_mout_i,   // SELU output scale: 24-bit mantissa and right shift
+    input logic [5:0]               cfg_gp_shout_i,
     input logic [7:0]               cfg_gp_zout_i,
     // Packing, taken with cfg_load_i: every set of the layer is packed this way (sienna-packing)
     input logic [2:0]                          cfg_pack_shift_i,
@@ -68,8 +68,8 @@ module sienna_layer #(
     input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_max_i,
     input logic [PACK_ENTRIES-1:1][15:0]       cfg_pack_mx_i,
     input logic [PACK_ENTRIES-1:1][4:0]        cfg_pack_shx_i,
-    input logic [PACK_ENTRIES-1:1][31:0]       cfg_pack_mout_i,
-    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_shout_i,
+    input logic [PACK_ENTRIES-1:1][23:0]       cfg_pack_mout_i,
+    input logic [PACK_ENTRIES-1:1][5:0]        cfg_pack_shout_i,
     input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_zout_i,
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
@@ -79,8 +79,8 @@ module sienna_layer #(
     credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
     input  logic [N-1:0][ACC_W-1:0]  w_bias_i,
-    input  logic [N-1:0][31:0]       w_req_mult_i,
-    input  logic [N-1:0][7:0]        w_req_shift_i,
+    input  logic [N-1:0][23:0]       w_req_mult_i,   // per channel: requantize scale's 24-bit mantissa and right shift
+    input  logic [N-1:0][5:0]        w_req_shift_i,
 
     credit_link_if.producer          out[NUM_LANES],  // L9: lane k's results, one word per put while the consumer's credit is held
     output logic                     set_done_o  // a set left the pipeline with its last word (partial sums leave with no results)
@@ -117,17 +117,19 @@ module sienna_layer #(
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
   logic [LFSR_WIDTH-1:0] seed_q;
-  logic [7:0] rq_zp_q, rq_min_q, rq_max_q, gp_shout_q, gp_zout_q;  // int8 layer-wide parameters
+  logic [7:0] rq_zp_q, rq_min_q, rq_max_q, gp_zout_q;  // int8 layer-wide parameters
+  logic [5:0] gp_shout_q;
   logic [15:0] gp_mx_q;
   logic [4:0] gp_shx_q;
-  logic [31:0] gp_mout_q;
+  logic [23:0] gp_mout_q;
   logic [2:0] pk_shift_q;  // packing configuration, as the cfg_pack_* ports
   logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pk_map_q;
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
-  logic [PACK_ENTRIES-1:1][7:0] pk_zp_q, pk_min_q, pk_max_q, pk_shout_q, pk_zout_q;
+  logic [PACK_ENTRIES-1:1][7:0] pk_zp_q, pk_min_q, pk_max_q, pk_zout_q;
+  logic [PACK_ENTRIES-1:1][5:0] pk_shout_q;
   logic [PACK_ENTRIES-1:1][15:0] pk_mx_q;
   logic [PACK_ENTRIES-1:1][4:0] pk_shx_q;
-  logic [PACK_ENTRIES-1:1][31:0] pk_mout_q;
+  logic [PACK_ENTRIES-1:1][23:0] pk_mout_q;
   logic [31:0] total_sets;
   logic active;
 
@@ -138,8 +140,8 @@ module sienna_layer #(
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
   logic [N-1:0][ACC_W-1:0]       p_bias;
-  logic [N-1:0][31:0]            p_mult;   // int8: the requantize words of the set being started
-  logic [N-1:0][7:0]             p_shift;
+  logic [N-1:0][23:0]            p_mult;   // int8: the requantize words of the set being started
+  logic [N-1:0][5:0]             p_shift;
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
   logic [WCTW-1:0]               p_tile;
   logic [WCAW-1:0]               p_wc_addr;
@@ -248,8 +250,8 @@ module sienna_layer #(
   if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
     $fatal(1, "sienna_layer: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
   end
-  logic [N-1:0][31:0] mult_buf[2];  // int8: the requantize words of the block each half holds
-  logic [N-1:0][7:0] shift_buf[2];
+  logic [N-1:0][23:0] mult_buf[2];  // int8: the requantize words of the block each half holds
+  logic [N-1:0][5:0] shift_buf[2];
   logic [DIM_W-1:0] wl_blk;  // block the loader works on
   logic wl_bias_done;  // its bias row is in
   logic [DIM_W-1:0] wl_tile;  // tiles of it complete

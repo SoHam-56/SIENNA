@@ -24,12 +24,13 @@ module TB_sienna_model;
     $fatal(1, "TB_sienna_model: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
   end
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
-  logic [N-1:0][31:0] req_mult_i;
-  logic [N-1:0][7:0]  req_shift_i;
-  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_shout_i, gp_zout_i;
+  logic [N-1:0][23:0] req_mult_i;
+  logic [N-1:0][5:0]  req_shift_i;
+  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_zout_i;
+  logic [5:0]         gp_shout_i;
   logic [15:0]        gp_mx_i;
   logic [4:0]         gp_shx_i;
-  logic [31:0]        gp_mout_i;
+  logic [23:0]        gp_mout_i;
   `include "int8_tb_util.svh"  // unpack_requant
   localparam int WC_TILES = 128;
   logic weight_cached_i, wc_write_enable_i;

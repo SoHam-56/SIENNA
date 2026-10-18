@@ -15,37 +15,12 @@ typedef struct packed {
   logic [PACK_ENTRIES-1:0][7:0]               amax;
   logic [PACK_ENTRIES-1:0][15:0]              mx;             // int8 per entry: GPNAE input rescale and output requantize
   logic [PACK_ENTRIES-1:0][4:0]               shx;
-  logic [PACK_ENTRIES-1:0][31:0]              mout;
-  logic [PACK_ENTRIES-1:0][7:0]               shout;
+  logic [PACK_ENTRIES-1:0][23:0]              mout;
+  logic [PACK_ENTRIES-1:0][5:0]               shout;
   logic [PACK_ENTRIES-1:0][7:0]               zout;
-  logic [N-1:0][31:0]                         mult;           // int8 per output channel: requantize multiplier (Q0.31) and signed shift
-  logic [N-1:0][7:0]                          shift;
+  logic [N-1:0][23:0]                         mult;           // int8 per output channel: requantize scale as a 24-bit mantissa and right shift
+  logic [N-1:0][5:0]                          shift;
   logic                                       res_hold;       // int8 residual: the last depth pass; its beats go to hold_mem, no bank, no output
   logic                                       res_add;        // int8 residual: the identity pass; its beats meet hold_mem in add_lanes
-  logic [7:0]                                 add_zp1;        // the ADD's words (tfliteAdd): input zero points, multipliers and shifts, output zero point and clamp
-  logic [7:0]                                 add_zp2;
-  logic [31:0]                                add_m1;
-  logic [7:0]                                 add_s1;
-  logic [31:0]                                add_m2;
-  logic [7:0]                                 add_s2;
-  logic [31:0]                                add_mo;
-  logic [7:0]                                 add_so;
-  logic [7:0]                                 add_zpo;
-  logic [7:0]                                 add_min;
-  logic [7:0]                                 add_max;
+  sienna_add_pkg::add_words_t                 add;            // int8 residual: the ADD's words
 } set_side_t;
-
-// One add set's ADD words as tfliteAdd takes them; every reader names a field, so no bit position is written twice.
-typedef struct packed {
-  logic [7:0]  zp1;
-  logic [7:0]  zp2;
-  logic [31:0] m1;
-  logic [7:0]  s1;
-  logic [31:0] m2;
-  logic [7:0]  s2;
-  logic [31:0] mo;
-  logic [7:0]  so;
-  logic [7:0]  zpo;
-  logic [7:0]  amin;
-  logic [7:0]  amax;
-} add_words_t;

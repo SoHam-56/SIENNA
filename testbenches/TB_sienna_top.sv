@@ -37,20 +37,22 @@ module TB_sienna_top #(
     $fatal(1, "TB_sienna_top: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
   end
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
-  logic [N-1:0][31:0] req_mult_i;
-  logic [N-1:0][7:0]  req_shift_i;
-  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_shout_i, gp_zout_i;
+  logic [N-1:0][23:0] req_mult_i;
+  logic [N-1:0][5:0]  req_shift_i;
+  logic [7:0]         req_zp_i, req_min_i, req_max_i, gp_zout_i;
   logic [15:0]        gp_mx_i;
   logic [4:0]         gp_shx_i;
-  logic [31:0]        gp_mout_i;
+  logic [23:0]        gp_mout_i;
+  logic [5:0]         gp_shout_i;
   localparam int PACK_ENTRIES = 8, PEW = 3;
   logic [2:0] pack_shift_i;  // the set's pack shift and parameter table (pack_<k>.mem), with the start
   logic [N/2-1:0][PEW-1:0] pack_map_i;
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pack_act_i;
-  logic [PACK_ENTRIES-1:1][7:0] pack_zp_i, pack_min_i, pack_max_i, pack_shout_i, pack_zout_i;
+  logic [PACK_ENTRIES-1:1][7:0] pack_zp_i, pack_min_i, pack_max_i, pack_zout_i;
   logic [PACK_ENTRIES-1:1][15:0] pack_mx_i;
   logic [PACK_ENTRIES-1:1][4:0] pack_shx_i;
-  logic [PACK_ENTRIES-1:1][31:0] pack_mout_i;
+  logic [PACK_ENTRIES-1:1][23:0] pack_mout_i;
+  logic [PACK_ENTRIES-1:1][5:0] pack_shout_i;
   localparam int WC_TILES = 128;
   logic                     weight_cached_i;  // this set takes B from cache tile weight_tile_i
   logic [$clog2(WC_TILES)-1:0] weight_tile_i;
@@ -60,8 +62,7 @@ module TB_sienna_top #(
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic res_hold_i, res_add_i;  // int8 residual: the set's hold and add flags and its ADD's words (apply_add)
-  logic [7:0] add_zp1_i, add_zp2_i, add_s1_i, add_s2_i, add_so_i, add_zpo_i, add_min_i, add_max_i;
-  logic [31:0] add_m1_i, add_m2_i, add_mo_i;
+  sienna_add_pkg::add_words_t add_words_i;
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;  // result beats per set
 
   // The test's TB-only settings, read from test_knobs.mem at time 0 (written with its stimulus): no build depends on them, so one build runs every test of its group.
@@ -390,17 +391,7 @@ module TB_sienna_top #(
     s.shift         = req_shift_i;
     s.res_hold      = res_hold_i;
     s.res_add       = res_add_i;
-    s.add_zp1       = add_zp1_i;
-    s.add_zp2       = add_zp2_i;
-    s.add_m1        = add_m1_i;
-    s.add_s1        = add_s1_i;
-    s.add_m2        = add_m2_i;
-    s.add_s2        = add_s2_i;
-    s.add_mo        = add_mo_i;
-    s.add_so        = add_so_i;
-    s.add_zpo       = add_zpo_i;
-    s.add_min       = add_min_i;
-    s.add_max       = add_max_i;
+    s.add           = add_words_i;
 `ifdef TB_FLOAT_ADD
     s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a float build fires a_float_no_add
 `endif
@@ -1000,14 +991,15 @@ module TB_sienna_top #(
   end
 
   // A residual test's add_<k>.mem: flags (partial, bias, hold, add, activation in 7:4), then the ADD's words; other tests leave the table empty.
-  logic [31:0] add_tab[int][12];
+  localparam int ADD_MEM_WORDS = 9;  // flags, zp1, zp2, m1, m2, shift, zpo, amin, amax
+  logic [31:0] add_tab[int][ADD_MEM_WORDS];
   task automatic read_add_tables();
     logic [31:0] q[$];
     if (k_residual == 0) return;
     for (int k = 0; k < k_num_sets; k++) begin
       read_word_file($sformatf("add_%0d.mem", k), q);
-      if (q.size() != 12) $fatal(1, "TB_sienna_top: add_%0d.mem holds %0d words, not 12", k, q.size());
-      for (int i = 0; i < 12; i++) add_tab[k][i] = q[i];
+      if (q.size() != ADD_MEM_WORDS) $fatal(1, "TB_sienna_top: add_%0d.mem holds %0d words, not %0d", k, q.size(), ADD_MEM_WORDS);
+      for (int i = 0; i < ADD_MEM_WORDS; i++) add_tab[k][i] = q[i];
     end
   endtask
 
@@ -1025,22 +1017,18 @@ module TB_sienna_top #(
 
   // Set k's hold and add flags and ADD words (add_<k>.mem); zeros outside a residual test and in a pass that puts the set alone.
   task automatic apply_add(input int k, input bit single = 0);
-    {res_hold_i, res_add_i, add_zp1_i, add_zp2_i, add_m1_i, add_s1_i, add_m2_i, add_s2_i, add_mo_i, add_so_i, add_zpo_i, add_min_i,
-     add_max_i} = '0;
+    {res_hold_i, res_add_i, add_words_i} = '0;
     if (k_residual == 0 || single) return;
-    res_hold_i = add_tab[k][0][2];
-    res_add_i  = add_tab[k][0][3];
-    add_zp1_i  = add_tab[k][1][7:0];
-    add_zp2_i  = add_tab[k][2][7:0];
-    add_m1_i   = add_tab[k][3];
-    add_s1_i   = add_tab[k][4][7:0];
-    add_m2_i   = add_tab[k][5];
-    add_s2_i   = add_tab[k][6][7:0];
-    add_mo_i   = add_tab[k][7];
-    add_so_i   = add_tab[k][8][7:0];
-    add_zpo_i  = add_tab[k][9][7:0];
-    add_min_i  = add_tab[k][10][7:0];
-    add_max_i  = add_tab[k][11][7:0];
+    res_hold_i        = add_tab[k][0][2];
+    res_add_i         = add_tab[k][0][3];
+    add_words_i.zp1   = add_tab[k][1][7:0];
+    add_words_i.zp2   = add_tab[k][2][7:0];
+    add_words_i.m1    = add_tab[k][3];
+    add_words_i.m2    = add_tab[k][4];
+    add_words_i.shift = add_tab[k][5][5:0];
+    add_words_i.zpo   = add_tab[k][6][7:0];
+    add_words_i.amin  = add_tab[k][7][7:0];
+    add_words_i.amax  = add_tab[k][8][7:0];
   endtask
 
   // Set k's bias: with k_has_bias, the first pass of each group reads bias_<k>.mem; a residual test's flags say.
@@ -1073,8 +1061,8 @@ module TB_sienna_top #(
       pack_max_i[e]   = q[o+3][7:0];
       pack_mx_i[e]    = q[o+4][15:0];
       pack_shx_i[e]   = q[o+5][4:0];
-      pack_mout_i[e]  = q[o+6];
-      pack_shout_i[e] = q[o+7][7:0];
+      pack_mout_i[e]  = q[o+6][23:0];
+      pack_shout_i[e] = q[o+7][5:0];
       pack_zout_i[e]  = q[o+8][7:0];
     end
   endtask

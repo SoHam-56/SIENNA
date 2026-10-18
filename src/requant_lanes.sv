@@ -1,19 +1,18 @@
 `timescale 1ns / 100ps
 
-// int8: one tfliteRequant per lane on the wide read; lane k's channel is (k*PER_LANE + b) % N, or k % N for a packed set; zero point and clamp per lane.
+// int8: one int8Requantizer per lane on the wide read; lane k's channel is (k*PER_LANE + b) % N, or k % N for a packed set; zero point and clamp per lane.
 module requant_lanes #(
-    parameter int    NUM_LANES = 32,
-    parameter int    N         = 16,
-    parameter int    PER_LANE  = N * N / NUM_LANES,
-    parameter string ROUNDING  = sienna_fmt_pkg::REQ_ROUNDING  // TFLite reference kernels' variant, pinned at G0 (Task 2)
+    parameter int NUM_LANES = 32,
+    parameter int N         = 16,
+    parameter int PER_LANE  = N * N / NUM_LANES
 ) (
     input  logic                       clk_i,
     input  logic                       rstn_i,
     input  logic                       clear_i,  // no set in the stage: the next beat is beat 0
     input  logic                       valid_i,  // one wide-read beat
     input  logic [NUM_LANES-1:0][31:0] acc_i,    // int32 sums
-    input  logic [N-1:0][31:0]         mult_i,   // per output channel, Q0.31
-    input  logic [N-1:0][7:0]          shift_i,  // per output channel, signed
+    input  logic [N-1:0][23:0]         mult_i,   // per output channel: the scale's 24-bit mantissa
+    input  logic [N-1:0][5:0]          shift_i,  // and its right shift
     input  logic                       packed_i, // the stage's set is packed: lane k reads column k % N at every beat
     input  logic [NUM_LANES-1:0][7:0]  zp_i,     // output zero point, per lane
     input  logic [NUM_LANES-1:0][7:0]  min_i,    // clamp, signed, per lane: the int8 range, or the fused ReLU / ReLU6
@@ -35,7 +34,7 @@ module requant_lanes #(
   for (genvar k = 0; k < NUM_LANES; k++) begin : LANE
     logic [CW-1:0] ch;
     assign ch = packed_i ? CW'(k % N) : CW'((k * PER_LANE + int'(beat)) % N);
-    tfliteRequant #(.ROUNDING(ROUNDING)) rq (
+    int8Requantizer rq (
         .clk_i    (clk_i),
         .rstn_i   (rstn_i),
         .valid_i  (valid_i),

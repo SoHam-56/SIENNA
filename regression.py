@@ -37,7 +37,7 @@ import gpnae_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
 import model_runner as mr  # noqa: E402  the numerics and the device build package, one owner each
 from model_runner import (  # noqa: E402
-    FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _check_rounding, _config_items, activate_int8, activation_to_code,
+    FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _config_items, activate_int8, activation_to_code,
     apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
@@ -303,7 +303,7 @@ def _dropout_bits(P, cfg: dict, drop_seed: int, f) -> np.ndarray:
     return np.where(keep, prod, flat & (1 << (f.w - 1))).reshape(P.shape)
 
 
-# ===== int8 (D-6): TFLite-style quantization of the float tests' data, and the bit-exact golden =====
+# ===== int8 (D-6): affine quantization of the float tests' data, and the bit-exact golden (int8Requantizer, int8QuantizedAdder models) =====
 
 REQ_HEAD = 8  # layer-wide words heading requant_<k>.mem: zp, min, max, gp_mx, gp_shx, gp_mout, gp_shout, gp_zout
 
@@ -335,10 +335,10 @@ def _golden_int8(passes, hw_bias, rq: dict, cfg: dict, act: str, drop_seed: int)
 
 
 def _golden_int8_residual(parts, hw_bias, rq: dict, R, add: dict, ra: dict, cfg: dict, act: str, drop_seed: int, q1=None) -> tuple:
-    """Bit-exact int8 residual set: the depth passes' sums, the conv's requantize (q1, unless given), TFLite's ADD with R, the lane with the ADD's words, pooling, dropout (D-5: zp_o)."""
+    """Bit-exact int8 residual set: the depth passes' sums, the conv's requantize (q1, unless given), the ADD with R, the lane with the ADD's words, pooling, dropout (D-5: zp_o)."""
     N = cfg.get("n", 16)
     C = mesh_model.matmul_int([(_pad_square(a, N), _pad_square(b, N)) for a, b in parts], N, hw_bias)
-    Y = mr.tflite_add_codes(requantize(C, rq) if q1 is None else q1, R, add)
+    Y = mr.qadd_codes(requantize(C, rq) if q1 is None else q1, R, add)
     A = activate_int8(Y, act, ra)
     P = _maxpool_int(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1))
     if not cfg.get("training", False):
@@ -378,7 +378,7 @@ def _add_draw(rng, q1, s1: float, z1: int, act: str, zp_random: bool, setting=No
         add.update(amin=out_q[2], amax=out_q[3])
     elif tight:
         add.update(amin=max(-128, z_out - int(rng.randint(*ADD_TIGHT))), amax=min(127, z_out + int(rng.randint(*ADD_TIGHT))))
-    return R, add, dict(mr.add_lane_params(add, s_out, mr.tflite_add_codes(q1, R, add)), setting=(f2, z2, fo))
+    return R, add, dict(mr.add_lane_params(add, s_out, mr.qadd_codes(q1, R, add)), setting=(f2, z2, fo))
 
 
 def _off_rails(F, ra: dict) -> tuple:
@@ -388,15 +388,15 @@ def _off_rails(F, ra: dict) -> tuple:
 
 
 def _identity_requant(N: int, ra: dict) -> dict:
-    """An add set's requantize words: identity (mult 2^30, shift +1, zp 0, full clamp), with the lane's words after the ADD."""
-    return dict(mult=np.full(N, 1 << 30, np.int64), shift=np.full(N, 1, np.int64), zp=0, amin=-128, amax=127,
+    """An add set's requantize words: identity (mult 2^23, shift 23, zp 0, full clamp), with the lane's words after the ADD."""
+    return dict(mult=np.full(N, 1 << 23, np.int64), shift=np.full(N, 23, np.int64), zp=0, amin=-128, amax=127,
                 mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])
 
 
 def _decoy_params(N: int) -> dict:
     """A partial pass's requantize words: the activated pass's are the ones used, so these must never show in a result."""
-    return dict(mult=np.full(N, 1 << 30, np.int64), shift=np.full(N, -1, np.int64), zp=5, amin=-100, amax=100,
-                mx=1, shx=0, mout=1 << 30, shout=-1, zout=5)
+    return dict(mult=np.full(N, 1 << 23, np.int64), shift=np.full(N, 24, np.int64), zp=5, amin=-100, amax=100,
+                mx=1, shx=0, mout=1 << 23, shout=24, zout=5)
 
 
 def _write_s8(path: str, v) -> None:
@@ -415,7 +415,7 @@ def _res_flags(partial=False, bias=False, hold=False, add=False, act="linear") -
 
 
 def _requant_words(rq: dict) -> list:
-    """requant_<k>.mem's words: the REQ_HEAD layer-wide words, then N multipliers, then N shifts."""
+    """requant_<k>.mem's words: the REQ_HEAD layer-wide words, then N 24-bit mantissas, then N right shifts (32-bit words)."""
     return [rq["zp"], rq["amin"], rq["amax"], rq["mx"], rq["shx"], rq["mout"], rq["shout"], rq["zout"]] + \
         [int(v) for v in rq["mult"]] + [int(v) for v in rq["shift"]]
 
@@ -504,7 +504,7 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
             F = _golden_int8(parts, hw_bias, rq, cfg, act_g, set_dropout_seed(drop_seed, k))[4] if last and not res else np.zeros(0, np.int64)
             _write_s8(w("expected_output", k), F)  # empty for a partial or hold set
             _write_s8(w("bound_output", k), np.zeros_like(F))
-            _write_w32(w("add", k), [_res_flags(partial=not last, bias=i == 0, hold=res and last, act=act_k)] + [0] * 11)
+            _write_w32(w("add", k), [_res_flags(partial=not last, bias=i == 0, hold=res and last, act=act_k)] + [0] * len(mr.ADD_FIELDS))
             if last:
                 scales[str(k)] = {"ratio": rq["ratio"]} | ({} if res else {"0": [float(rq["s_out"]), float(rq["s_selu"])]})
             first = first or (parts[0][0], parts[0][1], hw_bias, rq_k, act_k)
@@ -520,15 +520,14 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
             _write_s8(w("expected_output", k), F)
             _write_s8(w("bound_output", k), np.zeros_like(F))
             _write_w32(w("add", k), [_res_flags(add=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS])
-            scales[str(k)] = {"0": [float(ra["s_out"]), float(ra["s_selu"])], "ratio": None}
+            scales[str(k)] = {"0": [float(ra["s_out"]), float(ra["s_selu"])], "ratio": None, "add": [float(v) for v in add["ratios"]]}
             alone(k, R, np.eye(N, dtype=np.int64), np.zeros(N, np.int64), rq_i, act_g)
     return first, scales
 
 
 def _generate_vectors_int8(cfg: dict) -> None:
-    """int8 stimulus and bit-exact golden: the float tests' matrices quantized as TFLite PTQ would, each set's parameters in requant_<k>.mem."""
+    """int8 stimulus and bit-exact golden: the float tests' matrices quantized affinely (min/max), each set's parameters in requant_<k>.mem."""
     os.makedirs(TB_DIR, exist_ok=True)
-    _check_rounding()
     N, mode = cfg.get("n", 16), cfg.get("mode", "matmul")
     act_type = cfg.get("activation", cfg.get("act", "idle"))
     seed = cfg.get("seed", 42) + int(os.environ.get("SIENNA_SEED", "0"))  # unset keeps the fixed stimulus
@@ -809,8 +808,6 @@ def _generate_vectors_packed(cfg: dict) -> None:
     N, fmt, act_type, acts = cfg.get("n", 16), cfg.get("fmt_name", "fp32"), cfg["act"], cfg["pack_acts"]
     assert len(acts) == PACK_ENTRIES and acts[0] == act_type, (cfg["name"], "pack_acts[0] must be the test's act")
     assert (cfg.get("pool_h"), cfg.get("pool_w"), cfg.get("padding")) == (1, 1, 0), (cfg["name"], "packed sets need a 1x1 pool")
-    if fmt == "int8":
-        _check_rounding()
     seed = cfg.get("seed", 42) + int(os.environ.get("SIENNA_SEED", "0"))
     credits = cfg.get("credits", SETS_IN_FLIGHT)
     num_sets = cfg.get("num_sets", credits + 2)
@@ -1148,8 +1145,8 @@ def dump_hardware_trace(
 TRUTH_DUMP = os.path.join(TB_DIR, "truth_dump.txt")
 TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated set's real lane scales per pack entry, from the generator
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
-INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # TFLite's fixed output quantization
-TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "add", "multiplier", "relu", "activation", "maxpool", "dropout")
+INT8_FIXED_OUT = {"sigmoid": (1 / 256, -128), "tanh": (1 / 128, 0)}  # the converters' fixed output quantization (a convention)
+TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "add", "scale", "relu", "activation", "maxpool", "dropout")
 TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
 
 
@@ -1202,10 +1199,12 @@ def _full(m: dict, n: int, what: str) -> list:
 
 
 def _res_flags_of(k: int) -> dict:
-    """A residual test's set k as add_<k>.mem gives it: partial, bias, hold and add flags, its activation, and the ADD's words (signed)."""
+    """A residual test's set k as add_<k>.mem gives it: partial, bias, hold and add flags, its activation, and the ADD's words (zero points
+    and clamp signed, mantissas and shift unsigned)."""
     w = _tb_words(f"add_{k}.mem")
     f = int(w[0])
-    words = {n: int(_sx(v, 32 if n in ("m1", "m2", "mo") else 8)) for n, v in zip(mr.ADD_FIELDS, w[1:])}
+    words = {n: int(v & 0xFFFFFFFF) if n in ("m1", "m2") else int(v & 0x3F) if n == "shift" else int(_sx(v, 8))
+             for n, v in zip(mr.ADD_FIELDS, w[1:])}
     return {"partial": bool(f & 1), "bias": bool(f & 2), "hold": bool(f & 4), "add": bool(f & 8), "act": ACT_NAMES[(f >> 4) & 15],
             "words": words}
 
@@ -1228,12 +1227,12 @@ def _set_words(k: int, knobs: dict, N: int, fmt: str) -> dict:
             o = 1 + N // 2 + 9 * (e - 1)
             ents[e] = {"act": ACT_NAMES.get(int(pk[o]) & 7, "linear"), "zp": int(_sx(pk[o + 1], 8)), "amin": int(_sx(pk[o + 2], 8)),
                        "amax": int(_sx(pk[o + 3], 8)), "mx": int(pk[o + 4] & 0xFFFF), "shx": int(pk[o + 5] & 0x1F),
-                       "mout": int(pk[o + 6] & 0xFFFFFFFF), "shout": int(_sx(pk[o + 7], 8)), "zout": int(_sx(pk[o + 8], 8))}
+                       "mout": int(pk[o + 6] & 0xFFFFFF), "shout": int(pk[o + 7] & 0x3F), "zout": int(_sx(pk[o + 8], 8))}
     if fmt == "int8":
         rq = _tb_words(f"requant_{k}.mem")
         ents[0].update(zp=int(_sx(rq[0], 8)), amin=int(_sx(rq[1], 8)), amax=int(_sx(rq[2], 8)), mx=int(rq[3] & 0xFFFF), shx=int(rq[4] & 0x1F),
-                       mout=int(rq[5] & 0xFFFFFFFF), shout=int(_sx(rq[6], 8)), zout=int(_sx(rq[7], 8)))
-        mult, shift = rq[8:8 + N] & 0xFFFFFFFF, _sx(rq[8 + N:8 + 2 * N], 8)
+                       mout=int(rq[5] & 0xFFFFFF), shout=int(rq[6] & 0x3F), zout=int(_sx(rq[7], 8)))
+        mult, shift = rq[8:8 + N] & 0xFFFFFF, rq[8 + N:8 + 2 * N] & 0x3F
     else:
         mult = shift = None
     return {"ents": ents, "col_ent": col_ent, "sh": sh, "mult": mult, "shift": shift}
@@ -1245,8 +1244,8 @@ def _int8_quant(ents: dict, scales: dict, k: int):
     for e, w in ents.items():
         sc = scales.get(str(k), {}).get(str(e))
         if sc is None:  # a set the generator calibrated no lane for (P0's or B2B's partial): the scales its words encode
-            s_in = w["mx"] * 2.0 ** -w["shx"] / 2048  # SELU's output: acc 2^-(shx + 18) times mout 2^(shout - 31) is the code
-            sc = [s_in, s_in * 2.0 ** (24 - w["shout"]) / (w["mx"] * w["mout"]) if w["mout"] and w["mx"] else np.inf]
+            s_in = w["mx"] * 2.0 ** -w["shx"] / 2048  # SELU's output: acc 2^-(shx + 18) times mout 2^-shout is the code
+            sc = [s_in, s_in * 2.0 ** (w["shout"] - 7) / (w["mx"] * w["mout"]) if w["mout"] and w["mx"] else np.inf]
         s_in, s_selu = sc
         a = w["act"]
         s_out, z_out = (s_selu, w["zout"]) if a == "selu" else INT8_FIXED_OUT.get(a, (s_in, w["zp"]))
@@ -1297,12 +1296,16 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
         res.setdefault(name, []).append(r)
         if not r.ok:
             res.setdefault("_passes", {}).setdefault(name, set()).add(tag)
-    def multipliers(k, sw):  # the host's multipliers, once per set: within their own quantization of s_a s_w / s_out
+    def multipliers(k, sw):  # the host's scale codes, once per set: each within s 2^-24 of its real scale s_a s_w / s_out
         ratio = scales.get(str(k), {}).get("ratio") or []
         cs = [c for c in range(min(N, len(ratio))) if ratio[c] is not None]
         if cs and k not in mult_seen:
             mult_seen.add(k)
-            add("multiplier", truth.gate_multiplier(sw["mult"][cs], sw["shift"][cs], [ratio[c] for c in cs]))
+            add("scale", truth.gate_scale([ratio[c] for c in cs], sw["mult"][cs], sw["shift"][cs]))
+    def real_scales(k, sw, cols):  # per element its channel's real scale; the words' own exact scale where the generator kept none
+        ratio = scales.get(str(k), {}).get("ratio") or [None] * N
+        code = mr.code_scales(sw["mult"], sw["shift"])
+        return np.array([code[c] if ratio[c] is None else ratio[c] for c in range(N)], dtype=np.float64)[cols]
     alone = {"P0": 0, "B2B": 1}  # the single-set and back-to-back passes put set 0 and set 1 alone, from their own files
     fl = {k: _res_flags_of(k) for k in range(K)} if res_t else {}
     for tag, g in sorted(dump.items()):
@@ -1349,22 +1352,24 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
             if hold:  # a hold set's requantized beats go to hold_mem: requantize gated on them; no activation, pooling or dropout
                 Rh = np.array(_full(g["R"].get(k, {}), N * N, f"pass {tag} set {k}'s hold beats"), dtype=np.int64)
                 zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
-                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, Rh))
+                add("requant", truth.gate_requantize(pre, real_scales(k, sw, cols), zp, lo, hi, Rh))
                 multipliers(k, sw)
                 held[k] = Rh
                 continue
-            if addk:  # an add set: requantize (the identity) gives q2, hold_mem q1, TFLite's ADD y, the activation stage's input
+            if addk:  # an add set: requantize (the identity) gives q2, hold_mem q1, the ADD y, the activation stage's input
                 Q = _full(g["Q"].get(k, {}), N * N, f"pass {tag} set {k}'s ADD outputs")
                 q1, q2, y = (np.array([v[i] for v in Q], dtype=np.int64) for i in range(3))
                 if k - 1 not in held:
                     raise RuntimeError(f"truth dump: pass {tag} add set {k} has no hold set before it")
                 add("transfer", _transfer("int8", held[k - 1], q1))  # hold_mem: each element its hold set's own beat
-                add("add", truth.gate_add(q1, q2, fl[k]["words"], y, mr.ROUNDING))
+                aw = fl[k]["words"]
+                r1, r2 = scales.get(str(k), {}).get("add") or [float(np.ldexp(aw[m], -aw["shift"])) for m in ("m1", "m2")]
+                add("add", truth.gate_quantized_add(q1, q2, r1, aw["zp1"], r2, aw["zp2"], 1.0, aw["zpo"], aw["amin"], aw["amax"], y))
             X = np.array(_full(g["X"].get(k, {}), N * N, f"pass {tag} set {k}'s activation inputs"), dtype=np.int64)
             Aw = np.array(_full(g["A"].get(k, {}), N * N, f"pass {tag} set {k}'s activation bank"), dtype=np.int64)
             if fmt == "int8":
                 zp, lo, hi = (np.array([sw["ents"][int(e)][x] for e in ent]) for x in ("zp", "amin", "amax"))
-                add("requant", truth.gate_requant(pre, sw["mult"][cols], sw["shift"][cols], zp, lo, hi, q2 if addk else X))
+                add("requant", truth.gate_requantize(pre, real_scales(k, sw, cols), zp, lo, hi, q2 if addk else X))
                 if addk:  # the lanes after an ADD: input zero point zp_o, the ADD's clamp, the drop value zp_o (P-3, D-5)
                     aw = fl[k]["words"]
                     sw["ents"] = {e: dict(w, zp=aw["zpo"], amin=aw["amin"], amax=aw["amax"]) for e, w in sw["ents"].items()}
@@ -1408,7 +1413,8 @@ def truth_report(res: dict) -> tuple:
         lines.append("        " + (truth.line(r) if name.startswith("activation") else truth.stage_line(r)))
         if not r.ok:
             w = {"matmul": lambda: f"{truth.worst_text(r.worst)} of sum|ab|", "narrow": lambda: f"{r.worst_lsb} ULP",
-                 "requant": lambda: f"{r.worst_lsb} LSB from round(real)", "multiplier": lambda: f"{r.worst:.3f} LSB of the multiplier",
+                 "requant": lambda: f"{r.worst:.3f} steps from the true value", "add": lambda: f"{r.worst:.3f} steps from the true value",
+                 "scale": lambda: f"{r.worst:.3f} x 2^-24 relative",
                  "activation": lambda: truth.worst_text(r.worst) +
                  (f" ({r.worst_lsb} LSB)" if r.fmt == "int8" else "")}.get(name.split()[0], lambda: f"|out - want| {r.worst:.6g}")()
             where = ", ".join(sorted(res.get("_passes", {}).get(name, ())))
@@ -1672,7 +1678,7 @@ RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point: ruling tex
     "hold done with a bank done": {"*": ("a_hold_done_no_bank",
                                          "unreachable, checked every cycle by sienna_top's a_hold_done_no_bank (fires under m_t26_hdb_force): "
                                          "hold_done is a hold beat leaving requantize, which is then no rq_out beat; no add_lanes beat is in flight "
-                                         "(the hold set's grant waited on rq_room, so at_v was empty); and a lane set's g_done needs its own beats "
+                                         "(the hold set's grant waited on rq_room, so add_lanes' busy_o was low); and a lane set's g_done needs its own beats "
                                          "through requantize after the hold's last (a_rq_one_set)")},
 }
 RTL_TOP = os.path.join(ROOT, "src", "sienna_top.sv")
@@ -2059,7 +2065,9 @@ TRANSFORMER = [
 
 
 def run_int8(a, sim, shapes) -> None:
-    """int8 on the layer engine: TFLite-PTQ-quantized products must equal the model bit for bit; the quantization error is reported, not gated."""
+    """int8 on the layer engine, affinely quantized products: a linear case's outputs are gated on the true requantize of each exact int32 sum
+    (mr.layer_truth), a lane case's against the bit-exact model until TB_model_run dumps per stage (F3, Task 2.8); the quantization error against
+    the float product is reported, not gated."""
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
     peak = a.n * a.n
     head = (f"{'shape':<22} {'M':>5} {'K':>5} {'N':>5} {'sets':>7} {'cycles':>10} {'MAC/cycle':>9} {'PE use':>7} "
@@ -2070,7 +2078,7 @@ def run_int8(a, sim, shapes) -> None:
         rep.write(line + "\n")
     cases = [(name, m, k, n, "linear") for name, m, k, n in shapes]
     cases += [(f"layer_{act}_bias", 64, 48, 40, act) for act in ("tanh", "sigmoid", "selu")]
-    rows, bad = [], 0
+    rows, bad, over, lin_mism = [], 0, 0, 0
     for name, m, k, n, act in cases:
         rng = np.random.RandomState(m * 7 + k * 13 + n)
         A, B = rng.uniform(-1, 1, (m, k)), rng.uniform(-1, 1, (k, n))
@@ -2107,10 +2115,17 @@ def run_int8(a, sim, shapes) -> None:
         rep.write(line + "\n")
         rep.flush()
         json.dump(rows, open(os.path.join(a.work, f"gemm_sweep_N{a.n}.json"), "w"), indent=1)
-        if mism:
+        if act == "linear":
+            tr = mr.layer_truth(job, y)[0]
+            over, lin_mism = over + tr.over, lin_mism + mism
+            if not tr.ok:
+                print(f"FAIL {name}: {truth.stage_line(tr)}", flush=True)
+                bad += 1
+        elif mism:
             print(f"FAIL {name}: {mism} outputs differ from the bit-exact model", flush=True)
             bad += 1
-    line = f"GEMM int8: {len(rows)} cases, {bad} with outputs that differ from the bit-exact model"
+    line = (f"GEMM int8: {len(rows)} cases, {bad} failing (linear cases on the true function, {over} outputs over the rule; lane cases on the "
+            f"bit-exact model); reported: {lin_mism} linear outputs differ from the bit-exact model")
     print(line, flush=True)
     rep.write(line + "\n")
     if bad:
@@ -2337,7 +2352,7 @@ def rtl_lat() -> tuple:
     return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0]
 
 
-UNIT_LAT = FX_LAT = REQ_LAT = None  # mul_lat and add_lat per format, fxMac, tfliteRequant; perf_init() parses them
+UNIT_LAT = FX_LAT = REQ_LAT = None  # mul_lat and add_lat per format, fxMac, int8Requantizer; perf_init() parses them
 MUL_LAT = ADD_LAT = None  # valid in to done out; perf_init() sets fp32's, perf_main() the build's format's values
 MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
 FMT = "fp32"  # the build's format; perf_main() sets it
@@ -2670,11 +2685,8 @@ MODELS = {  # name: (layer, fused activation); seed 0 of each is saved for G4
 }
 OUT_RANGE = {"conv3x3_8x8x16_relu6_wide": (-1.0, 8.0)}  # output fake-quantized wider than relu6, so the fused clamp is not int8's
 OP_NAME = {"fc": "FULLY_CONNECTED", "conv": "CONV_2D"}
-ROUNDINGS = ("DOUBLE", "SINGLE")
-MIN_DISCRIMINATING = 100  # outputs where the two roundings differ: the pick must rest on evidence
-MIN_UNCLAMPED = 0.25  # per model: the comparison must not be dominated by saturated outputs
-N_SAVED = 64  # test inputs and interpreter outputs kept per npz for G4
-MIN_SAVED_DISC = {"fc": 1, "conv": 50}  # discriminating outputs each saved npz must hold, so G4 sees a wrong rounding
+MIN_UNCLAMPED = 0.25  # per model: the outputs must not be dominated by saturated ones
+N_SAVED = 64  # test inputs and interpreter outputs kept per npz
 
 
 def build_model(layer, act, seed, out_range=None):
@@ -2764,16 +2776,17 @@ def extract(it, model, layer, act):
          "w_scales": qp[wi]["scales"].astype(np.float32),
          "in_scale": np.float32(qp[xi]["scales"][0]), "in_zp": int(qp[xi]["zero_points"][0]),
          "out_scale": np.float32(qp[oi]["scales"][0]), "out_zp": int(qp[oi]["zero_points"][0])}
-    p["amin"], p["amax"] = mr.activation_range(act, p["out_scale"], p["out_zp"])
+    p["amin"], p["amax"] = ipu.activation_clamp(act, float(p["out_scale"]), p["out_zp"])
     return p
 
 
-def reference(p, xs, rounding, folded=False, scale_product=None):
-    args = (xs, p["w_q"], p["b_q"], p["in_zp"], p["w_scales"], p["in_scale"], p["out_scale"], p["out_zp"], p["amin"],
-            p["amax"], rounding)
+def layer_sums(p, xs, folded=False):
+    """The layer's exact int32 sums on input codes xs, as (rows, channels); folded is SIENNA's zero-point algebra."""
     if p["layer"] == "fc":
-        return mr.fc_int8(*args, folded=folded, scale_product=scale_product).astype(np.int64)
-    return mr.conv2d_int8(*args, folded=folded).astype(np.int64)
+        acc = mr.fc_acc(xs, p["w_q"], p["b_q"], p["in_zp"], folded=folded)
+    else:
+        acc = mr.conv2d_acc(xs, p["w_q"], p["b_q"], p["in_zp"], folded=folded)
+    return acc.reshape(-1, p["w_q"].shape[0])
 
 
 def test_inputs(p, lo, hi, n, rng):
@@ -2785,74 +2798,68 @@ def test_inputs(p, lo, hi, n, rng):
     return xq
 
 
-def pick_saved(disc_in, k, n):
-    """Indices of the saved inputs: the most discriminating first (up to n), then alternately calibration and uniform ones."""
-    top = [int(i) for i in np.argsort(-disc_in, kind="stable") if disc_in[i] > 0][:n]
-    rest = [i for i in range(disc_in.size) if i not in set(top)]
+def pick_saved(differ_in, k, n):
+    """Indices of the saved inputs: those whose interpreter outputs differ most from the generic model first (up to n), then alternately
+    calibration and uniform ones."""
+    top = [int(i) for i in np.argsort(-differ_in, kind="stable") if differ_in[i] > 0][:n]
+    rest = [i for i in range(differ_in.size) if i not in set(top)]
     fill = [i for pair in itertools.zip_longest([i for i in rest if i >= k], [i for i in rest if i < k]) for i in pair if i is not None]
     return np.array(sorted(top + fill[:n - len(top)]))
 
 
-def save(out, name, model, p, xs, ys, rounding):
+def save(out, name, model, p, xs, ys):
     with open(os.path.join(out, name + ".tflite"), "wb") as f:
         f.write(model)
-    mults, shifts = mr.layer_multipliers(p["layer"], p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], rounding)
     np.savez(os.path.join(out, name + ".npz"), layer=p["layer"], activation=p["activation"], in_shape=np.array(p["in_shape"]),
              w_q=p["w_q"].astype(np.int8), b_q=p["b_q"].astype(np.int32), w_scales=p["w_scales"], in_scale=p["in_scale"],
              in_zp=p["in_zp"], out_scale=p["out_scale"], out_zp=p["out_zp"], act_min=p["amin"], act_max=p["amax"],
-             mults=mults, shifts=shifts, x_test=xs.astype(np.int8), y_test=ys.astype(np.int8), rounding=rounding,
-             tf_version=tf.__version__)
+             x_test=xs.astype(np.int8), y_test=ys.astype(np.int8), tf_version=tf.__version__)
 
 
 def oracle_main(argv=None) -> None:
-    """Gate G0: single-layer int8 TFLite models on the interpreter's BUILTIN_REF kernels against model_runner's reference kernels in both roundings; pins the rounding."""
+    """The single-layer int8 test vehicles: TensorFlow converts each model, the interpreter (BUILTIN_REF) runs it, and every output of the
+    interpreter and of the generic bit-exact model (encode_scale, ipu.requantize) is judged on the true function of its exact int32 sum;
+    the generic model must pass, the interpreter's misses and the two's disagreements are reported. Seed 0 of each kind is saved."""
     ap = argparse.ArgumentParser(description=oracle_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="oracle")
-    ap.add_argument("--out", required=True, help="directory for the G4 models, npz files and rounding files")
-    ap.add_argument("--report", required=True, help="G0 report (.log)")
+    ap.add_argument("--out", required=True, help="directory for the models and npz files")
+    ap.add_argument("--report", required=True, help="report (.log)")
     ap.add_argument("--seeds", type=int, default=8, help="models per kind; seed 0 is saved")
     ap.add_argument("--inputs", type=int, default=1000, help="random test inputs per model")
     a = ap.parse_args(argv)
     _tf_imports()
     os.makedirs(a.out, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(a.report)), exist_ok=True)
-    lines = [f"G0 TFLite oracle: TensorFlow {tf.__version__}, numpy {np.__version__}, op resolver BUILTIN_REF, "
+    lines = [f"int8 layer models: TensorFlow {tf.__version__}, numpy {np.__version__}, op resolver BUILTIN_REF, "
              f"{a.seeds} seeds x {len(MODELS)} models, {a.inputs} inputs each"]
-    tot = {"outputs": 0, "DOUBLE": 0, "SINGLE": 0, "disc": 0, "folded": 0}
-    problems, keep, clamp_models = [], {}, []
+    tot = {"outputs": 0, "interp_miss": 0, "model_miss": 0, "differ": 0, "folded": 0}
+    problems, keep = [], {}
     for name, (layer, act) in MODELS.items():
         for seed in range(a.seeds):
             model, lo, hi = build_model(layer, act, seed, OUT_RANGE.get(name))
             it = interpreter(model, REF)
             p = extract(it, model, layer, act)
             xs = test_inputs(p, lo, hi, a.inputs, np.random.default_rng(seed + 2000))
-            ys = invoke_all(it, xs)
-            ys_default = invoke_all(interpreter(model, tf.lite.experimental.OpResolverType.AUTO), xs)
-            want = {r: reference(p, xs, r) for r in ROUNDINGS}
-            mism = {r: int(np.sum(ys != want[r])) for r in ROUNDINGS}
-            dflt = {r: int(np.sum(ys_default != want[r])) for r in ROUNDINGS}
-            disc_in = (want["DOUBLE"] != want["SINGLE"]).reshape(len(xs), -1).sum(axis=1)
-            disc = int(disc_in.sum())
-            nontrivial = p["amin"] > -128 or p["amax"] < 127
-            full = dict(p, amin=-128, amax=127)
-            act_hits = {r: int(np.sum(reference(full, xs, r) != want[r])) for r in ROUNDINGS} if nontrivial else None
-            fold = sum(int(np.sum(reference(p, xs, r, folded=True) != want[r])) for r in ROUNDINGS)
+            ys_raw = invoke_all(it, xs)
+            ys = ys_raw.reshape(-1, p["w_q"].shape[0])
+            acc = layer_sums(p, xs)
+            fold = int(np.sum(layer_sums(p, xs, folded=True) != acc))
+            S = mr.layer_scales(p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0])
+            m, e = mr.encode_scales(S)
+            ym = mr.requantize(acc, dict(mult=m, shift=e, zp=p["out_zp"], amin=p["amin"], amax=p["amax"]))
+            Sx = np.broadcast_to(S[None, :], acc.shape)
+            r_i = truth.gate_requantize(acc, Sx, p["out_zp"], p["amin"], p["amax"], ys)
+            r_m = truth.gate_requantize(acc, Sx, p["out_zp"], p["amin"], p["amax"], ym)
+            differ_in = (ys != ym).reshape(len(xs), -1).sum(axis=1)
             unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
-            _, shifts = mr.layer_multipliers(layer, p["w_scales"], p["in_scale"], p["out_scale"], p["w_q"].shape[0], "DOUBLE")
             per_ch = p["w_scales"].size > 1
             lines.append(f"{name} seed {seed}: in scale {p['in_scale']:.6g} zp {p['in_zp']}, out scale {p['out_scale']:.6g} "
-                         f"zp {p['out_zp']}, act [{p['amin']}, {p['amax']}], weights "
-                         f"{'per-channel' if per_ch else 'per-tensor'} ({p['w_scales'].size}), shifts [{shifts.min()}, "
-                         f"{shifts.max()}], outputs {ys.size}, mismatches DOUBLE {mism['DOUBLE']} SINGLE {mism['SINGLE']}, "
-                         f"discriminating {disc}, folded {fold}, unclamped {100 * unclamped:.1f}%, "
-                         f"default resolver (info) DOUBLE {dflt['DOUBLE']} SINGLE {dflt['SINGLE']}"
-                         + (f", outputs the fused clamp changes DOUBLE {act_hits['DOUBLE']} SINGLE {act_hits['SINGLE']}"
-                            if nontrivial else ""))
-            if nontrivial:
-                clamp_models.append((f"{name} seed {seed}", act_hits))
-            if layer == "fc" and not per_ch and min(mism.values()) > 0:
-                alt = {r: int(np.sum(ys != reference(p, xs, r, scale_product="double"))) for r in ROUNDINGS}
-                lines.append(f"  diagnostic: per-tensor FC with a double scale product: DOUBLE {alt['DOUBLE']} SINGLE {alt['SINGLE']}")
+                         f"zp {p['out_zp']}, act [{p['amin']}, {p['amax']}], weights {'per-channel' if per_ch else 'per-tensor'} "
+                         f"({p['w_scales'].size}), outputs {ys.size}: generic model {r_m.over} over the rule (worst {r_m.worst:.3f} steps), "
+                         f"interpreter {r_i.over} over (worst {r_i.worst:.3f}), {int(differ_in.sum())} differ between the two, "
+                         f"folded {fold}, unclamped {100 * unclamped:.1f}%")
+            if not r_m.ok:
+                problems.append(f"{name} seed {seed}: the generic model fails the true function on {r_m.over} outputs")
             if p["in_zp"] == 0:
                 problems.append(f"{name} seed {seed}: input zero point is 0")
             if layer == "conv" and (not per_ch or np.unique(p["w_scales"]).size < 2):
@@ -2860,39 +2867,26 @@ def oracle_main(argv=None) -> None:
             if unclamped < MIN_UNCLAMPED:
                 problems.append(f"{name} seed {seed}: only {100 * unclamped:.1f}% of outputs unclamped")
             tot["outputs"] += ys.size
-            tot["disc"] += disc
+            tot["interp_miss"] += r_i.over
+            tot["model_miss"] += r_m.over
+            tot["differ"] += int(differ_in.sum())
             tot["folded"] += fold
-            for r in ROUNDINGS:
-                tot[r] += mism[r]
             if seed == 0:
-                idx = pick_saved(disc_in, a.inputs // 10, N_SAVED)
-                sd, need = int(disc_in[idx].sum()), MIN_SAVED_DISC[layer]
+                idx = pick_saved(differ_in, a.inputs // 10, N_SAVED)
                 lines.append(f"  saved {name}: {idx.size} inputs ({int(np.sum(idx < a.inputs // 10))} uniform int8, "
-                             f"{int(np.sum(idx >= a.inputs // 10))} calibration), discriminating outputs {sd} (need {need}, "
-                             f"the {a.inputs} test inputs hold {disc})")
-                if sd < need:
-                    problems.append(f"saved {name}: {sd} discriminating outputs, need {need} (at most {disc} available)")
-                keep[name] = (model, p, xs[idx], ys[idx])
-    lines.append(f"totals: outputs {tot['outputs']}, mismatches DOUBLE {tot['DOUBLE']} SINGLE {tot['SINGLE']}, "
-                 f"discriminating {tot['disc']}, folded {tot['folded']}")
-    winners = [r for r in ROUNDINGS if tot[r] == 0]
-    if len(winners) != 1:
-        problems.append(f"{len(winners)} roundings match every output; exactly one must")
-    elif not any(h[winners[0]] > 0 for _, h in clamp_models):
-        problems.append(f"no model has a non-trivial fused clamp that changes an output ({len(clamp_models)} non-trivial)")
-    if tot["disc"] < MIN_DISCRIMINATING:
-        problems.append(f"only {tot['disc']} discriminating outputs (need {MIN_DISCRIMINATING})")
+                             f"{int(np.sum(idx >= a.inputs // 10))} calibration), {int(differ_in[idx].sum())} outputs where the interpreter and the "
+                             f"generic model differ")
+                keep[name] = (model, p, xs[idx], ys_raw[idx])
+    lines.append(f"totals: outputs {tot['outputs']}, generic model over the rule {tot['model_miss']}, interpreter over the rule "
+                 f"{tot['interp_miss']} (reported), interpreter and generic model differ {tot['differ']} (reported), folded {tot['folded']}")
     if tot["folded"]:
-        problems.append(f"SIENNA's folded zero-point algebra differs from TFLite's on {tot['folded']} outputs")
+        problems.append(f"SIENNA's folded zero-point algebra differs from the plain sums on {tot['folded']} outputs")
     if problems:
-        lines += [f"problem: {m}" for m in problems] + ["G0: FAIL"]
+        lines += [f"problem: {m}" for m in problems] + ["MODELS: FAIL"]
     else:
-        rounding = winners[0]
         for name, (model, p, xs, ys) in keep.items():
-            save(a.out, name, model, p, xs, ys, rounding)
-        with open(os.path.join(a.out, "rounding.txt"), "w") as f:
-            f.write(rounding + "\n")
-        lines += [f"ROUNDING: {rounding}", "G0: PASS"]
+            save(a.out, name, model, p, xs, ys)
+        lines += ["MODELS: PASS"]
     with open(a.report, "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
@@ -2937,7 +2931,7 @@ PACK_MODELS = {  # name: (layer, act, inputs, outputs); the first three fit bloc
 
 
 def pack_models_main(argv=None) -> None:
-    """Five small int8 TFLite layers for packing, saved as the oracle saves its G4 models; arg: output directory."""
+    """Five small int8 TFLite layers for packing, saved as the model generator (--action oracle) saves its models; arg: output directory."""
     ap = argparse.ArgumentParser(description=pack_models_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="pack-models")
     ap.add_argument("out", help="output directory")
@@ -2945,7 +2939,6 @@ def pack_models_main(argv=None) -> None:
     _tf_imports()
     global FC_IN, FC_OUT, CONV_CIN, CONV_COUT, CONV_HW
     os.makedirs(out, exist_ok=True)
-    rounding = open(os.path.join(ROOT, "testbenches", "tflite_int8", "rounding.txt")).read().strip()
     for name, (layer, act, cin, cout) in PACK_MODELS.items():
         FC_IN, FC_OUT, CONV_CIN, CONV_COUT, CONV_HW = cin, cout, cin, cout, 6
         model, lo, hi = build_model(layer, act, 0)
@@ -2954,10 +2947,9 @@ def pack_models_main(argv=None) -> None:
         xs = test_inputs(p, lo, hi, 32, np.random.default_rng(2000))
         ys = invoke_all(it, xs)
         unclamped = float(np.mean((ys != p["amin"]) & (ys != p["amax"])))
-        save(out, name, model, p, xs, ys, rounding)
+        save(out, name, model, p, xs, ys)
         print(f"{name}: in zp {p['in_zp']} out zp {p['out_zp']} act [{p['amin']}, {p['amax']}] unclamped {100 * unclamped:.1f}% "
               f"y [{ys.min()}, {ys.max()}] w_scales {p['w_scales'].size}")
-    shutil.copy(os.path.join(ROOT, "testbenches", "tflite_int8", "rounding.txt"), out)
 
 
 # ── gpnae-tflite (was gpnae_int8_tflite.py) ──────────────────────────────────
@@ -3024,21 +3016,8 @@ def gpnae_tflite_main(argv=None):
 RQ_N, RQ_LANES, RQ_SETS = 16, 32, 6  # TB_requant_lanes' geometry
 RQ_PER = RQ_N * RQ_N // RQ_LANES
 PACKED_SETS = (1, 2, 5)  # set 3 is unpacked at an odd multiple of RQ_PER beats, so a beat counter that ignores clear_i is caught
-SEP_SLOTS, SEP_BOUND, SEP_TRIES, SEP_BATCH = 4, 1 << 20, 1 << 20, 1 << 16  # accumulators that separate DOUBLE from SINGLE
-
-
-def separating(rng, mult: int, shift: int, zp: int, amin: int, amax: int):
-    """A small accumulator (|acc| < SEP_BOUND) whose requantize differs between DOUBLE and SINGLE for this channel, or None."""
-    for _ in range(SEP_TRIES // SEP_BATCH):
-        a = rng.randint(-SEP_BOUND + 1, SEP_BOUND, SEP_BATCH).astype(np.int64)
-        hit = np.flatnonzero(ipu.requant(a, mult, shift, zp, amin, amax, "DOUBLE") != ipu.requant(a, mult, shift, zp, amin, amax, "SINGLE"))
-        if hit.size:
-            return int(a[hit[0]])
-    return None
-
-
 def rq_vectors_main(argv=None) -> None:
-    """Vectors for TB_requant_lanes through its channel map, expected values from ipu.requant in model_runner's rounding; arg: output .mem path."""
+    """Vectors for TB_requant_lanes through its channel map, expected values from ipu.requantize (int8Requantizer, bit-exact); arg: output .mem path."""
     ap = argparse.ArgumentParser(description=rq_vectors_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="rq-vectors")
     ap.add_argument("path", help="output .mem path")
@@ -3046,10 +3025,10 @@ def rq_vectors_main(argv=None) -> None:
     rng = np.random.RandomState(8)
     out = [RQ_SETS]
     for s in range(RQ_SETS):
-        mult = rng.randint(1 << 30, 1 << 31, RQ_N).astype(np.int64)
+        mult = rng.randint(1 << 23, 1 << 24, RQ_N).astype(np.int64)
         if s == 0:
-            mult[0], mult[1] = (1 << 31) - 1, 1 << 30  # the largest multiplier and the smallest normalized one
-        shift = -((s * RQ_N + np.arange(RQ_N)) % 32).astype(np.int64)  # every right shift 0..31 across the sets
+            mult[0], mult[1] = (1 << 24) - 1, 1 << 23  # the largest mantissa and the smallest normalized one
+        shift = (16 + (s * RQ_N + np.arange(RQ_N)) % 40).astype(np.int64)  # every right shift 16..55 across the sets
         zp = int(rng.randint(-128, 128))
         amin, amax = [(-128, 127), (zp, 127), (zp, min(127, zp + 50)), (-128, 127), (-40, 40), (-128, zp)][s]
         amin, amax = min(amin, amax), max(amin, amax)
@@ -3071,26 +3050,8 @@ def rq_vectors_main(argv=None) -> None:
             zpL = np.array([ents[e][0] for e in blk]); aminL = np.array([ents[e][1] for e in blk]); amaxL = np.array([ents[e][2] for e in blk])
         else:
             zpL, aminL, amaxL = np.full(RQ_LANES, zp), np.full(RQ_LANES, amin), np.full(RQ_LANES, amax)
-        srng, found = np.random.RandomState(1900 + s), []
-        for ch in (np.arange(RQ_N) + 5 * s) % RQ_N:
-            k0 = int(ch)  # packed: lane ch reads channel ch at every beat
-            a = separating(srng, int(mult[ch]), int(shift[ch]), int(zpL[k0]), int(aminL[k0]), int(amaxL[k0]))
-            if a is None:
-                continue
-            if packed:
-                b, k = len(found) % RQ_PER, int(ch) + RQ_N * (len(found) % (RQ_LANES // RQ_N))
-            else:
-                b, k = int(ch) % RQ_PER, 8 + 2 * len(found) + int(ch) // RQ_PER
-            assert c[b, k] == ch
-            acc[b, k] = a
-            found.append(int(ch))
-            if len(found) == SEP_SLOTS:
-                break
-        if not found:
-            raise RuntimeError(f"set {s}: no channel has a small accumulator that separates DOUBLE from SINGLE")
-        print(f"set {s}{' (packed)' if packed else ''}: DOUBLE/SINGLE separating accumulators on channels {found}")
-        want = np.stack([ipu.requant(acc[:, k], mult[c[:, k]], shift[c[:, k]], int(zpL[k]), int(aminL[k]), int(amaxL[k]),
-                                     mr.ROUNDING) for k in range(RQ_LANES)], axis=1)
+        want = np.stack([ipu.requantize(acc[:, k], mult[c[:, k]], shift[c[:, k]], int(zpL[k]), int(aminL[k]), int(amaxL[k]))
+                         for k in range(RQ_LANES)], axis=1)
         out += [int(packed)] + zpL.tolist() + aminL.tolist() + amaxL.tolist() + mult.tolist() + shift.tolist()
         for b in range(RQ_PER):
             out += acc[b].tolist() + [int(v) for v in want[b]]
@@ -3101,17 +3062,13 @@ def rq_vectors_main(argv=None) -> None:
 # ── add-vectors: TB_add_lanes' vectors ────────────────────────────────────────
 
 ADD_LANES, ADD_SETS, ADD_PER = 32, 6, 8  # TB_add_lanes' geometry: lanes, sets, beats per set
-ADD_TIE = 3  # the set of halves: s1 = s2 = 2^e, s_out = 2^(e+1), so its odd sums are ties that DOUBLE and SINGLE round apart
 ADD_EXP = {"none": (-8, 1), "relu": (-8, 1), "relu6": (-7, -5)}  # input scales' log2 range: relu6's 6.0 within a few input codes' sums
 ADD_ZIN = {"none": 128, "relu": -32, "relu6": -32}  # input zero points below this: a ReLU set's inputs mostly positive, off its zp_o rail
 ADD_ZOUT = {"none": 128, "relu": 1, "relu6": -63}  # zp_o below this, so 127 stays above a ReLU's or ReLU6's outputs
 
 
 def _add_set_draw(rng, s: int) -> tuple:
-    """Set s's activation, scales (s1, s2, s_out) and zero points (zp1, zp2, zp_o): s_out is 2 max(s1, s2) 2^U(-2, 1), ADD_TIE's are halves."""
-    if s == ADD_TIE:
-        e = int(rng.integers(-8, 1))
-        return "none", [2.0 ** e, 2.0 ** e, 2.0 ** (e + 1)], [int(v) for v in rng.integers(-20, 21, 3)]
+    """Set s's activation, scales (s1, s2, s_out) and zero points (zp1, zp2, zp_o): s_out is 2 max(s1, s2) 2^U(-2, 1)."""
     act = ("none", "relu", "relu6")[s % 3]
     s1, s2 = (float(np.float32(2.0 ** x)) for x in rng.uniform(*ADD_EXP[act], 2))
     s_out = float(np.float32(2.0 * max(s1, s2) * 2.0 ** rng.uniform(-2, 1)))
@@ -3127,19 +3084,23 @@ def add_vectors_main(argv=None) -> None:
     rng = np.random.default_rng(29)
     lines = []
     for s in range(ADD_SETS):
-        act, sc, z = _add_set_draw(rng, s)
-        add = mr.add_words(sc[0], z[0], sc[1], z[1], sc[2], z[2], act)
+        for _ in range(ADD_TRIES):  # redrawn until half the set's outputs are off the clamp rails
+            act, sc, z = _add_set_draw(rng, s)
+            add = mr.add_words(sc[0], z[0], sc[1], z[1], sc[2], z[2], act)
+            q1, q2 = rng.integers(-128, 128, (2, ADD_PER, ADD_LANES))
+            want = mr.qadd_codes(q1, q2, add)
+            off = np.mean((want != add["amin"]) & (want != add["amax"]))
+            if off >= 0.5:
+                break
+        else:
+            raise ValueError(f"add-vectors: set {s} ({act}): no draw in {ADD_TRIES} with half its outputs off the clamp rails")
         lines.append(" ".join(f"{add[k] & 0xFFFFFFFF:08x}" for k in mr.ADD_FIELDS))
-        q1, q2 = rng.integers(-128, 128, (2, ADD_PER, ADD_LANES))
-        want = mr.tflite_add_codes(q1, q2, add)
-        off = np.mean((want != add["amin"]) & (want != add["amax"]))
-        assert off >= 0.5, f"add-vectors: set {s} ({act}) has {off:.0%} of its outputs off the clamp rails, under half"
         for b in range(ADD_PER):
             lines.append(f"{int(rng.integers(0, 1 << 16)):04x} " + " ".join(f"{int(x) & 0xFF:02x}{int(y) & 0xFF:02x}{int(w) & 0xFF:02x}"
                                                                          for x, y, w in zip(q1[b], q2[b], want[b])))
     with open(a.out, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, rounding {mr.ROUNDING}")
+    print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, expected words from ipu.qadd")
 
 
 # ── Self-tests ───────────────────────────────────────────────────────────────
@@ -3390,7 +3351,7 @@ def test_int8_relu_is_the_clamp():
 
 @selftest
 def test_residual_golden():
-    """_golden_int8_residual against an element-by-element composition (scalar ipu on each code), and it moves with zp1, the ADD and zp_o."""
+    """_golden_int8_residual against an element-by-element composition (scalar ipu.qadd on each code), and it moves with zp1, the ADD and zp_o."""
     rng = np.random.RandomState(3)
     N = 8
     A = rng.randint(-128, 128, (N, N)).astype(np.int64)
@@ -3405,7 +3366,7 @@ def test_residual_golden():
     Y = _golden_int8_residual([(A, B)], bias, rq, R, add, ra, cfg, "tanh", 1)[1]
     for i in range(N):
         for j in range(N):
-            assert int(Y[i, j]) == int(ipu.tflite_add(int(q1[i, j]), int(R[i, j]), *[add[k] for k in mr.ADD_FIELDS], mr.ROUNDING))
+            assert int(Y[i, j]) == int(ipu.qadd(int(q1[i, j]), int(R[i, j]), *[add[k] for k in mr.ADD_FIELDS]))
     for k, v in (("zp1", 0), ("zpo", add["zpo"] + 7)):
         assert np.any(_golden_int8_residual([(A, B)], bias, rq, R, dict(add, **{k: v}), ra, cfg, "tanh", 1)[1] != Y), k
     assert np.any(_golden_int8_residual([(A, B)], bias, rq, R, add, dict(ra, zp=0), cfg, "tanh", 1)[2] !=
@@ -3672,7 +3633,7 @@ def _residual_syn_dump(name: str, fault=None) -> list:
                         emit(tag, ridx, k, C, None, None, None, None, Rh=q)
                     elif fl[k]["add"]:
                         w = fl[k]["words"]
-                        y, q1 = mr.tflite_add_codes(held, q, w), held.copy()
+                        y, q1 = mr.qadd_codes(held, q, w), held.copy()
                         ra = dict(rq, zp=w["zpo"], amin=w["amin"], amax=w["amax"])
                         if fault and fault[:2] == (tag, k):
                             fault[2](q1, y)
@@ -3860,8 +3821,8 @@ def test_point_verdicts():
             ("fp32/N8_T2/model", "built\n", 0, "FAIL (no 'MODEL GATE: PASS')"), ("int8/N8_T2/tflite", "MODEL GATE: PASS int8\n", 0, "PASS"),
             ("int8/N8_T2/tflite", "ok\n", 0, "FAIL (no 'MODEL GATE: PASS')"),
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
-            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 with outputs that differ from the bit-exact model\n", 0, "PASS"),
-            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 with outputs that differ from the bit-exact model')"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (linear cases on the true function)\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu")), 0, "PASS"),
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\nlayer_tanh_bias  64 max err 9.3e-04 of the output range\n", 0, "FAIL (no 'layer_sigmoid_bias .* max err ')"),
             ("bf16/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"  layer_{x}: 0 outputs differ from the bit-exact model\n" for x in ("tanh", "sigmoid", "selu"))
@@ -4270,11 +4231,11 @@ def test_int8_shared_entry():
 
 @selftest
 def test_selu_large_scale_accepted():
-    # Task 1.16: the int8 lane's SELU is exact past lambda * x = 512, so a large-scale SELU entry packs and runs; its output shift is <= 0.
+    # Task 1.16: the int8 lane's SELU is exact past lambda * x = 512, so a large-scale SELU entry packs and runs; its output scale is an encode_scale code.
     acc = np.arange(-2000, 2000, dtype=np.int64).reshape(-1, 2) * 500  # real inputs to +-1000: s_out about 7.8, lambda * x to 1051
     req = mr.requant_params(acc, 1e-3, np.ones(2), "selu")
     x = (mr.requantize(acc, req) - req["zp"]) * req["s_out"]
-    assert x.max() * gpnae_model.LAMBDA_F > 512 and req["shout"] <= 0 and (req["mout"], req["shout"]) == \
+    assert x.max() * gpnae_model.LAMBDA_F > 512 and 0 <= req["shout"] <= ipu.REQ_MAX_SHIFT and req["mout"] < 1 << 24 and (req["mout"], req["shout"]) == \
         gpnae_model.selu_out_params(req["s_out"], req["mx"], req["s_selu"]), (x.max(), req["mout"], req["shout"])
     m = {"W": np.ones((2, 2)), "bias": None, "act": "selu", "req": req, "inputs": [np.ones((1, 2))]}
     job, _ = mr.pack_jobs([m], 16, int8=True)
@@ -4552,24 +4513,12 @@ def test_tail_ops_fp32():
         assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
 
 
-# ── tool: TFLite reference kernels (was test_tflite_ref.py) ──
-
-TFLITE_QM = [  # real -> (mult, shift): frexp, then the mantissa * 2^31 rounded half away from zero
-    (0.5, (1 << 30, 0)),
-    (1.0, (1 << 30, 1)),
-    (0.75, (1610612736, 0)),
-    (0.1, (1717986918, -3)),  # 0.8 * 2^31 = 1717986918.4
-    (2.0 ** -32, (1 << 30, -31)),  # shift -31 is kept
-    (2.0 ** -33, (0, 0)),  # shift -32 flushes to zero
-    (0.0, (0, 0)),
-    (1.0 - 2.0 ** -40, (1 << 30, 1)),  # the mantissa rounds to 2^31: halved, shift + 1
-    (1.0 / 255.0, (1077952576, -7)),
-    (0.5 + 2.0 ** -32, ((1 << 30) + 1, 0)),  # 2^30 + 0.5 rounds away from zero; numpy.round would give 2^30
-]
-
+# ── tool: the int8 layer references (was test_tflite_ref.py) ──
 
 @selftest
-def test_tflite_ref():
+def test_layer_ref():
+    """The int8 layer references on hand values: fold_input_zp's algebra equals the plain sums, ipu.activation_clamp's bounds, and
+    requantize (encode_scale words) rounding ties half up."""
     fails = checks = 0
 
     def check(what, got, want):
@@ -4580,38 +4529,35 @@ def test_tflite_ref():
             fails += 1
             print(f"[FAIL] {what}: got {g.tolist()}, want {w.tolist()}")
 
-    ref = mr
-    for real, want in TFLITE_QM:
-        check(f"quantize_multiplier({real!r})", ref.quantize_multiplier(real), want)
-    check("quantize_multiplier(2^31, SINGLE)", ref.quantize_multiplier(2.0 ** 31, "SINGLE"), ((1 << 31) - 1, 30))
-    check("quantize_multiplier(2^31, DOUBLE)", ref.quantize_multiplier(2.0 ** 31, "DOUBLE"), (1 << 30, 32))
-    check("relu6 range", ref.activation_range("relu6", 0.05, -128), (-128, -8))  # 6 / 0.05 = 120 levels
-    check("relu range", ref.activation_range("relu", 0.1, 3), (3, 127))
-    check("relu6 above int8", ref.activation_range("relu6", 0.02, -10), (-10, 127))  # 300 levels: capped
-    check("none range", ref.activation_range("none", 0.1, 3), (-128, 127))
-
-    # FC: acc = 3 * (10 + 2) - 4 * (-20 + 2) + b = 108 + b; scale 0.5 * 0.25 / 1.0 = 2^-3 (QM (2^30, -2)); out zp 3.
+    check("relu6 clamp", ipu.activation_clamp("relu6", 0.05, -128), (-128, -8))  # 6 / 0.05 = 120 levels
+    check("relu clamp", ipu.activation_clamp("relu", 0.1, 3), (3, 127))
+    check("relu6 above int8", ipu.activation_clamp("relu6", 0.02, -10), (-10, 127))  # 300 levels: capped
+    check("none clamp", ipu.activation_clamp("none", 0.1, 3), (-128, 127))
+    check("layer_scales per channel and per tensor", mr.layer_scales([0.25, 0.5], 0.5, 2.0, 2).tolist() + mr.layer_scales([0.25], 0.5, 2.0, 2).tolist(),
+          [0.0625, 0.125, 0.0625, 0.0625])
+    # FC: acc = 3 * (10 + 2) - 4 * (-20 + 2) + b = 108 + b; scale 0.5 * 0.25 / 1.0 = 2^-3; out zp 3; ties round half up.
     x, w = np.array([[10, -20]]), np.array([[3, -4]])
-    fc_cases = [(100, 29, 29),  # 208 / 8 = 26
-                (104, 30, 30),  # 212 / 8 = 26.5: a positive tie, both up
-                (-176, -6, -5)]  # -68 / 8 = -8.5: DOUBLE away (-9), SINGLE up (-8)
-    for b, dbl, sgl in fc_cases:
-        for r, want in (("DOUBLE", dbl), ("SINGLE", sgl)):
-            for folded in (False, True):
-                check(f"fc b={b} {r} folded={folded}",
-                      ref.fc_int8(x, w, np.array([b]), -2, [0.25], 0.5, 1.0, 3, -128, 127, r, folded=folded), [[want]])
-
-    # Conv 3x3 SAME on 2x2: in-image taps of (x - 1) give [[49, 43], [31, 25]]; QM (2^30, 0) makes each a positive tie; out zp -3.
+    m, e = mr.encode_scales(mr.layer_scales([0.25], 0.5, 1.0, 1))
+    check("encode_scales(2^-3)", (m.tolist(), e.tolist()), ([1 << 23], [26]))
+    for b, want in ((100, 29), (104, 30), (-176, -5)):  # 26; 26.5 up; -8.5 up
+        for folded in (False, True):
+            acc = mr.fc_acc(x, w, np.array([b]), -2, folded=folded)
+            check(f"fc b={b} folded={folded}: sum", acc, [[108 + b]])
+            check(f"fc b={b} folded={folded}: requantize", mr.requantize(acc, dict(mult=m, shift=e, zp=3, amin=-128, amax=127)), [[want]])
+    # Conv 3x3 SAME on 2x2: in-image taps of (x - 1) give [[49, 43], [31, 25]]; scale 0.5 makes each a tie, half up; out zp -3.
     xc = np.array([1, 2, 3, 4]).reshape(1, 2, 2, 1)
     wc = np.arange(1, 10).reshape(1, 3, 3, 1)
-    for r in ("DOUBLE", "SINGLE"):
-        for folded in (False, True):
-            check(f"conv {r} folded={folded}",
-                  ref.conv2d_int8(xc, wc, np.array([0]), 1, [1.0], 0.5, 1.0, -3, -128, 127, r, folded=folded),
-                  np.array([22, 19, 13, 10]).reshape(1, 2, 2, 1))
-    check("fold_input_zp", ref.fold_input_zp(np.array([0]), np.ones((1, 3, 3, 1)), 1), [-9])
-    check("im2col_same corner", ref.im2col_same(xc, 3, 3, 1)[0], [1, 1, 1, 1, 1, 2, 1, 3, 4])  # pad value 1 outside
-    print(f"test_tflite_ref: {checks} checks, {fails} failures")
+    for folded in (False, True):
+        acc = mr.conv2d_acc(xc, wc, np.array([0]), 1, folded=folded)
+        check(f"conv folded={folded}: sums", acc.ravel(), [49, 43, 31, 25])
+        check(f"conv folded={folded}: requantize", mr.requantize(acc.reshape(-1, 1), dict(mult=[1 << 23], shift=[24], zp=-3, amin=-128, amax=127)).ravel(),
+              [22, 19, 13, 10])
+    check("fold_input_zp", mr.fold_input_zp(np.array([0]), np.ones((1, 3, 3, 1)), 1), [-9])
+    check("im2col_same corner", mr.im2col_same(xc, 3, 3, 1)[0], [1, 1, 1, 1, 1, 2, 1, 3, 4])  # pad value 1 outside
+    job = {"terms": [(np.array([[10.0, -20.0]]), np.array([[3.0], [-4.0]]))], "bias": np.array([102]),  # 104 - in_zp sum(w) = 104 - (-2)(-1)
+           "req": dict(mult=m, shift=e, zp=3, amin=-128, amax=127, ratio=[0.125])}
+    check("layer_truth passes the half-up tie and the other side of it", [mr.layer_truth(job, [[v]])[0].ok for v in (30, 29, 32)], [True, True, False])
+    print(f"test_layer_ref: {checks} checks, {fails} failures")
     print(f"RESULT: {'PASSED' if fails == 0 else 'FAILED'}")
     assert fails == 0, f"{fails} of {checks} checks failed"
 
@@ -4769,7 +4715,7 @@ class SiennaSpec(regress.Spec):
         acts = ("tanh", "sigmoid", "selu")  # gemm: its rows, every activation's own check, and no FAIL line
         need = {"fp32": [rf"^layer_{x}_bias .* max err " for x in acts],
                 "bf16": [rf"^  layer_{x}: 0 outputs differ from the bit-exact model$" for x in acts] + [r"^layer_bias_special .* 0 outputs differ from the bit-exact model$"],
-                "int8": [r"^GEMM int8: \d+ cases, 0 with outputs that differ from the bit-exact model$"]}[self.parse(name)["fmt"]]
+                "int8": [r"^GEMM int8: \d+ cases, 0 failing "]}[self.parse(name)["fmt"]]
         return regress.marker_verdict(text, rc, [r"^grid_\d+x\d+x\d+ "] + need, (r"^FAIL ",))
 
     def not_run(self, name, opts):

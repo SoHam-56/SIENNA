@@ -181,12 +181,13 @@ module sienna_top #(
   logic act_bypass;  // every lane's code is ReLU or linear; declared here because the lane-control block above its old place reads it
   logic [CRW-1:0] gp_sets;  // sets past the activation stage and not yet complete; pooling takes them in id order
   // int8: the requantize and GPNAE parameters of the set the activation stage holds (g_*); p_zp: dropout's drop value for the pooled set.
-  logic [N-1:0][31:0] g_mult;
-  logic [N-1:0][7:0]  g_shift;
-  logic [NUM_LANES-1:0][7:0]  g_zp, g_min, g_max, g_shout, g_zout, p_zp;  // per lane: its column block's entry
+  logic [N-1:0][23:0] g_mult;
+  logic [N-1:0][5:0]  g_shift;
+  logic [NUM_LANES-1:0][7:0]  g_zp, g_min, g_max, g_zout, p_zp;  // per lane: its column block's entry
   logic [NUM_LANES-1:0][15:0] g_mx;
   logic [NUM_LANES-1:0][4:0]  g_shx;
-  logic [NUM_LANES-1:0][31:0] g_mout;
+  logic [NUM_LANES-1:0][23:0] g_mout;
+  logic [NUM_LANES-1:0][5:0]  g_shout;
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -203,7 +204,7 @@ module sienna_top #(
   // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
   // =========================================================================
   `include "sienna_set_side.svh"
-  add_words_t g_add_w;  // the activation stage's set's ADD words
+  sienna_add_pkg::add_words_t g_add_w;  // the activation stage's set's ADD words
   logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
   assign g_add_zpo = g_add_w.zpo;
   localparam int SIDE_W = $bits(set_side_t);
@@ -243,13 +244,6 @@ module sienna_top #(
 
   // L0 and L1: a host put is the set's start and goes to the mesh at once; a staging credit passes to the host while the entry admits.
   set_side_t side;
-  // add_words_t loads by name from side's flat add_* fields, and width warnings are off, so a width differing between the two fails elaboration
-  if ($bits(side.add_zp1) != $bits(g_add_w.zp1) || $bits(side.add_zp2) != $bits(g_add_w.zp2) || $bits(side.add_m1) != $bits(g_add_w.m1) ||
-      $bits(side.add_s1) != $bits(g_add_w.s1) || $bits(side.add_m2) != $bits(g_add_w.m2) || $bits(side.add_s2) != $bits(g_add_w.s2) ||
-      $bits(side.add_mo) != $bits(g_add_w.mo) || $bits(side.add_so) != $bits(g_add_w.so) || $bits(side.add_zpo) != $bits(g_add_w.zpo) ||
-      $bits(side.add_min) != $bits(g_add_w.amin) || $bits(side.add_max) != $bits(g_add_w.amax)) begin : G_BAD_ADD_W
-    $fatal(1, "sienna_top: set_side_t's add_* fields and add_words_t's fields differ in width");
-  end
   logic [1:0] l1_cnt;  // staging credits held here or passed to the host and not yet spent
   logic l0_grant;
   assign side = l0.data;
@@ -869,19 +863,21 @@ module sienna_top #(
 
   // int8 (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
   if (IS_INT) begin : G_REQ_SETS
-    logic [N-1:0][31:0] s_mult [NUM_IDS];
-    logic [N-1:0][7:0]  s_shift[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_shout[NUM_IDS], s_zout[NUM_IDS];
+    logic [N-1:0][23:0] s_mult [NUM_IDS];
+    logic [N-1:0][5:0]  s_shift[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_zout[NUM_IDS];
     logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
     logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][31:0] s_mout[NUM_IDS];
-    add_words_t   s_add[NUM_IDS];  // int8 residual: an add set's ADD words
+    logic [PACK_ENTRIES-1:0][23:0] s_mout[NUM_IDS];
+    logic [PACK_ENTRIES-1:0][5:0]  s_shout[NUM_IDS];
+    sienna_add_pkg::add_words_t s_add[NUM_IDS];  // int8 residual: an add set's ADD words
     logic [7:0]   pe_add_zpo;  // the pooled set's ADD output zero point, for the drop value
     logic         pe_add;  // the pooled set is an add set
-    logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_shout, ge_zout;  // the activation stage's copy of its set's entries
+    logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_zout;  // the activation stage's copy of its set's entries
     logic [PACK_ENTRIES-1:0][15:0] ge_mx;
     logic [PACK_ENTRIES-1:0][4:0]  ge_shx;
-    logic [PACK_ENTRIES-1:0][31:0] ge_mout;
+    logic [PACK_ENTRIES-1:0][23:0] ge_mout;
+    logic [PACK_ENTRIES-1:0][5:0]  ge_shout;
     logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] pe_act;  // the pooling stage's copy of its set's codes, zp and zout, for the drop value
     logic [PACK_ENTRIES-1:0][7:0]  pe_zp, pe_zout;
     always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
@@ -896,8 +892,7 @@ module sienna_top #(
         s_mout[host_next_id]  <= side.mout;
         s_shout[host_next_id] <= side.shout;
         s_zout[host_next_id]  <= side.zout;
-        s_add[host_next_id]   <= '{zp1: side.add_zp1, zp2: side.add_zp2, m1: side.add_m1, s1: side.add_s1, m2: side.add_m2, s2: side.add_s2,
-                                   mo: side.add_mo, so: side.add_so, zpo: side.add_zpo, amin: side.add_min, amax: side.add_max};
+        s_add[host_next_id]   <= side.add;
       end
       if (g_accept) begin
         g_mult   <= s_mult[g_next_id];
@@ -937,7 +932,7 @@ module sienna_top #(
       always_comb
         case (pe_act[p_lane_ent[k]])
           CONTROL_WIDTH'(3'b001): p_zp[k] = pe_zout[p_lane_ent[k]];  // SELU: its requantized output's zero point
-          CONTROL_WIDTH'(3'b010): p_zp[k] = 8'h80;  // sigmoid: TFLite's fixed output zero point -128
+          CONTROL_WIDTH'(3'b010): p_zp[k] = 8'h80;  // sigmoid: its fixed output zero point -128 (output scale 1/256)
           CONTROL_WIDTH'(3'b100), CONTROL_WIDTH'(3'b101): p_zp[k] = pe_add ? pe_add_zpo : pe_zp[p_lane_ent[k]];  // ReLU, linear: the ADD's or the requantize output's
           default: p_zp[k] = 8'h00;  // tanh: zero point 0
         endcase
@@ -969,8 +964,7 @@ module sienna_top #(
     requant_lanes #(
         .NUM_LANES(NUM_LANES),
         .N        (N),
-        .PER_LANE (PER_LANE),
-        .ROUNDING (sienna_fmt_pkg::REQ_ROUNDING)
+        .PER_LANE (PER_LANE)
     ) rq (
         .clk_i   (clk_i),
         .rstn_i  (rstn_i),
@@ -986,7 +980,7 @@ module sienna_top #(
         .valid_o (rq_v),
         .result_o(rq_d)
     );
-    // Each beat's destination rides beside tfliteRequant, which takes its own mult, shift, zp, min and max at stage 1.
+    // Each beat's destination rides beside int8Requantizer, which takes its own mult, shift, zp, min and max at stage 1.
     localparam int RQL = sienna_fmt_pkg::req_lat();
     logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
     logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
@@ -1014,31 +1008,23 @@ module sienna_top #(
     end
     assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last beat is in: the stage may leave while it drains
     // int8 residual: hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
-    localparam int QAL = sienna_fmt_pkg::qadd_lat();
     localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
     localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
     logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
-    logic hold_wr, add_in, rq_out, add_v;
-    logic [HMW-1:0] hold_rd_idx;
+    logic hold_wr, add_in, rq_out, add_v, add_busy;
+    logic [HMW-1:0] hold_idx;
     logic [NUM_LANES-1:0][7:0] add_d;
     logic [ATW-1:0] add_tag;
-    logic [QAL-1:0] at_v;  // an add beat at each add_lanes stage
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
-    assign hold_rd_idx = HMW'(tg_idx[RQL-1]);
+    assign hold_idx    = HMW'(tg_idx[RQL-1]);
     assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
-    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_rd_idx] <= rq_d;  // the hold beat's own index, as an add beat reads it
-    add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) addl (
-        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_rd_idx]), .q2_i(rq_d),
-        .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}),
-        .zp1_i(g_add_w.zp1), .zp2_i(g_add_w.zp2), .m1_i(g_add_w.m1), .s1_i(g_add_w.s1), .m2_i(g_add_w.m2),
-        .s2_i(g_add_w.s2), .mo_i(g_add_w.mo), .so_i(g_add_w.so), .zpo_i(g_add_w.zpo), .min_i(g_add_w.amin),
-        .max_i(g_add_w.amax),  // add_words_t fields by name (Task 2.4 review): no numeric slices
-        .valid_o(add_v), .result_o(add_d), .tag_o(add_tag));
-    always_ff @(posedge clk_i or negedge rstn_i)
-      if (!rstn_i) at_v <= '0;
-      else at_v <= QAL'({at_v, add_in});  // elaborates at any qadd_lat() >= 1
+    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index, as an add beat reads it
+    add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
+        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_idx]), .q2_i(rq_d),
+        .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),
+        .valid_o(add_v), .result_o(add_d), .tag_o(add_tag), .busy_o(add_busy));
     // The fill sees one source a cycle (Task 2.7's a_fill_one_source checks it): requantize's non-ADD beats, or add_lanes' beats with their own tags.
     logic f_byp, f_bank, f_pack;
     logic [FCNT_W-1:0] f_idx;
@@ -1046,11 +1032,11 @@ module sienna_top #(
     assign fill_d   = add_v ? add_d : rq_d;
     assign fill_add = add_v;
     assign {f_byp, f_bank, f_pack, f_idx} = add_v ? add_tag : {tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]};
-    assign rq_drain = |tg_v || |at_v;
+    assign rq_drain = |tg_v || add_busy;
     // Beats granted now arrive 2 or more cycles later; after an add set, grant only once no add beat is in requantize or add_lanes.
     localparam int RQ_HOLD = (RQL > 2) ? RQL - 2 : 0;
     always_comb begin
-      rq_room = !(|(tg_v & tg_add)) && !(|at_v);
+      rq_room = !(|(tg_v & tg_add)) && !add_busy;
       for (int i = 0; i < RQ_HOLD; i++) if (tg_v[i]) rq_room = 1'b0;
     end
     assign lane_v     = fill_v && !f_byp;
@@ -1063,7 +1049,7 @@ module sienna_top #(
     assign bank_sel   = byp_wr ? f_bank : act_wr;
 `ifndef SYNTHESIS
     assign {add_in_s, hold_wr_s} = {add_in, hold_wr};
-    assign add_q1_s = hold_mem[hold_rd_idx];
+    assign add_q1_s = hold_mem[hold_idx];
     assign add_q2_s = rq_d;
     assign hold_d_s = rq_d;
 `endif

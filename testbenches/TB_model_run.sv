@@ -31,20 +31,22 @@ module TB_model_run #(
   logic [CONTROL_WIDTH-1:0] cfg_act_i = '0;
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
-  logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_shout_i = '0, cfg_gp_zout_i = '0;
+  logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
+  logic [5:0] cfg_gp_shout_i = '0;
   logic [15:0] cfg_gp_mx_i = '0;
   logic [4:0] cfg_gp_shx_i = '0;
-  logic [31:0] cfg_gp_mout_i = '0;
+  logic [23:0] cfg_gp_mout_i = '0;
   logic [N-1:0][ACC_W-1:0] w_bias_i = '0;  // int8: with each block's bias row
-  logic [N-1:0][31:0] w_req_mult_i = '0;
-  logic [N-1:0][7:0] w_req_shift_i = '0;
+  logic [N-1:0][23:0] w_req_mult_i = '0;
+  logic [N-1:0][5:0] w_req_shift_i = '0;
   logic [2:0] cfg_pack_shift_i = '0;  // packing: the P and E lines
   logic [N/2-1:0][2:0] cfg_pack_map_i = '0;
   logic [7:1][CONTROL_WIDTH-1:0] cfg_pack_act_i = '0;
-  logic [7:1][7:0] cfg_pack_zp_i = '0, cfg_pack_min_i = '0, cfg_pack_max_i = '0, cfg_pack_shout_i = '0, cfg_pack_zout_i = '0;
+  logic [7:1][7:0] cfg_pack_zp_i = '0, cfg_pack_min_i = '0, cfg_pack_max_i = '0, cfg_pack_zout_i = '0;
+  logic [7:1][5:0] cfg_pack_shout_i = '0;
   logic [7:1][15:0] cfg_pack_mx_i = '0;
   logic [7:1][4:0] cfg_pack_shx_i = '0;
-  logic [7:1][31:0] cfg_pack_mout_i = '0;
+  logic [7:1][23:0] cfg_pack_mout_i = '0;
   logic [31:0] ep[$];  // int8 epilogues, 3N words per column block
 
   // ── Row links (L10): this side is the producer of both streams, a counter and a checker on each ──
@@ -261,8 +263,8 @@ module TB_model_run #(
       end
       for (int c = 0; c < N; c++) begin
         w_bias_i[c]      = (ei < ne) ? ACC_W'(ep[(3*ei)*N+c]) : '0;
-        w_req_mult_i[c]  = (ei < ne) ? ep[(3*ei+1)*N+c] : '0;
-        w_req_shift_i[c] = (ei < ne) ? ep[(3*ei+2)*N+c][7:0] : '0;
+        w_req_mult_i[c]  = (ei < ne) ? ep[(3*ei+1)*N+c][23:0] : '0;
+        w_req_shift_i[c] = (ei < ne) ? ep[(3*ei+2)*N+c][5:0] : '0;
       end
     end
   end
@@ -334,8 +336,8 @@ module TB_model_run #(
         cfg_pack_max_i[e] = 8'(ev[3]);
         cfg_pack_mx_i[e] = 16'(ev[4]);
         cfg_pack_shx_i[e] = 5'(ev[5]);
-        cfg_pack_mout_i[e] = 32'(ev[6]);
-        cfg_pack_shout_i[e] = 8'(ev[7]);
+        cfg_pack_mout_i[e] = 24'(ev[6]);
+        cfg_pack_shout_i[e] = 6'(ev[7]);
         cfg_pack_zout_i[e] = 8'(ev[8]);
       end
     end
@@ -372,8 +374,8 @@ module TB_model_run #(
       cfg_req_max_i = 8'(qmax);
       cfg_gp_mx_i = 16'(qmx);
       cfg_gp_shx_i = 5'(qshx);
-      cfg_gp_mout_i = 32'(qmout);
-      cfg_gp_shout_i = 8'(qshout);
+      cfg_gp_mout_i = 24'(qmout);
+      cfg_gp_shout_i = 6'(qshout);
       cfg_gp_zout_i = 8'(qzout);
       cfg_load_i = 1;
       @(posedge clk_i);

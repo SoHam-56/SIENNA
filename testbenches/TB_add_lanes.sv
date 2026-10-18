@@ -1,26 +1,29 @@
 `timescale 1ns / 100ps
 
-// add_lanes against ipu.tflite_add (add_lanes.mem): per set its ADD words, per beat each lane's q1 and q2; the tag rides qadd_lat() cycles.
+// add_lanes against ipu.qadd (add_lanes.mem): per set its ADD words, per beat each lane's q1 and q2; the tag rides qadd_lat() cycles; busy_o is high exactly while a beat is inside.
 module TB_add_lanes;
   localparam int NUM_LANES = 32, SETS = 6, PER = 8, TAG_W = 16, LAT = sienna_fmt_pkg::qadd_lat();
-  logic clk_i = 0, rstn_i = 0, valid_i = 0, valid_o;
+  logic clk_i = 0, rstn_i = 0, valid_i = 0, valid_o, busy_o;
   logic [NUM_LANES-1:0][7:0] q1_i = '0, q2_i = '0, result_o;
   logic [TAG_W-1:0] tag_i = '0, tag_o;
-  logic [7:0] zp1_i = '0, zp2_i = '0, s1_i = '0, s2_i = '0, so_i = '0, zpo_i = '0, min_i = '0, max_i = '0;
-  logic [31:0] m1_i = '0, m2_i = '0, mo_i = '0;
+  sienna_add_pkg::add_words_t words_i = '0;
   always #5 clk_i = ~clk_i;
 
-  add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(TAG_W), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) dut (.*);
+  add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(TAG_W)) dut (.*);
 
   logic [NUM_LANES-1:0][7:0] want_q[$];
   logic [TAG_W-1:0] tag_q[$];
   longint t_in[$];
   longint cyc = 0;
-  int errs = 0, lat_errs = 0, tag_errs = 0, n_out = 0;
+  int errs = 0, lat_errs = 0, tag_errs = 0, busy_errs = 0, busy_hi = 0, n_out = 0;
+  logic [LAT-1:0] vin = '0;  // valid_i at the last LAT edges, newest in bit 0
 
   // One block owns the checker's state: the cycle count, the input times and the pops.
   always @(posedge clk_i) begin
     cyc <= cyc + 1;
+    if (rstn_i && busy_o !== (|vin)) busy_errs++;  // busy_o: a beat taken at one of the last LAT edges
+    busy_hi += int'(busy_o === 1'b1);
+    vin = rstn_i ? LAT'({vin, valid_i}) : '0;
     if (valid_i) t_in.push_back(cyc);
     if (valid_o && want_q.size() == 0) begin
       errs++;
@@ -44,13 +47,12 @@ module TB_add_lanes;
   task automatic scramble();
     for (int k = 0; k < NUM_LANES; k++) {q1_i[k], q2_i[k]} = 16'($urandom);
     tag_i = TAG_W'($urandom);
-    {zp1_i, zp2_i, s1_i, s2_i, so_i, zpo_i, min_i, max_i} = {$urandom, $urandom};
-    {m1_i, m2_i, mo_i} = {$urandom, $urandom, $urandom};
+    words_i = {$urandom, $urandom, $urandom, $urandom};
   endtask
 
   initial begin
     int fd;
-    logic [31:0] c[11];
+    logic [31:0] c[8];
     logic [15:0] tg;
     logic [23:0] e;
     fd = $fopen("add_lanes.mem", "r");
@@ -58,15 +60,14 @@ module TB_add_lanes;
     repeat (3) @(posedge clk_i);
     #1 rstn_i = 1;
     for (int s = 0; s < SETS; s++) begin
-      if ($fscanf(fd, "%h %h %h %h %h %h %h %h %h %h %h\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10]) != 11)
-        $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d has no line of 11 ADD words", s);
+      if ($fscanf(fd, "%h %h %h %h %h %h %h %h\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]) != 8)
+        $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d has no line of 8 ADD words", s);
       for (int b = 0; b < PER; b++) begin
         automatic logic [NUM_LANES-1:0][7:0] w;
         if ($fscanf(fd, "%h", tg) != 1) $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d beat %0d has no tag", s, b);
         @(posedge clk_i);
         #1;
-        {zp1_i, zp2_i, m1_i, s1_i, m2_i, s2_i, mo_i, so_i, zpo_i, min_i, max_i} = {c[0][7:0], c[1][7:0], c[2], c[3][7:0], c[4], c[5][7:0], c[6], c[7][7:0],
-                                                                                   c[8][7:0], c[9][7:0], c[10][7:0]};
+        words_i = '{zp1: c[0][7:0], zp2: c[1][7:0], m1: c[2], m2: c[3], shift: c[4][5:0], zpo: c[5][7:0], amin: c[6][7:0], amax: c[7][7:0]};
         for (int k = 0; k < NUM_LANES; k++) begin
           if ($fscanf(fd, "%h", e) != 1) $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d beat %0d lane %0d is missing", s, b, k);
           {q1_i[k], q2_i[k], w[k]} = e;
@@ -90,8 +91,10 @@ module TB_add_lanes;
     if ($fscanf(fd, "%h", e) == 1) $fatal(1, "TB_add_lanes: add_lanes.mem holds more than %0d sets of %0d beats", SETS, PER);  // at the end of the file this simulator's $fscanf gives 0, not -1
     repeat (LAT + 4) @(posedge clk_i);
     if (n_out != SETS * PER || want_q.size() != 0) errs++;
-    $display("add_lanes: %0d beats, %0d errors, %0d latency errors, %0d tag errors", n_out, errs, lat_errs, tag_errs);
-    $display("RESULT: %s", (errs == 0 && lat_errs == 0 && tag_errs == 0) ? "PASSED" : "FAILED");
+    if (busy_hi == 0) busy_errs++;  // busy_o never high: the check above saw nothing
+    $display("add_lanes: %0d beats, %0d errors, %0d latency errors, %0d tag errors, %0d busy errors (%0d busy cycles)", n_out, errs, lat_errs,
+             tag_errs, busy_errs, busy_hi);
+    $display("RESULT: %s", (errs == 0 && lat_errs == 0 && tag_errs == 0 && busy_errs == 0) ? "PASSED" : "FAILED");
     $finish;
   end
 endmodule

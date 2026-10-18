@@ -24,12 +24,12 @@
     req_max_i  = q[2][7:0];
     gp_mx_i    = q[3][15:0];
     gp_shx_i   = q[4][4:0];
-    gp_mout_i  = q[5];
-    gp_shout_i = q[6][7:0];
+    gp_mout_i  = q[5][23:0];  // the scale's 24-bit mantissa and right shift in 32-bit words
+    gp_shout_i = q[6][5:0];
     gp_zout_i  = q[7][7:0];
     for (int c = 0; c < N; c++) begin
-      req_mult_i[c]  = q[8+c];
-      req_shift_i[c] = q[8+N+c][7:0];
+      req_mult_i[c]  = q[8+c][23:0];
+      req_shift_i[c] = q[8+N+c][5:0];
     end
   endtask
 

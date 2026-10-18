@@ -1892,7 +1892,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     print(hdr(f"\n  TRUE-FUNCTION GATES, all tests ({fmt_name}, N={N}, TILE={T})"))
     for name in names:
         m = truth.merge([r["truth"].get(name) for r in gated])
-        print("  " + (truth.line(m) if name.startswith("activation") else truth.stage_line(m)))
+        print("  " + (truth.line(m, bound=_act_bound(m.func)) if name.startswith("activation") else truth.stage_line(m)))
         for r in gated:
             x = r["truth"].get(name)
             if x is not None and not x.ok:
@@ -2378,7 +2378,7 @@ def residual_main(argv=None) -> None:
         print(f"residual {name} N={a.n} T={a.tile}: {M} x {K} x {C}, {Y.size} outputs, sets {sets} (expected {rt * ct * (dt + 1)}), "
               f"cycles {cyc}; reported: {mism} outputs differ from the bit-exact model; the ADD gate rejects zp_1 = 0: {w1}, no ADD: {w2}", flush=True)
         for stage, r in gates:
-            print(f"    {stage}: {truth.line(r, bound=truth.TARGET if r.func in ('relu', 'linear') else None) if stage.startswith('activation') else truth.stage_line(r)}", flush=True)
+            print(f"    {stage}: {truth.line(r, bound=_act_bound(r.func)) if stage.startswith('activation') else truth.stage_line(r)}", flush=True)
             if not r.ok:
                 bad.append(f"{name} ({stage})")
         if sets != rt * ct * (dt + 1):

@@ -4147,11 +4147,11 @@ def test_regression_points():
     assert sweep(small) == [(8, 2), (8, 4), (8, 8), (16, 2), (16, 4), (16, 8), (16, 16)], sweep(small)
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
-    assert len(small) == len(set(small)) == 1 + 7 * 27 == 190 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 == 421, (len(small), len(full))
+    assert len(small) == len(set(small)) == 1 + 7 * 28 == 197 and len(full) == len(set(full)) == 1 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 == 439, (len(small), len(full))
     layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
         for n, t in sweep(full):  # back-to-back and sienna_layer's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
-            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f]
+            want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f] + (["residual"] if f == "int8" else [])
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
     assert SPEC.parse("fp32/N32_T8/gemm-ck0")["ck"] == 0
@@ -4163,7 +4163,7 @@ def test_regression_points():
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
                 "fp32/N8_T2/pack-ck0", "int8/N8_T2/model-ck0", "fp32/N8_T2/tflite-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
-                "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0"):
+                "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0", "fp32/N8_T2/residual", "bf16/N16_T4/residual"):
         try:
             SPEC.parse(bad)
         except ValueError:
@@ -4186,6 +4186,7 @@ def test_point_commands():
     assert SPEC.argv("int8/N8_T2/tflite-ck0", opts) == ["make", "tflite", *at("int8", 8, 2, 32), "COLLAPSE_K=0"]
     assert SPEC.argv("bf16/N64_T8/model-ck0", opts) == ["make", "model", *at("bf16", 64, 8, 128), "MODEL_DIR=/m", "MODEL_COUNT=3", "COLLAPSE_K=0"]
     assert SPEC.argv("fp32/N16_T4/gemm-ck0", opts) == ["make", "gemm", *at("fp32", 16, 4, 32), "QUICK=1", "COLLAPSE_K=0"]
+    assert SPEC.argv("int8/N8_T2/residual", opts) == ["make", "residual", *at("int8", 8, 2, 32)]
     assert SPEC.env("int8/N8_T2/gemm-ck0", {}) == {"OPT_FAST": "-O0"} and SPEC.env("int8/N8_T2/tflite-ck0", {}) == {}
     old = mr.COLLAPSE_K
     try:
@@ -4265,6 +4266,7 @@ def test_point_verdicts():
              "FAIL (log: TFLITE_PACK: 3 of 5 models in 2 packed layers at N = 16, 1 f)"),  # the verdict cuts the line
             ("int8/N16_T4/tflite-ck0", "MODEL GATE: PASS int8\n", 0, "PASS"),  # collapse-k 0 runs no packed layers
             ("int8/N16_T4/tflite-ck0", "MODEL GATE: FAIL int8\n", 0, "FAIL (log: MODEL GATE: FAIL int8)"),
+            ("int8/N8_T2/residual", "RESIDUAL: PASS\n", 0, "PASS"), ("int8/N8_T2/residual", "RESIDUAL: FAIL tiles\n", 0, "FAIL (log: RESIDUAL: FAIL tiles)"),
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (every case per stage on the true function)\n", 0, "PASS"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
@@ -4292,6 +4294,27 @@ def test_point_verdicts():
              f"FAIL ({n32} tests ran, fp32 has {n32 - n32p})")):
         got = v(p, text, rc)
         assert got == want, (p, text, rc, got, want)
+
+
+@selftest
+def test_residual_points():
+    """Every int8 (N, T) has a residual point and no float format has one; it runs make residual like the other kinds; its verdict needs RESIDUAL: PASS."""
+    pts = SPEC.points(False, list(FORMATS))
+    nt = {p.rsplit("/", 1)[0] for p in pts if p.startswith("int8/N") and p.endswith("/pipeline")}
+    res = {p.rsplit("/", 1)[0] for p in pts if p.endswith("/residual")}
+    assert res == nt and all(p.startswith("int8/") for p in pts if p.endswith("/residual")), (sorted(res), sorted(nt))
+    py = sys.executable
+    assert SPEC.argv("int8/N16_T4/residual", None) == ["make", "residual", "FMT=int8", f"PYTHON={py}", "N=16", "TILE=4", "LANES=32"]
+    assert SPEC.argv("int8/N64_T8/residual", None)[-1] == "LANES=128"
+    for bad in ("fp32/N8_T2/residual", "bf16/N16_T4/residual"):
+        try:
+            SPEC.parse(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"parse accepted {bad}")
+    v = lambda text, rc=0: SPEC.verdict("int8/N8_T2/residual", text, rc)
+    assert v("RESIDUAL: PASS\n") == "PASS" and v("RESIDUAL: PASS\n", 1) == "FAIL (exit 1)" and v("residual tiles ...\n") == "FAIL (no 'RESIDUAL: PASS')"
+    assert v("RESIDUAL: FAIL tiles\n").startswith("FAIL (log: RESIDUAL: FAIL") and v("RESIDUAL: PASS\n[x] Assertion failed in t\n").startswith("FAIL (log:")
 
 
 @selftest
@@ -5481,10 +5504,11 @@ def _engine():
 
 
 regress = _engine()
-KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite", "model-ck0", "gemm-ck0", "tflite-ck0")  # per N, tile size and format; model in fp32 and bf16, tflite in int8
+KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite", "model-ck0", "gemm-ck0", "tflite-ck0",
+         "residual")  # per N, tile size and format; model in fp32 and bf16, tflite and residual in int8
 PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
-LAYER_CK0 = KINDS[-3:]  # sienna_layer's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
+LAYER_CK0 = KINDS[-4:-1]  # sienna_layer's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 
@@ -5508,9 +5532,10 @@ class SiennaSpec(regress.Spec):
 
     @staticmethod
     def _offered(f, n, k):
-        """model in fp32 and bf16, tflite in int8 (-ck0 too), the pipeline's -ck0 kinds at CK0_SIZES, LAYER_CK0 at every N, the -b2b kinds at B2B_SIZES."""
+        """model in fp32 and bf16, tflite (-ck0 too) and residual in int8, the pipeline's -ck0 kinds at CK0_SIZES, LAYER_CK0 at every N, the -b2b kinds at B2B_SIZES."""
         b = k.removesuffix("-ck0")
-        return ((b != "model" or f != "int8") and (b != "tflite" or f == "int8") and ("-ck0" not in k or k in LAYER_CK0 or n in CK0_SIZES)
+        return ((b != "model" or f != "int8") and (b != "tflite" or f == "int8") and (k != "residual" or f == "int8")
+                and ("-ck0" not in k or k in LAYER_CK0 or n in CK0_SIZES)
                 and (not k.endswith("-b2b") or n in B2B_SIZES))
 
     def parse(self, name):
@@ -5523,7 +5548,7 @@ class SiennaSpec(regress.Spec):
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
         if not self._offered(f, n, k):
-            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite in int8, the pipeline's -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
+            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite and residual in int8, the pipeline's -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
                              f" and the -b2b kinds at N = {', '.join(map(str, B2B_SIZES))}")
         return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if "-ck0" in k else 1, "b2b": k.endswith("-b2b")}
 
@@ -5579,6 +5604,8 @@ class SiennaSpec(regress.Spec):
                                           (r"^MODEL GATE: FAIL", r"^TFLITE_PACK: .*, [1-9]\d* failing$"))
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
+        if k == "residual":
+            return regress.marker_verdict(text, rc, (r"^RESIDUAL: PASS",), (r"^RESIDUAL: FAIL",))
         if k == "pack":
             return regress.marker_verdict(text, rc, (r"^PACK REGRESSION PASS: 0 mismatching outputs$",))
         acts = ("tanh", "sigmoid", "selu")  # gemm: its rows, every activation's own check, and no FAIL line

@@ -1,6 +1,6 @@
 `timescale 1ns / 100ps
 
-// add_lanes against ipu.qadd (add_lanes.mem): per set its ADD words, per beat each lane's q1 and q2; the tag rides qadd_lat() cycles; busy_o is high exactly while a beat is inside.
+// add_lanes on add_lanes.mem: per set its ADD words, per beat each lane's q1 and q2; the tag rides qadd_lat() cycles; busy_o is high exactly while a beat is inside; outputs to add_lanes_out.mem for the true-function gate.
 module TB_add_lanes;
   localparam int NUM_LANES = 32, SETS = 6, PER = 8, TAG_W = 16, LAT = sienna_fmt_pkg::qadd_lat();
   logic clk_i = 0, rstn_i = 0, valid_i = 0, valid_o, busy_o;
@@ -15,7 +15,8 @@ module TB_add_lanes;
   logic [TAG_W-1:0] tag_q[$];
   longint t_in[$];
   longint cyc = 0;
-  int errs = 0, lat_errs = 0, tag_errs = 0, busy_errs = 0, busy_hi = 0, n_out = 0;
+  int errs = 0, lat_errs = 0, tag_errs = 0, busy_errs = 0, busy_hi = 0, n_out = 0, diffs = 0;  // diffs: outputs off the bit-exact model, reported only
+  integer fo;
   logic [LAT-1:0] vin = '0;  // valid_i at the last LAT edges, newest in bit 0
 
   // One block owns the checker's state: the cycle count, the input times and the pops.
@@ -35,11 +36,14 @@ module TB_add_lanes;
       n_out++;
       if (cyc - t != LAT) lat_errs++;
       if (tag_o !== tg) tag_errs++;
-      for (int k = 0; k < NUM_LANES; k++)
+      for (int k = 0; k < NUM_LANES; k++) begin
+        $fwrite(fo, "%02x ", result_o[k]);
         if (result_o[k] !== w[k]) begin
-          errs++;
-          if (errs <= 20) $display("[FAIL] beat %0d lane %0d: got %0d, want %0d", n_out - 1, k, $signed(result_o[k]), $signed(w[k]));
+          diffs++;
+          if (diffs <= 20) $display("[EXACT] beat %0d lane %0d: got %0d, bit-exact model %0d (reported)", n_out - 1, k, $signed(result_o[k]), $signed(w[k]));
         end
+      end
+      $fwrite(fo, "\n");  // one line per output beat, lane 0 first
     end
   end
 
@@ -57,6 +61,8 @@ module TB_add_lanes;
     logic [23:0] e;
     fd = $fopen("add_lanes.mem", "r");
     if (fd == 0) $fatal(1, "TB_add_lanes: no add_lanes.mem (regression.py --action add-vectors writes it)");
+    fo = $fopen("add_lanes_out.mem", "w");
+    if (fo == 0) $fatal(1, "TB_add_lanes: cannot write add_lanes_out.mem");
     repeat (3) @(posedge clk_i);
     #1 rstn_i = 1;
     for (int s = 0; s < SETS; s++) begin
@@ -92,8 +98,9 @@ module TB_add_lanes;
     repeat (LAT + 4) @(posedge clk_i);
     if (n_out != SETS * PER || want_q.size() != 0) errs++;
     if (busy_hi == 0) busy_errs++;  // busy_o never high: the check above saw nothing
-    $display("add_lanes: %0d beats, %0d errors, %0d latency errors, %0d tag errors, %0d busy errors (%0d busy cycles)", n_out, errs, lat_errs,
-             tag_errs, busy_errs, busy_hi);
+    $fclose(fo);
+    $display("add_lanes: %0d beats, %0d errors, %0d latency errors, %0d tag errors, %0d busy errors (%0d busy cycles); %0d outputs differ from the bit-exact model (reported)",
+             n_out, errs, lat_errs, tag_errs, busy_errs, busy_hi, diffs);
     $display("RESULT: %s", (errs == 0 && lat_errs == 0 && tag_errs == 0 && busy_errs == 0) ? "PASSED" : "FAILED");
     $finish;
   end

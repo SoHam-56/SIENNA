@@ -1960,6 +1960,7 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
     t0 = time.time()
     Yp, sets_p, cyc_p = sim.run_job(job, f"pk_s{sh}")
     bad = cyc_a = 0
+    gated = over = 0  # int8 linear and ReLU outputs on the true function, and those over the rule
     for c in range(N // b):
         cols = slice(c * b, (c + 1) * b)
         e = mp[c]
@@ -1968,6 +1969,13 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             alone = {"terms": [(A_q[:, cols].astype(np.float32), B_q[cols, cols].astype(np.float32))], "bias": hw[cols],
                      "act": ents[e][0], "shape": (R * N, b), "req": rq}
             gold = mr.int8_layer_exact(A_q[:, cols], B_q[cols, cols], hw[cols], rq, ents[e][0])
+            if ents[e][0] in ("linear", "relu"):  # the true requantize of each exact sum; lane activations wait for Task 2.8's dumps
+                real = dict(rq, ratio=[float(v) for v in s_a * s_w[cols] / rq["s_out"]])
+                tr = mr.layer_truth({"terms": [(A_q[:, cols], B_q[cols, cols])], "bias": hw[cols], "req": real}, Yp[:, cols])[0]
+                gated, over = gated + tr.n, over + tr.over
+                bad += tr.over + int(tr.n == 0)
+                if not tr.ok:
+                    print(f"  FAIL block {c} ({ents[e][0]}): {truth.stage_line(tr)}", flush=True)
         else:
             alone = {"terms": [(A[:, cols], B[cols, cols])], "bias": bias[cols], "act": a.acts[e], "shape": (R * N, b)}
             gold = exact_layer(A[:, cols], B[cols, cols], bias[cols] if np.any(bias[cols]) else None, a.acts[e], N, a.fmt, a.tile) if a.fmt == "bf16" else None  # fp32: RTL against RTL (F-GP1)
@@ -1979,7 +1987,8 @@ def run_case(a, sim, N, sh, R, seed, log, zero_rows=False):
             bad += int(np.sum(bits(Yp[:, cols]) != gold))
     line = (f"{a.fmt} N={N} T={a.tile} b={b:<3} rows={R * N:<4} {'zero rows ' if zero_rows else ''}packed: {sets_p} sets "
             f"{cyc_p} cycles | {N // b} jobs alone: {cyc_a} cycles | speedup {cyc_a / cyc_p:5.2f}x | mismatches {bad} | "
-            f"wall {time.time() - t0:.0f}s")
+            + (f"true function: {gated} linear/ReLU outputs, {over} over the rule | " if a.fmt == "int8" else "")
+            + f"wall {time.time() - t0:.0f}s")
     print(line, flush=True)
     log.write(line + "\n")
     return bad
@@ -3820,6 +3829,10 @@ def test_point_verdicts():
             ("fp32/N8_T2/model", "MODEL GATE: PASS  fp32 N=8\n", 0, "PASS"), ("fp32/N8_T2/model", "MODEL GATE: FAIL  fp32\n", 0, "FAIL (log: MODEL GATE: FAIL  fp32)"),
             ("fp32/N8_T2/model", "built\n", 0, "FAIL (no 'MODEL GATE: PASS')"), ("int8/N8_T2/tflite", "MODEL GATE: PASS int8\n", 0, "PASS"),
             ("int8/N8_T2/tflite", "ok\n", 0, "FAIL (no 'MODEL GATE: PASS')"),
+            ("int8/N16_T4/tflite", "MODEL GATE: PASS int8\nTFLITE_PACK: 3 of 5 models in 2 packed layers at N = 16, 0 failing\n", 0, "PASS"),
+            ("int8/N16_T4/tflite", "MODEL GATE: PASS int8\n", 0, "FAIL (no 'TFLITE_PACK: \\d+ of \\d+ models in \\d+ packed layers at N = \\d+, 0 failing')"),
+            ("int8/N16_T4/tflite", "MODEL GATE: PASS int8\nTFLITE_PACK: 3 of 5 models in 2 packed layers at N = 16, 1 failing\n", 0,
+             "FAIL (log: TFLITE_PACK: 3 of 5 models in 2 packed layers at N = 16, 1 f)"),  # the verdict cuts the line
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (linear cases on the true function)\n", 0, "PASS"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
@@ -4708,6 +4721,9 @@ class SiennaSpec(regress.Spec):
             if nb != (y if k.endswith("-b2b") else 0):  # a -b2b point runs the pass in every test, a plain point in none
                 return f"FAIL ({'no BACK_TO_BACK count' if nb is None else f'{nb} of {y} tests ran the back-to-back pass'})"
             return "PASS"
+        if k == "tflite" and self.parse(name)["n"] >= 16:  # the packed TFLite layers run there too
+            return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS", r"^TFLITE_PACK: \d+ of \d+ models in \d+ packed layers at N = \d+, 0 failing$"),
+                                          (r"^MODEL GATE: FAIL", r"^TFLITE_PACK: .*, [1-9]\d* failing$"))
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
         if k == "pack":

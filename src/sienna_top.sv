@@ -1066,6 +1066,36 @@ module sienna_top #(
     // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
     a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
       else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");
+    logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) hm_v <= '0;
+      else begin
+        if (hold_wr) hm_v[hold_idx] <= 1'b1;
+        if (add_in) hm_v[add_idx] <= 1'b0;
+      end
+    logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
+    assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
+    a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
+      else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
+    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                     add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[add_idx] && (hm_below == '0))
+      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
+                  tg_idx[RQL-1], add_idx);
+    a_fill_one_source: assert property (@(posedge clk_i) disable iff (!rstn_i) !(rq_out && add_v))
+      else $error("sienna_top: a_fill_one_source: a requantized beat and an add beat reached the fill in the same cycle");
+    logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
+    sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
+      else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
+    always_ff @(posedge clk_i) g_add_w_q <= g_add_w;
+    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                     !((g_state != G_IDLE) && g_hold && !act_bypass) && !(hold_wr && byp_wr) && !(hold_left_q && (act_wr != act_wr_q)))
+      else $error("sienna_top: a_hold_no_bank: a hold set runs a lane activation, writes a bank or toggles act_wr");
+    a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
+      else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
+    a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))
+      else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
 `endif
   end else begin : G_NO_REQ
     if ($bits(fill_d[0]) != OUT_W) begin : G_BAD_FILL  // float lanes take the mesh's result words as they are
@@ -1352,6 +1382,19 @@ module sienna_top #(
     else $error("sienna_top: pack shift %0d leaves blocks narrower than 2 of N=%0d", acc_shift_q, N);
   a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q && !acc_prev_accum_q)
     else $error("sienna_top: a packed set cannot be a partial sum or continue one");
+  if (IS_INT) begin : G_HOLD_PAIRS
+    logic acc_prev_hold_q, last_hold;  // the accept before this one was a hold set
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) {acc_prev_hold_q, last_hold} <= '0;
+      else begin
+        acc_prev_hold_q <= last_hold;
+        if (host_accept) last_hold <= side.res_hold;
+      end
+    a_hold_then_add: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                      acc_q |-> (acc_add_q == acc_prev_hold_q) && !(acc_hold_q && acc_add_q) &&
+                                                !((acc_hold_q || acc_add_q) && (acc_accum_q || acc_shift_q != '0)))
+      else $error("sienna_top: a_hold_then_add: hold and add sets come in pairs, hold first, neither a partial sum nor packed");
+  end
   if (!IS_INT) begin : G_FLOAT_NO_ADD
     a_float_no_add: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> !(acc_hold_q || acc_add_q))
       else $error("sienna_top: a_float_no_add: a float set was put as a hold or add set; the residual ADD is int8 only");

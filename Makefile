@@ -611,7 +611,7 @@ tflite:
 		--tile-size $(TILE) \
 		--lanes $(LANES)
 	@# the packed TFLite layers too, where a block of 8 fits N / 2 (N >= 16)
-	$(if $(filter 8,$(N)),,$(PYTHON) model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
+	$(if $(shell [ $(N) -ge 16 ] && echo y),$(PYTHON) model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
 
 # Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:

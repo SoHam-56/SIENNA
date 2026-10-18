@@ -1021,7 +1021,7 @@ module sienna_top #(
     assign hold_idx    = HMW'(tg_idx[RQL-1]);
     assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
     assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
-    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index, as an add beat reads it
+    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index (hold_idx)
     add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
         .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[add_idx]), .q2_i(rq_d),
         .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),

@@ -1540,7 +1540,7 @@ PIPELINE_TESTS = [
      "pack_acts": ["linear", "relu", "tanh", "selu", "sigmoid", "linear", "relu", "tanh"]},
     # int8 residual ADD (sienna-int8-residual): a residual group's last depth pass is a hold set, then an add set (the identity pass) meets it in add_lanes.
     {"name": "int8_residual_one_pair", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True, "num_sets": 2,
-     "formats": ("int8",)},  # one hold/add pair per pass, the first residual test run: the end-of-pass hold check sees a stale hold first
+     "req_random": True, "zp_random": True, "formats": ("int8",)},  # one hold/add pair per pass, the first residual test run: the end-of-pass hold check sees a stale hold first
     {"name": "int8_residual_relu", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True,
      "req_random": True, "zp_random": True, "formats": ("int8",)},
     {"name": "int8_residual_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "residual": True,
@@ -3836,7 +3836,8 @@ def test_residual_stimulus():
         layouts[t["name"]] = (gs[-1][0] + gs[-1][1] + gs[-1][2], [a for _, _, r, a in gs if r], [a for _, _, r, a in gs if not r])
     assert layouts["int8_residual_sigmoid_selu_nopool"] == (16, ["sigmoid", "selu"] * 4, []), layouts
     assert layouts["int8_residual_accum2_mixed_nopool"] == (18, ["relu", "linear", "sigmoid", "tanh"], ["tanh", "selu", "relu"]), layouts
-    assert all(n == 18 for k, (n, _, _) in layouts.items() if k != "int8_residual_sigmoid_selu_nopool"), layouts
+    assert layouts["int8_residual_one_pair"] == (2, ["relu"], []), layouts
+    assert all(n == 18 for k, (n, _, _) in layouts.items() if k not in ("int8_residual_sigmoid_selu_nopool", "int8_residual_one_pair")), layouts
 
 
 def _tb_hold_add_line(*v) -> str:

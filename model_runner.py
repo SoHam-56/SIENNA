@@ -375,6 +375,8 @@ class LayerRecord:
     stride: tuple = (1, 1)
     pads: tuple = (0, 0, 0, 0)  # zero-point padding (top, bottom, left, right), explicit: each importer resolves its framework's rule
     name: str = ""
+    s_out: float = None  # the output's real scale, for a layer whose output feeds an ADD
+    clamp: tuple = (None, None)  # the fused activation's real range (None: unbounded), for the true-function gate
 
 
 @dataclass
@@ -389,6 +391,16 @@ class AddRecord:
     lo: int
     hi: int
     name: str = ""
+    clamp: tuple = (None, None)  # the fused activation's real range (None: unbounded), for the true-function gate
+
+
+FUSED_RANGE = {"none": (None, None), "relu": (0.0, None), "relu6": (0.0, 6.0), "relu_n1_to_1": (-1.0, 1.0)}  # a fused kind's real range
+
+
+def real_range(relu=False, clip=None) -> tuple:
+    """A following Relu and / or Clip(min, max) as a real range (None: unbounded)."""
+    lo, hi = (None, None) if clip is None else (float(clip[0]), float(clip[1]))
+    return (0.0 if lo is None else max(0.0, lo), hi) if relu else (lo, hi)
 
 
 def clamp_codes(lo_real, hi_real, s_out: float, zp: int) -> tuple:
@@ -430,7 +442,7 @@ def record_of_tflite(layer: dict, name: str = "") -> LayerRecord:
             _, pl, pr = _same_pad(int(inp["shape"][2]), w.shape[2], stride[1])
             pads = (pt, pb, pl, pr)
     return LayerRecord(kind, w, bq, layer_scales(flt["scale"], inp["scale"][0], out["scale"][0], cout), int(inp["zp"][0]),
-                       int(out["zp"][0]), int(lo), int(hi), stride, pads, name)
+                       int(out["zp"][0]), int(lo), int(hi), stride, pads, name, float(out["scale"][0]), FUSED_RANGE[layer.get("fused", "none")])
 
 
 def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias=None, strides=(1, 1), pads=None, relu=False,
@@ -464,7 +476,7 @@ def record_of_onnx(op: str, x_scale, x_zp, w, w_scale, w_zp, y_scale, y_zp, bias
     if relu and clip is not None:
         lo = max(lo, zout)
     bq = np.zeros(cout, np.int64) if bias is None else np.asarray(bias, np.int64)
-    return LayerRecord(kind, w, bq, scale, zin, zout, lo, hi, tuple(int(v) for v in strides), pads, name)
+    return LayerRecord(kind, w, bq, scale, zin, zout, lo, hi, tuple(int(v) for v in strides), pads, name, s_out, real_range(relu, clip))
 
 
 def record_of_torch(kind: str, in_scale, in_zp, w_int, w_scales, w_zps, bias, out_scale, out_zp, relu=False, stride=(1, 1),
@@ -495,7 +507,7 @@ def record_of_torch(kind: str, in_scale, in_zp, w_int, w_scales, w_zps, bias, ou
     bq = np.zeros(cout, np.int64) if bias is None else np.floor(np.asarray(bias, np.float64) / (float(in_scale) * ws) + 0.5).astype(np.int64)
     lo, hi = (zout, 127) if relu else (-128, 127)
     return LayerRecord(kind, w, bq, layer_scales(ws, float(in_scale), float(out_scale), cout), zin, zout, max(-128, lo), hi,
-                       tuple(int(v) for v in np.broadcast_to(stride, 2)), pads, name)
+                       tuple(int(v) for v in np.broadcast_to(stride, 2)), pads, name, float(out_scale), real_range(relu))
 
 
 def add_record_of_onnx(a_scale, a_zp, b_scale, b_zp, c_scale, c_zp, relu=False, clip=None, unsigned=False, name: str = "") -> AddRecord:
@@ -504,14 +516,15 @@ def add_record_of_onnx(a_scale, a_zp, b_scale, b_zp, c_scale, c_zp, relu=False, 
     z1, z2, zo = (int(np.ravel(z)[0]) - sh for z in (a_zp, b_zp, c_zp))
     so = float(np.ravel(c_scale)[0])
     lo, hi = clamp_codes(0.0 if relu else (None if clip is None else clip[0]), None if clip is None else clip[1], so, zo)
-    return AddRecord(float(np.ravel(a_scale)[0]), z1, float(np.ravel(b_scale)[0]), z2, so, zo, lo, hi, name)
+    return AddRecord(float(np.ravel(a_scale)[0]), z1, float(np.ravel(b_scale)[0]), z2, so, zo, lo, hi, name, real_range(relu, clip))
 
 
 def add_record_of_torch(a_scale, a_zp, b_scale, b_zp, out_scale, out_zp, relu=False, unsigned=True, name: str = "") -> AddRecord:
     """The PyTorch importer's ADD record: QFunctional.add / add_relu with the inputs' and the module's scale and zero point."""
     sh = 128 if unsigned else 0
     zo = int(out_zp) - sh
-    return AddRecord(float(a_scale), int(a_zp) - sh, float(b_scale), int(b_zp) - sh, float(out_scale), zo, zo if relu else -128, 127, name)
+    return AddRecord(float(a_scale), int(a_zp) - sh, float(b_scale), int(b_zp) - sh, float(out_scale), zo, zo if relu else -128, 127, name,
+                     real_range(relu))
 
 
 def job_of_record(rec: LayerRecord, x) -> tuple:
@@ -535,6 +548,27 @@ def job_of_record(rec: LayerRecord, x) -> tuple:
                ratio=[float(v) for v in rec.scale])
     return {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape, "req": req}, shape
 
+
+
+def job_of_add_record(conv: LayerRecord, add: AddRecord, x, R) -> tuple:
+    """(int8 residual job for RtlLayer, output shape): conv on input codes x, then add's ADD of the residual codes R (input 1 is conv's output)."""
+    if conv.s_out is None:
+        raise ValueError(f"layer {conv.name or '(unnamed)'}: a conv feeding an ADD needs its output scale (s_out) on the record")
+    if add.z1 != conv.zp_out or not math.isclose(add.s1, conv.s_out, rel_tol=1e-9):
+        raise ValueError(f"ADD layer {add.name or '(unnamed)'}: input 1 ({add.s1:.9g}, zp {add.z1}) is not layer {conv.name or '(unnamed)'}'s "
+                         f"output ({conv.s_out:.9g}, zp {conv.zp_out})")
+    job, shape = job_of_record(conv, x)
+    (X, W), = job["terms"]
+    C = W.shape[1]
+    R = np.asarray(R, np.int64).reshape(X.shape[0], C)
+    words = add_record_words(add)
+    req = dict(job["req"], s_out=float(conv.s_out))
+    acc = wrap32(imatmul(X.astype(np.int64), W.astype(np.int64)) + np.asarray(job["bias"], np.int64)[None, :])
+    ra = add_lane_params(words, add.s_out, qadd_codes(requantize(acc, req), R, words))
+    req.update(mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])  # the lane after the ADD
+    job.update(terms=[(X, W), (R.astype(np.float32), np.eye(C, dtype=np.float32))], act="relu" if tuple(add.clamp) == (0.0, None) else "linear",
+               shape=(X.shape[0], C), req=req, add=words, lane=ra, clamps=(tuple(conv.clamp), tuple(add.clamp)))
+    return job, shape
 
 def load_tflite(path: str) -> dict:
     import tflite
@@ -692,9 +726,7 @@ def job_reference(job):
 
 
 def load_int8_graph(path: str) -> dict:
-    """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD operators in graph order, each with its tensors' codes and quantization (each tensor
-    keeps its index): a conv or fc has input, filter, bias and output, an ADD its inputs a and b and output; every op has its fused activation's
-    kind (fused) and clamp in codes (act_range). {"ops": [...], "input": index, "output": index}."""
+    """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD ops in order with their tensors (and indices), fused kinds and clamps."""
     import tflite
     from tflite.ActivationFunctionType import ActivationFunctionType as AF
     from tflite.BuiltinOperator import BuiltinOperator as BO
@@ -765,8 +797,7 @@ def load_layer(path: str) -> dict:
 
 
 def add_record_of_tflite(op: dict, first: int = None, name: str = "") -> AddRecord:
-    """The TFLite importer's ADD record from load_int8_graph's op: input first (a tensor index, default the op's first input) becomes (s1, z1);
-    the ADD is symmetric, so the order is the host's choice. Scales are the stored float32 ones in float64."""
+    """The TFLite importer's ADD record from load_int8_graph's op, tensor first (default its first input) as input 1."""
     first = op["inputs"][0] if first is None else first
     if first not in op["inputs"]:
         raise ValueError(f"ADD layer {name or '(unnamed)'}: tensor {first} is not one of its inputs {op['inputs']}")
@@ -774,7 +805,7 @@ def add_record_of_tflite(op: dict, first: int = None, name: str = "") -> AddReco
     out = op["output"]
     lo, hi = op["act_range"]
     return AddRecord(float(one["scale"][0]), int(one["zp"][0]), float(two["scale"][0]), int(two["zp"][0]), float(out["scale"][0]),
-                     int(out["zp"][0]), int(lo), int(hi), name)
+                     int(out["zp"][0]), int(lo), int(hi), name, FUSED_RANGE[op["fused"]])
 
 
 def job_of(layer: dict, x: np.ndarray, saved, name: str = "") -> tuple:
@@ -1204,8 +1235,8 @@ def _columns(job, C):
 
 
 def true_clamp(kind, s_out, zp) -> tuple:
-    """(lo, hi) in output codes, unrounded, of a fused activation's real range [0, inf) or [0, 6] on an output of scale s_out and zero point zp."""
-    lo, hi = {"none": (None, None), "relu": (0.0, None), "relu6": (0.0, 6.0)}[kind]
+    """(lo, hi) in output codes, unrounded, of a fused kind's or a (lo, hi) real range on an output of scale s_out and zero point zp."""
+    lo, hi = tuple(kind) if isinstance(kind, (tuple, list)) else FUSED_RANGE[kind]
     code = lambda v, d: d if v is None else min(127.0, max(-128.0, zp + v / s_out))
     return code(lo, -128.0), code(hi, 127.0)
 

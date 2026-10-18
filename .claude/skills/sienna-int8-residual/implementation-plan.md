@@ -3311,6 +3311,8 @@ A mutant whose run passes means the tests cannot see that bug: rerun it at `N=8 
 
 **Re-scope (Task 2.6b):** the `A` line is `A zp1 zp2 m1 m2 shift zpo amin amax` and `cfg_add_*` follow `add_words_t` (no s1, s2, mo, so; m1 and m2 unsigned). `mr.tflite_add_codes` is `mr.qadd_codes`, `mr.activation_range` is `ipu.activation_clamp`. The layer cases (resnet_relu, deep_cached, deep_uncached, tiles, relu6_conv_linear_add, tanh_after_add) gate on the true function per stage (fork F3): `TB_model_run` dumps each hold beat's requantized codes and each add beat's (q1, q2, y) as `TB_sienna_top`'s R and Q lines do, and the conv's requantize is gated with `truth.gate_requantize` on its real scales, the ADD with `truth.gate_quantized_add` on its real ratios, the lane with `truth.gate`; `int8_residual_exact` stays as a diagnostic (it still tells zp_1 = 0 or a missing ADD apart). The `A` line's words come from an `AddRecord` named after its layer (`mr.add_record_words`), so a refused ADD names the layer (production calls of `mr.add_words` pass no name today; re-review N5). pack's int8 linear and ReLU gate checks the requantize of the host-folded int32 sums (`fold_bias` is shared with the golden), as gemm's linear cases and tflite do, so a zero-point fold bug is invisible to it; one pack case gates against a float64 reference of the whole layer (as `test_importer_records`' `_float_layer`) to close that (re-review N9). The same dumps let gemm's three lane cases and pack's lane-activation blocks (tanh, sigmoid) gate per stage; until then those two, and only those, gate on the bit-exact model (gemm's linear cases, pack's linear and ReLU blocks, tflite and tflite --pack gate on the true function since Task 2.6b and its fix round 1). The `A` line and the layer cases build on `LayerRecord` / `AddRecord`. Step 5 (collapse-k 0) is unaffected.
 
+**As built (Task 2.8, SIENNA 7841f3e..08b58e5):** the ports are `cfg_add_zp2_i`, `cfg_add_m1_i`, `cfg_add_m2_i` [31:0], `cfg_add_shift_i` [5:0], `cfg_add_zpo_i`, `cfg_add_amin_i`, `cfg_add_amax_i` into one `add_words_t` register (zp1 from `cfg_req_zp_i`); the add set's identity requantize is mantissa 2^23, shift 23. The `A` line is `A zp2 m1 m2 shift zpo amin amax` (zp1 is Q's zp, so 8 fields). `TB_model_run +dump=<file>` writes X, R and Q lines per int8 run; `mr.read_stage_dump` and `mr.layer_stage_gates` gate every int8 layer per stage (gemm's cases, pack's entries and the residual cases), ReLU and linear at 1% (N10, TB_sienna_top's truth gate too); pack's linear and ReLU blocks also gate against a float64 reference of the whole layer (`float_layer_over`, N9). `--action residual` takes `--collapse-k`; `--tflite` and `--mid-reset` are refused until Task 2.9. Report: `.superpowers/sdd/implementation-plan/task-2.8-report.md`.
+
 
 **Files:**
 - Modify: `src/sienna_layer.sv`, `testbenches/TB_model_run.sv`, `model_runner.py` (Device protocol: `write_layer`; Backends: `RtlLayer.run_job`), `regression.py` (`--action residual`, self-tests)
@@ -3323,7 +3325,7 @@ A mutant whose run passes means the tests cannot see that bug: rerun it at `N=8 
   - `model_runner.write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_words=None, add=None)` (the merged signature plus `add`); `RtlLayer.run_job(job, tag, plusargs=())` passes `job["add"]`, gives the binary `plusargs` and the words of `$SIM_ARGS` (as `make verilator` gives them to its simulator, so a random power-up run reaches `TB_model_run`), records `self.first_hold` (the TB's `[RES] first hold_done C cycles into the layer`, or None) and keeps `self.last_log` (the run's stdout).
   - `regression.py --action residual [--n N] [--tile T] [--lanes L] [--cases ...] [--tflite] [--mid-reset] [--collapse-k 0|1]` printing per case `residual <case> N=<n> T=<t>: ...` and finally `RESIDUAL: PASS|FAIL`; a case whose simulation raises is a FAIL line, not a traceback.
 
-- [ ] **Step 1: Ports only, then the bench and the protocol (the failing test)**
+- [x] **Step 1: Ports only, then the bench and the protocol (the failing test)**
 
 `sienna_layer.sv`: after `cfg_gp_zout_i` add
 
@@ -3493,7 +3495,7 @@ def test_layer_file_add_line():
 
 Run: `python3 $T/regression.py --action selftest` (login node) → `ALL <n> PASSED` (the protocol exists); then `L rs2_lay_fail 64 4 $J/cmds/res_py.sh . regression.py --action residual --n 16 --tile 4` (`make residual` comes in Task 2.10) → every case prints `residual <case> N=16 T=4: FAIL: <case>: an assertion or a testbench check failed in the layer simulation` (`a_int_no_residual` fires), then `RESIDUAL: FAIL resnet_relu, deep_cached, ...`, and the job ends `exit=1`.
 
-- [ ] **Step 2: Implement the marking** — `sienna_layer.sv`:
+- [x] **Step 2: Implement the marking** — `sienna_layer.sv`:
 
 ```systemverilog
   logic int_res;  // an int8 residual layer: pass dt-1 holds, pass dt adds
@@ -3522,7 +3524,7 @@ line 333: `p_acc      = int_res ? (is_p < dt - 1) : (is_p != np - 1);  // int8 r
 
 Delete the `G_INT_NO_RESIDUAL` block (lines 553-556). Comments: line 9 gains "int8: the depth passes' last is a hold set and the residual pass an add set (sienna-int8-residual)"; `ONE`'s comment becomes `// int8: the identity pass gives the residual's codes exactly in int32`.
 
-- [ ] **Step 3: Run the cases to see them pass**
+- [x] **Step 3: Run the cases to see them pass**
 
 ```bash
 for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_lay_n${n}_t$t 64 6 $J/cmds/res_py.sh . regression.py --action residual --n $n --tile $t; done
@@ -3539,7 +3541,7 @@ done
 
 Expected: every diff prints nothing (the gemm rows' sets, cycles and errors, and each packed case's sets, cycles and mismatches, equal; they include the cached residual layer).
 
-- [ ] **Step 4: Commit (SIENNA), RTL first**
+- [x] **Step 4: Commit (SIENNA), RTL first**
 
 ```bash
 git -C $T add src/sienna_layer.sv
@@ -3552,7 +3554,7 @@ git -C $T add regression.py
 git -C $T commit -m "regression.py --action residual: int8 residual layers on sienna_layer bit-exact against int8_residual_exact (resnet_relu 64 x 144 x 16, deep_cached and deep_uncached dt 4, tiles rt 3 ct 3, relu6_conv_linear_add, tanh_after_add), random per-channel words and ADD scales, set counts rt ct (dt + 1); each case fails if its golden cannot tell zp_1 = 0 or a missing ADD. Self-test test_layer_file_add_line. Runs rs2_lay_*."
 ```
 
-- [ ] **Step 5: sienna_layer at collapse-k 0: the layer kinds in both mesh modes** (controller ruling on review row D6: spec G4 requires the residual layer cases and the TFLite blocks in both mesh modes, and the spec is binding; this covers the layer kinds' collapse-k 0, which the ledger's Task 1.15b line had carried to the restructure). On fe4d399 `TB_model_run` builds `sienna_layer` with its default `COLLAPSE_K = 1`, and the Makefile refuses `COLLAPSE_K=0` for `model`, `gemm`, `tflite`, `pack`, `perf-analysis` and `regression`.
+- [x] **Step 5: sienna_layer at collapse-k 0: the layer kinds in both mesh modes** (done by lane B, branch int8_ck0 bd2bb24, merged as 7841f3e; its residual cases at collapse-k 0 run in Step 3's sweep) (controller ruling on review row D6: spec G4 requires the residual layer cases and the TFLite blocks in both mesh modes, and the spec is binding; this covers the layer kinds' collapse-k 0, which the ledger's Task 1.15b line had carried to the restructure). On fe4d399 `TB_model_run` builds `sienna_layer` with its default `COLLAPSE_K = 1`, and the Makefile refuses `COLLAPSE_K=0` for `model`, `gemm`, `tflite`, `pack`, `perf-analysis` and `regression`.
 
 The failing tests first. In `regression.py`'s `test_parse_time_rejections`, the refused targets become `("regression", "pack", "perf-analysis")` and a new loop requires the layer targets to take it: `for t in ("gemm", "model", "tflite"): r = make_n(t, "COLLAPSE_K=0", "MODEL_DIR=/m", "FMT=int8" if t == "tflite" else "FMT=fp32", "PYTHON=py"); assert r.returncode == 0 and "--collapse-k 0" in r.stdout, (t, r.stdout + r.stderr)`. In `test_regression_points`: the counts become `1 + 7 * 27` (190) and `1 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6` (421); the per-(N, T) kinds list appends `["model-ck0", "gemm-ck0"]` for fp32 and bf16 and `["gemm-ck0", "tflite-ck0"]` for int8 at every N (`want = kinds[:1] + (...) + kinds[1:] + layer_ck0[f]`); `"int8/N8_T2/tflite-ck0"` and `"fp32/N8_T2/model-ck0"` leave the `bad` list, which gains `"int8/N8_T2/model-ck0"` and `"fp32/N8_T2/tflite-ck0"` and keeps `"fp32/N8_T2/pack-ck0"`; `assert SPEC.parse("fp32/N32_T8/gemm-ck0")["ck"] == 0`. In `test_point_commands`: `assert SPEC.argv("int8/N8_T2/tflite-ck0", opts) == ["make", "tflite", *at("int8", 8, 2, 32), "COLLAPSE_K=0"]` and `assert SPEC.argv("bf16/N64_T8/model-ck0", opts) == ["make", "model", *at("bf16", 64, 8, 128), "MODEL_DIR=/m", "MODEL_COUNT=3", "COLLAPSE_K=0"]`. In `test_regression_target`: `r = make_n("gemm", "COLLAPSE_K=0", "FMT=fp32", "PYTHON=py"); assert r.returncode == 0 and "--collapse-k 0" in r.stdout`, and the `regression` recipe's point names equal `SPEC.points` with the new kinds (it compares them already). Run (login node): `python3 -B regression.py --action selftest` → `test_parse_time_rejections`, `test_regression_points`, `test_point_commands` and `test_regression_target` fail (the Makefile refuses, no -ck0 layer point exists).
 

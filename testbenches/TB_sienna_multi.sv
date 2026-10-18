@@ -37,12 +37,13 @@ module TB_sienna_multi #(
   if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
     $fatal(1, "TB_sienna_multi: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
   end
-  logic [N-1:0][31:0] req_mult_i = '0;  // int8 (D-2)
-  logic [N-1:0][7:0] req_shift_i = '0;
-  logic [7:0] req_zp_i = '0, req_min_i = '0, req_max_i = '0, gp_shout_i = '0, gp_zout_i = '0;
+  logic [N-1:0][23:0] req_mult_i = '0;  // int8 (D-2)
+  logic [N-1:0][5:0] req_shift_i = '0;
+  logic [7:0] req_zp_i = '0, req_min_i = '0, req_max_i = '0, gp_zout_i = '0;
+  logic [5:0] gp_shout_i = '0;
   logic [15:0] gp_mx_i = '0;
   logic [4:0] gp_shx_i = '0;
-  logic [31:0] gp_mout_i = '0;
+  logic [23:0] gp_mout_i = '0;
   logic wc_write_enable_i = 0;
   logic [WCAW-1:0] wc_write_addr_i = '0;
   logic north_write_enable_i = 0, west_write_enable_i = 0, north_write_reset_i = 0, west_write_reset_i = 0;

@@ -2,7 +2,7 @@
 """SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers)."""
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
-#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, int8_layer_exact, add_words, tflite_add_codes, exact_sum, exact_layer; TFLite's kernels
+#   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
 #   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_layer, job_of
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
 #   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
@@ -32,7 +32,7 @@ import mesh_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
 sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
 import ipu  # noqa: E402
-from ipu import quantize_multiplier, round_half_away  # noqa: E402,F401  re-exported: TFLite's QuantizeMultiplier and TfLiteRound, one copy in AriL
+import truth  # noqa: E402
 
 
 # ── 1. Numerics: the reference arithmetic the host must reproduce ────────────
@@ -158,31 +158,41 @@ def fold_bias(bias, s_a: float, s_w, z_a: int, B_q) -> np.ndarray:
 
 
 def requantize(acc, rq: dict) -> np.ndarray:
-    """ipu.requant of int32 sums (rows x channels) with channel c's multiplier and shift on column c."""
+    """ipu.requantize (int8Requantizer, bit-exact) of int32 sums (rows x channels) with channel c's mantissa and shift on column c."""
     acc = np.asarray(acc, np.int64)
     m = np.broadcast_to(np.asarray(rq["mult"], np.int64)[None, :acc.shape[1]], acc.shape)
     s = np.broadcast_to(np.asarray(rq["shift"], np.int64)[None, :acc.shape[1]], acc.shape)
-    return np.asarray(ipu.requant(acc, m, s, rq["zp"], rq["amin"], rq["amax"], ROUNDING), np.int64)
+    return np.asarray(ipu.requantize(acc, m, s, rq["zp"], rq["amin"], rq["amax"]), np.int64)
+
+
+def encode_scales(scales):
+    """(mult, shift) arrays of ipu.encode_scale per real scale."""
+    pairs = [ipu.encode_scale(float(x)) for x in np.atleast_1d(scales)]
+    return np.array([m for m, _ in pairs], np.int64), np.array([e for _, e in pairs], np.int64)
+
+
+def code_scales(mult, shift) -> np.ndarray:
+    """The real scales mult 2^-shift that requantize words hold exactly."""
+    return np.ldexp(np.asarray(mult, np.float64), -np.asarray(shift, np.int64))
 
 
 def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
-    """Requantize and GPNAE parameters for int32 sums acc (rows x channels) as TFLite PTQ picks them; with rng, random words per channel."""
+    """Requantize and GPNAE parameters for int32 sums acc (rows x channels), asymmetric min/max calibration; with rng, random words per channel."""
     acc = np.asarray(acc, np.int64)
     s_w = np.asarray(s_w, np.float64)
     real = acc * (s_a * s_w)[None, :]
     if act == "relu":
         real = np.maximum(real, 0.0)
     _, s_out, z_out = quant_act(real)
-    qm = [quantize_multiplier(s_a * float(s) / s_out) for s in s_w]
-    mult = np.array([m for m, _ in qm], np.int64)
-    shift = np.array([e for _, e in qm], np.int64)
-    if rng is not None:  # every normalized multiplier, and right shifts 0..12 (TFLite's left shift can overflow int32)
-        mult = rng.randint(1 << 30, 1 << 31, s_w.size).astype(np.int64)
-        shift = rng.randint(-12, 1, s_w.size).astype(np.int64)
+    ratio = np.array([s_a * float(s) / s_out for s in s_w], np.float64)  # each channel's real scale s_a s_w / s_out
+    mult, shift = encode_scales(ratio)
+    if rng is not None:  # random words: every normalized mantissa, shifts 24..36 (scales 2^-13 .. 2), each its own exact scale
+        mult = rng.randint(1 << 23, 1 << 24, s_w.size).astype(np.int64)
+        shift = rng.randint(24, 37, s_w.size).astype(np.int64)
+        ratio = code_scales(mult, shift)
     mx, shx = gpnae_model.rescale_params(s_out)
     rq = dict(mult=mult, shift=shift, zp=z_out, amin=max(-128, z_out) if act == "relu" else -128, amax=127,
-              mx=mx, shx=shx, s_out=s_out,
-              ratio=None if rng is not None else [s_a * float(s) / s_out for s in s_w])  # the real ratios the multipliers encode
+              mx=mx, shx=shx, s_out=s_out, ratio=[float(x) for x in ratio])  # the real scales the requantize gate judges against
     if zq is not None:  # zp_random: the given (zero point, min, max) in place of the calibrated ones
         rq.update(zp=zq[0], amin=zq[1], amax=zq[2])
     x = (requantize(acc, rq) - rq["zp"]) * s_out  # the lane's real inputs
@@ -212,18 +222,22 @@ def drop_zp(act: str, rq: dict) -> int:
     return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
 
 
-ADD_FIELDS = ("zp1", "zp2", "m1", "s1", "m2", "s2", "mo", "so", "zpo", "amin", "amax")  # a layer's ADD words, tfliteAdd's order
+ADD_FIELDS = ("zp1", "zp2", "m1", "m2", "shift", "zpo", "amin", "amax")  # a layer's ADD words, add_words_t's order (add_<k>.mem)
 
 
 def add_words(s1, z1, s2, z2, s_out, z_out, act: str) -> dict:
-    """A layer's ADD words from its inputs' and output's quantization (TFLite's Prepare, ipu.add_params) and the fused activation's clamp."""
-    amin, amax = activation_range(act if act in ("relu", "relu6") else "none", s_out, int(z_out))
-    return dict(zp1=int(z1), zp2=int(z2), **ipu.add_params(s1, s2, s_out), zpo=int(z_out), amin=int(amin), amax=int(amax))
+    """A layer's ADD words from its inputs' and output's real scales and zero points (ipu.encode_add) and the fused activation's clamp
+    (ipu.activation_clamp); ratios keeps s1 / s_out and s2 / s_out for the true-function gate."""
+    amin, amax = ipu.activation_clamp(act if act in ("relu", "relu6") else "none", s_out, int(z_out))
+    r1, r2 = float(s1) / float(s_out), float(s2) / float(s_out)
+    m1, m2, e = ipu.encode_add(r1, r2)
+    return dict(zp1=int(z1), zp2=int(z2), m1=int(m1), m2=int(m2), shift=int(e), zpo=int(z_out), amin=int(amin), amax=int(amax),
+                ratios=(r1, r2))
 
 
-def tflite_add_codes(q1, q2, add: dict) -> np.ndarray:
-    """ipu.tflite_add of two int8 code arrays with a layer's ADD words, in the pinned rounding."""
-    return np.asarray(ipu.tflite_add(q1, q2, *[add[k] for k in ADD_FIELDS], ROUNDING), np.int64)
+def qadd_codes(q1, q2, add: dict) -> np.ndarray:
+    """ipu.qadd (int8QuantizedAdder, bit-exact) of two int8 code arrays with a layer's ADD words."""
+    return np.asarray(ipu.qadd(q1, q2, *[add[k] for k in ADD_FIELDS]), np.int64)
 
 
 def add_lane_params(add: dict, s_out: float, y) -> dict:
@@ -237,9 +251,9 @@ def add_lane_params(add: dict, s_out: float, y) -> dict:
 
 
 def int8_residual_exact(A_q, B_q, hw_bias, rq: dict, R_q, add: dict, ra: dict, act: str) -> np.ndarray:
-    """sienna_layer's int8 residual output for one product: the conv's requantize (q1), TFLite's ADD with the residual codes R_q, the lane."""
+    """sienna_layer's int8 residual output for one product, bit-exact: the conv's requantize (q1), the ADD with the residual codes R_q, the lane."""
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
-    return activate_int8(tflite_add_codes(requantize(acc, rq), R_q, add), act, ra)
+    return activate_int8(qadd_codes(requantize(acc, rq), R_q, add), act, ra)
 
 
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
@@ -290,50 +304,10 @@ def exact_layer(A, B, bias, act, N, fmt, T=4):
     return Y[:M, :C]
 
 
-def _check_rounding() -> None:
-    """sienna_fmt_pkg::REQ_ROUNDING must be the variant G0 pinned, as ipu and ROUNDING read it, or golden and RTL round apart."""
-    pkg = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
-    m = re.search(r'localparam string REQ_ROUNDING\s*=\s*"(\w+)"', open(pkg).read())
-    rtl = m.group(1) if m else "(no REQ_ROUNDING)"
-    if ROUNDING is None or rtl != ROUNDING or ipu.REQ_ROUNDING != ROUNDING:
-        raise ValueError(f"sienna_fmt_pkg rounds {rtl}, ipu.REQ_ROUNDING is {ipu.REQ_ROUNDING}, "
-                         f"model_runner.ROUNDING (rounding.txt) is {ROUNDING}")
-
-
-ROUNDING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "tflite_int8", "rounding.txt")
-ROUNDING = open(ROUNDING_FILE).read().strip() if os.path.exists(ROUNDING_FILE) else None  # G0's pinned variant; None before G0
-
-
-def effective_scale(in_scale, w_scale, out_scale, product: str) -> float:
-    """The real multiplier of TFLite's Prepare: 'double' is the per-channel path, 'float32' the per-tensor FC path."""
-    i, w, o = np.float32(in_scale), np.float32(w_scale), np.float32(out_scale)
-    if product == "double":
-        return float(i) * float(w) / float(o)
-    if product == "float32":
-        return float(i * w) / float(o)
-    raise ValueError(product)
-
-
-def layer_multipliers(layer, w_scales, in_scale, out_scale, cout, rounding, scale_product=None):
-    """Per output channel (mult, shift); a single weight scale is per tensor and broadcast (conv still takes the double path)."""
-    ws = np.atleast_1d(np.asarray(w_scales, dtype=np.float32))
-    product = scale_product or ("double" if layer == "conv" or ws.size > 1 else "float32")
-    pairs = [quantize_multiplier(effective_scale(in_scale, ws[c if ws.size > 1 else 0], out_scale, product), rounding)
-             for c in range(cout)]
-    return np.array([m for m, _ in pairs], dtype=np.int64), np.array([s for _, s in pairs], dtype=np.int64)
-
-
-def activation_range(activation: str, out_scale, out_zp: int):
-    """TFLite CalculateActivationRangeQuantized for int8: bounds quantized as zp + round(f / scale), f / scale in float32."""
-    def quant(f):
-        return int(out_zp) + round_half_away(float(np.float32(f) / np.float32(out_scale)))
-    if activation == "none":
-        return -128, 127
-    if activation == "relu":
-        return max(-128, quant(0.0)), 127
-    if activation == "relu6":
-        return max(-128, quant(0.0)), min(127, quant(6.0))
-    raise ValueError(activation)
+def layer_scales(w_scales, in_scale, out_scale, cout) -> np.ndarray:
+    """Per output channel the real requantize scale s_in s_w[c] / s_out in float64 from the tensors' stored scales; one weight scale is per tensor."""
+    ws = np.atleast_1d(np.asarray(w_scales, dtype=np.float64))
+    return np.array([float(in_scale) * float(ws[c if ws.size > 1 else 0]) / float(out_scale) for c in range(cout)], np.float64)
 
 
 def fold_input_zp(b_q, w_q, in_zp):
@@ -352,19 +326,16 @@ def im2col_same(x_q, kh, kw, pad_value):
     return np.stack(cols, axis=3).reshape(b * h * w, kh * kw * c)
 
 
-def fc_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False,
-            scale_product=None):
-    """reference_integer_ops::FullyConnected(PerChannel), requantized per channel; folded=True is SIENNA's algebra (fold_input_zp bias)."""
+def fc_acc(x_q, w_q, b_q, in_zp, folded=False) -> np.ndarray:
+    """A fully connected layer's int32 sums sum_k (x - in_zp) w + b; folded=True is SIENNA's algebra (fold_input_zp bias), equal exactly."""
     x = np.asarray(x_q, dtype=np.int64)
     w = np.asarray(w_q, dtype=np.int64)
     b = np.zeros(w.shape[0], dtype=np.int64) if b_q is None else np.asarray(b_q, dtype=np.int64)
-    acc = x @ w.T + fold_input_zp(b, w, in_zp) if folded else (x - int(in_zp)) @ w.T + b
-    mult, shift = layer_multipliers("fc", w_scales, in_scale, out_scale, w.shape[0], rounding, scale_product)
-    return ipu.requant(ipu.sx(acc, 32), mult, shift, out_zp, amin, amax, rounding).astype(np.int8)
+    return ipu.sx(x @ w.T + fold_input_zp(b, w, in_zp) if folded else (x - int(in_zp)) @ w.T + b, 32)
 
 
-def conv2d_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, amin, amax, rounding, folded=False):
-    """reference_integer_ops::ConvPerChannel, stride 1, SAME (outside taps skipped); folded=True pads with in_zp and folds the bias."""
+def conv2d_acc(x_q, w_q, b_q, in_zp, folded=False) -> np.ndarray:
+    """A stride-1 SAME convolution's int32 sums (outside taps add nothing); folded=True pads with in_zp and folds the bias, equal exactly."""
     x = np.asarray(x_q, dtype=np.int64)
     w = np.asarray(w_q, dtype=np.int64)
     bsz, h, wd, _ = x.shape
@@ -375,9 +346,7 @@ def conv2d_int8(x_q, w_q, b_q, in_zp, w_scales, in_scale, out_scale, out_zp, ami
         acc = im2col_same(x, kh, kw, int(in_zp)) @ wm.T + fold_input_zp(b, w, in_zp)
     else:
         acc = im2col_same(x - int(in_zp), kh, kw, 0) @ wm.T + b
-    mult, shift = layer_multipliers("conv", w_scales, in_scale, out_scale, cout, rounding)
-    acc = ipu.sx(acc, 32).reshape(bsz, h, wd, cout)
-    return ipu.requant(acc, mult, shift, out_zp, amin, amax, rounding).astype(np.int8)
+    return ipu.sx(acc, 32).reshape(bsz, h, wd, cout)
 
 
 # ── 2. Frontend: each op becomes Y = sum_i X_i @ W_i + b, then an activation ─
@@ -580,28 +549,23 @@ def load_layer(path: str) -> dict:
             raise ValueError(f"{path}: dilation is not supported")
         d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
     fa = opt.FusedActivationFunction()
-    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6"}  # the activations activation_range defines
+    acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6", AF.RELU_N1_TO_1: "relu_n1_to_1"}  # ipu.activation_clamp's kinds
     if fa not in acts:
         raise ValueError(f"{path}: fused activation {fa} is not supported")
-    d["act_range"] = activation_range(acts[fa], out["scale"][0], int(out["zp"][0]))
+    d["act_range"] = ipu.activation_clamp(acts[fa], float(out["scale"][0]), int(out["zp"][0]))
     return d
 
 
 def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
-    """(int8 job for RtlLayer, output shape) of one layer on the interpreter's input codes x; saved is the layer's G0 npz."""
+    """(int8 job for RtlLayer, output shape) of one layer on the saved input codes x; req holds each channel's real scale ('ratio')."""
     inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
     z_in, z_out = int(inp["zp"][0]), int(out["zp"][0])
     w = flt["data"].astype(np.int64)
     cout = w.shape[0]
-    if str(saved["rounding"]) != ROUNDING:
-        raise ValueError(f"the npz was written for {saved['rounding']}, the pinned rounding is {ROUNDING}")
-    mult, shift = np.asarray(saved["mults"], np.int64), np.asarray(saved["shifts"], np.int64)  # G0's words; the recompute below only checks them
-    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
-    rm, rs = layer_multipliers(kind, flt["scale"], inp["scale"][0], out["scale"][0], cout, ROUNDING)
-    if not (np.array_equal(rm, mult) and np.array_equal(rs, shift)):
-        raise ValueError("the .tflite's scales give other multipliers than its npz holds: the model and the npz do not belong together")
-    if tuple(layer["act_range"]) != (int(saved["act_min"]), int(saved["act_max"])):
-        raise ValueError(f"clamp {layer['act_range']} differs from the npz's ({int(saved['act_min'])}, {int(saved['act_max'])})")
+    ratio = layer_scales(flt["scale"], inp["scale"][0], out["scale"][0], cout)
+    mult, shift = encode_scales(ratio)
+    if max(abs(int(a) - int(saved[k])) for a, k in zip(layer["act_range"], ("act_min", "act_max"))) > 1:  # rounding may move a bound one code
+        raise ValueError(f"clamp {layer['act_range']} is not the npz's ({int(saved['act_min'])}, {int(saved['act_max'])}): the model and the npz do not belong together")
     if layer["kind"] == "CONV_2D":
         cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], layer["stride"], layer["same"],
                           pad_value=float(z_in)) for xi in x]  # every saved input image; rows in (image, y, x) order
@@ -615,7 +579,7 @@ def job_of(layer: dict, x: np.ndarray, saved) -> tuple:
     bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
     hw_bias = wrap32(bq - z_in * W.sum(axis=0))
     amin, amax = layer["act_range"]
-    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0)
+    req = dict(mult=mult, shift=shift, zp=z_out, amin=amin, amax=amax, mx=0, shx=0, mout=0, shout=0, zout=0, ratio=[float(v) for v in ratio])
     job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape,
            "req": req}
     return job, shape
@@ -960,8 +924,6 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
 def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
     """test_config_pkg.sv of the model simulators' build (RtlSets, RtlLayer): matmul_relu_nopool's configuration in fmt, no stimulus."""
     os.makedirs(TB_DIR, exist_ok=True)
-    if fmt == "int8":
-        _check_rounding()
     cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": N, "pool_h": 1, "pool_w": 1, "padding": 0}
     drop_seed = 0x2ACE0000 + 42 + int(os.environ.get("SIENNA_SEED", "0"))  # the generators' seed, so the package matches theirs
     write_test_config(os.path.join(TB_DIR, "test_config_pkg.sv"),
@@ -1529,7 +1491,8 @@ def model_main(argv=None):
 
 
 def tflite_main(argv=None):
-    """Runs testbenches/tflite_int8/'s single-layer int8 models through sienna_layer in int8, bit for bit against the interpreter's saved outputs."""
+    """Runs testbenches/tflite_int8/'s single-layer int8 models (TFLite importer) through sienna_layer in int8, each output gated on the true
+    function of its exact int32 sum and the layer's real scales; agreement with the interpreter and the bit-exact model is reported, not gated."""
     ap = argparse.ArgumentParser(description=tflite_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="tflite")
     ap.add_argument("--pack", action="store_true", help="run the packed TFLite layers instead (python model_runner.py --action tflite --pack --help)")
@@ -1555,39 +1518,36 @@ def tflite_main(argv=None):
     t0 = time.time()
     sim.build()
     log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes}, in {time.time() - t0:.0f} s")
-    bad, covered, hw_bad, task_bad = 0, False, 0, 0
+    bad, covered, hw_bad, n_interp, n_exact, n_words = 0, False, 0, 0, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]
         ref = np.load(path[:-len(".tflite")] + ".npz")
         x, y = ref["x_test"], ref["y_test"].astype(np.int64)
         layer = load_layer(path)
         job, shape = job_of(layer, x, ref)
-        X, W = job["terms"][0]
-        low = int8_layer_exact(X.astype(np.int64), W.astype(np.int64), job["bias"], job["req"], "linear").reshape(shape)
         got, sets, cyc = sim.run_job(job, name)
-        got = got.reshape(shape)
-        want = y.reshape(shape)
+        r, low, acc = layer_truth(job, got)
+        got, low, want = got.reshape(shape), low.reshape(shape), y.reshape(shape)
         per_channel = layer["filter"]["scale"].size > 1
         z_in = int(layer["input"]["zp"][0])
         padded = layer["kind"] == "CONV_2D" and layer["same"]
         covered |= padded and per_channel and z_in != 0
         m_rtl, m_low, m_hw = int(np.sum(got != want)), int(np.sum(low != want)), int(np.sum(got != low))
-        bad += int(m_rtl != 0 or m_hw != 0)
-        hw_bad += int(m_hw != 0)
-        task_bad += int(m_rtl != 0)
+        bad += int(not r.ok)
+        hw_bad += int(not r.ok)
+        n_interp, n_exact, n_words = n_interp + m_rtl, n_exact + m_hw, n_words + want.size
         log(f"MODEL {name}: {layer['kind']} out {shape} z_in {z_in} {'per-channel' if per_channel else 'per-tensor'} "
-            f"{'SAME-padded' if padded else 'unpadded'} clamp {layer['act_range']}: RTL {m_rtl}/{want.size} differ from the "
-            f"interpreter, host lowering {m_low}/{want.size}; {sets} sets, {cyc} cycles")
-        for what, ref_codes, n_bad in (("the bit-exact model (int8_layer_exact)", low, m_hw), ("the interpreter", want, m_rtl)):
-            if n_bad:
-                i = int(np.flatnonzero(got.ravel() != ref_codes.ravel())[0])
-                log(f"FAIL {name}: {n_bad} of {want.size} codes differ from {what}; first at index {i}: expected {int(ref_codes.flat[i])} got {int(got.flat[i])}")
+            f"{'SAME-padded' if padded else 'unpadded'} clamp {layer['act_range']}: {truth.stage_line(r)}; reported: RTL {m_rtl}/{want.size} "
+            f"differ from the interpreter, {m_hw} from the bit-exact model, the bit-exact model {m_low} from the interpreter; {sets} sets, {cyc} cycles")
+        for f in r.first:
+            log(f"FAIL {name}: output {f[0]} (int32 sum {f[1]}) is {f[2]}, the true value {f[3]:.4f}")
     if not covered:
         log("no SAME-padded per-channel conv with a non-zero input zero point among the models")
         bad += 1
     log(f"TFLITE_INT8: {len(paths)} models, {bad} failing")
     log(f"MODEL GATE: {'PASS' if bad == 0 else 'FAIL'}  int8 N={a.n} T={a.tile_size} lanes={a.lanes} TFLite layers: {len(paths)} models; "
-        f"hardware: {hw_bad} of {len(paths)} differ from the bit-exact model; task: {task_bad} of {len(paths)} differ from the interpreter"
+        f"hardware: {hw_bad} of {len(paths)} fail the true function; reported, not gated: {n_interp} of {n_words} codes differ from the "
+        f"interpreter, {n_exact} from the bit-exact model"
         f"{'; coverage missing (no SAME-padded per-channel conv with a non-zero zero point)' if not covered else ''}")
     log("RESULT: PASSED" if bad == 0 else "RESULT: FAILED")
     sys.exit(1 if bad else 0)
@@ -1605,8 +1565,19 @@ def model_of(path):
     return {"W": W, "bias": job["bias"], "act": "linear", "req": job["req"], "inputs": [X]}, shape, ref["y_test"].astype(np.int64)
 
 
+def layer_truth(job, got):
+    """(truth.gate_requantize Result, bit-exact model codes, int32 sums) of a linear int8 job's outputs got: each against the true
+    requantize of its exact int32 sum by its channel's real scale (job['req']['ratio']), zero point and clamp."""
+    (X, W), req = job["terms"][0], job["req"]
+    acc = wrap32(imatmul(np.asarray(X, np.int64), np.asarray(W, np.int64)) + np.asarray(job["bias"], np.int64)[None, :])
+    S = np.broadcast_to(np.asarray(req["ratio"], np.float64)[None, :acc.shape[1]], acc.shape)
+    r = truth.gate_requantize(acc, S, req["zp"], req["amin"], req["amax"], np.asarray(got, np.int64).reshape(acc.shape))
+    return r, requantize(acc, req), acc
+
+
 def tflite_pack_main(argv=None):
-    """Groups of TFLite layers share one packed sienna_layer layer; every model's outputs must equal the interpreter's bit for bit."""
+    """Groups of TFLite layers share one packed sienna_layer layer; every model's outputs are gated on the true function, as each alone;
+    agreement with the interpreter is reported."""
     ap = argparse.ArgumentParser(description=tflite_pack_main.__doc__)
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--tile-size", type=int, default=4)
@@ -1624,9 +1595,12 @@ def tflite_pack_main(argv=None):
         job, recipe = pack_jobs([m for m, _, _ in got], a.n, int8=True)
         Y, sets, cyc = sim.run_job(job, f"tflp{g}")
         for (m, shape, y), outs, n in zip(got, unpack(Y, recipe), names):
-            mism = int(np.sum(np.vstack(outs).reshape(shape) != y.reshape(shape)))
-            bad += int(mism != 0)
-            line = f"PACKED {n} (group {g}, b = {a.n >> job['pack']['shift']}): {mism}/{y.size} differ from the interpreter; {sets} sets, {cyc} cycles"
+            o = np.vstack(outs)
+            r = layer_truth({"terms": [(m["inputs"][0], m["W"])], "bias": m["bias"], "req": m["req"]}, o)[0]
+            mism = int(np.sum(o.reshape(shape) != y.reshape(shape)))
+            bad += int(not r.ok)
+            line = (f"PACKED {n} (group {g}, b = {a.n >> job['pack']['shift']}): {truth.stage_line(r)}; reported: {mism}/{y.size} differ "
+                    f"from the interpreter; {sets} sets, {cyc} cycles")
             print(line, flush=True)
             rep.write(line + "\n")
     tail = f"TFLITE_PACK: {sum(len(x) for x in GROUPS)} models in {len(GROUPS)} packed layers, {bad} failing"

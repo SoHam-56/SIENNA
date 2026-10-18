@@ -72,6 +72,7 @@ ACTIVATION ?= tanh
 PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 
 TOP_FILES = \
+	sienna_add_pkg.sv \
 	sienna_top.sv \
 	requant_lanes.sv \
 	add_lanes.sv \
@@ -99,8 +100,8 @@ SM_LIB_FILES = \
 	Adders/Int/src/intAdder.sv \
 	Converters/FPNarrow/src/fpNarrow.sv \
 	Multipliers/Fx/src/fxMac.sv \
-	Requant/src/tfliteRequant.sv \
-	Add/src/tfliteAdd.sv
+	Requantizer/src/int8Requantizer.sv \
+	QuantizedAdder/src/int8QuantizedAdder.sv
 
 # gpnae_poly's lane only: the published gpnae.sv and its InputFIFO / SeLu / sigtan build in GPNAE's own Makefile.
 GPNAE_FILES = \
@@ -306,9 +307,9 @@ help:
 	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
-	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, bit for bit (model_runner.py --action tflite); needs FMT=int8"
+	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make add-lanes                    - add_lanes against ipu.tflite_add (int8 residual ADD)"
+	@echo "  make add-lanes                    - add_lanes against ipu.qadd (int8 residual ADD)"
 	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
 	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
 	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
@@ -614,13 +615,14 @@ tflite:
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
-# add_lanes against ipu.tflite_add (regression.py --action add-vectors); fails unless the log has RESULT: PASSED and no error or failed assertion; its patterns are bracketed, so make's echo of the recipe does not read as a firing
+# add_lanes against ipu.qadd (regression.py --action add-vectors); fails unless the log has RESULT: PASSED and no error or failed assertion; its patterns are bracketed, so make's echo of the recipe does not read as a firing
 ADDL_DIR = $(VERILATOR_DIR)/add_lanes
 add-lanes:
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem
 	mkdir -p $(ADDL_DIR)
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
-	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Add/src/tfliteAdd.sv $(SRC_DIR)/add_lanes.sv $(TB_DIR)/TB_add_lanes.sv -o sim
+	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SRC_DIR)/sienna_add_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv \
+	  $(TB_DIR)/TB_add_lanes.sv -o sim
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
 

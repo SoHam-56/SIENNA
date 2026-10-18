@@ -1,18 +1,18 @@
 `timescale 1ns / 100ps
 
-// requant_lanes against ipu.requant (rq_lanes.mem): per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency.
+// requant_lanes against ipu.requantize (rq_lanes.mem): per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency.
 module TB_requant_lanes;
   localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;
   logic [NUM_LANES-1:0][31:0] acc_i = '0;
-  logic [N-1:0][31:0] mult_i = '0;
-  logic [N-1:0][7:0] shift_i = '0;
+  logic [N-1:0][23:0] mult_i = '0;
+  logic [N-1:0][5:0] shift_i = '0;
   logic packed_i = 0;
   logic [NUM_LANES-1:0][7:0] zp_i = '0, min_i = '0, max_i = '0;
   logic [NUM_LANES-1:0][7:0] result_o;
   always #5 clk_i = ~clk_i;
 
-  requant_lanes #(.NUM_LANES(NUM_LANES), .N(N), .ROUNDING(sienna_fmt_pkg::REQ_ROUNDING)) dut (.*);
+  requant_lanes #(.NUM_LANES(NUM_LANES), .N(N)) dut (.*);
 
   logic [31:0] v[$];
   logic [NUM_LANES-1:0][7:0] want_q[$];  // filled before reset is released, then only popped by the checker
@@ -74,8 +74,8 @@ module TB_requant_lanes;
         max_i[k] = v[p+1+2*NUM_LANES+k][7:0];
       end
       for (int c = 0; c < N; c++) begin
-        mult_i[c]  = v[p+1+3*NUM_LANES+c];
-        shift_i[c] = v[p+1+3*NUM_LANES+N+c][7:0];
+        mult_i[c]  = v[p+1+3*NUM_LANES+c][23:0];
+        shift_i[c] = v[p+1+3*NUM_LANES+N+c][5:0];
       end
       p += 1 + 3 * NUM_LANES + 2 * N;
       @(negedge clk_i);

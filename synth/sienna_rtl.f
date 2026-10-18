@@ -14,8 +14,8 @@ SystolicMesh/ArithmeticLibrary/Adders/FP/src/fpAdder.sv
 SystolicMesh/ArithmeticLibrary/Adders/Int/src/intAdder.sv
 SystolicMesh/ArithmeticLibrary/Converters/FPNarrow/src/fpNarrow.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Fx/src/fxMac.sv
-SystolicMesh/ArithmeticLibrary/Requant/src/tfliteRequant.sv
-SystolicMesh/ArithmeticLibrary/Add/src/tfliteAdd.sv
+SystolicMesh/ArithmeticLibrary/Requantizer/src/int8Requantizer.sv
+SystolicMesh/ArithmeticLibrary/QuantizedAdder/src/int8QuantizedAdder.sv
 SystolicMesh/src/engine/ProcessingElement.sv
 SystolicMesh/src/engine/AccumulationUnit.sv
 SystolicMesh/src/mem/MeshOutputSram.sv
@@ -33,6 +33,7 @@ GPNAE/src/lane_link.sv
 GPNAE/src/gpnae_poly.sv
 Maxpool/Maxpool_2D.sv
 Dropout/dropout.sv
+src/sienna_add_pkg.sv
 src/fwft.sv
 src/requant_lanes.sv
 src/add_lanes.sv

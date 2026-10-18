@@ -3371,19 +3371,57 @@ def gpnae_tflite_main(argv=None):
 RQ_N, RQ_LANES, RQ_SETS = 16, 32, 6  # TB_requant_lanes' geometry
 RQ_PER = RQ_N * RQ_N // RQ_LANES
 PACKED_SETS = (1, 2, 5)  # set 3 is unpacked at an odd multiple of RQ_PER beats, so a beat counter that ignores clear_i is caught
+
+
+def _lane_codes(path: str, beats: int, lanes: int) -> np.ndarray:
+    """A lane bench's output file (one line per output beat, each lane's code in hex, lane 0 first) as signed codes; ValueError on another shape."""
+    rows = [ln.split() for ln in open(path) if ln.strip()]
+    if len(rows) != beats or any(len(r) != lanes for r in rows):
+        raise ValueError(f"{path}: {len(rows)} output beats of {sorted({len(r) for r in rows})} lanes, the vectors have {beats} of {lanes}")
+    return truth.int8_codes(np.array([[int(x, 16) for x in r] for r in rows], np.int64))
+
+
+def _bench_check(name: str, gate, out: str, beats: int, lanes: int) -> None:
+    """A lane bench's true-function gate on its output file: the stage line, then '<NAME>: PASS' or FAIL; exit 1 unless it passed."""
+    try:
+        r = gate(_lane_codes(out, beats, lanes))
+        print(truth.stage_line(r))
+        for m in r.first:
+            print(f"  miss (index, inputs..., got, true): {m}")
+        ok, why = r.ok, f"{r.n} outputs, {r.over} over the bound"
+    except (OSError, ValueError) as e:
+        ok, why = False, str(e)
+    print(f"{name}: {'PASS' if ok else 'FAIL'} ({why})")
+    sys.exit(0 if ok else 1)
+
+
 def rq_vectors_main(argv=None) -> None:
-    """Vectors for TB_requant_lanes through its channel map, expected values from ipu.requantize (int8Requantizer, bit-exact); arg: output .mem path."""
+    """Vectors for TB_requant_lanes through its channel map: real scales per channel, their words from ipu.encode_scale, the bit-exact codes from
+    ipu.requantize (reported by the bench); --truth keeps the true function's inputs, --check gates the bench's outputs on it (truth.gate_requantize)."""
     ap = argparse.ArgumentParser(description=rq_vectors_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="rq-vectors")
-    ap.add_argument("path", help="output .mem path")
-    path = ap.parse_args(argv).path
+    ap.add_argument("path", nargs="?", help="output .mem path")
+    ap.add_argument("--truth", help="the true function's inputs (JSON): written with the vectors, read by --check")
+    ap.add_argument("--check", metavar="OUT", help="gate TB_requant_lanes' outputs (rq_lanes_out.mem) on the true function of --truth")
+    a = ap.parse_args(argv)
+    if a.check:
+        if not a.truth:
+            ap.error("--check needs --truth")
+        t = json.load(open(a.truth))
+        acc, scale = (np.array([x[k] for x in t["sets"]], np.float64).reshape(-1, RQ_LANES) for k in ("acc", "scale"))
+        zp, lo, hi = (np.repeat(np.array([x[k] for x in t["sets"]], np.int64), RQ_PER, axis=0) for k in ("zp", "lo", "hi"))
+        _bench_check("REQUANT LANES", lambda q: truth.gate_requantize(acc.astype(np.int64), scale, zp, lo, hi, q), a.check, acc.shape[0], RQ_LANES)
+    if not a.path:
+        ap.error("the output .mem path is needed without --check")
+    path = a.path
     rng = np.random.RandomState(8)
-    out = [RQ_SETS]
+    out, sets = [RQ_SETS], []
     for s in range(RQ_SETS):
-        mult = rng.randint(1 << 23, 1 << 24, RQ_N).astype(np.int64)
+        e = (16 + (s * RQ_N + np.arange(RQ_N)) % 40).astype(np.int64)  # every right shift 16..55 across the sets
+        real = rng.uniform(1.0, 2.0, RQ_N) * np.ldexp(1.0, 23 - e)  # each channel's real scale, its mantissa normalized at shift e
         if s == 0:
-            mult[0], mult[1] = (1 << 24) - 1, 1 << 23  # the largest mantissa and the smallest normalized one
-        shift = (16 + (s * RQ_N + np.arange(RQ_N)) % 40).astype(np.int64)  # every right shift 16..55 across the sets
+            real[0], real[1] = np.ldexp(float((1 << 24) - 1), -int(e[0])), np.ldexp(float(1 << 23), -int(e[1]))  # the largest mantissa and the smallest
+        mult, shift = mr.encode_scales(real)
         zp = int(rng.randint(-128, 128))
         amin, amax = [(-128, 127), (zp, 127), (zp, min(127, zp + 50)), (-128, 127), (-40, 40), (-128, zp)][s]
         amin, amax = min(amin, amax), max(amin, amax)
@@ -3410,8 +3448,12 @@ def rq_vectors_main(argv=None) -> None:
         out += [int(packed)] + zpL.tolist() + aminL.tolist() + amaxL.tolist() + mult.tolist() + shift.tolist()
         for b in range(RQ_PER):
             out += acc[b].tolist() + [int(v) for v in want[b]]
+        sets.append({"acc": acc.tolist(), "scale": real[c].tolist(), "zp": [int(v) for v in zpL], "lo": [int(v) for v in aminL],
+                     "hi": [int(v) for v in amaxL]})
     with open(path, "w") as f:
         f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in out))
+    if a.truth:
+        json.dump({"sets": sets}, open(a.truth, "w"))
 
 
 # ── add-vectors: TB_add_lanes' vectors ────────────────────────────────────────
@@ -3431,13 +3473,25 @@ def _add_set_draw(rng, s: int) -> tuple:
 
 
 def add_vectors_main(argv=None) -> None:
-    """Vectors for TB_add_lanes: per set its ADD words, then per beat a random tag and each lane's q1, q2 and expected code; arg: output .mem path."""
+    """Vectors for TB_add_lanes: per set its ADD words, then per beat a random tag and each lane's q1, q2 and bit-exact code (ipu.qadd, reported by
+    the bench); --truth keeps the true function's inputs, --check gates the bench's outputs on it (truth.gate_quantized_add)."""
     ap = argparse.ArgumentParser(description=add_vectors_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="add-vectors")
-    ap.add_argument("out")
+    ap.add_argument("out", nargs="?", help="output .mem path")
+    ap.add_argument("--truth", help="the true function's inputs (JSON): written with the vectors, read by --check")
+    ap.add_argument("--check", metavar="OUT", help="gate TB_add_lanes' outputs (add_lanes_out.mem) on the true function of --truth")
     a = ap.parse_args(argv)
+    if a.check:
+        if not a.truth:
+            ap.error("--check needs --truth")
+        t = json.load(open(a.truth))["sets"]
+        q1, q2 = (np.array([x[k] for x in t], np.int64).reshape(-1, ADD_LANES) for k in ("q1", "q2"))
+        r1, r2, z1, z2, zo, lo, hi = (np.repeat(np.array([x[k] for x in t], np.float64), ADD_PER)[:, None] for k in ("r1", "r2", "z1", "z2", "zo", "lo", "hi"))
+        _bench_check("ADD LANES", lambda q: truth.gate_quantized_add(q1, q2, r1, z1, r2, z2, 1.0, zo, lo, hi, q), a.check, q1.shape[0], ADD_LANES)
+    if not a.out:
+        ap.error("the output .mem path is needed without --check")
     rng = np.random.default_rng(29)
-    lines = []
+    lines, sets = [], []
     for s in range(ADD_SETS):
         for _ in range(ADD_TRIES):  # redrawn until half the set's outputs are off the clamp rails
             act, sc, z = _add_set_draw(rng, s)
@@ -3450,12 +3504,17 @@ def add_vectors_main(argv=None) -> None:
         else:
             raise ValueError(f"add-vectors: set {s} ({act}): no draw in {ADD_TRIES} with half its outputs off the clamp rails")
         lines.append(" ".join(f"{add[k] & 0xFFFFFFFF:08x}" for k in mr.ADD_FIELDS))
+        lo, hi = mr.true_clamp(act, sc[2], z[2])  # the fused activation's real range on the output, unrounded
+        sets.append({"q1": q1.tolist(), "q2": q2.tolist(), "r1": add["ratios"][0], "r2": add["ratios"][1], "z1": z[0], "z2": z[1], "zo": z[2],
+                     "lo": lo, "hi": hi})
         for b in range(ADD_PER):
             lines.append(f"{int(rng.integers(0, 1 << 16)):04x} " + " ".join(f"{int(x) & 0xFF:02x}{int(y) & 0xFF:02x}{int(w) & 0xFF:02x}"
                                                                          for x, y, w in zip(q1[b], q2[b], want[b])))
     with open(a.out, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, expected words from ipu.qadd")
+    if a.truth:
+        json.dump({"sets": sets}, open(a.truth, "w"))
+    print(f"{a.out}: {ADD_SETS} sets x {ADD_PER} beats x {ADD_LANES} lanes, bit-exact words from ipu.qadd" + (f"; true function's inputs {a.truth}" if a.truth else ""))
 
 
 # ── Self-tests ───────────────────────────────────────────────────────────────

@@ -3583,6 +3583,8 @@ git -C $T add model_runner.py regression.py Makefile && git -C $T commit -m "sie
 **Re-scope (Task 2.6b):** the converter-made blocks stay as test vehicles through the TFLite importer; each stage is gated on the true function (as Task 2.8); "0 differ from the interpreter (BUILTIN_REF)" becomes a reported agreement count, not a gate (nonzero by design: rounding at ties, and TFLite's own misses near cancellation). `mr.layer_multipliers` and `mr.ROUNDING` are gone: the scales are `mr.layer_scales` (float64 from the stored float32 scales) and `mr.encode_scales`. "ADD input 1 is the residual" stays (an importer check). The mid-stream reset part is unchanged.
 
 
+**As built (Task 2.9, SIENNA da2b423..d0f664b):** `sienna_top.hm_any` (simulation only, `|hm_v`, 0 in float builds) has two readers: `TB_model_run` (`+hold_wait`, `+hold_check`, the `[RES] reset C cycles into the layer, inside|outside the hold window` line, `[RES] first hold window closed C cycles into the layer`, and the end-of-run M5 check) and `TB_sienna_top` (a residual stream pass fails if `hm_any` is set after its last set; M5 for the pipeline tests, and without a reader there `hm_any` is an UNUSEDSIGNAL key). The blocks come in through the neutral importer: `mr.load_int8_graph` (CONV_2D, FULLY_CONNECTED and ADD with tensor indices, fused kinds and clamps; `load_layer` uses it), `mr.record_of_tflite` / `mr.job_of_record` for each conv and `mr.add_record_of_tflite(op, first)` with the conv's output as input 1 (zp_1 is the requantize zp); `residual_tflite(sim, seed, work)` gates every stage with `layer_stage_gates` (the true clamps from the fused kinds) and reports the interpreter agreement and the ADD input order (the converter lists the conv first: "ADD input 1 is the residual: no"). `residual_mid_reset(sim, job, Y0, want)` runs the control, then two resets with `+hold_wait +hold_check`: from first hold_done + 1 ("full") and from the cycle the first hold window closed ("waiting", which must land after it); each gates on the plain run's outputs and every stage gate, and the bit-exact model is a reported count (`RtlLayer.first_free` holds the window close). `--mid-reset` needs the tiles case and runs right after its plain run. Runs: `rs2_t29_res_{,rand_}n{8,16}` (every tile, collapse-k 1 and 0), `rs2_t29_fin_*`, mutant `m_keep_last` (`$J/cmds/t29_mut_keep_last.patch`; TB_sienna_top's check shown on the one-pair harness test `$J/cmds/t29_one_pair_test.patch`). Report: `.superpowers/sdd/implementation-plan/task-2.9-report.md`.
+
 **Files:**
 - Modify: `src/sienna_top.sv` (`hm_any`, simulation only), `regression.py` (`residual_tflite`, `residual_mid_reset`), `testbenches/TB_model_run.sv` (`+hold_wait`, `+hold_check`)
 
@@ -3590,7 +3592,7 @@ git -C $T add model_runner.py regression.py Makefile && git -C $T commit -m "sie
 - Consumes: `mr.im2col`, `mr.layer_multipliers`, `mr.activation_range`, `mr.add_words`, `mr.RtlLayer`; TensorFlow from the venv (`--tflite` only).
 - Produces: `residual_tflite(sim, seed) -> list[str]` (failures), lines `tflite <model>: ...` with `ADD input 1 is the residual: yes|no`; `residual_mid_reset(sim, job, Y, want) -> list[str]`.
 
-- [ ] **Step 1: Write them**
+- [x] **Step 1: Write them**
 
 ```python
 def _tf_res_models(tf, seed: int) -> dict:
@@ -3742,7 +3744,7 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
 
 (Checked on the merged main `9fa414e`: `_tf_imports()` sets the globals `tf` and `REF` (BUILTIN_REF), `mr.im2col(x, kh, kw, stride, same, channel_major=False, pad_value=0.0)` and `mr.layer_multipliers(layer, w_scales, in_scale, out_scale, cout, rounding, scale_product=None)`.)
 
-- [ ] **Step 2: Run** (TensorFlow: the venv, on the farm)
+- [x] **Step 2: Run** (TensorFlow: the venv, on the farm)
 
 ```bash
 for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_tfl_n${n}_t$t 64 6 $J/cmds/res_py.sh . regression.py --action residual --n $n --tile $t --tflite --mid-reset --cases tiles; done
@@ -3750,7 +3752,7 @@ for nt in $NT; do n=${nt%,*}; t=${nt#*,}; L rs2_tfl_n${n}_t$t 64 6 $J/cmds/res_p
 
 Expected: `tflite block: 4096 outputs, 0 differ ...` and `tflite block_s2: 1024 outputs, 0 differ ...` (the print counts `Y.size`: 4 images x 64 rows x 16 channels, and 4 x 16 x 16), `tflite block_s2 shortcut layer: 1024 outputs, 0 differ ...`, the conv's own codes `0 differ`, the `ADD input 1 is the residual` answer recorded (spec: ResNet-8's op 3 lists the residual first); `residual tiles mid-reset control (+mid_reset=1 +hold_check): the check fires outside the hold window`; `residual tiles mid-reset asked from <c> cycles, landed at <a>, inside the hold window: ... 0 differ from the run without it, 0 from the golden` with `<a> >= <c>` (both recorded in the ledger); `RESIDUAL: PASS`; no `Assertion failed` (with `a_add_pop_full` live, a stale `hold_mem` read after the reset would fire). If the converter does not produce the expected ops (`the converter made ...`), report its op list to Soham (spec Risk 2: the residual block's int8 form is assumed from the float model) before changing the model.
 
-- [ ] **Step 3: Commit (SIENNA)**
+- [x] **Step 3: Commit (SIENNA)**
 
 ```bash
 git -C $T add testbenches/TB_model_run.sv

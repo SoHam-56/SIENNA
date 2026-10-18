@@ -1273,6 +1273,11 @@ def _transfer(fmt: str, want, got) -> "truth.Result":
                         int(bad.size), 0, 0, 0, [(int(i), int(got[i]), int(want[i])) for i in bad[:truth.FIRST]])
 
 
+def _act_bound(func: str) -> float:
+    """An activation stage's bound: ReLU and linear at the 1% target, the lane activations at the 10% waiver."""
+    return truth.TARGET if func in ("relu", "linear") else truth.BOUND
+
+
 def truth_test(N: int, fmt: str, lanes: int) -> dict:
     """{stage (activation: 'activation <func>'): Result} over every activated set of the dumped passes of the test just run."""
     knobs, pkg = _tb_knobs(), _pkg_fields(os.path.join(TB_DIR, "test_config_pkg.sv"))
@@ -1386,13 +1391,14 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
                         raise RuntimeError(f"truth_scales.json has no scales for set {k} entry {e}")
                     if func == "relu":  # sienna_top runs int8 ReLU as the requantize clamp: its activation stage is the identity
                         w = sw["ents"][e]
-                        add("activation relu", truth.gate("int8", "linear", X[m], Aw[m], quant=(1.0, w["zp"], 1.0, w["zp"]))._replace(func="relu"))
+                        add("activation relu", truth.gate("int8", "linear", X[m], Aw[m], quant=(1.0, w["zp"], 1.0, w["zp"]),
+                                                          bound=truth.TARGET)._replace(func="relu"))
                         if str(e) in scales.get(str(k), {}) and not (res_t and fl[k]["add"] and not addk):  # a calibrated ReLU entry: its
                             add("relu clamp", _relu_clamp(w, k, e))  # clamp must start at its zero point; an add set alone has the identity's
                         continue
-                    add(f"activation {func}", truth.gate("int8", func, X[m], Aw[m], quant=q8[e]))
+                    add(f"activation {func}", truth.gate("int8", func, X[m], Aw[m], quant=q8[e], bound=_act_bound(func)))
                 else:
-                    add(f"activation {func}", truth.gate(fmt, func, X[m], Aw[m]))
+                    add(f"activation {func}", truth.gate(fmt, func, X[m], Aw[m], bound=_act_bound(func)))
             Pw = _full(g["P"].get(k, {}), W, f"pass {tag} set {k}'s dropout inputs")
             Pv, keep = np.array([a for a, _ in Pw], dtype=np.int64), np.array([b for _, b in Pw], dtype=bool)
             add("maxpool", truth.gate_maxpool(fmt, Aw.reshape(N, N), Pv, ph, pw, pad))
@@ -1410,7 +1416,7 @@ def truth_report(res: dict) -> tuple:
     lines, bad = [], []
     for name in sorted((k for k in res if not k.startswith("_")), key=lambda x: (TRUTH_STAGES.index(x.split()[0]), x)):
         r = res[name]
-        lines.append("        " + (truth.line(r) if name.startswith("activation") else truth.stage_line(r)))
+        lines.append("        " + (truth.line(r, bound=_act_bound(r.func)) if name.startswith("activation") else truth.stage_line(r)))
         if not r.ok:
             w = {"matmul": lambda: f"{truth.worst_text(r.worst)} of sum|ab|", "narrow": lambda: f"{r.worst_lsb} ULP",
                  "requant": lambda: f"{r.worst:.3f} steps from the true value", "add": lambda: f"{r.worst:.3f} steps from the true value",

@@ -1089,9 +1089,12 @@ module sienna_top #(
       if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
       else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
     always_ff @(posedge clk_i) g_add_w_q <= g_add_w;
-    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i)
-                                     !((g_state != G_IDLE) && g_hold && !act_bypass) && !(hold_wr && byp_wr) && !(hold_left_q && (act_wr != act_wr_q)))
-      else $error("sienna_top: a_hold_no_bank: a hold set runs a lane activation, writes a bank or toggles act_wr");
+    a_hold_no_lane: assert property (@(posedge clk_i) disable iff (!rstn_i) !((g_state != G_IDLE) && g_hold && !act_bypass))
+      else $error("sienna_top: a_hold_no_lane: a hold set runs a lane activation");
+    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_wr && byp_wr))
+      else $error("sienna_top: a_hold_no_bank: a hold beat met a bank write");
+    a_hold_keeps_act_wr: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_left_q && (act_wr != act_wr_q)))
+      else $error("sienna_top: a_hold_keeps_act_wr: act_wr toggled as a hold set left the stage");
     a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
       else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
     a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))

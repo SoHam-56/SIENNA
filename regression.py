@@ -5335,6 +5335,10 @@ def test_importer_records():
         tc = np.clip(np.maximum(a.s1 * (q1 - a.z1) + a.s2 * (q2 - a.z2), 0.0) / a.s_out + a.z_out, -128, 127)
         assert not np.any(np.abs(y - tc) > np.maximum(0.01 * np.abs(tc - a.z_out), 1.0)), a.name
     assert r0.clamp == (0.0, None) and mr.record_of_tflite(dict(tcv, fused="relu6"), "c6").clamp == (0.0, 6.0), (r0.clamp,)
+    # the ADD importer's checks: a plain int8 ADD passes; broadcast, constant and per-axis inputs are refused below
+    ten = lambda **k: dict({"type": 9, "shape": (1, 4, 4, 8), "data": None, "scale": np.float32([0.1]), "zp": np.array([0])}, **k)
+    plain = {"a": ten(), "b": ten(), "output": ten()}
+    mr.check_int8_add(plain, "a0")
     # refusals
     for bad, why in ((lambda: mr.record_of_onnx("QLinearMatMul", 0.1, 0, np.ones((2, 2)), 0.1, 3, 0.1, 0), "weight zero point"),
                      (lambda: mr.record_of_onnx("QLinearConv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, 0.1, 0, pads=[0, 1, 0]), "pads"),
@@ -5346,6 +5350,10 @@ def test_importer_records():
                      (lambda: mr.record_of_torch("conv", 0.1, 0, np.ones((1, 1, 3, 3)), 0.1, 0, None, 0.1, 0, dilation=(2, 2)), "dilation"),
                      (lambda: mr.record_of_tflite(dict(tcv, stride=None), "c4"), "layer c4: stride"),
                      (lambda: mr.add_record_of_tflite(tadd, 11, "t7"), "ADD layer t7: tensor 11"),
+                     (lambda: mr.check_int8_add(dict(plain, b=ten(shape=(1, 1, 1, 8))), "a1"), "a1: input shapes"),
+                     (lambda: mr.check_int8_add(dict(plain, b=ten(data=np.zeros((1, 4, 4, 8), np.int8))), "a2"), "a2: a constant input"),
+                     (lambda: mr.check_int8_add(dict(plain, a=ten(scale=np.float32([0.1, 0.2]))), "a3"), "a3: per-axis"),
+                     (lambda: mr.check_int8_add(dict(plain, output=ten(type=3)), "a4"), "a4: inputs and output must be int8"),
                      (lambda: mr.add_record_words(mr.AddRecord(2.0 ** 24, 0, 1.0, 0, 1.0, 0, -128, 127, "res3")), "ADD layer res3")):
         try:
             bad()

@@ -949,8 +949,11 @@ def bias_word_index(cfg, a, w) -> list:
     return [a.size + (c // N) * per * N + c % N for c in range(cfg["n"])]
 
 
-def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_words=None):
-    """TB_model_run's layer file: L (configuration), int8's Q (requantize), a packed layer's P (shift, block map) and E (entries 1-7), rows of N words, int8's epilogue words."""
+def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_words=None, add=None):
+    """TB_model_run's layer file: L (configuration), int8's Q (requantize), an int8 residual layer's A (the ADD's words but zp1), a packed
+    layer's P (shift, block map) and E (entries 1-7), rows of N words, int8's epilogue words."""
+    if fmt == "int8" and cfg["residual"] and (add is None or int(add["zp1"]) != int(req["zp"])):  # zp1 is Q's zp, the conv output's
+        raise ValueError("an int8 residual layer needs its ADD words (job['add']) with zp1 equal to the requantize zp")
     words = op_hex(np.concatenate([a.ravel(), w.ravel()]), fmt)
     if bias_words is not None:  # TEST ONLY: raw bias words, such as bf16 subnormals, which op_hex flushes to a signed zero
         for i, b in zip(bias_word_index(cfg, a, w), bias_words):
@@ -961,6 +964,8 @@ def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_w
         f.write(f"L {cfg['m']} {cfg['kb']} {cfg['n']} {cfg['residual']} {cfg['bias']} {cfg['act']} 0 0 {len(a)} {len(w)} {int(bool(pack))}\n")
         if fmt == "int8":
             f.write(f"Q {req['zp']} {req['amin']} {req['amax']} {req['mx']} {req['shx']} {req['mout']} {req['shout']} {req['zout']}\n")
+            if cfg["residual"]:
+                f.write("A " + " ".join(str(int(add[k])) for k in ADD_FIELDS[1:]) + "\n")
         if pack:
             f.write("P " + " ".join(str(int(v)) for v in [pack["shift"]] + list(pack["map"])) + "\n")
             for act, rq_e in pack["ents"][1:]:
@@ -1115,6 +1120,7 @@ class RtlLayer:
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
         self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
+        self.first_hold = self.last_log = None
 
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
@@ -1126,8 +1132,9 @@ class RtlLayer:
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
             raise RuntimeError("TB_model_run build failed")
 
-    def run_job(self, job, tag):
-        """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run, reads the results."""
+    def run_job(self, job, tag, plusargs=()):
+        """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run (with plusargs
+        and $SIM_ARGS), reads the results; keeps the run's log and its first hold_done cycle."""
         N = self.N
         int8 = self.fmt_name == "int8"
         if int8 and job.get("req") is None:
@@ -1139,8 +1146,12 @@ class RtlLayer:
             pack_precheck(pk, cfg, (M, C, rt), N, self.lanes, tag)
         lf = os.path.join(self.work, f"{tag}.layer")
         of = os.path.join(self.work, f"{tag}.out")
-        write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None, job.get("bias_words"))
-        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}"], cwd=os.path.dirname(self.bin), capture_output=True, text=True)
+        write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None, job.get("bias_words"), add=job.get("add"))
+        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *plusargs, *os.environ.get("SIM_ARGS", "").split()],
+                           cwd=os.path.dirname(self.bin), capture_output=True, text=True)
+        self.last_log = r.stdout
+        h = re.search(r"\[RES\] first hold_done (\d+) cycles into the layer", r.stdout)
+        self.first_hold = int(h.group(1)) if h else None
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")

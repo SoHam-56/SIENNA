@@ -1061,6 +1061,7 @@ module TB_sienna_top #(
       pack_max_i[e]   = q[o+3][7:0];
       pack_mx_i[e]    = q[o+4][15:0];
       pack_shx_i[e]   = q[o+5][4:0];
+      if (q[o+6][31:24] != 0 || q[o+7][31:6] != 0) $fatal(1, "TB_sienna_top: pack entry %0d's SELU words %h %h are too wide", e, q[o+6], q[o+7]);
       pack_mout_i[e]  = q[o+6][23:0];
       pack_shout_i[e] = q[o+7][5:0];
       pack_zout_i[e]  = q[o+8][7:0];

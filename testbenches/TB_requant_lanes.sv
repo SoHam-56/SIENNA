@@ -74,6 +74,7 @@ module TB_requant_lanes;
         max_i[k] = v[p+1+2*NUM_LANES+k][7:0];
       end
       for (int c = 0; c < N; c++) begin
+        if (v[p+1+3*NUM_LANES+c][31:24] != 0 || v[p+1+3*NUM_LANES+N+c][31:6] != 0) $fatal(1, "TB_requant_lanes: channel %0d's words are too wide", c);
         mult_i[c]  = v[p+1+3*NUM_LANES+c][23:0];
         shift_i[c] = v[p+1+3*NUM_LANES+N+c][5:0];
       end

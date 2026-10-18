@@ -155,6 +155,7 @@ module sienna_top #(
 `ifndef SYNTHESIS
   logic add_in_s, hold_wr_s;
   logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
+  logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_model_run's +hold_check)
 `endif
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
@@ -1073,6 +1074,7 @@ module sienna_top #(
         if (hold_wr) hm_v[hold_idx] <= 1'b1;
         if (add_in) hm_v[add_idx] <= 1'b0;
       end
+    assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window
     logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
     assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
     a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
@@ -1123,6 +1125,7 @@ module sienna_top #(
     assign add_q1_s = '0;
     assign add_q2_s = '0;
     assign hold_d_s = '0;
+    assign hm_any = 1'b0;
 `endif
   end
 

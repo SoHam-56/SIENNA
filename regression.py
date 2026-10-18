@@ -2961,7 +2961,7 @@ def gpnae_tflite_judge(rows):
     """Report lines and pass flag: each row (func, op, quant, q, hw, tfl, ex) gated on truth.py, TFLite agreement characterization only."""
     L = ["GPNAE int8 lane (gpnae_model, bit-exact with the RTL at G2) on every int8 input, quantization from TFLite's converter (BUILTIN_REF)",
          "Gate: truth.py, the lane's words against the true function of the real input (bound "
-         f"{100 * truth.BOUND:g}%, int8 floor {truth.I8_FLOOR} LSB, target {100 * truth.TARGET:g}%); TFLite agreement is characterization, not gated",
+         f"max({100 * truth.BOUND:g}% |t|, one output step), target {100 * truth.TARGET:g}%); TFLite agreement is characterization, not gated",
          f"{'op':<9}{'s_in':>11}{'z_in':>6}{'truth':>6}{'worst':>9}{'LSB':>4}{'>bound':>7}{'>1%':>5}"
          f"{'equal':>7}{'|d|=1':>7}{'max |d|':>8}{'TFLite-exact':>13}{'lane-exact':>11}"]
     res = {}
@@ -4580,7 +4580,7 @@ def test_gptfl_gate():
     L, ok = gpnae_tflite_judge(gptfl_rows())
     assert ok and L[-2].startswith("ACCURACY: PASS (true function, truth.py") and "TFLITE AGREEMENT (characterization, not gated)" in L[-1], L[-3:]
     L, ok = gpnae_tflite_judge(gptfl_rows(ladder=False))  # the 2a lane: sigmoid saturated past 3.5
-    assert not ok and L[-2].startswith("ACCURACY: FAIL") and "sigmoid worst 100.000% (7 LSB), 34 of 1280 over 10%" in L[-2], L[-3:]
+    assert not ok and L[-2].startswith("ACCURACY: FAIL") and "sigmoid worst 100.000% (7 LSB), 43 of 1280 over 10%" in L[-2], L[-3:]  # 34 with the one-code form
     L, ok = gpnae_tflite_judge(gptfl_rows(tfl=lambda hw, ex: 127 - hw))  # TFLite far off: characterization only, the verdict stands
     assert ok and L[-2].startswith("ACCURACY: PASS") and "tanh 0 of 1280 equal" in L[-1], L[-2:]
     off = [r[:4] + (np.clip(r[4] + 3 * (r[0] == "tanh"), -128, 127),) + r[5:] for r in gptfl_rows()]  # tanh 3 LSB high

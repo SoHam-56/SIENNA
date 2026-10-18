@@ -2295,7 +2295,11 @@ RES_CASES = {  # name: N -> (rows M, depth K, columns C, conv clamp, ADD's fused
     "tiles": lambda N: (2 * N + 3, N + 2, 2 * N + 5, "none", "relu", "relu"),  # rt 3, ct 3, dt 2
     "relu6_conv_linear_add": lambda N: (2 * N, 2 * N, N, "relu6", "none", "linear"),  # Review Focus 3
     "tanh_after_add": lambda N: (N, 2 * N, N, "none", "none", "tanh"),
+    "shallow_cached": lambda N: (2 * N, N - 3, N, "none", "relu", "relu"),  # dt 1, rt 2: the hold set is the first pass and the bias pass, cached
+    "shallow_uncached": lambda N: (N, N - 1, N, "relu6", "none", "sigmoid"),  # dt 1, rt 1: uncached, a lane after the ADD
 }
+RES_SEED = ("deep_cached", "deep_uncached", "relu6_conv_linear_add", "resnet_relu", "tanh_after_add", "tiles", "shallow_cached",
+            "shallow_uncached")  # seed offsets: the first six sorted, as they were, then each later case appended
 
 
 def residual_case(name: str, N: int, rng) -> tuple:
@@ -2359,7 +2363,7 @@ def residual_main(argv=None) -> None:
     sim.build()
     bad = []
     for name in a.cases:
-        job, want, wrong, q1, R_q = residual_case(name, a.n, np.random.RandomState(a.seed + sorted(RES_CASES).index(name)))
+        job, want, wrong, q1, R_q = residual_case(name, a.n, np.random.RandomState(a.seed + RES_SEED.index(name)))
         M, K, C = RES_CASES[name](a.n)[:3]
         rt, ct, dt = -(-M // a.n), -(-C // a.n), -(-K // a.n)
         try:

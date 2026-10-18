@@ -9,6 +9,7 @@
 // Activation stream (a_rows), per column block, per row tile: the depth tiles of A (N rows each), then the residual tile if cfg_residual_i.
 // Row credits, in stream order: a set's N A rows (and N B rows if uncached) while an L0 credit is held, a bias row's one, a cache tile's N.
 // int8: every block has a bias beat, its int32 bias and requantize words on w_bias_i, w_req_mult_i, w_req_shift_i with its put (its row ignored).
+// int8 residual: the depth passes' last is a hold set and the residual pass an add set (sienna-int8-residual).
 // Results leave per output tile on the output links (L9), column blocks outer and row tiles inner; lane L's j-th word of a set is word j*NUM_LANES + L.
 module sienna_layer #(
     parameter int NUM_LANES         = 32,
@@ -59,6 +60,14 @@ module sienna_layer #(
     input logic [23:0]              cfg_gp_mout_i,   // SELU output scale: 24-bit mantissa and right shift
     input logic [5:0]               cfg_gp_shout_i,
     input logic [7:0]               cfg_gp_zout_i,
+    // int8 residual only, taken with cfg_load_i: the ADD's words (sienna_add_pkg::add_words_t); zp1 is cfg_req_zp_i, the conv output's
+    input logic [7:0]               cfg_add_zp2_i,
+    input logic [31:0]              cfg_add_m1_i,
+    input logic [31:0]              cfg_add_m2_i,
+    input logic [5:0]               cfg_add_shift_i,
+    input logic [7:0]               cfg_add_zpo_i,
+    input logic [7:0]               cfg_add_amin_i,
+    input logic [7:0]               cfg_add_amax_i,
     // Packing, taken with cfg_load_i: every set of the layer is packed this way (sienna-packing)
     input logic [2:0]                          cfg_pack_shift_i,
     input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] cfg_pack_map_i,
@@ -92,7 +101,7 @@ module sienna_layer #(
   localparam int ADDR_LINES = $clog2(N * N);
   localparam int RW = (N > 1) ? $clog2(N) : 1;  // row within a tile
   localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);
-  localparam logic [DATA_WIDTH-1:0] ONE = IS_INT ? DATA_WIDTH'(1)  // int8: a residual adds its raw codes into the int32 sum
+  localparam logic [DATA_WIDTH-1:0] ONE = IS_INT ? DATA_WIDTH'(1)  // int8: the identity pass gives the residual's codes exactly in int32
                                                  : DATA_WIDTH'(((1 << (EXP_W > 0 ? EXP_W - 1 : 0)) - 1) << MAN_W);  // 1.0 in the format
   localparam int RCW = $clog2(N + 1);  // row credits: a set's or a tile's N in one cycle
   localparam int TOW = $clog2(2 * N + 1);  // cache tile rows outstanding: at most two tiles
@@ -122,6 +131,7 @@ module sienna_layer #(
   logic [15:0] gp_mx_q;
   logic [4:0] gp_shx_q;
   logic [23:0] gp_mout_q;
+  sienna_add_pkg::add_words_t add_q;  // int8 residual: the ADD's words, zp1 the requantize zero point
   logic [2:0] pk_shift_q;  // packing configuration, as the cfg_pack_* ports
   logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pk_map_q;
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
@@ -136,6 +146,9 @@ module sienna_layer #(
   function automatic logic [DIM_W-1:0] tiles(input logic [DIM_W-1:0] x);
     return (x + DIM_W'(N - 1)) / DIM_W'(N);
   endfunction
+
+  logic int_res;  // an int8 residual layer: pass dt-1 holds, pass dt adds
+  assign int_res = IS_INT && res_q;
 
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
@@ -180,6 +193,19 @@ module sienna_layer #(
     p_side.zout          = {pk_zout_q, gp_zout_q};
     p_side.mult          = p_mult;
     p_side.shift         = p_shift;
+    p_side.res_hold      = int_res && (is_p == dt - 1);  // the conv's words and clamp, linear: its beats wait in hold_mem
+    p_side.res_add       = int_res && is_res_pass;  // identity requantize, the ADD's words, the layer's activation
+    if (p_side.res_hold) p_side.act[0] = CONTROL_WIDTH'(3'b101);
+    if (p_side.res_add) begin
+      for (int c = 0; c < N; c++) begin  // scale 2^23 2^-23 = 1: the residual's codes unchanged
+        p_side.mult[c]  = 24'h80_0000;
+        p_side.shift[c] = 6'd23;
+      end
+      p_side.zp[0]   = '0;
+      p_side.amin[0] = 8'h80;
+      p_side.amax[0] = 8'h7F;
+      p_side.add     = add_q;
+    end
   end
 
   // The cache regions (L2): the loader puts once per cached block's fill, on the region of its half, when it holds that region's credit.
@@ -332,7 +358,7 @@ module sienna_layer #(
       for (int c = 0; c < N; c++) p_north[c] = (c == int'(a_row)) ? ONE : '0;
     p_wc_we    = wl_take_tile;
     p_wc_addr  = WCAW'((int'(wl_blk[0]) * HALF + int'(wl_tile)) * N * N + int'(wl_row) * N);
-    p_acc      = (is_p != np - 1);
+    p_acc      = int_res ? (is_p < dt - 1) : (is_p != np - 1);  // int8 residual: the hold set closes the conv's sum, the add set is its own
     p_bias_v   = bias_q && (is_p == 0);
     p_bias     = bias_buf[is_blk[0]];
     p_mult     = mult_buf[is_blk[0]];
@@ -364,6 +390,7 @@ module sienna_layer #(
       gp_mout_q <= '0;
       gp_shout_q <= '0;
       gp_zout_q <= '0;
+      add_q <= '0;
       pk_shift_q <= '0;
       pk_map_q <= '0;
       pk_act_q <= '0;
@@ -420,6 +447,8 @@ module sienna_layer #(
         gp_mout_q <= cfg_gp_mout_i;
         gp_shout_q <= cfg_gp_shout_i;
         gp_zout_q <= cfg_gp_zout_i;
+        add_q <= '{zp1: cfg_req_zp_i, zp2: cfg_add_zp2_i, m1: cfg_add_m1_i, m2: cfg_add_m2_i, shift: cfg_add_shift_i, zpo: cfg_add_zpo_i,
+                   amin: cfg_add_amin_i, amax: cfg_add_amax_i};
         pk_shift_q <= cfg_pack_shift_i;
         pk_map_q <= cfg_pack_map_i;
         pk_act_q <= cfg_pack_act_i;
@@ -552,10 +581,6 @@ module sienna_layer #(
     else {wgb_q, wgn_q} <= {wb_grant, (s_grant && g_need_w) || wt_grant};
   a_w_one_grant: assert property (@(posedge clk_i) disable iff (!rstn_i) !(wgb_q && wgn_q))
     else $error("sienna_layer: a bias row's weight credit and a set's or tile's N in one cycle: the credit mux sent only N");
-  if (IS_INT) begin : G_INT_NO_RESIDUAL  // int8 residual adds raw codes: its rescale is 2b
-    a_int_no_residual: assert property (@(posedge clk_i) disable iff (!rstn_i) !(cfg_load_i && !active && cfg_residual_i))
-      else $error("sienna_layer: int8 residual is not supported until 2b");
-  end
   // A float bias row word must land in bias_buf as the word followed by zeros, -0 and subnormals included.
   logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias), float builds
   logic chk_bias_h;

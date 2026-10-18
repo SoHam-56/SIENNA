@@ -3018,7 +3018,7 @@ with `a_real_has_bank`'s antecedent gaining `&& !set_hold[p_next_id]`.
 
 (Delete the old `rq_drain`, `RQ_HOLD`/`rq_room`, `lane_v` .. `bank_sel` lines this replaces; `a_rq_tag_aligned` now compares `rq_v == tg_v[RQL-1]`.)
 
-For the truth dump (Task 2.5 Step 4.9), at module level under `ifndef SYNTHESIS` beside `hm_any`: `logic add_in_s, hold_wr_s; logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump`; in `G_REQ` under `ifndef SYNTHESIS`: `assign {add_in_s, hold_wr_s} = {add_in, hold_wr}; assign add_q1_s = hold_mem[hold_idx]; assign add_q2_s = rq_d; assign hold_d_s = rq_d;` (with fallback (a) of Step 6, `add_q1_s = hold_q`); in `G_NO_REQ` under `ifndef SYNTHESIS`: all five `'0`.
+For the truth dump (Task 2.5 Step 4.9), at module level under `ifndef SYNTHESIS` beside `fill_add`: `logic add_in_s, hold_wr_s; logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump`; in `G_REQ` under `ifndef SYNTHESIS`: `assign {add_in_s, hold_wr_s} = {add_in, hold_wr}; assign add_q1_s = hold_mem[hold_idx]; assign add_q2_s = rq_d; assign hold_d_s = rq_d;` (with fallback (a) of Step 6, `add_q1_s = hold_q`); in `G_NO_REQ` under `ifndef SYNTHESIS`: all five `'0`.
 
 - [ ] **Step 5: Run the residual tests and the existing ones**
 
@@ -3178,14 +3178,18 @@ Design of record: `/proj/work/spramanik/sienna_report/int8_generic_design.log`; 
 **Re-scope (Task 2.6b):** unchanged in substance (integration properties, not arithmetic). The text below uses `hold_idx`, `add_busy` and `add_words_t`'s 110 bits. The unit mutants moved to Task 2.6b and became generic (rounding half down, the 10-bit saturation removed, the shift off by one, the mantissa's top bit dropped, zp1 ignored, the clamp before + zp; `$J/res_mut/g6b_rq_*`, `g6b_qa_*`); "the rounding variant swapped" and "left_shift 19" are gone.
 
 
+**As built (Task 2.7 and its fix round 1, task-2.7-report.md, task-2.7-review.md):** the brief's `m_off` (`hold_idx + 1`) moved hold_mem's write and read alike, an equivalent mutant, so hold_mem's read index became its own signal `add_idx` and `a_add_pop_full` also checks beat order; `hm_any` moved to Task 2.9, its only consumer (here it was a new UNUSEDSIGNAL key in every lint configuration); the hold-pair registers live in `G_HOLD_PAIRS` (in the shared accept tuple `acc_prev_hold_q` was unused in fp32 and bf16); `a_hold_no_bank`'s three conjuncts are three assertions (review M1). Verdicts are read from each run's `stdout.log` (the sweep's rows, `Sweep Aborted` and the first firing); `Assertion failed` and `[FAIL]` lines are only in `results/pipeline/<test>.log`, counted one per line.
+
 **Files:**
-- Modify: `src/sienna_top.sv` (assertions in `G_REQ`'s `ifndef SYNTHESIS` block and in the accept-term section)
-- Create (local): `$J/res_mut/m_pair.patch`, `m_push.patch`, `m_off.patch`, `m_room.patch`, `m_roomonly.patch`, `m_par.patch`, `m_bank.patch`, `m_hold_lane.patch`, `m_hold_byp.patch`, `m_zp1.patch`, `m_drop.patch`, `m_zin.patch`
+- Modify: `src/sienna_top.sv` (Step 0: `add_idx`; Step 1: assertions in `G_REQ`'s `ifndef SYNTHESIS` block and in `G_HOLD_PAIRS` after the accept-term section)
+- Create (local): `$J/res_mut/m_pair.patch`, `m_push.patch`, `m_off.patch`, `m_off_wr.patch`, `m_room.patch`, `m_roomonly.patch`, `m_par.patch`, `m_bank.patch`, `m_hold_lane.patch`, `m_hold_byp.patch`, `m_zp1.patch`, `m_drop.patch`, `m_zin.patch`, `m_idx_hi.patch`, `m_skip0.patch`
 
 **Interfaces:**
-- Produces: `a_hold_then_add`, `a_hold_push_empty`, `a_add_pop_full`, `a_fill_one_source`, `a_hold_no_bank`, `a_add_par_stable`, `a_add_last_no_accept` (Task 2.3 added `a_float_no_add`, Task 2.4 `a_lanes_in_step`), each on internal or registered terms (no host input sampled at its edge), each shown firing by a mutant.
+- Produces: `a_hold_then_add`, `a_hold_push_empty`, `a_add_pop_full`, `a_fill_one_source`, `a_hold_no_lane`, `a_hold_no_bank`, `a_hold_keeps_act_wr`, `a_add_par_stable`, `a_add_last_no_accept` (Task 2.3 added `a_float_no_add`, Task 2.4 `a_lanes_in_step`), each on internal or registered terms (no host input sampled at its edge), each shown firing by a mutant. Not `hm_any` (Task 2.9).
 
-- [ ] **Step 1: Write the assertions** — in `G_REQ`'s `ifndef SYNTHESIS` block, after `a_rq_one_set`:
+- [ ] **Step 0: hold_mem's read index (RTL, its own commit)** — in `G_REQ`: `logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)`, `assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index`, and `hold_mem[add_idx]` at `add_lanes`' `q1_i` and at `add_q1_s`; the write-port comment reads `// the hold beat's own index (hold_idx)`. Logic-neutral (same expression as `hold_idx`).
+
+- [ ] **Step 1: Write the assertions** — in `G_REQ`'s `ifndef SYNTHESIS` block, after `a_hold_done_no_bank`:
 
 ```systemverilog
     logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
@@ -3193,36 +3197,49 @@ Design of record: `/proj/work/spramanik/sienna_report/int8_generic_design.log`; 
       if (!rstn_i) hm_v <= '0;
       else begin
         if (hold_wr) hm_v[hold_idx] <= 1'b1;
-        if (add_in) hm_v[hold_idx] <= 1'b0;
+        if (add_in) hm_v[add_idx] <= 1'b0;
       end
-    assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window
+    logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
+    assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
     a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
       else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
-    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i) add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[hold_idx])
-      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem where no hold beat waits", tg_idx[RQL-1]);
+    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                     add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[add_idx] && (hm_below == '0))
+      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
+                  tg_idx[RQL-1], add_idx);
     a_fill_one_source: assert property (@(posedge clk_i) disable iff (!rstn_i) !(rq_out && add_v))
       else $error("sienna_top: a_fill_one_source: a requantized beat and an add beat reached the fill in the same cycle");
     logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
-    sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge (110 bits since Task 2.6b)
+    sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
       else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
     always_ff @(posedge clk_i) g_add_w_q <= g_add_w;
-    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i)
-                                     !((g_state != G_IDLE) && g_hold && !act_bypass) && !(hold_wr && byp_wr) && !(hold_left_q && (act_wr != act_wr_q)))
-      else $error("sienna_top: a_hold_no_bank: a hold set runs a lane activation, writes a bank or toggles act_wr");
+    a_hold_no_lane: assert property (@(posedge clk_i) disable iff (!rstn_i) !((g_state != G_IDLE) && g_hold && !act_bypass))
+      else $error("sienna_top: a_hold_no_lane: a hold set runs a lane activation");
+    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_wr && byp_wr))
+      else $error("sienna_top: a_hold_no_bank: a hold beat met a bank write");
+    a_hold_keeps_act_wr: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_left_q && (act_wr != act_wr_q)))
+      else $error("sienna_top: a_hold_keeps_act_wr: act_wr toggled as a hold set left the stage");
     a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
       else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
     a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))
       else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
 ```
 
-(`hold_idx` is HMW = $clog2(PER_LANE) bits and PER_LANE is a power of two at every build, so a range check on `hold_idx` itself would be vacuous; `a_add_pop_full` checks the FCNT_W-bit `tg_idx`, where a beat index past the set is visible. `add_v`, `add_tag` and `add_busy` (`add_lanes`' `busy_o`, the OR of its registered valid line, since Task 2.6b) are `add_lanes`' registered outputs and `g_accept` a function of the stage's registers, so every term is internal: spec Risk 3's add-set coincidence is closed by design, `rq_room`, and this assertion pins it.)
+(`hold_idx` and `add_idx` are HMW = $clog2(PER_LANE) bits and PER_LANE is a power of two at every build, so a range check on them would be vacuous; `a_add_pop_full` checks the FCNT_W-bit `tg_idx`, where a beat index past the set is visible. An occupancy check alone cannot see a read shifted by one: the shift wraps and reads every slot once, so `hm_below` adds beat order. `add_v`, `add_tag` and `add_busy` (`add_lanes`' `busy_o`, the OR of its registered valid line, since Task 2.6b) are `add_lanes`' registered outputs and `g_accept` a function of the stage's registers, so every term is internal: spec Risk 3's add-set coincidence is closed by design, `rq_room`, and `a_add_last_no_accept` pins it. `a_fill_one_source` is implied by `a_add_last_no_accept` with an in-order pipeline and stays as a second line of defense. A write-side shift of hold_mem is seen only by the outputs: `hm_v` follows the write address; a per-slot beat tag would close it, review M3.)
 
-At module level, under `ifndef SYNTHESIS` right after `logic fill_add;` (Task 2.3, after line 152, so it is declared before `G_REQ` uses it): `logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_model_run's +hold_check)`, and in `G_NO_REQ`, under `ifndef SYNTHESIS`, `assign hm_any = 1'b0;`. In the accept-term section (`ifndef SYNTHESIS` near line 1170), beside `last_accum`: `logic acc_prev_hold_q, last_hold;  // the accept before this one was a hold set`, reset with the others, `acc_prev_hold_q <= last_hold;` in the registered tuple and `if (host_accept) last_hold <= side.res_hold;`, then:
+After the accept-term section (its tuple unchanged), the int8-only pair check with its own registers:
 
 ```systemverilog
   if (IS_INT) begin : G_HOLD_PAIRS
+    logic acc_prev_hold_q, last_hold;  // the accept before this one was a hold set
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) {acc_prev_hold_q, last_hold} <= '0;
+      else begin
+        acc_prev_hold_q <= last_hold;
+        if (host_accept) last_hold <= side.res_hold;
+      end
     a_hold_then_add: assert property (@(posedge clk_i) disable iff (!rstn_i)
                                       acc_q |-> (acc_add_q == acc_prev_hold_q) && !(acc_hold_q && acc_add_q) &&
                                                 !((acc_hold_q || acc_add_q) && (acc_accum_q || acc_shift_q != '0)))
@@ -3230,59 +3247,65 @@ At module level, under `ifndef SYNTHESIS` right after `logic fill_add;` (Task 2.
   end
 ```
 
-- [ ] **Step 2: The mutants** (spec G4: a hold read one beat off, zp_1 taken from the add set, the drop value from `pe_zp`, `rq_room` and `rq_drain` unwidened; and one per assertion and per conjunct of `a_hold_no_bank`). Each runs with `SIM_ARGS=+verilator+error+limit+1000`: Verilator stops at the first `$error` by default and `run_regression` reports only the first firing line, so the raised limit lets every assertion a mutant trips, and the wrong outputs, reach the per-test log (`results/pipeline/<test>.log`).
+- [ ] **Step 2: The mutants** (spec G4: a hold read one beat off, zp_1 taken from the add set, the drop value from `pe_zp`, `rq_room` and `rq_drain` unwidened; one per assertion, one per `a_add_pop_full` conjunct). Each runs with `SIM_ARGS=+verilator+error+limit+1000`: Verilator stops at the first `$error` by default and `run_regression` prints only the first firing line to stdout, so the raised limit lets every assertion a mutant trips, and the wrong outputs, reach the per-test log.
 
 ```bash
 S=src/sienna_top.sv
 $J/cmds/res_mkmut.sh m_pair regression.py "[_res_flags(add=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS]" "[_res_flags(hold=True, act=act_g)] + [add[f] for f in mr.ADD_FIELDS]"
 $J/cmds/res_mkmut.sh m_push $S "assign hold_wr     = rq_v && tg_hold[RQL-1];" "assign hold_wr     = rq_v && (tg_hold[RQL-1] || tg_add[RQL-1]);"
-$J/cmds/res_mkmut.sh m_off $S "assign hold_idx    = HMW'(tg_idx[RQL-1]);" "assign hold_idx    = HMW'(tg_idx[RQL-1] + 1'b1);"
+$J/cmds/res_mkmut.sh m_off $S "assign add_idx     = HMW'(tg_idx[RQL-1]);" "assign add_idx     = HMW'(tg_idx[RQL-1] + 1'b1);"
+$J/cmds/res_mkmut.sh m_off_wr $S "assign hold_idx    = HMW'(tg_idx[RQL-1]);" "assign hold_idx    = HMW'(tg_idx[RQL-1] + 1'b1);"
 $J/cmds/res_mkmut.sh m_room $S "rq_room = !(|(tg_v & tg_add)) && !add_busy;" "rq_room = 1'b1;" "assign rq_drain = |tg_v || add_busy;" "assign rq_drain = |tg_v;"
 $J/cmds/res_mkmut.sh m_roomonly $S "rq_room = !(|(tg_v & tg_add)) && !add_busy;" "rq_room = 1'b1;"
 $J/cmds/res_mkmut.sh m_par $S "if (g_accept) g_add_w <= s_add[g_next_id];" "if (g_accept || wide_rd_valid) g_add_w <= s_add[g_next_id];"
 $J/cmds/res_mkmut.sh m_bank $S "if (g_done && !g_hold) act_wr <= ~act_wr;" "if (g_done) act_wr <= ~act_wr;"
 $J/cmds/res_mkmut.sh m_hold_lane regression.py 'act_k, rq_k = ("linear" if res and last else act_g),' 'act_k, rq_k = (act_g),'
 $J/cmds/res_mkmut.sh m_hold_byp $S "assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];" "assign rq_out      = rq_v && !tg_add[RQL-1];"
-$J/cmds/res_mkmut.sh m_zp1 $S ".words_i(g_add_w)," ".words_i('{zp1: g_zp[0], zp2: g_add_w.zp2, m1: g_add_w.m1, m2: g_add_w.m2, shift: g_add_w.shift, zpo: g_add_w.zpo, amin: g_add_w.amin, amax: g_add_w.amax}),"
+$J/cmds/res_mkmut.sh m_zp1 $S ".words_i(g_add_w)," ".words_i(sienna_add_pkg::add_words_t'{zp1: g_zp[0], zp2: g_add_w.zp2, m1: g_add_w.m1, m2: g_add_w.m2, shift: g_add_w.shift, zpo: g_add_w.zpo, amin: g_add_w.amin, amax: g_add_w.amax}),"
 $J/cmds/res_mkmut.sh m_drop $S "p_zp[k] = pe_add ? pe_add_zpo : pe_zp[p_lane_ent[k]];" "p_zp[k] = pe_zp[p_lane_ent[k]];"
 $J/cmds/res_mkmut.sh m_zin $S ".gp_zin_i      (g_add ? g_add_zpo : g_zp[g])," ".gp_zin_i      (g_zp[g]),"
-for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp m_zp1 m_drop m_zin; do
-  L rs2_mut_$m 64 6 $J/cmds/res_mut.sh $J/res_mut/$m.patch $J/cmds/mk.sh pipeline FMT=int8 N=16 TILE=4 TEST=int8_residual PYTHON=$J/venv/bin/python SIM_ARGS=+verilator+error+limit+1000
+$J/cmds/res_mkmut.sh m_idx_hi $S "tg_idx[0] <= rq_in;" "tg_idx[0] <= g_add ? (rq_in | PER_LANE[FCNT_W-1:0]) : rq_in;"
+$J/cmds/res_mkmut.sh m_skip0 $S "assign hold_wr     = rq_v && tg_hold[RQL-1];" "assign hold_wr     = rq_v && tg_hold[RQL-1] && (tg_idx[RQL-1] != '0);"
+for m in m_pair m_push m_off m_off_wr m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp m_zp1 m_drop m_zin m_idx_hi m_skip0; do
+  $J/cmds/t27_mut_test.sh mut_$m $m 16 4 int8_residual  # rs2_t27_mut_$m: make -j8 pipeline FMT=int8 TRACE=0 SIM_ARGS=+verilator+error+limit+1000
 done
-for m in m_pair m_push m_off m_room m_roomonly m_par m_bank m_hold_lane m_hold_byp; do echo "$m: $(command grep -ho 'a_[a-z_]*: ' $J/runs/rs2_mut_$m/stdout.log $J/runs/rs2_mut_$m/results/pipeline/*.log | sort -u | tr -d '\n')"; done
+$J/cmds/t27_mut_test.sh mut_m_room_thenrelu_n8 m_room 8 2 int8_residual_then_relu_nopool
+$J/cmds/t27_mut_test.sh mut_m_zin_sigselu m_zin 16 4 int8_residual_sigmoid_selu_nopool
+$J/cmds/t27_mut_test.sh ctl ctl 16 4 int8_residual
+for r in $J/runs/rs2_t27_mut_*; do
+  echo "$(basename $r): $(command grep -aE 'Sweep Aborted|Assertion failed|\[FAIL\] truth' $r/stdout.log | head -2 | tr '\n' ' ')"
+  cat $r/results/pipeline/*.log | command grep -a 'Assertion failed' | command grep -ao 'dut\.[A-Za-z_.]*' | sort | uniq -c  # firings, one per line
+done
 ```
 
-(`m_pair`'s OLD string is Task 2.5 Step 3's add-set flags expression, and `m_par`'s is Task 2.3's one-line `g_add_w` load, written on its own line after the `if (g_accept) begin ... end` block for this patch; `res_mkmut.sh` exits 1 if either is missing. `run_regression` stops at the first failing test (`Sweep Aborted`), so each mutant's verdict is its first failing residual test, in `build_order`.)
+(`m_pair`'s OLD string is Task 2.5 Step 3's add-set flags expression, and `m_par`'s is Task 2.3's one-line `g_add_w` load; `res_mkmut.sh` exits 1 if an OLD string is missing. `run_regression` stops at the first failing test (`Sweep Aborted`), so each mutant's verdict is its first failing residual test, in `build_order`.)
 
-- [ ] **Step 3: Read each verdict**
+- [ ] **Step 3: Read each verdict** (stdout.log for the verdict; per-test logs for every firing)
 
 | Mutant | Must show |
 |---|---|
-| `m_pair` | `a_hold_then_add` in `Assertion failed`, the test FAILED |
+| `m_pair` | `a_hold_then_add` first in stdout, the test FAILED |
 | `m_push` | `a_hold_push_empty` |
-| `m_off` | `a_add_pop_full`, and `[FAIL]` output lines in the same log (the raised error limit lets the run finish); at the set's last beat the +1 wraps to beat 0, already read, which `hm_v[0]` catches |
-| `m_room` | `a_fill_one_source` (in `int8_residual_then_relu_nopool` or `_accum2_mixed_nopool`; `a_rq_one_set` may fire too) |
-| `m_roomonly` | `a_add_last_no_accept` (controller ruling 1; `a_rq_one_set` may fire first, since `rq_drain` still covers `add_lanes`) |
+| `m_off` | `a_add_pop_full` through its order term (beat 0 reads slot 1 while slot 0 is unread), and `[FAIL]` output lines |
+| `m_off_wr` | outputs FAIL (`truth: transfer`); no assertion, because `hm_v` follows the write address |
+| `m_idx_hi` | `a_add_pop_full` alone, through `tg_idx < PER_LANE` (add beats' index tag gains its PER_LANE bit; `add_idx` truncates to the right slot, set, nothing unread below). A fault in the `rq_in` counter cannot isolate this term: the add set is a bypass set whose done is `byp_all_in` (`rq_in == PER_LANE`), so a stale count ends the set before its beats and over-grants L3 (`res_cc.a_no_overflow` first; rs2_t27_r3_mut_m_noclear, _m_noclear_hold) |
+| `m_skip0` | `a_add_pop_full` alone, through `hm_v[add_idx]` (add beat 0 reads a slot no hold beat wrote; `hm_below` is 0 at index 0) |
+| `m_room` | `a_add_last_no_accept` first in stdout; `a_fill_one_source` in the per-test log of `TEST=int8_residual_then_relu_nopool` at N=8 TILE=2 |
+| `m_roomonly` | `a_add_last_no_accept` (controller ruling 1; `a_rq_one_set` may fire too, since `rq_drain` still covers `add_lanes`) |
 | `m_par` | `a_add_par_stable`, and `[FAIL]` output lines |
-| `m_bank` | `a_hold_no_bank` (the `act_wr` conjunct) |
-| `m_hold_lane` | `a_hold_no_bank` (a hold set with a lane activation: `int8_residual_tanh`'s hold sets get tanh) |
-| `m_hold_byp` | `a_hold_no_bank` (`hold_wr && byp_wr`: hold beats also reach the bypass write) |
-| `m_zp1` | FAILED outputs in the `zp_random` tests (zp_1 is never 0 there) |
+| `m_bank` | `a_hold_keeps_act_wr` |
+| `m_hold_lane` | `a_hold_no_lane` (`int8_residual_tanh`'s hold sets get tanh; `int8_residual_relu` passes) |
+| `m_hold_byp` | `a_hold_no_bank` (hold beats also reach the bypass write) |
+| `m_zp1` | FAILED outputs (`truth: add`) in the first test whose zp_1 is non-zero |
 | `m_drop` | `int8_residual_train` FAILED (drops to 0, not zp_o): the tests before it pass, since only training drops |
-| `m_zin` | the first residual test with a lane after the ADD (`int8_residual_tanh`, `_sigmoid_selu_nopool` or `_accum2_mixed_nopool`) FAILED (Review Focus 1); rerun with `TEST=int8_residual_sigmoid_selu_nopool` to see the second lane test fail too |
+| `m_zin` | `int8_residual_tanh` FAILED (`truth: activation/tanh`); `TEST=int8_residual_sigmoid_selu_nopool` FAILED too (selu, sigmoid) |
+| control | every residual test PASSED, no `Assertion failed` |
 
-A mutant whose run passes means the tests cannot see that bug: rerun it at `N=8 TILE=2`; if it still passes, strengthen the stream (more sets, a test whose schedule reaches the cross) before going on, and say which mutant needed it in the commit message. Record each run and verdict in the ledger.
+A mutant whose run passes means the tests cannot see that bug: rerun it at `N=8 TILE=2`; if it still passes, strengthen the stream before going on, and say which mutant needed it in the commit message. Record each run and verdict in the ledger. `a_lanes_in_step` is shown by Task 2.4's `m_step`, `a_float_no_add` by Task 2.3's `rs2_fadd`.
 
-The `grep` loop prints each mutant's firing assertions; each must include its row's assertion. `a_lanes_in_step` is shown by Task 2.4's `m_step`, `a_float_no_add` by Task 2.3's `rs2_fadd`.
+- [ ] **Step 4: The unmutated tree stays clean** — `rs2_t27_asrt16` and `rs2_t27_asrt8`: `$J/cmds/mk.sh -j8 pipeline FMT=int8 N=16 TILE=4` and `N=8 TILE=2`, `TRACE=0` (the whole int8 pipeline suite) → every test PASSED, no `Assertion failed`; lint (`t26_lint.sh`, 12 configurations) gains no -Wall key against the base.
 
-- [ ] **Step 4: The unmutated tree stays clean** — `L rs2_asrt16 64 6 $J/cmds/mk.sh pipeline FMT=int8 N=16 TILE=4 PYTHON=$J/venv/bin/python` (the whole int8 pipeline suite) → every test PASSED, no `Assertion failed`.
-
-- [ ] **Step 5: Commit (SIENNA)**
-
-```bash
-git -C $T add src/sienna_top.sv
-git -C $T commit -m "sienna_top: simulation assertions for the int8 residual path, each shown firing by a mutant (rs2_mut_*): a_hold_then_add (hold and add sets in pairs, hold first, neither partial nor packed; registered accept terms), a_hold_push_empty and a_add_pop_full (hold_mem's per-beat occupancy), a_fill_one_source (requantize and add_lanes never fill in one cycle; fires when rq_room is not widened), a_hold_no_bank (a hold set runs no lane activation, writes no bank, keeps act_wr; each conjunct by its own mutant), a_add_par_stable (the ADD words hold while add beats are in requantize), a_add_last_no_accept (an add set's last fill beat never meets the next accept: spec Risk 3's coincidence is excluded by rq_room, rs2_mut_m_roomonly). The spec's mutants also fail the tests: a hold read one beat off, zp_1 from the add set, the drop value from pe_zp, and the lanes' zero point from the identity requantize."
-```
+- [ ] **Step 5: Commit (SIENNA)** — Step 0 alone first, then the assertions: "sienna_top: simulation assertions for the int8 residual path, each shown firing by a mutant (rs2_t27_mut_*): ..." naming each assertion and its mutant as in Step 3.
 
 ### Task 2.8: `sienna_layer`, the `A` line, and the layer-level cases
 
@@ -3559,7 +3582,7 @@ git -C $T add model_runner.py regression.py Makefile && git -C $T commit -m "sie
 
 
 **Files:**
-- Modify: `regression.py` (`residual_tflite`, `residual_mid_reset`), `testbenches/TB_model_run.sv` (`+hold_wait`, `+hold_check`)
+- Modify: `src/sienna_top.sv` (`hm_any`, simulation only), `regression.py` (`residual_tflite`, `residual_mid_reset`), `testbenches/TB_model_run.sv` (`+hold_wait`, `+hold_check`)
 
 **Interfaces:**
 - Consumes: `mr.im2col`, `mr.layer_multipliers`, `mr.activation_range`, `mr.add_words`, `mr.RtlLayer`; TensorFlow from the venv (`--tflite` only).
@@ -3701,6 +3724,8 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
     return bad + ([] if n == 0 and np.array_equal(Y, want) else ["mid-reset"])
 ```
 
+`src/sienna_top.sv` first, its own commit (moved here from Task 2.7, which had no reader for it): at module level under `ifndef SYNTHESIS` after `logic fill_add;`, `logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_model_run's +hold_check)`; in `G_REQ`'s `ifndef SYNTHESIS` block after `hm_v`, `assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window`; in `G_NO_REQ` under `ifndef SYNTHESIS`, `assign hm_any = 1'b0;`. Lint gains no UNUSEDSIGNAL key only once `TB_model_run` reads it. The model runs keep an end-of-run check that no hold set is left without its add set (`hm_any` 0 after the last set, or the TB's `[HOLD/ADD]` count; Task 2.7 review M5).
+
 `TB_model_run.sv` (controller ruling Q4: the reset takes the nearest cycle at or after `first_hold + 1` at which it still lands inside the hold window, records it, and checks it hit a hold): with the plusargs, `int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it` and `hold_wait = $test$plusargs("hold_wait"); hold_check = $test$plusargs("hold_check");`; the break (file line 398) becomes `if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.pipe.hm_any)) break;  // mid-stream, with A credits held (and, with +hold_wait, hold_mem waiting for its add set)`; and after the `[Reset] mid-stream` display:
 
 ```systemverilog
@@ -3711,7 +3736,7 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
         end
 ```
 
-(`hm_any` is Task 2.7's simulation-only `|hm_v`, 0 in float builds. If the window closes before a cycle with A credits held, the layer finishes first and the TB's own `[FATAL] the layer finished before +mid_reset` stops the run: report it to the controller.)
+(`hm_any` (added in this task) is the simulation-only `|hm_v` of Task 2.7's `hm_v`, 0 in float builds. If the window closes before a cycle with A credits held, the layer finishes first and the TB's own `[FATAL] the layer finished before +mid_reset` stops the run: report it to the controller.)
 
 (Checked on the merged main `9fa414e`: `_tf_imports()` sets the globals `tf` and `REF` (BUILTIN_REF), `mr.im2col(x, kh, kw, stride, same, channel_major=False, pad_value=0.0)` and `mr.layer_multipliers(layer, w_scales, in_scale, out_scale, cout, rounding, scale_product=None)`.)
 

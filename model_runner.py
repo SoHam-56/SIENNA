@@ -1233,13 +1233,19 @@ class RtlLayer:
         self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
         self.first_hold = self.last_log = self.last_stages = None
+        self.retries = 0  # Verilator internal-error rebuilds
 
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0",
-                            f"FMT={self.fmt_name}", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
-                            "GEN_PKG=0"],  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
-                           cwd=ROOT, capture_output=True, text=True)
+        cmd = ["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0", f"FMT={self.fmt_name}", f"N={self.N}",
+               f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
+               "GEN_PKG=0"]  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0 and "Internal Error" in r.stdout + r.stderr:  # Verilator's intermittent V3TSP error: one rebuild, never more
+            self.retries += 1
+            print(f"[RETRY] Verilator internal error, rebuilding TB_model_run (retry {self.retries}): "
+                  f"{next((l for l in (r.stdout + r.stderr).splitlines() if 'Internal Error' in l), '').strip()}", flush=True)
+            r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
             raise RuntimeError("TB_model_run build failed")

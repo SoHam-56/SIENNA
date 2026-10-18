@@ -4891,6 +4891,36 @@ def test_stage_dump_gates():
 
 
 @selftest
+def test_build_retry():
+    """RtlLayer.build rebuilds once, printing [RETRY], when make prints a Verilator Internal Error; a second internal error or any other failure
+    raises; a clean build runs make once."""
+    real_run, real_exists, real_pkg = mr.subprocess.run, mr.os.path.exists, mr.write_build_pkg
+    R = lambda rc, out: subprocess.CompletedProcess([], rc, out, "")
+    ierr = R(2, "%Error: Internal Error: ../V3TSP.cpp:353: No unmarked edges found in tour\nmake: *** [Makefile:431: verilator] Error 1\n")
+    other = R(2, "%Error: TB_model_run.sv:12: syntax error\nmake: *** [Makefile:431: verilator] Error 1\n")
+    ok = R(0, "built\n")
+    try:
+        mr.write_build_pkg = lambda *a: None
+        mr.os.path.exists = lambda p: True
+        for seq, want_calls, want_ok in (([ok], 1, True), ([ierr, ok], 2, True), ([ierr, ierr], 2, False), ([other, ok], 1, False),
+                                         ([ierr, other], 2, False)):
+            calls = []
+            mr.subprocess.run = lambda *a, **k: (calls.append(1), seq[len(calls) - 1])[1]
+            sim = mr.RtlLayer(8, 32, "/nonexistent", "int8", 2)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    sim.build()
+                    good = True
+                except RuntimeError:
+                    good = False
+            assert (len(calls), good) == (want_calls, want_ok), (seq, len(calls), good)
+            assert ("[RETRY] Verilator internal error" in buf.getvalue()) == (seq[0] is ierr) and sim.retries == int(seq[0] is ierr), buf.getvalue()
+    finally:
+        mr.subprocess.run, mr.os.path.exists, mr.write_build_pkg = real_run, real_exists, real_pkg
+
+
+@selftest
 def test_pack_float_reference():
     """float_layer_over passes a layer whose int32 bias folds the input zero point (fold_bias) and fails one that drops the fold, a bug the host,
     the golden and the per-stage requantize gate would share; ReLU's reference clamps at 0."""

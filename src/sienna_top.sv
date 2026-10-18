@@ -1012,17 +1012,18 @@ module sienna_top #(
     localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
     logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
     logic hold_wr, add_in, rq_out, add_v, add_busy;
-    logic [HMW-1:0] hold_idx;
+    logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
     logic [NUM_LANES-1:0][7:0] add_d;
     logic [ATW-1:0] add_tag;
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
     assign hold_idx    = HMW'(tg_idx[RQL-1]);
+    assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
     assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
     always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index, as an add beat reads it
     add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
-        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[hold_idx]), .q2_i(rq_d),
+        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[add_idx]), .q2_i(rq_d),
         .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),
         .valid_o(add_v), .result_o(add_d), .tag_o(add_tag), .busy_o(add_busy));
     // The fill sees one source a cycle (Task 2.7's a_fill_one_source checks it): requantize's non-ADD beats, or add_lanes' beats with their own tags.
@@ -1049,7 +1050,7 @@ module sienna_top #(
     assign bank_sel   = byp_wr ? f_bank : act_wr;
 `ifndef SYNTHESIS
     assign {add_in_s, hold_wr_s} = {add_in, hold_wr};
-    assign add_q1_s = hold_mem[hold_idx];
+    assign add_q1_s = hold_mem[add_idx];
     assign add_q2_s = rq_d;
     assign hold_d_s = rq_d;
 `endif

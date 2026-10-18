@@ -64,7 +64,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -2263,6 +2263,105 @@ def layer_bias_special(a, sim, rep) -> bool:
     print(line, flush=True)
     rep.write(line + "\n")
     return good
+
+
+# ── residual: int8 ADD layers on sienna_layer (sienna-int8-residual) ─────────
+
+RES_CASES = {  # name: N -> (rows M, depth K, columns C, conv clamp, ADD's fused activation, the lane after the ADD)
+    "resnet_relu": lambda N: (64, 144, 16, "none", "relu", "relu"),  # ResNet-8's shape: 8x8 rows, 3x3x16 depth, 16 channels
+    "deep_cached": lambda N: (2 * N, 3 * N + 1, N, "none", "relu", "relu"),  # dt 4, rt 2: cached
+    "deep_uncached": lambda N: (N, 3 * N + 1, N, "none", "none", "linear"),  # dt 4, rt 1: uncached
+    "tiles": lambda N: (2 * N + 3, N + 2, 2 * N + 5, "none", "relu", "relu"),  # rt 3, ct 3, dt 2
+    "relu6_conv_linear_add": lambda N: (2 * N, 2 * N, N, "relu6", "none", "linear"),  # Review Focus 3
+    "tanh_after_add": lambda N: (N, 2 * N, N, "none", "none", "tanh"),
+}
+
+
+def residual_case(name: str, N: int, rng) -> tuple:
+    """One int8 residual layer job (random codes, per-channel words and ADD scales; the ADD words from an AddRecord named after the layer), its
+    bit-exact output (a diagnostic) and the ADD outputs of two wrong ADDs (zp_1 taken as 0, no ADD) the stage gate must reject."""
+    M, K, C, conv_act, add_act, lane_act = RES_CASES[name](N)
+    A_q = rng.randint(-128, 128, (M, K)).astype(np.int64)
+    W_q = rng.randint(-127, 128, (K, C)).astype(np.int64)
+    s_w = np.exp(rng.uniform(np.log(1e-3), np.log(2e-2), C))
+    hw_bias = rng.randint(-2000, 2000, C).astype(np.int64)
+    acc = wrap32(imatmul(A_q, W_q) + hw_bias[None, :])
+    rq = requant_params(acc, 0.02, s_w, "linear" if conv_act == "none" else "relu", np.random.RandomState(rng.randint(1 << 30)))
+    rq["amin"], rq["amax"] = ipu.activation_clamp(conv_act, rq["s_out"], rq["zp"])
+    q1 = requantize(acc, rq)
+    s2, z2 = rq["s_out"] * 2.0 ** rng.uniform(-3.0, 3.0), int(rng.randint(-100, 101))
+    R_q = rng.randint(-128, 128, (M, C)).astype(np.int64)
+    y = rq["s_out"] * (q1 - rq["zp"]) + s2 * (R_q - z2)
+    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if add_act == "relu" else y)
+    s_out *= 2.0 ** rng.uniform(-0.5, 0.5)
+    lo, hi = ipu.activation_clamp(add_act, s_out, z_out)
+    add = mr.add_record_words(mr.AddRecord(float(rq["s_out"]), int(rq["zp"]), float(s2), z2, float(s_out), int(z_out), int(lo), int(hi), name))
+    ra = mr.add_lane_params(add, s_out, mr.qadd_codes(q1, R_q, add))
+    want = mr.int8_residual_exact(A_q, W_q, hw_bias, rq, R_q, add, ra, lane_act)
+    wrong = (mr.qadd_codes(q1, R_q, dict(add, zp1=0)), q1)  # the ADD's outputs with zp_1 taken as the add set's 0, and with no ADD
+    req = dict(rq, mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])  # Q: the conv's zp and clamp, the lane's words
+    job = {"terms": [(A_q.astype(np.float32), W_q.astype(np.float32)), (R_q.astype(np.float32), np.eye(C, dtype=np.float32))],
+           "bias": hw_bias, "act": lane_act, "shape": (M, C), "req": req, "add": add, "lane": ra}
+    return job, want, wrong, q1, R_q
+
+
+def residual_rejects(job, q1, R_q, wrong) -> tuple:
+    """Whether the ADD stage gate fails each wrong ADD's outputs (zp_1 = 0, no ADD) on the host's q1 and q2 = R_q."""
+    a = job["add"]
+    lo = max(a["amin"], a["zpo"]) if job["act"] == "relu" else a["amin"]
+    g = lambda y: truth.gate_quantized_add(q1, R_q, a["ratios"][0], a["zp1"], a["ratios"][1], a["zp2"], 1.0, a["zpo"], lo, a["amax"], y)
+    return tuple(not g(y).ok for y in wrong)
+
+
+def residual_main(argv=None) -> None:
+    """int8 residual layers on sienna_layer (TB_model_run), each stage gated on the true function (the conv's requantize, the identity
+    requantize, hold_mem, the ADD, the fill, the lane); int8_residual_exact is a diagnostic. --tflite adds the residual-block TFLite models,
+    --mid-reset a reset with hold_mem full (Task 2.9)."""
+    ap = argparse.ArgumentParser(description=residual_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="residual")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--cases", nargs="*", default=list(RES_CASES), choices=list(RES_CASES))
+    ap.add_argument("--tflite", action="store_true")
+    ap.add_argument("--mid-reset", action="store_true")
+    ap.add_argument("--collapse-k", type=int, choices=[0, 1], default=1, help="the mesh's COLLAPSE_K the layer engine builds")
+    ap.add_argument("--seed", type=int, default=5)
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "residual"))
+    a = ap.parse_args(argv)
+    if a.tflite or a.mid_reset:
+        ap.error("--tflite and --mid-reset come with Task 2.9")
+    mr.COLLAPSE_K = a.collapse_k
+    os.makedirs(a.work, exist_ok=True)
+    print(f"residual: N={a.n} T={a.tile} lanes={a.lanes} collapse-k {a.collapse_k} sim args '{os.environ.get('SIM_ARGS', '')}'", flush=True)
+    sim = mr.RtlLayer(a.n, a.lanes, a.work, "int8", a.tile)
+    sim.build()
+    bad = []
+    for name in a.cases:
+        job, want, wrong, q1, R_q = residual_case(name, a.n, np.random.RandomState(a.seed + sorted(RES_CASES).index(name)))
+        M, K, C = RES_CASES[name](a.n)[:3]
+        rt, ct, dt = -(-M // a.n), -(-C // a.n), -(-K // a.n)
+        try:
+            Y, sets, cyc = sim.run_job(job, name)
+            gates = mr.layer_stage_gates(job, Y, sim.last_stages, a.n)
+        except (RuntimeError, ValueError) as e:  # an assertion, a TB check, a refusal or a missing stage: this case fails, the others still run
+            print(f"residual {name} N={a.n} T={a.tile}: FAIL: {e}", flush=True)
+            bad.append(name)
+            continue
+        mism = int(np.sum(Y != want))
+        w1, w2 = residual_rejects(job, q1, R_q, wrong)
+        print(f"residual {name} N={a.n} T={a.tile}: {M} x {K} x {C}, {Y.size} outputs, sets {sets} (expected {rt * ct * (dt + 1)}), "
+              f"cycles {cyc}; reported: {mism} outputs differ from the bit-exact model; the ADD gate rejects zp_1 = 0: {w1}, no ADD: {w2}", flush=True)
+        for stage, r in gates:
+            print(f"    {stage}: {truth.line(r, bound=truth.TARGET if r.func in ('relu', 'linear') else None) if stage.startswith('activation') else truth.stage_line(r)}", flush=True)
+            if not r.ok:
+                bad.append(f"{name} ({stage})")
+        if sets != rt * ct * (dt + 1):
+            bad.append(f"{name} (sets)")
+        if (job["add"]["zp1"] != 0 and not w1) or not w2:
+            bad.append(f"{name} (its gate cannot tell a wrong ADD)")
+    print(f"RESIDUAL: {'PASS' if not bad else 'FAIL ' + ', '.join(bad)}")
+    sys.exit(1 if bad else 0)
 
 
 # ── perf (was perf_analysis.py) ──────────────────────────────────────────────
@@ -4673,6 +4772,104 @@ def _record_check(rec, x_codes, x_real, w_real, b_real, s_out, out_zp, lo_real=N
 
 
 @selftest
+def test_layer_file_add_line():
+    """An int8 residual layer file carries A after Q (zp2 .. amax, add_words_t's order); write_layer refuses one without ADD words or with zp1
+    off the Q line's zp; the A line's words come from an AddRecord named after the layer, so a refused ADD names it."""
+    job, _, _, _, _ = residual_case("deep_uncached", 8, np.random.RandomState(1))
+    cfg, a_rows, w_rows, _ = mr.format_layer(job, 8)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "l.layer")
+        mr.write_layer(p, cfg, a_rows, w_rows, "int8", job["req"], None, mr.layer_epilogue(job, 8), add=job["add"])
+        lines = open(p).read().splitlines()
+        assert lines[1].startswith("Q ") and lines[2].split()[0] == "A" and len(lines[2].split()) == 8, lines[:3]
+        assert [int(v) for v in lines[2].split()[1:]] == [job["add"][k] for k in mr.ADD_FIELDS[1:]]
+        for add in (None, dict(job["add"], zp1=job["req"]["zp"] + 1)):
+            try:
+                mr.write_layer(p, cfg, a_rows, w_rows, "int8", job["req"], None, mr.layer_epilogue(job, 8), add=add)
+                raise AssertionError("write_layer accepted a residual layer with bad ADD words")
+            except ValueError:
+                pass
+        plain = dict(job, terms=job["terms"][:1])  # no residual term: no A line, and no ADD words needed
+        cfg0, a0, w0, _ = mr.format_layer(plain, 8)
+        mr.write_layer(p, cfg0, a0, w0, "int8", job["req"], None, mr.layer_epilogue(plain, 8))
+        assert not any(l.startswith("A ") for l in open(p).read().splitlines()[:3])
+    try:
+        mr.add_record_words(mr.AddRecord(1.0, 0, 1e9, 0, 1.0, 0, -128, 127, "res_blk3"))
+        raise AssertionError("an ADD outside the adder's domain was accepted")
+    except ValueError as e:
+        assert "res_blk3" in str(e), e
+
+
+@selftest
+def test_stage_dump_gates():
+    """layer_stage_gates on stage dumps built from the host models (read_stage_dump's format): a clean residual layer passes every stage; a
+    hold_mem beat off fails hold_mem, an ADD output off by 3 fails add, zp_1 taken as 0 fails add, a lane output off fails the activation, a
+    missing element and a duplicate line are refused; a plain tanh layer's requantize off by 2 codes fails requant."""
+    N = 8
+    job, want, wrong, q1, R_q = residual_case("tiles", N, np.random.RandomState(3))
+    M, C = job["shape"]
+    rt, ct, np_ = -(-M // N), -(-C // N), -(-RES_CASES["tiles"](N)[1] // N) + 1
+    y = mr.qadd_codes(q1, R_q, job["add"])
+
+    pad = lambda g: np.pad(np.asarray(g, np.int64), ((0, rt * N - M), (0, ct * N - C)))  # the TB dumps whole tiles
+
+    def dump(path, R, Q1, Q2, Yq, X):  # the TB's lines, set k = (c rt + r) np_ + p, element e row-major in the tile
+        R, Q1, Q2, Yq, X = (pad(v) for v in (R, Q1, Q2, Yq, X))
+        with open(path, "w") as f:
+            f.write("H pass 0\nX 0 0 9\nH pass 1\n")  # a cut pass's lines come before the last H
+            for c in range(ct):
+                for r in range(rt):
+                    t = (c * rt + r) * np_
+                    for e in range(N * N):
+                        i, j = r * N + e // N, c * N + e % N
+                        f.write(f"R {t + np_ - 2} {e} {R[i, j]}\nQ {t + np_ - 1} {e} {Q1[i, j]} {Q2[i, j]} {Yq[i, j]}\nX {t + np_ - 1} {e} {X[i, j]}\n")
+
+    def gates(R=q1, Q1=q1, Yq=y, X=y, out=want, edit=None):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "s")
+            dump(p, R, Q1, R_q, Yq, X)
+            if edit:
+                ls = open(p).readlines()
+                open(p, "w").writelines(edit(ls))
+            st = mr.read_stage_dump(p, N, rt, ct, np_)
+        return {s: r.ok for s, r in mr.layer_stage_gates(job, out, st, N)}
+
+    ok = gates()
+    assert all(ok.values()) and set(ok) == {"requant", "requant identity", "hold_mem", "add", "fill", "activation relu"}, ok
+    off = q1.copy()
+    off[1, 2] += 1 if off[1, 2] < 127 else -1
+    assert not gates(Q1=off)["hold_mem"]
+    y3 = y.copy()
+    y3[2, 1] += 3 if y3[2, 1] < 120 else -3
+    assert not gates(Yq=y3, X=y3)["add"]
+    if job["add"]["zp1"] != 0:
+        assert not gates(Yq=wrong[0], X=wrong[0])["add"]
+    o = want.copy()
+    o[o > -100] -= 3
+    assert not gates(out=o)["activation relu"]
+    for edit, msg in ((lambda ls: ls[:-1], "miss"), (lambda ls: ls + ls[-1:], "two")):
+        try:
+            gates(edit=edit)
+            raise AssertionError(f"read_stage_dump accepted a dump with {msg}")
+        except RuntimeError as e:
+            assert msg in str(e), e
+    # a plain tanh layer: requantize and the lane
+    rng = np.random.RandomState(4)
+    A_q, W_q = rng.randint(-128, 128, (N, 2 * N)), rng.randint(-127, 128, (2 * N, N))
+    hw = rng.randint(-500, 500, N)
+    acc = wrap32(imatmul(A_q, W_q) + hw[None, :])
+    rq = requant_params(acc, 0.02, np.full(N, 0.01), "tanh")
+    X = requantize(acc, rq)
+    plain = {"terms": [(A_q.astype(np.float32), W_q.astype(np.float32))], "bias": hw, "act": "tanh", "shape": (N, N), "req": rq}
+    Yt = activate_int8(X, "tanh", rq)
+    run = lambda Xd: {s: r.ok for s, r in mr.layer_stage_gates(plain, Yt, {"np": 2, "X": {1: Xd}}, N)}
+    assert run(X) == {"requant": True, "activation tanh": True}, run(X)
+    X2 = X.copy()
+    X2[0, 0] += 2 if X2[0, 0] < 120 else -2
+    assert not run(X2)["requant"]
+
+
+@selftest
 def test_importer_records():
     """The neutral layer and ADD records from hand-built TFLite, ONNX (QLinearConv, QLinearMatMul + Clip, QLinearAdd, uint8) and
     PyTorch (Conv2d + ReLU with a float bias, Linear, add_relu, quint8) tensors, each run through job_of_record or add_record_words and
@@ -4950,7 +5147,7 @@ class SiennaSpec(regress.Spec):
 SPEC = SiennaSpec(ROOT, os.path.join(ROOT, "testbenches", "results", "regression"))
 
 
-MAINS = {"pack": pack_main, "gemm": gemm_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
+MAINS = {"pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
          "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          "summary": summary_main, **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point")}}  # each parses its own options (regression.py --action A --help)
 

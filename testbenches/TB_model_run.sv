@@ -9,6 +9,8 @@ import test_config_pkg::*;
 // Layer file: "L m kb n residual bias act train seed a_rows w_rows packed", then a_rows and w_rows rows of N hex words.
 // packed: a "P sh m0 .. m(N/2-1)" line and seven "E act zp min max mx shx mout shout zout" lines after L (and Q).
 // int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
+// int8 residual: an "A zp2 m1 m2 shift zpo amin amax" line after Q (zp1 is Q's zp).
+// int8 +dump=<file>: per stage "X k e code" (activation input), "R k e code" (hold beat), "Q k e q1 q2 y" (ADD); k the set in issue order, e its tile element.
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
 // FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many.
 // +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
@@ -36,6 +38,9 @@ module TB_model_run #(
   logic [15:0] cfg_gp_mx_i = '0;
   logic [4:0] cfg_gp_shx_i = '0;
   logic [23:0] cfg_gp_mout_i = '0;
+  logic [7:0] cfg_add_zp2_i = '0, cfg_add_zpo_i = '0, cfg_add_amin_i = '0, cfg_add_amax_i = '0;  // int8 residual: the A line
+  logic [31:0] cfg_add_m1_i = '0, cfg_add_m2_i = '0;
+  logic [5:0] cfg_add_shift_i = '0;
   logic [N-1:0][ACC_W-1:0] w_bias_i = '0;  // int8: with each block's bias row
   logic [N-1:0][23:0] w_req_mult_i = '0;
   logic [N-1:0][5:0] w_req_shift_i = '0;
@@ -129,6 +134,13 @@ module TB_model_run #(
       .cfg_gp_mout_i   (cfg_gp_mout_i),
       .cfg_gp_shout_i  (cfg_gp_shout_i),
       .cfg_gp_zout_i   (cfg_gp_zout_i),
+      .cfg_add_zp2_i   (cfg_add_zp2_i),
+      .cfg_add_m1_i    (cfg_add_m1_i),
+      .cfg_add_m2_i    (cfg_add_m2_i),
+      .cfg_add_shift_i (cfg_add_shift_i),
+      .cfg_add_zpo_i   (cfg_add_zpo_i),
+      .cfg_add_amin_i  (cfg_add_amin_i),
+      .cfg_add_amax_i  (cfg_add_amax_i),
       .cfg_pack_shift_i(cfg_pack_shift_i),
       .cfg_pack_map_i  (cfg_pack_map_i),
       .cfg_pack_act_i  (cfg_pack_act_i),
@@ -153,6 +165,83 @@ module TB_model_run #(
 
   longint cycle = 0;
   always_ff @(posedge clk_i) cycle <= cycle + 1;
+  longint t0 = 0;  // the pass's configure: +mid_reset and first_hold count from it
+  bit streaming = 0;
+  longint first_hold = -1;  // cycles from t0 to the first hold set's last beat into hold_mem
+  always @(posedge clk_i) if (IS_INT != 0 && streaming && dut.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
+
+  // int8 per-stage dump: each set's number in issue order by its id, beats in order from the mesh, requantize and add_lanes.
+  localparam int PER_LANE = N * N / NUM_LANES;
+  localparam int TR_IDS = 1 << $clog2(SETS_IN_FLIGHT + 1);  // sienna_top's set ids
+  integer dump_fd = 0;
+  function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
+    return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
+  endfunction
+  initial begin : stage_dump
+    int tr_k[TR_IDS];  // per set id: the set's number in issue order
+    int beat[TR_IDS];  // beats of each set id read from the mesh so far
+    int put_seq;
+    logic [$clog2(TR_IDS)-1:0] q_id[$], h_id[$];  // beats inside requantize: their set id and beat index
+    int q_i[$], h_i[$];
+    bit q_pk[$];
+    logic [NUM_LANES-1:0][7:0] a_q1[$], a_q2[$];  // add beats inside add_lanes, their two inputs
+    put_seq = 0;
+    forever begin
+      @(negedge clk_i);
+      if (!rstn_i) begin  // the cut pass's beats are dropped; its lines stay before the next H line
+        put_seq = 0;
+        q_id.delete();
+        q_i.delete();
+        q_pk.delete();
+        h_id.delete();
+        h_i.delete();
+        a_q1.delete();
+        a_q2.delete();
+      end else if (IS_INT != 0 && dump_fd != 0) begin
+        if (dut.pipe.host_accept) tr_k[int'(dut.pipe.host_next_id)] = put_seq++;
+        if (dut.pipe.g_accept) beat[int'(dut.pipe.g_next_id)] = 0;
+        if (dut.pipe.wide_rd_valid) begin  // a beat leaves the mesh into requantize
+          if (!dut.pipe.g_hold) begin
+            q_id.push_back(dut.pipe.g_set_id);
+            q_i.push_back(beat[int'(dut.pipe.g_set_id)]);
+            q_pk.push_back(dut.pipe.g_pack);
+          end else begin
+            h_id.push_back(dut.pipe.g_set_id);
+            h_i.push_back(beat[int'(dut.pipe.g_set_id)]);
+          end
+          beat[int'(dut.pipe.g_set_id)]++;
+        end
+        if (dut.pipe.hold_wr_s) begin  // a hold beat into hold_mem: the conv's requantized codes
+          if (h_id.size() == 0) $display("[FAIL] stage dump: a hold_mem write with no hold beat in the requantize pipeline");
+          else begin
+            automatic logic [$clog2(TR_IDS)-1:0] id = h_id.pop_front();
+            automatic int i = h_i.pop_front();
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "R %0d %0d %0d", tr_k[id], tr_elem(k, i, 1'b0), $signed(dut.pipe.hold_d_s[k]));
+          end
+        end
+        if (dut.pipe.fill_v) begin  // a beat into the activation stage, from requantize or add_lanes
+          if (q_id.size() == 0) $display("[FAIL] stage dump: a fill beat no requantize or add_lanes beat accounts for");
+          else begin
+            automatic logic [$clog2(TR_IDS)-1:0] id = q_id.pop_front();
+            automatic int i = q_i.pop_front();
+            automatic bit pk = q_pk.pop_front();
+            if (dut.pipe.fill_add && a_q1.size() == 0) $display("[FAIL] stage dump: an add_lanes fill with no add beat before it");
+            else if (dut.pipe.fill_add) begin
+              automatic logic [NUM_LANES-1:0][7:0] q1 = a_q1.pop_front(), q2 = a_q2.pop_front();
+              for (int k = 0; k < NUM_LANES; k++)
+                $fdisplay(dump_fd, "Q %0d %0d %0d %0d %0d", tr_k[id], tr_elem(k, i, pk), $signed(q1[k]), $signed(q2[k]),
+                          $signed(dut.pipe.fill_d[k][7:0]));
+            end
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(dump_fd, "X %0d %0d %0d", tr_k[id], tr_elem(k, i, pk), $signed(dut.pipe.fill_d[k][7:0]));
+          end
+        end
+        if (dut.pipe.add_in_s) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
+          a_q1.push_back(dut.pipe.add_q1_s);
+          a_q2.push_back(dut.pipe.add_q2_s);
+        end
+      end
+    end
+  end
 
   // Results per set in window order: lane L's j-th word is window j*NUM_LANES + L, whatever each lane's stalls; empty for partial sums.
   logic [DATA_WIDTH-1:0] lane_q[NUM_LANES][$];
@@ -232,7 +321,7 @@ module TB_model_run #(
 
   logic [DATA_WIDTH-1:0] a_rows[$], w_rows[$];  // N words per row, back to back
   int ai = 0, wi = 0, na = 0, nw = 0, ne = 0;
-  bit streaming = 0, faulted = 0;
+  bit faulted = 0;
 
   // The producers: a row goes on the falling edge while a credit is held and the random input stall allows it.
   always @(negedge clk_i) begin
@@ -277,9 +366,11 @@ module TB_model_run #(
     integer fin, fout, rc;
     int m, kb, n, res, bias, act, train, seed, pk, idle, last_ai, last_wi, last_sets;
     int qzp, qmin, qmax, qmx, qshx, qmout, qshout, qzout;
+    int azp2, ash, azpo, aamin, aamax;
+    longint am1, am2;  // unsigned 32-bit mantissas
+    string dump_f;
     logic [DATA_WIDTH-1:0] v;
     logic [31:0] w32;
-    longint t0;
     bit finished;
     int failed = 0, osp, mid_reset = 0, msp;
 
@@ -314,6 +405,16 @@ module TB_model_run #(
         $display("[FATAL] %s: an int8 layer file needs its Q line", layer_f);
         $finish;
       end
+    end
+    {azp2, am1, am2, ash, azpo, aamin, aamax} = '0;
+    if (IS_INT != 0 && res != 0) begin
+      rc = $fscanf(fin, "%s %d %d %d %d %d %d %d", kind, azp2, am1, am2, ash, azpo, aamin, aamax);
+      if (rc != 8 || kind != "A") begin
+        $display("[FATAL] %s: an int8 residual layer file needs its A line", layer_f);
+        $finish;
+      end
+      if (ash < 0 || ash >= 64 || azp2 < -128 || azp2 > 127 || azpo < -128 || azpo > 127 || aamin < -128 || aamin > 127 || aamax < -128 || aamax > 127)
+        $fatal(1, "TB_model_run: the A line's words %0d %0d %0d %0d %0d are out of range", azp2, ash, azpo, aamin, aamax);
     end
     if (pk) begin
       int sh, mv, ev[9];
@@ -356,6 +457,10 @@ module TB_model_run #(
       ep.push_back(w32);
     end
     $fclose(fin);
+    if (IS_INT != 0 && $value$plusargs("dump=%s", dump_f)) begin
+      dump_fd = $fopen(dump_f, "w");
+      if (dump_fd == 0) $fatal(1, "TB_model_run: cannot open %s", dump_f);
+    end
 
     repeat (5) @(posedge clk_i);
     #1 rstn_i = 1;
@@ -382,6 +487,15 @@ module TB_model_run #(
       cfg_gp_mout_i = 24'(qmout);
       cfg_gp_shout_i = 6'(qshout);
       cfg_gp_zout_i = 8'(qzout);
+      cfg_add_zp2_i = 8'(azp2);
+      if (am1 < 0 || am1 >= 64'h1_0000_0000 || am2 < 0 || am2 >= 64'h1_0000_0000) $fatal(1, "TB_model_run: the ADD's mantissas %0d %0d are out of range", am1, am2);
+      cfg_add_m1_i = 32'(am1);
+      cfg_add_m2_i = 32'(am2);
+      cfg_add_shift_i = 6'(ash);
+      cfg_add_zpo_i = 8'(azpo);
+      cfg_add_amin_i = 8'(aamin);
+      cfg_add_amax_i = 8'(aamax);
+      if (dump_fd != 0) $fdisplay(dump_fd, "H pass %0d", pass);  // the reader keeps the lines after the last H
       cfg_load_i = 1;
       @(posedge clk_i);
       #1 cfg_load_i = 0;
@@ -475,6 +589,8 @@ module TB_model_run #(
       $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d epilogues=%0d/%0d out_stall=%0d in_stall=%0d collapse_k=%0d",
                bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct,
                dut.pipe.systolic_array_inst.COLLAPSE_K);  // the elaborated mesh's mode, not the package's: run_job checks it
+    if (first_hold >= 0) $display("[RES] first hold_done %0d cycles into the layer", first_hold);
+    if (dump_fd != 0) $fclose(dump_fd);
 `ifdef PERF
     $display("[PERF] rows=%0d stalls: mid-set=%0d credits=%0d staging=%0d bias=%0d tile=%0d other=%0d", st_rows, st_input,
              st_credit, st_staging, st_bias, st_tile, st_idle);

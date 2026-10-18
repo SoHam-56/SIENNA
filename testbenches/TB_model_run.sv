@@ -99,6 +99,7 @@ module TB_model_run #(
       .NUM_LANES     (NUM_LANES),
       .N             (N),
       .TILE_SIZE     (TILE_SIZE),
+      .COLLAPSE_K    (COLLAPSE_K),  // the package's mesh mode, a build item as in TB_sienna_top
       .SETS_IN_FLIGHT(SETS_IN_FLIGHT),
       .DATA_WIDTH    (DATA_WIDTH),
       .EXP_W         (EXP_W),
@@ -471,8 +472,9 @@ module TB_model_run #(
     end
     $fclose(fout);
     if (failed == 0)
-      $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d epilogues=%0d/%0d out_stall=%0d in_stall=%0d",
-               bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct);
+      $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d epilogues=%0d/%0d out_stall=%0d in_stall=%0d collapse_k=%0d",
+               bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct,
+               dut.pipe.systolic_array_inst.COLLAPSE_K);  // the elaborated mesh's mode, not the package's: run_job checks it
 `ifdef PERF
     $display("[PERF] rows=%0d stalls: mid-set=%0d credits=%0d staging=%0d bias=%0d tile=%0d other=%0d", st_rows, st_input,
              st_credit, st_staging, st_bias, st_tile, st_idle);

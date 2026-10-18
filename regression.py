@@ -4635,6 +4635,13 @@ def test_importer_records():
                             y_unsigned=True, name="c2")
     over, n = _record_check(rec, x6 - 128, xs * (x6 - xz), w_real, b * xs * ws, ys, yz - 128, pads=(1, 1, 1, 1))
     assert over == 0 and n == 72, ("onnx stride 2 pads 1", over, n)
+    # ONNX asymmetric pads [top 0, left 0, bottom 1, right 1] (as tf2onnx emits for SAME at stride 2): checks the reorder to (t, b, l, r)
+    x5 = rng.integers(0, 256, (1, 5, 5, 3))
+    rec = mr.record_of_onnx("QLinearConv", xs, xz, w, ws, np.zeros(4), ys, yz, b, strides=(2, 2), pads=[0, 0, 1, 1], x_unsigned=True,
+                            y_unsigned=True, name="c5")
+    over, n = _record_check(rec, x5 - 128, xs * (x5 - xz), w_real, b * xs * ws, ys, yz - 128, pads=(0, 1, 0, 1))
+    assert over == 0 and n == 16, ("onnx asymmetric pads", over, n)
+    assert rec.pads == (0, 1, 0, 1), rec.pads
     # ONNX QLinearMatMul (w (K, N)), int8, Clip(-1, 2)
     x, w2, ws2 = rng.integers(-128, 128, (6, 8)), rng.integers(-127, 128, (8, 5)), np.full(5, 0.004)
     rec = mr.record_of_onnx("QLinearMatMul", 0.03, -7, w2, ws2, np.zeros(1), 0.02, 9, clip=(-1.0, 2.0), name="m1")

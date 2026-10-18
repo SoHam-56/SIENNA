@@ -1697,7 +1697,7 @@ def tflite_main(argv=None):
         got, low, want = got.reshape(shape), low.reshape(shape), y.reshape(shape)
         per_channel = layer["filter"]["scale"].size > 1
         z_in = int(layer["input"]["zp"][0])
-        padded = layer["kind"] == "CONV_2D" and layer["same"]
+        padded = layer["kind"] == "CONV_2D" and any(record_of_tflite(layer, name).pads)  # a SAME conv with all-zero pads is unpadded
         covered |= padded and per_channel and z_in != 0
         m_rtl, m_low, m_hw = int(np.sum(got != want)), int(np.sum(low != want)), int(np.sum(got != low))
         bad += int(not r.ok)

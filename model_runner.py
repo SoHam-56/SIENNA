@@ -187,7 +187,7 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
     _, s_out, z_out = quant_act(real)
     ratio = np.array([s_a * float(s) / s_out for s in s_w], np.float64)  # each channel's real scale s_a s_w / s_out
     mult, shift = encode_scales(ratio)
-    if rng is not None:  # random words: every normalized mantissa, shifts 24..36 (scales 2^-13 .. 2), each its own exact scale
+    if rng is not None:  # random words: every normalized mantissa, shifts 24..36 (scales in [2^-13, 1)), each its own exact scale
         mult = rng.randint(1 << 23, 1 << 24, s_w.size).astype(np.int64)
         shift = rng.randint(24, 37, s_w.size).astype(np.int64)
         ratio = code_scales(mult, shift)

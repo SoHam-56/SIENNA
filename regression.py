@@ -2778,6 +2778,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
         # then T^2 reads and the tree.
         mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 2 + T * T + LAT,
         per_lane=per_lane, LAT=LAT)
+    m["mesh_lat"] += (cfg.get("accum_passes", 1) - 1) * m["host"]  # each further depth pass launches one host interval later (TB_sienna_top is host-bound)
     act = cfg.get("act")
     windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
@@ -5084,6 +5085,15 @@ def test_residual_hold_add_pairs():
 
 PERF_P8 = dict(N=8, TILE_SIZE=2, NUM_LANES=32, HOST_WORDS=8, SRAM_DEPTH=64, IN_ROWS=8, IN_COLS=8, POOL_H=1, POOL_W=1, STRIDE_ROWS=1,
                STRIDE_COLS=1, PADDING=0, NUM_SETS=18)  # rs2_perf2_int8_n8_t2's test_config_pkg
+
+
+@perf_selftest
+def test_mesh_lat_passes():
+    with perf_fmt("bf16"):  # matmul_accum3_bias_linear_nopool at N16 T4: first pass's launch to the third pass's result written, read off the trace
+        a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
+        P16 = {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}
+        m1, m3 = pa.model({"act": "linear"}, True, P16, 256), pa.model({"act": "linear", "accum_passes": 3}, True, P16, 256)
+        assert m1["mesh_lat"] == 71 and m3["mesh_lat"] == 71 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 109
 
 
 @perf_selftest

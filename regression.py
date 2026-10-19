@@ -2762,24 +2762,25 @@ def model(cfg: dict, collapse: bool = True) -> dict:
 
 
 def lane_params() -> tuple:
-    """gpnae_poly's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_top overrides either."""
+    """gpnae_poly's K and TAIL_CONTEXTS defaults and its bf16 TAIL_NEWTON, parsed from the RTL; fails if sienna_top overrides K or TAIL_CONTEXTS."""
     poly = open(os.path.join(ROOT, "GPNAE", "src", "gpnae_poly.sv")).read()
     inst = re.search(r"gpnae_poly #\((.*?)\) gpnae_inst", open(os.path.join(ROOT, "src", "sienna_top.sv")).read(), re.S)
     k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
-    if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
-        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS defaults not found, or sienna_top overrides them")
-    return int(k.group(1)), int(t.group(1))
+    nw = re.search(r"localparam int TAIL_NEWTON = FP32 \? 0 : (\d+);", poly)  # Task 1.14a: bf16 sigmoid x < 0's Newton steps
+    if not (k and t and nw and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
+        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS / TAIL_NEWTON not found, or sienna_top overrides them")
+    return int(k.group(1)), int(t.group(1)), int(nw.group(1))
 
 
-GROUP_K = TAIL_CTX = None  # gpnae_poly's K and TAIL_CONTEXTS, which sienna_top leaves at their defaults; perf_init() parses them
+GROUP_K = TAIL_CTX = TAIL_NEWTON = None  # gpnae_poly's K, TAIL_CONTEXTS and bf16 TAIL_NEWTON; perf_init() parses them
 
 
 def perf_init() -> None:
     """Parses the RTL's unit latencies and lane parameters for the perf model; at perf's entry, not at import, so an unparsable RTL fails only perf."""
-    global UNIT_LAT, FX_LAT, REQ_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX
+    global UNIT_LAT, FX_LAT, REQ_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX, TAIL_NEWTON
     UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()
     MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]
-    GROUP_K, TAIL_CTX = lane_params()
+    GROUP_K, TAIL_CTX, TAIL_NEWTON = lane_params()
 DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
 
 
@@ -2794,18 +2795,22 @@ def lane_inputs(k: int, P: dict, collapse: bool) -> list:
 
 def in_tail(x: float, act: str) -> bool:
     """gpnae_poly's sig_in_tail: past the fitted range, gpnae_tail computes the element."""
+    if FMT == "bf16" and act == "sigmoid" and x < 0: return True  # Task 1.14a: every negative bf16 sigmoid input takes the fp32 tail
     return x < -4.0 if act == "selu" else abs(x) > (3.5 if act == "sigmoid" else 4.0)
 
 
 def tail_ops(x: float, act: str) -> int:
     """gpnae_tail's cycles for one element alone, from its first state to T_DONE: each step is request, issue, unit, state update."""
-    cm, ca = MUL_LAT + 2, ADD_LAT + 2
+    cm, ca = (UNIT_LAT["fp32"][0] if FMT == "bf16" else MUL_LAT) + 2, (UNIT_LAT["fp32"][1] if FMT == "bf16" else ADD_LAT) + 2  # bf16's tail computes in fp32 since Task 1.14a
+    nwt = TAIL_NEWTON if FMT == "bf16" and act == "sigmoid" and x < 0 else 0  # gpnae_tail's NEWTON: Newton steps for this element
     a = x if act == "selu" else -abs(x) if act == "sigmoid" else -2 * abs(x)  # e^a, a <= 0
     if act == "tanh" and abs(x) >= 64.0:
         a = -math.inf  # x's exponent at BIAS + 6: the underflow path
     out = ca if act == "tanh" or (act == "sigmoid" and x >= 0) else 0  # 1 - 2s, 1 - s, or s as it is
+    # u = 1 - E, v = E u, w = 1 - v, s = E w, then the output step; with Newton: D = 1 + E, y = 1.5 - D/2, nwt rounds of t = D y, t = 2 - t, y = y t, then s = E y
+    close = ca + ca + nwt * (cm + ca + cm) + cm if nwt else ca + cm + ca + cm + out
     if abs(a) > 104.0:  # e^a underflows: straight to the closing steps
-        return cm if act == "selu" else ca + cm + ca + cm + out
+        return cm if act == "selu" else close
     mant, m = math.frexp(abs(a))  # |a| = mant * 2^m, mant in [0.5, 1): the Taylor z = a / 2^m and m doublings back
     z = -mant if m > 0 else a
     m = max(m, 0)
@@ -2818,7 +2823,7 @@ def tail_ops(x: float, act: str) -> int:
             ops += 1
             break
         ops += cm
-    return ops + ca + cm + ca + cm + out  # u = 1 - E, v = E u, w = 1 - v, s = E w, then the output step
+    return ops + close
 
 
 def lane_cycles(xs: list, act: str, s: int) -> int:
@@ -5054,6 +5059,16 @@ def test_tail_ops_fp32():
         assert pa.tail_ops(60.0, "tanh") == 7 + 10 + 7 + 10 + 7  # |a| = 120 > 104: e^a underflows
         assert pa.tail_ops(-4.5, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10  # x < 0 keeps s, no output step
         assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
+
+
+@perf_selftest
+def test_tail_ops_bf16():
+    with perf_fmt("bf16"):  # Task 1.14a: the tail in fp32 units (multiply 8 + 2, add 5 + 2), sigmoid x < 0 with two Newton steps, by hand
+        assert pa.TAIL_NEWTON == 2 and pa.in_tail(-0.01, "sigmoid") and not pa.in_tail(0.0, "sigmoid") and not pa.in_tail(-0.01, "tanh")
+        assert pa.tail_ops(-0.5, "sigmoid") == 10 * 17 + 10 + 7 + 7 + 7 + 2 * (10 + 7 + 10) + 10  # E = 1 + d, D, y0, two rounds, s = E y
+        assert pa.tail_ops(-200.0, "sigmoid") == 7 + 7 + 2 * (10 + 7 + 10) + 10  # e^a underflows: straight to the Newton steps
+        assert pa.tail_ops(4.0, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10 + 7  # x > 3.5 keeps the series and 1 - s
+        assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # fp32 units, as fp32's
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──

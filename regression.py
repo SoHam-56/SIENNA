@@ -2840,7 +2840,7 @@ def lane_cycles(xs: list, act: str, s: int) -> int:
         post = run + ncoef * max(n, loop + 1) + loop + 3 + n  # RUN rounds of max(n, loop + 1), DRAIN loop + 2, EMIT n: G_POST
         if int8:  # result flag MUL_LAT (+ REQ_LAT for SELU) after the issue; sigmoid in place; tanh's saturated inputs read as unsaturated
             lat = [MUL_LAT + REQ_LAT if act == "selu" else MUL_LAT if tanh else -1] * n
-        else:
+        else:  # bf16 tanh below T_TINY returns x and SELU's lambda is 0x3F87 (Task 1.16) in the same cycles; Task 1.14bc built no RTL
             lat = [(-1 if x >= 0 else DN_LAT[FMT]) if act == "sigmoid" else MUL_LAT for x in grp]
         ready = [post + i + 2 + lat[i] for i in range(n)]
         if not int8:  # tail elements start as captured, one per cycle, on TAIL_CTX contexts; unit contention is not modelled

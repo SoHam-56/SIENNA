@@ -1,0 +1,76 @@
+Gate G2 (sigmoid ladder), Task 1.13. Local report, outside git.
+Tree (every run below): T=/proj/scratch/spramanik/int8_res: SIENNA 9fa414e (int8_residual, " M GPNAE", " M SystolicMesh"), GPNAE 3efe6f6, SystolicMesh b920a06, ArithmeticLibrary 22ef3a4 (both copies). Submitted after Step 0 was committed.
+
+== Step 0: GPNAE int8_residual rebuilt from de08ba4 (backup tag int8_residual_pre_rebuild = 2a1026b, kept)
+commit   files                                         python3 -B check_gpnae_model_int8.py (login node, numpy 1.26.2)
+8d7736c  src/gpnae_poly_int8.sv (flat packed SIG_LAD_T)  de08ba4's check file: 0 errors, RESULT: PASSED
+f458116  gpnae_model.py, check_gpnae_model_int8.py      0 errors, RESULT: PASSED (no fpc lines; rtl_ladder pins SIG_LAD_N)
+dd28e16  fit_poly_coeffs.py, check_gpnae_model_int8.py  0 errors, RESULT: PASSED (threshold eq and raises guards added)
+c18d5b7  regression.py                                  0 errors, RESULT: PASSED
+3efe6f6  Makefile, test_regression_sweep.py             0 errors, RESULT: PASSED
+git diff int8_residual_pre_rebuild HEAD: check_gpnae_model_int8.py only (rtl_ladder parses SIG_LAD_N; the literal eq compares (SIG_LAD_X0, SIG_LAD_T, SIG_LAD_N) with (5120, gm.SIG_LAD_T, 19)).
+SIG_LAD_N pin, login node on a copy of the tree: SIG_LAD_N = 18 -> "[FAIL] gpnae_poly_int8's ladder literals are gpnae_model's (SIG_LAD_X0, SIG_LAD_T, SIG_LAD_N): got (5120, (...), 18), want (5120, (...), 19)", RESULT: FAILED, exit 1; the 2a1026b check passed the same copy (0 errors); SIG_LAD_N = 19 -> PASSED.
+co-authored-by in git log --format=%B de08ba4..HEAD: 0.
+
+== Step 1: gate rs1_g2 ($J/cmds/res_g2.sh), exit=0, GATE-FAIL lines: 0
+int8_seed1      BITEXACT: PASS  selu 52736/52736  sigmoid 52736/52736  tanh 52736/52736  relu 52736/52736  linear 52736/52736  stream 2098/2098
+int8_seed101    BITEXACT: PASS  (same counts)
+int8_seed202    BITEXACT: PASS  (same counts)
+int8_seed303    BITEXACT: PASS  (same counts)
+int8_randinit   BITEXACT: PASS  (same counts; seed 7, EXTRA_FLAGS -DNO_ZERO_INIT --x-initial unique --x-assign unique, SIM_ARGS +verilator+rand+reset+2 through make's environment)
+each of the five: ACCURACY: PASS (rel <= 6.25% or abs <= 1 LSB; gated: sigmoid 0 of 1280 outside; reported, not gated: selu 0 of 1024 outside, tanh 0 of 1280 outside); stream exact 2098/2098, 205 of 205 group starts
+fp32            Verdict : All patterns passed
+bf16_hw         Verdict : All patterns passed (--model hw)
+bm_int8         RESULT: PASSED (TB_barrel_mac_int8, seed 5)
+model_check     check_gpnae_model_int8: 0 errors, RESULT: PASSED
+lint_0_7        make exit=0, errors=0, 81 warnings (rs1_base_gp_lint: 81), none names SIG_LAD or sig_ladder
+rs1_gp_checks_g2 (res_gp_checks.sh): check_gpnae_model_int8 PASSED, check_gpnae_model_fp32 PASSED, test_regression_sweep ALL 4 PASSED, exit=0
+
+== Step 2: mutants (each must fail)
+rs1_mut_m_thr        16'd5761 -> 16'd5762      exit=1  BITEXACT: FAIL sigmoid 52730/52736; ladder edge segment sigmoid 10494/10496 (other activations full); stream 2098/2098  CAUGHT
+rs1_mut_m_thr_check  same patch, model check   exit=1  [FAIL] gpnae_poly_int8's ladder literals are gpnae_model's (...) got (..., 5762, ...), RESULT: FAILED  CAUGHT
+rs1_mut_m_x0         SIG_LAD_X0 5120 -> 7168   exit=1  BITEXACT: FAIL sigmoid 51065/52736; ladder edge 9730/10496; stream 2077/2098  CAUGHT
+rs1_mut_m_pos        positive branch k - 128   exit=1  BITEXACT: FAIL sigmoid 30304/52736; ladder edge 9121/10496; stream 2014/2098  CAUGHT
+rs1_mut_m_mkgoal     Makefile $(filter regression,...) in place of regression%  exit=1  test_regression_sweep.py:61 AssertionError (regression/int8/lane FMT=fp16 returned 0); both model checks PASSED  CAUGHT
+m_thr is caught both by the farm sim's ladder edge segment and by the literal check, as the brief expects.
+Note: every RTL mutant still reports ACCURACY: PASS (gated sigmoid 0 of 1280); only BITEXACT catches them.
+
+== Step 3: identity (base: main 22f0b44; stimulus base rs1_base_gp_*, GPNAE 61867b6, whose src, model and tables equal 22f0b44's)
+RTL files changed besides gpnae_poly_int8.sv: 0
+poly_coeffs.mem, poly_coeffs_bf16.mem, poly_coeffs_int8.mem, taylor_coeffs.mem, src/TYTAN/Memory: TABLES-SAME
+gpnae_model.py hunks (22f0b44 side): 196, 272, 364, 366, 370, 393, 395; all after the '# int8 lane' section (line 180 in 22f0b44; the brief said 158)
+selu SAME, tanh SAME, relu SAME, linear SAME (expected outputs, first 25856); every *_in.mem prefix SAME
+sigmoid outputs changed in the first 1280: 172 (spec: 172)
+sigmoid outputs changed in the first 25856: 593
+fp32: 6 stimulus files compared, none MOVED; bf16: 6 compared, none MOVED
+
+== Step 4: depth (yosys_depth.sh gpnae_poly_int8 - <variant>, Yosys generic gates; levels, not timing)
+run                 RTL                                           variant  ltp  POSTQ.s2_p  MAC.s1_p  sat_buf  mac_in  res_buf[*]  comb_cells
+rs1_base_yd_gp_c    2a (yardstick; brief's rs1_base_yd_gp)        generic  58   58          58        58       58      30          25747
+rs1_yd_gp_base2     de08ba4 RTL, today's shim                     generic  58   58          58        58       58      30          25747
+rs1_yd_gp_ctl       2a + only x_sat's sigmoid >= / <= 5120         generic  54   54          53        54       54      31          25416
+rs1_yd_gp           final (3efe6f6)                               generic  59   59          59        59       58      51          25772
+rs1_yd_gp_base2_r   de08ba4 RTL                                   dchr     58   58          53        44       44      28          41180
+rs1_yd_gp_ctl_r     control                                       dchr     54   54          52        46       43      27          41141
+rs1_yd_gp_r         final                                         dchr     59   59          43        46       43      40          42399
+Cones at 59 in the final RTL (generic): POSTQ.s2_p, POSTQ.s3_q, SQ.sum, barrel_mac G_INT.MAC.s1_p, pm_sh, sat_buf; under dchr only POSTQ.s2_p.
+Ruling test: the control is 54, not 59; but the unchanged cones POSTQ.s2_p (tfliteRequant's multiply) and MAC.s1_p each moved 58 -> 59, the same +1 as the lane worst, so 59 is accepted as mapping noise (second condition).
+Supporting: POSTQ.s2_p, whose RTL is identical in all three, reads 58 / 54 / 59 under both generic and dchr, so its depth moves with unrelated edits; the ladder cone (res_buf) is 51 generic / 40 dchr, below the lane worst; G_POST at 51 accepted (ruling).
+No k_buf or compare fix applied.
+
+== G3 (Task 1.8): G3 by diff PASS: mesh unchanged (SystolicMesh tree: pointer only; ArithmeticLibrary 815feba..22ef3a4: Add/ added, ipu.py and sienna_fmt_pkg.sv extended, no unit the mesh builds changed: UNITS-UNCHANGED).
+
+== Phase 1 end state
+SystolicMesh/ArithmeticLibrary int8_residual 22ef3a4 0 changes; GPNAE/ArithmeticLibrary int8_residual 22ef3a4 0; GPNAE int8_residual 3efe6f6 0; SystolicMesh int8_residual b920a06 0; SIENNA int8_residual 9fa414e 2 (" M GPNAE", " M SystolicMesh")
+co-authored-by in origin/main..HEAD: 0 in all five checkouts. Nothing pushed (no remote int8_residual ref).
+Other gates: G0b /proj/work/spramanik/sienna_jobs/runs/rs1_g0b/results/res/g0b_add_oracle.log; G1 /proj/work/spramanik/sienna_jobs/runs/rs1_g1/g1_add_gate.log (GATE G1 (tfliteAdd): PASS, rs1_g1c).
+
+GATE G2 (sigmoid ladder): PASS
+
+Addendum (controller, after the Task 1.13 review, 2026-10-11):
+- Depth acceptance rests on cone disjointness and the dchr per-cone numbers, not on the generic +1 coincidence: the lane's worst cone POSTQ.s2_p starts at FF dut.POSTQ.s1_m and shares no logic with the ladder or x_sat; under dchr (map -r) the changed cones are res_buf 28 -> 40 and sat_buf 44 -> 46, below POSTQ.s2_p's 59. Under generic, res_buf is 51 against a control worst of 54 (3 levels margin): k_buf stays the pre-approved fallback if a real timing flow makes it critical.
+- ltp on this lane swings 54..59 on identical RTL (POSTQ.s2_p), so a whole-lane ltp delta under ~5 levels is undecidable; ltp is topological levels, not timing. Sign-off is STA on the chosen synthesis tool.
+- Intermediate commits pass check_gpnae_model_int8.py; a full-sim bisect at 8d7736c/f458116 would fail sigmoid bit-exact (RTL-first order: the RTL leads the model by one commit).
+- Identity covers the base's 25,856-line stimulus prefix; the new ladder-edge and scale-sweep sets have no 2a counterpart, and their selu/tanh/relu/linear outputs rest on the model check and BITEXACT PASS.
+- res_g2.sh now exits 1 when any GATE-FAIL is echoed (it exited 0 before; this run's verdict rests on 0 GATE-FAIL lines in stdout.log).
+- Stale int8 files in g2/fp32 and g2/bf16_hw come from the shared results dir and are not read by any verdict.

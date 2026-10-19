@@ -9,7 +9,29 @@ Read from SIENNA main fce13e8 (clean clone `/proj/scratch/spramanik/n8_fix`), GP
 TensorFlow 2.18.1 in `sienna_jobs/venv`. Nothing was built or simulated. The sigmoid numbers below come from evaluating
 `gpnae_model` (numpy, bit-exact with the RTL per G2) in this investigation, not from RTL runs.
 
+**Status: implemented and verified 2026-10-18 on branch `int8_residual` in all four repos, at N = 8 and 16 at every tile size (gate G4: PASS, run rs2_g4, `sienna-report/history/2026-10-18_sienna_int8_residual_g4.txt`); N = 32 and 64 run in the final sweep after the restructure.** The spec below is kept as written; "As built" lists where the build departs from it.
+
 **Status (Soham 2026-10-17, Task 2.6b): everything generic, in logic and names.** Decision 1's TFLite bit-exactness is reversed: the ADD is `int8QuantizedAdder` (ArithmeticLibrary `QuantizedAdder/`: y = clamp(sat10(round half up of ((q1 - zp1) m1 + (q2 - zp2) m2) 2^-shift) + zpo), m1 and m2 unsigned 32-bit on one shared shift, 6 stages, qadd_lat() 6) and the requantize is `int8Requantizer` (`Requantizer/`: 24-bit mantissa, 6-bit right shift, 4 stages), both gated on the true function (|hw - t| <= max(1% |t|, one step)); the host encodes real scales with `ipu.encode_scale` and `ipu.encode_add` (which refuses max(s1, s2) / s_out >= 2^23). `add_lanes` takes one `add_words_t` (`src/sienna_add_pkg.sv`: zp1, zp2, m1, m2, shift, zpo, amin, amax; 110 bits) and has `busy_o`, which `sienna_top`'s `rq_room` and `rq_drain` read. G0b, D1's left shift and Prepare, P-11 and P-13 are history; agreement with the TFLite interpreter is a reported count, not a gate. Design: `sienna_report/int8_generic_design.log`; the plan's Task 2.6b and its re-scoped Tasks 2.7-2.12.
+
+## As built (2026-10-18)
+
+Departures from the spec, each with its reason (plan `implementation-plan.md`, decisions P-1 to P-14):
+
+- **Generic units (Task 2.6b, Soham 2026-10-17, forks F1-F5).** Decision 1 is reversed: `int8QuantizedAdder` and `int8Requantizer` replace `tfliteAdd` and `tfliteRequant`, both gated on the true function (|hw - t| <= max(1% |t|, one step); activations at 10%). G0b and the rounding pin are history; agreement with the TFLite interpreter is reported, not gated. G4's criterion became F4: cycles identical to the base, every int8 word gated on the true function, changed int8 words counted per test.
+- **P-1** `qadd_lat()` (6), not `add_lat()`: the name was taken by the float adder's latency.
+- **P-2** G0b lived in ArithmeticLibrary beside the unit (history since Task 2.6b).
+- **P-3** an add set's lanes take `gp_zin_i` = the ADD's zp_o (`g_add_zpo`); mutant `m_zin` fails `truth: activation/tanh` (rerun at G4: rs2_g4_ctl_zin).
+- **P-4** the polynomial fit still scores tables on the 2a lane, so `poly_coeffs_int8.mem` is byte-identical.
+- **P-5** two rescales per threshold in the ladder edge sets.
+- **P-6** (Ruling F26, spec row D5) the device-protocol half of the host interface: the layer file's `A` line, `write_layer` from `job["add"]`, `RtlLayer.run_job`; model lowering of the ADD stays 2b.
+- **P-7** set-level tests in `TB_sienna_top` (nine `int8_residual_*` tests; `_one_pair` added in Task 2.9), layer cases in `sienna_layer` / `TB_model_run` (`regression.py --action residual`: resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add).
+- **P-8** exhaustive ADD pairs checked from a dump (history with G1).
+- **P-9** reversed by Task 2.10b: `--action perf` models the residual tests; validated per test against measured cycles (PERF MODEL: PASS, 805 test-points; control `m_perf_sig` fails).
+- **F3** every stage of a residual layer is gated from `TB_model_run`'s per-stage dumps (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane).
+- **D6 (review row)** the set-level tests, the layer cases and the TFLite blocks run in both mesh modes (collapse-k 1 and 0) and at random power-up.
+- **Changed words against main 9fa414e** (G4, N = 8 and 16, every tile size; per test in the G4 report): fp32 only 3 words in each of 2 mixed tests with tanh at N = 16 (T_TINY, Task 1.16); bf16 words in 22 tests with a sigmoid, tanh or SELU set (134,112 words over 154 test-points) and their cycles in 118 test-points (Decision 5: the fp32 tail and refits); int8 cycles and results identical everywhere, words changed in 238 test-points: the 6 `req_random` tests 157,649 words (redrawn for the new units), 13 sigmoid and SELU tests 14,053 (the ladder, Task 1.16's SELU, rounding), 20 others 1,030, at most 39 in one test-point (round half up at ties). Every changed word passes the true-function gates.
+- **Crosses (spec Risk 3)** hold done with an L3 grant: reached at 6 of 7 points (0 at N16 T16); hold done with a bank done: unreachable by design (`a_hold_done_no_bank`, shown firing by a forced mutant); an add set's last beat with the next accept: excluded by design (`rq_room` reads `busy_o`; `a_add_last_no_accept`, shown firing by `m_roomonly`).
+- **Depth (Yosys dchr, topological levels, not timing; information only).** Generic units: `int8Requantizer` 45, `int8QuantizedAdder` 34, `add_lanes` with sienna_top's drivers at N = 32 35 (stage 1 from hold_mem's read mux 16). History: `tfliteAdd` 52 against `tfliteRequant`'s 53; `add_lanes` with drivers 54.
 
 ## Goal
 

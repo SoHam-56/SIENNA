@@ -55,7 +55,8 @@ Organised top to bottom as the layers a driver/compiler has, each a labelled sec
    `pack_precheck`), with the rules stated where they live: block width, at most 8 settings, N | lanes, a set runs at
    its slowest activation.
 4. **Device protocol**: the one boundary between host and hardware — the layer file TB_model_run reads (`L`, `Q`,
-   `P`, `E` lines, rows of N hex words, per-block epilogue) and the result file it writes. Written as one documented
+   `P`, `E` lines, rows of N hex words, per-block epilogue; an int8 residual layer adds an `A` line with its ADD words,
+   written by `write_layer` from `job["add"]` and refused by TB_model_run when missing) and the result file it writes. Written as one documented
    encoder / decoder pair, so a driver for real silicon replaces only what is below it.
 5. **Backends**: `RtlLayer` (TB_model_run: build once, run a layer per invocation; was LayerSim), `RtlSets`
    (TB_sienna_model, the host-driven set engine; was Sim), `Emulator` (numpy stand-in; was EmuSim). Same interface:
@@ -74,9 +75,11 @@ never the other way round.
 - `--action pkg --test NAME` — test_config_pkg.sv and one test's stimulus (`make pkg` and the guard use it), as today; `gen`, `analyze` as today
 - `--action pack [--act] [--rows ...]` — packed layers vs each job alone (was pack_regression.py)
 - `--action gemm [--quick] [--engine]` — GEMM sweep (was gemm_sweep.py)
-- `--action perf ...` — streamed-set performance analysis (was perf_analysis.py)
+- `--action perf ...` — streamed-set performance analysis (was perf_analysis.py). Its model covers every activation path as built (the bf16 sigmoid's fp32 tail, Task 1.14; the int8 lanes, Task 1.16), packed sets lane by lane, accumulate tests' depth passes and the int8 residual tests (hold and add sets); Task 2.10b validated it per test against measured cycles (805 test-points at N = 8 and 16, every tile size and format, each within its base-tree bound; worst activation error 4%, mesh latency 3.2%)
 - `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite --report F` (was gpnae_int8_tflite.py): the int8 tanh and sigmoid lane at TFLite's converter scales, gated on the true function (truth.py, exit 1 and `ACCURACY: FAIL` on a miss); its agreement with TFLite's integer TANH and LOGISTIC is printed beside the gate, not gated
-- `--action rq-vectors OUT` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py)
+- `--action rq-vectors OUT [--check F --truth J]` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py), and with `--check` its outputs gated on the true function (`make rq-lanes`)
+- `--action add-vectors OUT [--check F --truth J]` — TB_add_lanes vectors and, with `--check`, its outputs gated on the true function (`make add-lanes`)
+- `--action residual [--n --tile --lanes --cases ... --tflite --mid-reset --collapse-k 0|1 --seed --work]` — the int8 residual layer cases on `sienna_layer` / TB_model_run (resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add), each stage gated on the true function (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane); `--tflite` adds converter-made residual blocks through the importer and a hand-built ONNX-style block, `--mid-reset` a reset inside the hold window; ends `RESIDUAL: PASS|FAIL` (`make residual FMT=int8`)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
 - `--action points [--small] [--formats f,...]`, `--action point --name P`, `--action summary` — make regression (below); they replaced `--action all`, the single-point gate, on 2026-10-10
 
@@ -109,9 +112,12 @@ unit bench and model check once, each lint on its count lines) have their own, o
   `<REG_DIR>/<point>.log` and `.json` (rc, seconds, run, host), keeps a failing point's `testbenches/results` in
   `<point>.artifacts/`, and writes the table. Its own self-tests are ArithmeticLibrary's `regression.py --action selftest`.
 - **SIENNA's points** (`SiennaSpec` in regression.py): `selftest` once, and per N in {8, 16, 32, 64} (SMALL=1: {8, 16})
-  x every power-of-2 tile size x format: `pipeline` (`make pipeline`), `model` in fp32 and bf16 (`make model
-  MODEL_COUNT=3`, the four MLPerf Tiny models), `pack`, `gemm` (QUICK=1) and `tflite` in int8. LANES is 32 up to
-  N = 32 and 128 at N = 64. Names are `selftest` and `fmt/N<n>_T<t>/kind`: 85 points with SMALL=1, 217 in full;
+  x every power-of-2 tile size x format: `pipeline` (`make pipeline`) with `pipeline-b2b` (-DBACK_TO_BACK), and at N = 8
+  and 16 `pipeline-ck0` and `pipeline-ck0-b2b` (COLLAPSE_K=0), `model` and `model-ck0` in fp32 and bf16 (`make model
+  MODEL_COUNT=3`, the four MLPerf Tiny models), `pack`, `gemm` and `gemm-ck0` (QUICK=1), and in int8 `tflite`,
+  `tflite-ck0` and `residual` (`make residual`, the int8 residual layer cases); `add-lanes` and `rq-lanes` run once,
+  like `selftest`. LANES is 32 up to N = 32 and 128 at N = 64. Names are `selftest`, `add-lanes`, `rq-lanes` and
+  `fmt/N<n>_T<t>/kind`: 199 points with SMALL=1, 441 in full (counts of 2026-10-18; `--action points` is the source);
   SMALL= and FMT= narrow it only on make's command line (`$(origin)`), never from the environment; MODEL_DIR reaches the
   points absolute (`$(abspath)`, and the engine's `--model-dir`), since a point runs in a private copy.
 - **Targets.** Each point is `make regression/<point>`, so `make -jN` runs N side by side (N for the memory, never a bare -j); `make regression` runs
@@ -120,12 +126,19 @@ unit bench and model check once, each lint on its count lines) have their own, o
   running anything. REG_RUN names the run: `make regression` sets one, each result records it, and the summary turns a
   result of another run into NOT RUN (stale). Without REG_RUN the summary takes any run.
 - **Verdicts**, never "finished cleanly": pipeline `Passed : X / X` with X = every pipeline test of the format (32 fp32,
-  33 bf16, 41 int8) and `Sanity Clean`; model and tflite `MODEL GATE: PASS`; pack `PACK REGRESSION PASS: 0 mismatching
+  33 bf16, 50 int8 with the nine `int8_residual_*` tests; the -ck0 kinds without the packed tests), `Sanity Clean`, every
+  test gated on the true function (`TRUTH: X tests gated`) and the back-to-back count of its kind; residual
+  `RESIDUAL: PASS`; add-lanes and rq-lanes their bench's 0-error line, `RESULT: PASSED` and `ADD LANES: PASS` /
+  `REQUANT LANES: PASS`; model and tflite `MODEL GATE: PASS`; pack `PACK REGRESSION PASS: 0 mismatching
   outputs`; gemm its `grid_*` rows, each check's own line (fp32 the three `layer_<act>_bias` errors, bf16 `layer_<act>: 0
   outputs differ` and layer_bias_special's 0, int8 `GEMM int8: N cases, 0 with outputs that differ`) and no `FAIL` line;
   every point exit 0 and no `Assertion failed` / `%Error` line. Model points without a usable MODEL_DIR (unset, missing,
   or without the four .tflite files) are NOT RUN with how to set it. The summary exits 1 on any gated FAIL or NOT RUN,
   on no point selected, or when no point ran.
+- A residual pipeline test reads its sets' hold, add and activation flags and ADD words from `add_<k>.mem` when the
+  test knob `residual` (test_knobs.mem) is set; the run prints `[HOLD/ADD]` per stream pass and `RESIDUAL CROSSES`
+  (spec Risk 3's same-cycle crosses), and the sweep fails a cross that no point reached unless a ruling names the
+  assertion that makes it unreachable (`RESIDUAL_CROSS_UNREACHABLE`).
 - Self-tests: `test_regression_points`, `test_point_commands`, `test_point_verdicts`, `test_model_points_need_model_dir`,
   `test_regression_target` (make -n).
 - **Run times** (measured 2026-10-10, 8-core machines, one build per group): SIENNA SMALL=1 (85 points) 3.4 h one point

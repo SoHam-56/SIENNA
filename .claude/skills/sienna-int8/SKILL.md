@@ -8,7 +8,10 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 **Since 2026-10-17 (Soham; sienna-int8-residual Task 2.6b): the requantize is the generic `int8Requantizer` (24-bit mantissa, 6-bit right shift, round half up, 4 stages), gated on the true function; the TFLite-exact `tfliteRequant`, the G0 rounding pin and `REQ_ROUNDING` are gone, and the TFLite models are test vehicles whose interpreter agreement is reported. The text below records 2a as built.**
 
 **Status: 2a implemented and verified 2026-09-30 on the `int8` branch of all four repos, at N = 8-32; N = 64 is
-deferred to one final sweep after check-in (Soham 2026-09-29); 2b not started.**
+deferred to one final sweep after check-in (Soham 2026-09-29). 2b: its pre-synthesis RTL part (the residual ADD and the
+int8 sigmoid ladder, skill `sienna-int8-residual`) implemented and verified 2026-10-18 on branch `int8_residual` at
+N = 8 and 16 at every tile size (gate G4, run rs2_g4); N = 32 and 64 run in the final sweep. The rest of 2b (model
+lowering of the ADD, average pooling, depthwise, softmax) is not started.**
 Gate reports, verbatim in the `sienna-report` skill's `history/`:
 - 2026-10-01 rerun after the requantize split and the Taylor capture fix (farm runs `sp_*`, not in `history/`): G1
   `sp_g1` PASS, G2 `sp_g2` bit-exact, SIENNA int8 37/37 at N = 16 and 32 (both mesh modes, random power-up at N = 16),
@@ -20,11 +23,12 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
   modes, random power-up; fp32 / bf16 cycles identical; N = 64 deferred to the final sweep)
 - G2 GPNAE: `2026-09-29_gpnae_gate_int8.txt` (Task 12; VERDICT: PASS for correctness, the lane bit-exact everywhere;
   accuracy against GPNAE's tolerance over the full Q4.11 range: SELU 0/262144 (over the Q4.11 range only) and tanh
-  0/65536 outside, sigmoid 3370/65536 outside, from saturation below x = -3.5. Rerun 2026-10-01 after SELU fix A (farm
+  0/65536 outside, sigmoid 3370/65536 outside then, from saturation below x = -3.5 (closed 2026-10-11 by the sigmoid
+  ladder, sienna-int8-residual G2, `history/2026-10-11_g2_sigmoid_ladder_int8.txt`: 0 of 65,536 outside, a hard gate). Rerun 2026-10-01 after SELU fix A (farm
   run `gb_c3_g2b`, not in `history/`): positive SELU is exact to lambda * x < 512 (x < 487.29) and saturates beyond;
   the not-gated SELU case s_in = 0.21875 is 0 of 256 outside, worst 1 LSB (was 49 of 256, 102 LSB), and 64 positive
-  SELU sets per seed, x = 0 to past the limit, are bit-exact. Open accuracy items: sigmoid below x = -3.5, and SELU
-  past x = 487.29 (the host guard rejects it); the int8 regression's `matmul_large_selu` (lane inputs 19-68 at
+  SELU sets per seed, x = 0 to past the limit, are bit-exact. Open accuracy items then: sigmoid below x = -3.5 (closed,
+  above), and SELU past x = 487.29 (the host guard rejects it); the int8 regression's `matmul_large_selu` (lane inputs 19-68 at
   N = 8-64, default seed) now has 0 saturated inputs (measured at N = 16 and 32; at N = 8 and 64 it follows from
   68 < 487.29) and passes against the unsaturated golden)
 - G1 ArithmeticLibrary: `2026-09-29_aril_gate_int8.txt` (Task 8; VERDICT: PASS, all units bit-exact; fxMac sweeps

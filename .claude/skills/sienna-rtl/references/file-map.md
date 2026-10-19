@@ -23,7 +23,10 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 
 | File | Lines | Status | What it is |
 |---|---|---|---|
-| `sienna_top.sv` | 1,270 | live | Top level: entry admission and the L0/L1/L3/L6/L9 links, the activation stage (lane fill on L4, collector on L5), the window dispatcher (L7 per lane), the pooling lanes (FIFO2 → Maxpool_2D → dropout on L8); the per-lane maxpool feeder FSM is gone since 2026-10-07 |
+| `sienna_top.sv` | 1,414 | live | Top level: entry admission and the L0/L1/L3/L6/L9 links, the activation stage (lane fill on L4, collector on L5; in int8 the requantize, `hold_mem` (N^2 bytes) and `add_lanes` for residual hold and add sets), the window dispatcher (L7 per lane), the pooling lanes (FIFO2 → Maxpool_2D → dropout on L8); the per-lane maxpool feeder FSM is gone since 2026-10-07 |
+| `requant_lanes.sv` | 53 | live (int8) | One `int8Requantizer` per lane on the mesh's int32 sums, with each beat's tag (destination, hold or add) beside it for `req_lat()` cycles |
+| `add_lanes.sv` | 54 | live (int8) | The residual ADD: one `int8QuantizedAdder` per lane on an add set's requantized beat and the `hold_mem` beat of the same index, the tag riding beside it for `qadd_lat()` cycles; `busy_o` while a beat is inside |
+| `sienna_add_pkg.sv` | 18 | live | `add_words_t`, an add set's 110-bit ADD words (zp1, zp2, m1, m2, shift, zpo, amin, amax), shared by `set_side_t`, `sienna_top` and `add_lanes` |
 | `fwft.sv` | — | live | First-word-fall-through FIFO on credit links (L7 in, L8 out) since 2026-10-07; no overwrite |
 | `sienna_set_side.svh` | 24 | live | `set_side_t`, the L0 host link's per-set sideband, included by sienna_top, sienna_layer, sienna_multi and their TBs |
 
@@ -40,6 +43,7 @@ The repo has two git submodules, `GPNAE` and `SystolicMesh`, each with its own n
 |---|---|---|
 | `TB_sienna_top.sv` | live | The full-pipeline testbench. 474 lines |
 | `test_config_pkg.sv` | **generated** | Written by `regression.py` and `model_runner.py` (`write_sv_package()`). Edits are lost on the next run |
+| `TB_add_lanes.sv`, `TB_requant_lanes.sv` | live | Unit benches of `add_lanes` and `requant_lanes` on `regression.py --action add-vectors` / `rq-vectors` (`make add-lanes`, `make rq-lanes`); outputs gated on the true function |
 | `TB_model_run.sv` | live | Layer-file testbench of `sienna_layer` (was `TB_sienna_layer`); `model_runner.RtlLayer` builds it once and runs one layer per invocation |
 | `TB_sienna_model.sv` | live | Host-driven set engine on `sienna_top`; `model_runner.RtlSets` (`--engine sets`) |
 | `tb_l9_sink.svh` | live | One lane's L9 consumer for the testbenches (slots, random stalls, a checker and `a_l9_slots`), included by TB_model_run, TB_sienna_model and TB_sienna_multi |

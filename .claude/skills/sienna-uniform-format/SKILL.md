@@ -126,13 +126,23 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
 
 ## Open decisions (Soham)
 
-- **bf16 activation accuracy.** Worst relative error against the exact functions: SELU 2.82%,
-  sigmoid 7.22% (12.68% at range 8), tanh 8.59%, against the regression's 6.25% tolerance. The
-  hardware matches its bit-exact model; the error is the lane design at 8 significand bits
-  (sigmoid's 1 - P near -3.5, power-basis Horner for tanh). `2026-09-28_gpnae_gate.txt` (sienna-report history) has the table.
-  Decided for the gate 2026-10-05 (Soham, option 2): GPNAE's `make regression` gates bf16 bit-exactness (`bf16/lane`) and reports this
-  accuracy (`bf16/lane-accuracy`), not gated (sienna-tooling). GPNAE's dense negative pattern act_neg_dense (61867b6) puts bf16 sigmoid's worst at 17.6%. Improving the fit (earlier tail hand-off for negative sigmoid, a split tanh
-  range) is still open and would change GPNAE's coefficients, so it needs Soham's go-ahead.
+- **bf16 activation accuracy: decided and fixed (Soham 2026-10-10 and 2026-10-11, sienna-int8-residual Decisions 4 and 5;
+  Tasks 1.14a and 1.16 of its plan).** Worst relative error of the RTL's words against numpy float64 over every finite bf16
+  input (GPNAE `bf16/lane`, pattern `bf16_all`):
+  - sigmoid 106.55% (x = -59.75; 18.06% within [-8, 8], 698 inputs over 1%) -> **0.772%** (x = 0.0156, 0 over 1%): every
+    x < 0 takes the tail in fp32 with two Newton steps for 1/(1 + e^-|x|), rounded to bf16 once (runs rs1_b16_* RED,
+    rs1_b16f_green2). **Hard gate at 1%** (`SIGMOID GATE`, wherever |exact| >= 2^-126). Cost: all-negative inputs take
+    about 6x the cycles of positive ones (13-76 cycles per input; cycles change in bf16 sigmoid tests only); fp32 and int8
+    lanes unchanged.
+  - tanh 8.51% worst over |x| >= 2^-120 (at |x| = 3.84, the fit's c0), unchanged by the tail's refit (tail-region worst
+    0.391% -> 0.063%); below T_TINY = 0.0903 it returns x (Task 1.16), so tiny inputs no longer flush to zero.
+  - SELU 2.49% worst (x < 0); x >= 0 within 0.38% with lambda stored as 0x3F87 (Task 1.16; it was 1.08%).
+  - tanh and SELU gate at the activation bound in force, 10% (`truth.BOUND`, a waiver; 1% is the target, every run
+    prints the count over 1%); reaching 1% needs the fp32-tail candidates of `sienna_report/bf16_tanh_selu_study.log`
+    (about 1.6x cycles), not taken.
+  History (before 2026-10-10): SELU 2.82%, sigmoid 7.22% (12.68% at range 8; 17.6% on GPNAE's dense negative pattern),
+  tanh 8.59% against the regression's 6.25% tolerance, from `2026-09-28_gpnae_gate.txt`; on 2026-10-05 Soham chose to
+  gate bf16 bit-exactness and report accuracy, superseded by Decision 6 (every activation gates on the true function).
 - **fp32 gpnae_model, negative sigmoid: closed 2026-10-10 (GPNAE 61867b6).** `--model hw` failed 9 of 10 patterns,
   sigmoid only: the model took `fpAdder(P, -1)` where the RTL's `fp32_down` drops P's last bit (no guard bit). The model
   now computes `fp32_down` stage for stage (the RTL is the intended arithmetic, unchanged), so fp32 is bit-exact on every

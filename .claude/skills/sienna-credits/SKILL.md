@@ -163,6 +163,7 @@ Notes per link:
 - Datapath flops are not reset (D-8): `credit_reg`'s data registers and the data of `sienna_top`'s 2*LINK_STAGES write-bus delay line; put, credit and the bus enables and resets are.
 - `credit` is compared as `int` everywhere, never truncated to CRW: a `CRW'(2)` at `SETS_IN_FLIGHT` 1 read 0 and deadlocked (found in Task 5a review, fixed in 2615bb2).
 - No credit leaves during reset: a `live` flop (one cycle after reset) gates every advertisement in the mesh, `sienna_top`, `sienna_layer` and `sienna_multi`.
+- int8 residual (sienna-int8-residual): `hold_mem` is internal to the activation stage and has no credit link; its occupancy is fixed by set order (`a_rq_one_set`: one set in the requantize at a time; a hold set's beats are read by the next add set before another hold set writes), and a hold set takes an L3 grant and an L6 reservation it returns at `hold_done` without filling a bank.
 
 ### Where the build differs from the design above
 

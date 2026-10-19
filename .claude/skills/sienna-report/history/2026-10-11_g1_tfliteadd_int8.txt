@@ -1,0 +1,67 @@
+GATE G1 (tfliteAdd) report, Task 1.7, 2026-10-11 (updated after fix round 1)
+Tree: SIENNA 9fa414e, GPNAE 22f0b44, SystolicMesh 2bf84b9, SystolicMesh/ArithmeticLibrary 9f60566 (branch int8_residual, clean), GPNAE/ArithmeticLibrary 815feba
+ArithmeticLibrary commits for Task 1.7: ef6739a (stage-1 shift flag), 1aaf257 (SIM error grep, +N= required), d59930a (rstn_i dropped from the check's gate), 9f60566 (reverts d59930a, see below); RTL content of 9f60566 = 1aaf257's
+Gate script: /proj/work/spramanik/sienna_jobs/cmds/res_g1.sh (lint || fail, rc, exit ${rc:-0}); int8_aril.sh greps anchored (^RESULT: PASSED, ^RESULT: FAILED); G0b data: /proj/scratch/spramanik/int8_res_data/g0b
+Superseded gate runs: rs1_g1 (on 1aaf257, PASS), rs1_g1b (on d59930a, PASS but that head fails random power-up, see fold-in 3)
+
+== Step 2: rs1_g1c (on 9f60566, exit=0, no GATE-FAIL line)
+Add both:
+  tfliteAdd ROUNDING=DOUBLE: 1010746 vectors from vec_double.txt, 0 errors, latency 6 / RESULT: PASSED
+  tfliteAdd ROUNDING=SINGLE: 1010746 vectors from vec_single.txt, 0 errors, latency 6 / RESULT: PASSED
+  tfliteAdd ROUNDING=DOUBLE: 10092544 results of 154 constant sets dumped to dump_corners_double.txt, 0 errors, latency 6
+  check_add: 10092544 results of 154 constant sets against ipu.tflite_add (DOUBLE), 0 mismatches / RESULT: PASSED
+  tfliteAdd ROUNDING=SINGLE: 10092544 results of 154 constant sets dumped to dump_corners_single.txt, 0 errors, latency 6
+  check_add: 10092544 results of 154 constant sets against ipu.tflite_add (SINGLE), 0 mismatches / RESULT: PASSED
+G0b replay:
+  tfliteAdd ROUNDING=DOUBLE: 53477376 results of 816 constant sets dumped to dump_oracle_double.txt, 0 errors, latency 6
+  check_add: 53477376 results of 816 constant sets against G0b's interpreter outputs (/proj/scratch/spramanik/int8_res_data/g0b), 0 mismatches / RESULT: PASSED
+  tfliteAdd ROUNDING=SINGLE: 53477376 results of 816 constant sets dumped to dump_oracle_single.txt, 0 errors, latency 6
+  check_add: 53477376 results of 816 constant sets against ipu.tflite_add (SINGLE), 0 mismatches
+    info: 127752 results differ from the interpreter (DOUBLE), as the other rounding should / RESULT: PASSED
+Random power-up (-DNO_ZERO_INIT --x-initial unique --x-assign unique, +verilator+rand+reset+2):
+  seed 2 and seed 7: tfliteAdd ROUNDING=DOUBLE: 1010746 vectors, 0 errors, latency 6 / RESULT: PASSED
+  extra sweep rs1_g1c_riseeds: seeds 1-64 in each rounding (1000 random vectors), 0 failing
+vivado_tb: DOUBLE and SINGLE 20746 vectors, 0 errors, latency 6 / RESULT: PASSED
+lint Add: 18 warnings (9 per rounding: UNUSEDSIGNAL r1/r2 [43:32] and r [63:32] in tfliteAdd, 6 in sienna_fmt_pkg); no %Error, LATCH, MULTIDRIVEN or UNOPTFLAT; make lint exit 0
+lint_bad: REJECTED
+Existing units: Common pkg and ipu RESULT: PASSED; Requant both 1035718 x 2 and vivado_tb 45718 x 2, 0 errors, latency 4, RESULT: PASSED
+Totals: 20 ^RESULT: PASSED, 0 ^RESULT: FAILED, 0 "Assertion failed" lines
+Anchored int8_aril.sh on other units: Requant, Common pkg/ipu (in rs1_g1c) and Converters/FPNarrow check (rs1_g1b_narrow) print their verdicts at column 0 and pass
+
+== Step 3: mutants (saved patches in /proj/work/spramanik/sienna_jobs/res_mut, through res_add_mboth.sh: Add both's four parts, each run after an earlier failure; a part counts as failing only with a TB '[FAIL] n results differ' or 'check_add: ... n mismatches' line, n > 0, else INCONCLUSIVE, exit 3)
+mutant                   run                           vec DOUBLE  vec SINGLE  exh DOUBLE  exh SINGLE  verdict
+m_ls19                   rs1_g1c_mut_m_ls19            255714      255450      6047369     6040635     VALUE-FAIL x4
+m_round                  rs1_g1c_mut_m_round           4425        4425        333861      333861      VALUE-FAIL x4 (both roundings)
+m_clampfirst             rs1_g1c_mut_m_clampfirst      589866      589840      1905300     1904789     VALUE-FAIL x4
+m_so_sign                rs1_g1c_mut_m_so_sign         554411      619891      7770983     7444726     VALUE-FAIL x4
+add_in1_round            rs1_g1c_mut_add_in1_round     551         496         192         512         VALUE-FAIL x4
+add_in2_round            rs1_g1c_mut_add_in2_round     495         474         192         512         VALUE-FAIL x4
+add_inboth_round         rs1_g1c_mut_add_inboth_round  907         839         384         1024        VALUE-FAIL x4
+add_out_round            rs1_g1c_mut_add_out_round     3780        3762        333861      334245      VALUE-FAIL x4
+(every run: summary value-fail=4 pass=0 inconclusive=0, exit 1; counts identical to the first round rs1_mut_* / rs1_mut2_* and to rs1_g1b_mut_*)
+
+== Step 4: logic depth (yosys_depth.sh, generic, ltp -noff length = longest topological path)
+tfliteAdd     ROUNDING=DOUBLE  rs1_yd_add_d      length=52
+tfliteAdd     ROUNDING=SINGLE  rs1_yd_add_s      length=52
+tfliteRequant ROUNDING=DOUBLE  rs1_base_yd_rq_d  length=53
+tfliteRequant ROUNDING=SINGLE  rs1_base_yd_rq_s  length=53
+Verdict: each tfliteAdd length is at or below tfliteRequant's in the same rounding; no stage split; qadd_lat() stays 6 (RTL depth unchanged by fix round 1: only simulation-only lines differ).
+Caveat: ltp -noff starts paths at flip-flops and at the primary inputs, so the number is the longest input-or-register to register path, not only register-to-register.
+  Stage 1 starts at tfliteAdd's ports: 51 levels in DOUBLE (s1_p1 from q1_i) and 50 in SINGLE (s1_p1 from q1_i, s1_p2 from zp2_i).
+  Any logic add_lanes puts in front of those ports (hold_mem read mux, constant selection) adds to stage 1, so the integration depth probe must include tfliteAdd's port drivers.
+
+== Fold-ins from Task 1.6's review (final runs on 9f60566)
+3. Shift check on a stage-1 flag (ef6739a): PASS
+   rs1_g1c_both: four parts PASS with no assertion line (bubbles' random shifts stay quiet)
+   rs1_g1c_flag_s1 / _s2 / _so: a TB driving s1 = 1 / s2 = -32 / so = 1 on a valid beat fails in both builds ('shifts 1, 0, -20' / '-29, -32, -20' / '-29, 0, 1')
+   rs1_g1c_flag_nogate: the flag loaded and asserted every edge fires on a bubble ('shifts -68, -28, 83')
+   Fix round 1 item 1 (drop rstn_i from the gate, d59930a) was reverted (9f60566): rs1_g1b_riseeds showed the check firing at the first edge (t = 5 ns) on 15 of 63 random power-up seeds per rounding, because v1 and s1_bad power up random and no edge has reset v1 yet; rs1_g1c_riseeds with rstn_i: 0 of 128
+4a. SIM fails on %Error or a failed assertion (1aaf257): PASS
+   rs1_g1_errlim_old (old bench): the assertion's $error under +verilator+error+limit let make pass
+   rs1_g1c_errlim: the same run now fails the target although the sim prints RESULT: PASSED
+   rs1_g1c_fake_assert: an 'Assertion failed' line with no %Error fails the target
+   rs1_g1c_fake_error: a '%Error:' line with no assertion fails the target
+4b. +N= required in default-file mode (1aaf257): PASS
+   rs1_g1c_noN: vivado_tb without +N= stops with '%Fatal ... needs +N=<its row count>', make Error 1; rs1_g1c (vivado_tb with +N=) passes
+
+GATE G1 (tfliteAdd): PASS

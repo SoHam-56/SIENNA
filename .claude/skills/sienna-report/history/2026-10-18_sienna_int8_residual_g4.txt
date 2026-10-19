@@ -1,0 +1,220 @@
+GATE G4 (int8 residual): the int8 residual ADD and the sigmoid ladder in SIENNA, Task 2.11. Local report, outside git.
+Date 2026-10-18. Criterion: Soham's fork F4 (2026-10-17): cycles identical to the base except where a listed, intended change applies;
+every int8 word gated on the true function under the decimal rule |hw - t| <= max(tol |t|, one step), tol 1% (10% for activations);
+changed int8 words counted per test, split between the random-requantize-word (req_random) tests and all others.
+
+== Trees
+Branch (every rs2_g4_* run): T=/proj/scratch/spramanik/int8_res, branch int8_residual, clean: SIENNA 307e4d1, GPNAE bae31b5,
+  SystolicMesh 80a66d1, ArithmeticLibrary 033c430 (both copies).
+Base: TB=/proj/scratch/spramanik/int8_res_base, merged main 9fa414e (GPNAE 22f0b44, SystolicMesh 2bf84b9, ArithmeticLibrary 815feba);
+  reference runs rs2_base_{fp32,bf16,int8}_n{8,16} (Task 2.0) and rs2_base_gptfl.
+Scope: N = 8 and 16 at every valid tile size (T = 2, 4, 8; 2, 4, 8, 16), both mesh modes, random power-up. N = 32 and 64 are
+  deferred to the final sweep after the restructure (plan Task 2.12), with the performance report; not run here by design.
+No Verilator internal-error retry ([RETRY]) in any run. Verilation at -j 1 (unchanged).
+
+== 1. make regression, every repo (each its own table)
+SIENNA  SMALL=1, fp32 bf16 int8   SIENNA REGRESSION PASS: 199 of 199 gated points passed; RESIDUAL CROSSES: PASS
+        runs rs2_g4_reg_* (18 nodes, the rs2_t210b_fin split: selftest; {fp32,bf16,int8}_n{8,16}; lck0_*; ck0solo_*, ck0b2bsolo_*
+        (fp32/bf16 N16_T2 pipeline-ck0 and -ck0-b2b alone); res = add-lanes, rq-lanes and the 7 int8 residual points), merged
+        and judged by regression.py --action summary --small (table: rs2_g4/sienna_small1_table.log). Longest node 1:24:43.
+GPNAE   make -j8 -k regression        GPNAE REGRESSION PASS: 10 of 10 gated points passed (rs2_g4_gpnae, 8:54)
+SystolicMesh make -j8 -k SMALL=1 regression  SYSTOLICMESH REGRESSION PASS: 45 of 45 gated points passed (rs2_g4_sm, 48:32)
+ArithmeticLibrary make -j8 -k regression     ARITHMETICLIBRARY REGRESSION PASS: 43 of 43 gated points passed (rs2_g4_aril, 2:47)
+
+== 2. Verdicts per (format, N) and mesh mode (SIENNA points, from the table)
+format N   pipeline  -b2b  -ck0  -ck0-b2b  model  model-ck0  pack  gemm  gemm-ck0  tflite  tflite-ck0  residual
+fp32   8   3/3       3/3   3/3   3/3       3/3    3/3        3/3   3/3   3/3       -       -           -
+fp32   16  4/4       4/4   4/4   4/4       4/4    4/4        4/4   4/4   4/4       -       -           -
+bf16   8   3/3       3/3   3/3   3/3       3/3    3/3        3/3   3/3   3/3       -       -           -
+bf16   16  4/4       4/4   4/4   4/4       4/4    4/4        4/4   4/4   4/4       -       -           -
+int8   8   3/3       3/3   3/3   3/3       -      -          3/3   3/3   3/3       3/3     3/3         3/3
+int8   16  4/4       4/4   4/4   4/4       -      -          4/4   4/4   4/4       4/4     4/4         4/4
+once: selftest PASS, add-lanes PASS, rq-lanes PASS.  All 199 PASS.
+Pipeline tests per point: fp32 32, bf16 33, int8 50 (the nine int8_residual_* tests included); every test gated on the true function.
+
+== 3. Against the base (res_cmp_points.py, pipeline per-test logs; branch runs rs2_g4_{fmt}_n{n}, res_g4_pipes.sh = res_g4_pts.sh per tile)
+Expected differences (plan preamble, updated in this task for Task 2.6b): fp32 words in tanh tests (T_TINY, Task 1.16); bf16 words and
+cycles in tests with a sigmoid, tanh or SELU set (Tasks 1.14a and 1.16; Task 2.2's ruling --cycles-acts sigmoid,tanh,selu); int8 words in
+every test (generic int8Requantizer: req_random tests redraw their words, others move at rounding ties; plus the sigmoid ladder and Task
+1.16's SELU), int8 cycles and results identical.
+fp32 N8   --words-acts tanh                          96 tests, 3 points: IDENTICAL
+fp32 N16  --words-acts tanh                          128 tests, 4 points: 8 allowed (words), 0 other: IDENTICAL-EXCEPT-ALLOWED
+bf16 N8   --words-acts/--cycles-acts sigmoid,tanh,selu  99 tests: 96 allowed, 0 other: IDENTICAL-EXCEPT-ALLOWED (Task 2.2: 96)
+bf16 N16  same                                        132 tests: 176 allowed, 0 other: IDENTICAL-EXCEPT-ALLOWED (Task 2.2: 176)
+int8 N8   --words-acts '*' --split req_random         123 tests: 90 allowed (words), 0 other (no cycle or result change)
+int8 N16  same                                        164 tests: 148 allowed (words), 0 other (no cycle or result change)
+Results: every reference test PASSED on both sides. The nine int8_residual_* tests are new at all 7 points (no base counterpart).
+The -ck0, -b2b, -ck0-b2b, model-ck0, gemm-ck0, tflite-ck0, residual, add-lanes and rq-lanes points have no base counterpart and pass on
+their own verdicts (section 2).
+Layer kinds (gemm, pack, tflite; g6b_cmp_cycles.py, rs2_g4/layer_cycles_vs_base.log): fp32 and int8 sets and cycles identical at all 7
+points; bf16 differ only in gemm's layer_sigmoid_bias and pack's mixed-activation packed table (bf16 sigmoid's fp32 tail, expected);
+int8 tflite at N16 has 3 more counts (the new tflite --pack layers; its 5 base counts are identical).
+
+-- fp32 changed words per test (no cycle moved)
+test                                        N16_T2    N16_T4    N16_T8   N16_T16   (words; * = cycles moved too)
+matmul_accum2_mixed_nopool                       3         3         3         3
+packed_mixed_act_nopool                          3         3         3         3
+tests 2, word test-points 8 (24 words), cycle test-points 0
+
+-- bf16 changed words per test; * = cycles moved too (every one a sigmoid, tanh or SELU test)
+test                                         N8_T2     N8_T4     N8_T8    N16_T2    N16_T4    N16_T8   N16_T16   (words; * = cycles moved too)
+conv_basic_selu                                923       923       923     3405*     3405*     3405*     3405*
+conv_basic_selu_train                          463       463       463     1620*     1620*     1620*     1620*
+conv_basic_tanh                                 57        57        57      174*      174*      174*      174*
+matmul_accum2_cached_bias_tanh                 31*       31*       31*      161*      161*      161*      161*
+matmul_accum2_mixed_nopool                       6         6         6       57*       57*       57*       57*
+matmul_accum2_tanh                              14        14        14      130*      130*      130*      130*
+matmul_accum2_tanh_train                         8         8         8       70*       70*       70*       70*
+matmul_accum3_selu                            364*      364*      364*     1291*     1291*     1291*     1291*
+matmul_bias_tanh                                73        73        73      173*      173*      173*      173*
+matmul_ident_selu                              923       923       923     3297*     3297*     3297*     3297*
+matmul_large_selu                            1116*     1116*     1116*     3806*     3806*     3806*     3806*
+matmul_large_sigm                             744*      744*      744*     3009*     3009*     3009*     3009*
+matmul_large_tanh                             717*      717*      717*     2860*     2860*     2860*     2860*
+matmul_mixed_act                               74*       74*       74*      271*      271*      271*      271*
+matmul_random_selu                             991       991       991     3529*     3529*     3529*     3529*
+matmul_random_sigm                            242*      242*      242*      554*      554*      554*      554*
+matmul_random_sigm_train                       93*       93*       93*      272*      272*      272*      272*
+matmul_random_tanh                              65        65        65      178*      178*      178*      178*
+matmul_random_tanh_train                        29        29        29      106*      106*      106*      106*
+matmul_tanh_credits3                            29        29        29       52*       52*       52*       52*
+packed_bias_cached_train_nopool               147*      147*      147*      723*      723*      723*      723*
+packed_mixed_act_nopool                       567*      567*      567*     2033*     2033*     2033*     2033*
+tests 22, word test-points 154 (134112 words), cycle test-points 118
+
+-- int8 changed words per test (cycles identical everywhere). F4's split: req_random against all others; 'all others' is shown
+   in two parts, the sigmoid/SELU tests (the ladder, Task 1.16's SELU, plus rounding) and the rest (rounding at ties only).
+== req_random: 6 tests, 42 test-points, 157649 words
+   test                                         acts                      N8_T2    N8_T4    N8_T8   N16_T2   N16_T4   N16_T8  N16_T16
+   int8_accum2_mixed_bypass_nopool              linear,relu,selu,tanh       959      959      959     3372     3372     3372     3372
+   int8_input_zp_perchannel_accum3_tanh         tanh                        255      255      255      648      648      648      648
+   int8_mixed_act_train                         linear,relu,selu,sigmoid,tanh      579      579      579     1540     1540     1540     1540
+   int8_mixed_bypass_lane_nopool                linear,relu,selu,tanh      1862     1862     1862     7077     7077     7077     7077
+   int8_packed_zp_random_nopool                 linear,relu,selu,sigmoid,tanh     2050     2050     2050     8312     8312     8312     8312
+   int8_perchannel_random_linear_nopool         linear                     3046     3046     3046    11900    11900    11900    11900
+== sigmoid/selu: 13 tests, 91 test-points, 14053 words
+   test                                         acts                      N8_T2    N8_T4    N8_T8   N16_T2   N16_T4   N16_T8  N16_T16
+   conv_basic_selu                              selu                        155      155      155      378      378      378      378
+   conv_basic_selu_train                        selu                         81       81       81      208      208      208      208
+   int8_input_zp_selu_train                     selu                         72       72       72      159      159      159      159
+   matmul_accum3_selu                           selu                         78       78       78       90       90       90       90
+   matmul_ident_selu                            selu                        135      135      135      234      234      234      234
+   matmul_large_selu                            selu                         63       63       63       64       64       64       64
+   matmul_large_sigm                            sigmoid                     301      301      301      564      564      564      564
+   matmul_mixed_act                             linear,relu,selu,sigmoid,tanh        9        9        9       18       18       18       18
+   matmul_random_selu                           selu                        143      143      143      262      262      262      262
+   matmul_random_sigm                           sigmoid                       9        9        9      171      171      171      171
+   matmul_random_sigm_train                     sigmoid                       3        3        3       76       76       76       76
+   packed_bias_cached_train_nopool              linear,relu,selu,sigmoid,tanh       40       40       40      154      154      154      154
+   packed_mixed_act_nopool                      linear,relu,selu,sigmoid,tanh       54       54       54      278      278      278      278
+== other: 20 tests, 105 test-points, 1030 words
+   test                                         acts                      N8_T2    N8_T4    N8_T8   N16_T2   N16_T4   N16_T8  N16_T16
+   conv_basic_tanh                              tanh                          0        0        0        6        6        6        6
+   int8_input_zp_bias_relu_nopool               relu                          9        9        9       13       13       13       13
+   int8_pad_negative_tanh                       tanh                          0        0        0        3        3        3        3
+   matmul_accum2_cached_bias_tanh               tanh                          0        0        0        3        3        3        3
+   matmul_accum2_mixed_nopool                   linear,relu,tanh              5        5        5        3        3        3        3
+   matmul_accum2_tanh                           tanh                          2        2        2        0        0        0        0
+   matmul_accum2_tanh_train                     tanh                          2        2        2        0        0        0        0
+   matmul_accum3_bias_linear_nopool             linear                        0        0        0        5        5        5        5
+   matmul_bias_relu_nopool                      relu                         10       10       10       34       34       34       34
+   matmul_bias_tanh                             tanh                          0        0        0        3        3        3        3
+   matmul_cached_relu_nopool                    relu                         18       18       18       15       15       15       15
+   matmul_random_linear                         linear                        0        0        0        6        6        6        6
+   matmul_random_relu                           relu                          6        6        6        6        6        6        6
+   matmul_random_tanh                           tanh                          0        0        0        6        6        6        6
+   matmul_random_tanh_train                     tanh                          0        0        0        3        3        3        3
+   matmul_relu_nopool                           relu                         18       18       18       15       15       15       15
+   matmul_relu_nopool_credits3                  relu                         12       12       12        6        6        6        6
+   matmul_signed_zero_linear                    linear                        0        0        0        6        6        6        6
+   matmul_zero_rows_relu                        relu                          6        6        6        6        6        6        6
+   packed_all_bypass_nopool                     linear,relu                  18       18       18       39       39       39       39
+totals: req_random 157649, sigmoid/selu 14053, other 1030
+F4 split totals (res_cmp_points --split req_random): N8 req_random 6 tests, 18 test-points, 26,253 words; others 24 tests, 72
+test-points, 3,747 words (max 301, matmul_large_sigm). N16 req_random 6 tests, 24 test-points, 131,396 words; others 31 tests, 124
+test-points, 11,336 words (max 564, matmul_large_sigm). Outside the sigmoid and SELU tests the most in one test-point is 39
+(packed_all_bypass_nopool N16). Every changed word is judged by the run's own true-function gates (section 2: all PASS).
+Allowances are per test, not per set: in an allowed mixed or packed test a set's words could move unnoticed by this comparison; each run
+still gates every set on the true function and on its regenerated golden.
+
+-- Comparison controls (rs2_g4/cmp_controls.log, login node, logs only)
+C1 rs2_base_int8_n16 against itself: IDENTICAL (164 tests), exit 0.
+C2 rs2_base_int8_n8 against rs2_g4_int8_n8 with no allowance: 90 other differences, DIFFERS, exit 1 (the word changes are visible).
+C3 a copy of rs2_g4_int8_n8 with matmul_random_relu N8_T2's completion cycles planted at 999999, under --words-acts '*': 1 other
+   difference (that cycle line), DIFFERS, exit 1 (int8 cycles are never allowed).
+
+== 4. Residual cases
+Set-level (TB_sienna_top, nine tests per point: _one_pair, _relu, _linear_nopool, _tanh, _sigmoid_selu_nopool, _train, _then_relu_nopool,
+_two_layers_nopool, _accum2_mixed_nopool): PASS at all 7 points in pipeline, -b2b, -ck0 and -ck0-b2b (section 2).
+[HOLD/ADD] crosses (spec Risk 3), summed over the nine tests' 36 stream passes per point (pipeline kind, rs2_g4_int8_n*):
+point    hold done with an L3 grant  hold done with a bank done  grants held for an add drain
+N8_T2    18                          0                           471
+N8_T4    12                          0                           118
+N8_T8    4                           0                           27
+N16_T2   17                          0                           96
+N16_T4   17                          0                           96
+N16_T8   17                          0                           16
+N16_T16  0                           0                           0
+The -ck0, -b2b and -ck0-b2b kinds give the same L3-grant counts (table). Reached: hold done with an L3 grant (6 of 7 points).
+Not reached, by design: hold done with a bank done (RESIDUAL_CROSS_UNREACHABLE ruling, guarded every cycle by sienna_top's
+a_hold_done_no_bank, shown firing by the forced mutant m_t26_hdb_force in Task 2.6). The third coincidence, an add set's last beat with
+the next accept, is excluded by design: rq_room holds the next grant while add_lanes is busy (busy_o), checked by a_add_last_no_accept,
+shown firing by m_roomonly (Task 2.7). So Risk 3's third coincidence is closed by design, not by coverage.
+
+Layer cases (sienna_layer / TB_model_run, regression.py --action residual, each stage on the true function: the conv's requantize, the
+identity requantize, hold_mem, the ADD, the lane): resnet_relu, deep_cached, deep_uncached, tiles, relu6_conv_linear_add, tanh_after_add,
+shallow_cached, shallow_uncached; every case 0 outputs differ from the bit-exact model (reported); requantize and ADD worst 0.500 steps,
+0 over the bound.
+  collapse-k 1: int8/N*_T*/residual, 7 of 7 RESIDUAL: PASS (rs2_g4_reg_res).
+  collapse-k 0: rs2_g4_ck0res_{8_t2,8_t4,8_t8,16_t2,16_t4,16_t8,16_t16}, each prints 'residual: N=<n> T=<t> lanes=32 collapse-k 0' and
+    ends RESIDUAL: PASS (res_ck0_res.sh switches COLLAPSE_K in sienna_top and sienna_layer).
+  random power-up: rs2_g4_ri_n{n}_t{t}, 7 of 7 'res_ri: N=<n> T=<t> pipeline exit=0 residual exit=0', each with 'residual: ... sim args
+    '+verilator+rand+reset+2'' (EXTRA_FLAGS -DNO_ZERO_INIT --x-initial unique --x-assign unique; make pipeline TEST=int8_residual and
+    make residual).
+TFLite and ONNX-style blocks (in every residual run, both mesh modes): block (conv 3x3 + ADD + ReLU) 4,096 outputs, 160 sets;
+  block_s2 (1x1 stride-2 shortcut as its own layer, then the block) 1,024 + 1,024 outputs; the converter puts the conv on ADD input 1 and
+  the residual on input 2 ('ADD input 1 is the residual: no'); agreement with the interpreter (BUILTIN_REF), reported: 2 of 4,096 and 2 of
+  1,024 differ, the conv's hold codes 3 and 0 differ from its tensor; the hand-built ONNX-style block (QLinearConv + QLinearAdd + Relu
+  records) 2,048 outputs, 80 sets. All gated on the true function: PASS.
+Mid-stream reset (tiles case, +mid_reset, with the +hold_check control firing outside the hold window first): at N16 T4, asked from cycle
+  119 (first hold_done 118), landed at 119 with 8 of 8 hold beats unread; the waiting variant asked from 155, landed at 180 with 1 of 8
+  unread; at N16 T16 432 (8 of 8) and 944 (8 of 8). Each 1,295 outputs, 0 differ from the run without the reset.
+
+== 5. Controls at this head (each must FAIL; patches in $J/res_mut)
+rs2_g4_ctl_zin     m_zin (lanes after an ADD take the identity requantize's zero point)  make pipeline int8 N8 T2 TEST=int8_residual_tanh:
+                   exit 2, TRUTH int8 tanh: FAIL (1,188 of 1,600 over 10%, worst 92 LSB). CAUGHT.
+rs2_g4_ctl_rqscale g4_rq_scale5 (requantize words from 1.05x the real scale, golden and RTL agree)  TEST=int8_input_zp_bias_relu_nopool:
+                   exit 2, TRUTH int8 requantize: FAIL (2,086 of 4,480 over, worst 12.3 steps) and TRUTH int8 scale: FAIL. CAUGHT.
+rs2_g4_ctl_addr    g4_add_r105 (ADD m1 from 1.05x s1/s_out)  make residual int8 N8 T2: exit 2, TRUTH int8 qadd: FAIL in every case
+                   (e.g. 169 of 1,024 over, worst 7.5 steps). CAUGHT.
+Comparison controls C1-C3: section 3.
+
+== 6. Earlier evidence this gate rests on (not rerun here)
+add-lanes bench and mutants (Task 2.4): m_tag (48 tag errors), m_addl_short, m_addl_long (beat-count fatals), m_step (a_lanes_in_step),
+  m_addl_swap (616 value errors), m_addl_lane (515), m_f24_qal (a_tag_lat): all CAUGHT; the bench is rerun green here (add-lanes PASS).
+Assertions and mutants (Task 2.7, rerun on 806fa4b as rs2_t27_r3_*): m_pair (a_hold_then_add), m_push (a_hold_push_empty), m_off
+  (a_add_pop_full), m_off_wr (truth: transfer), m_room and m_roomonly (a_add_last_no_accept; a_fill_one_source in the per-test log),
+  m_par (a_add_par_stable), m_bank, m_hold_lane, m_hold_byp (a_hold_no_bank), m_zp1 (truth: add), m_drop (truth: dropout), m_zin (truth:
+  activation), m_skip0 and m_idx_hi (a_add_pop_full alone): all CAUGHT.
+Perf model (Task 2.10b, 307e4d1): PERF MODEL: PASS on 805 test-points against the base tree's bound (worst activation 4.00%, mesh latency
+  3.17%, residual 3.33%); the control m_perf_sig FAILS (18 outside), m_perf_qadd FAILS (2 outside). 307e4d1 is this gate's head.
+G2 (Task 1.13): the ladder, 0 of 65,536 dense and 0 of 1,280 gated sigmoid inputs outside tolerance, a hard gate (history file).
+
+== 7. Integration depth probe (Yosys dchr, generic gates; topological levels, not timing; information only per Soham's ruling)
+This head (rs2_g4_yd_*): int8Requantizer worst 45 (s2_prod, the 32 x 24 product); int8QuantizedAdder worst 34 (s2_p1, from s1_m1);
+  add_lanes with sienna_top's drivers (yd_addl_g_top: hold_mem and its read mux on q1, requantize's register on q2, the words from a
+  register; N = 32, 32 lanes, PER_LANE 32) worst 35 (inside the adder), stage 1 from hold_mem's read mux 16. The ADD path is 10 levels
+  below the requantizer's worst. Cells: int8Requantizer 12,540, int8QuantizedAdder 9,830, add_lanes with drivers 312,683.
+History (Task 2.6, rs2_t26_yd_*): tfliteAdd 52 against tfliteRequant's 53 (DOUBLE 54); add_lanes with drivers 54.
+
+== 8. TFLite logistic agreement before and after the ladder (gpnae-tflite, reported, not gated)
+before rs2_base_gptfl (9fa414e): logistic 958 of 1,280 equal, max |d| 7; tanh 990 of 1,280, max |d| 3.
+after  rs2_g4_gptfl: logistic 1,130 of 1,280 equal, max |d| 2; tanh 990 of 1,280, max |d| 3. ACCURACY: PASS (sigmoid worst 1.653%,
+  2 LSB; tanh 4.305%, 3 LSB; 0 of 1,280 over 10% each).
+
+== 9. Area and latency
+The spec's estimate table (sienna-int8-residual SKILL.md, "Area / latency") is unchanged and remains estimates: no synthesis ran. Its
+rows describe tfliteAdd; the generic units were not synthesized (Yosys cell counts above are generic gates, not area). Latency as built:
+non-ADD int8 sets 0 cycles, add-set beats qadd_lat() = 6 more, the set after an add set waits for add_lanes to drain, sigmoid 0 cycles.
+
+GATE G4 (int8 residual): PASS

@@ -202,12 +202,13 @@ define copy_mem_files
 	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.hex found)"; fi
 endef
 
+# One verilation thread: Verilator 5.035 at -j 8 segfaulted in 3 of 63 TB_sienna_top builds on od-r7a-2xl (0 of 96 at -j 1, same wall time); the C++ build keeps every core.
 VERILATOR_FLAGS = \
 	--timing \
 	--assert \
 	--top-module $(TOP_MODULE) \
 	--threads $(SIM_THREADS) \
-	-j $(shell nproc) \
+	-j 1 \
 	--build-jobs $(shell nproc) \
 	--output-split 20000 \
 	--output-split-cfuncs 20000 \

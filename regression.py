@@ -2782,7 +2782,9 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
     m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
-    if (cfg.get("residual") or cfg.get("residual_every")) and not cfg.get("mixed_acts"):  # the add set's stage
+    if cfg.get("packed"):  # each lane runs its own column's pack entry
+        m["act"] = packed_stage(P, collapse)
+    elif (cfg.get("residual") or cfg.get("residual_every")) and not cfg.get("mixed_acts"):  # the add set's stage
         # A lane set's beats reach the lanes qadd_lat() later through add_lanes; a ReLU or linear set leaves at byp_all_in, before add_lanes drains.
         m["act"] = per_lane + 4 if act in ("relu", "linear") else lane_stage(act, P, collapse) + QADD_LAT
         m["hold"] = per_lane + 4  # a hold set passes the stage into hold_mem
@@ -2902,6 +2904,22 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
         xs = lane_inputs(k, P, collapse)
         out.append(max(lane_cycles(xs[L * per_lane:(L + 1) * per_lane], act, start + 1) for L in range(lanes)) + 2)
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
+
+
+def packed_stage(P: dict, collapse: bool = True) -> int:
+    """Activation stage cycles of a packed set (median over the streamed sets): lane L runs column L % N's entry down its rows; ReLU and linear lanes do not bound it."""
+    N, per_lane, lanes = P["N"], P["SRAM_DEPTH"] // P["NUM_LANES"], P["NUM_LANES"]
+    start, knobs, out = per_lane + 3 + (REQ_LAT if FMT == "int8" else 0), _tb_knobs(), []
+    for k in range(P["NUM_SETS"]):
+        sw = _set_words(k, knobs, N, FMT)
+        acts = [sw["ents"][int(sw["col_ent"][L % N])]["act"] for L in range(lanes)]
+        if not any(a in DEGREE for a in acts):  # every lane ReLU or linear: the bypass path
+            out.append(per_lane + 4)
+            continue
+        xs = [0.0] * (N * N) if FMT == "int8" else lane_inputs(k, P, collapse)  # int8 has no tail path: data-free
+        col = lambda L: [xs[((L // N) * per_lane + i) * N + L % N] for i in range(per_lane)]  # sienna_top's elem() for a packed set
+        out.append(max(lane_cycles(col(L), a, start + 1) for L, a in enumerate(acts) if a in DEGREE) + 2)
+    return med(out)
 
 
 def fmt_table(rows: list, cols: list) -> list:

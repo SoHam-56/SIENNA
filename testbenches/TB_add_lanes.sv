@@ -101,6 +101,7 @@ module TB_add_lanes;
     $fclose(fo);
     $display("add_lanes: %0d beats, %0d errors, %0d latency errors, %0d tag errors, %0d busy errors (%0d busy cycles); %0d outputs differ from the bit-exact model (reported)",
              n_out, errs, lat_errs, tag_errs, busy_errs, busy_hi, diffs);
+    $display("values: not judged here; regression.py --action add-vectors --check gates add_lanes_out.mem on the true function");
     $display("RESULT: %s", (errs == 0 && lat_errs == 0 && tag_errs == 0 && busy_errs == 0) ? "PASSED" : "FAILED");
     $finish;
   end

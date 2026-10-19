@@ -108,6 +108,7 @@ module TB_requant_lanes;
     if (lat_errs != 0) $display("[FAIL] %0d beats did not come %0d cycles after their input", lat_errs, REQ_LAT);
     $fclose(fo);
     $display("TB_requant_lanes: %0d beats, %0d errors, %0d latency errors; %0d outputs differ from the bit-exact model (reported)", n_out, errs, lat_errs, diffs);
+    $display("values: not judged here; regression.py --action rq-vectors --check gates rq_lanes_out.mem on the true function");
     // A ternary of two strings prints as a number under Verilator, so branch instead.
     if (errs == 0 && lat_errs == 0) $display("RESULT: PASSED");
     else $display("RESULT: FAILED");

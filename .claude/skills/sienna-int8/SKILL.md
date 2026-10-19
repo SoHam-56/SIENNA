@@ -1,6 +1,6 @@
 ---
 name: sienna-int8
-description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the generic affine requantize stage (int8Requantizer), fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 matches TFLite, why GPNAE is fixed point in int8, or what 2a covers against 2b.
+description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the generic affine requantize stage (int8Requantizer), fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 results are gated and how they compare with the TFLite interpreter, why GPNAE is fixed point in int8, or what 2a covers against 2b.
 ---
 
 # SIENNA: the int8 build (sub-project 2a)
@@ -39,9 +39,13 @@ Gate reports, verbatim in the `sienna-report` skill's `history/`:
 **REQUIRED BACKGROUND:** the `sienna-uniform-format` skill (one number format per build; this is its sub-project 2)
 and the `sienna-rtl` skill.
 
-## Goal (agreed with Soham, 2026-09-29)
+## Goal (agreed with Soham, 2026-09-29; superseded 2026-10-17 by sienna-int8-residual Task 2.6b)
 
-An int8 build of SIENNA whose results are **bit-exact against TFLite's own int8 kernels** wherever TFLite defines the
+**Today:** the int8 path is generic (`int8Requantizer`, `int8QuantizedAdder`, any scale the host encoder accepts) and every
+int8 output is gated on the true function, |hw - t| <= max(1% |t|, one step) (10% for activations); TFLite models are test
+vehicles whose interpreter agreement is reported, not gated. The 2a goal below is history.
+
+**History (2a):** an int8 build of SIENNA whose results are **bit-exact against TFLite's own int8 kernels** wherever TFLite defines the
 operation: conv and fully connected layers with per-channel symmetric int8 weights, int8 activations with zero points,
 int32 bias, TFLite's fixed-point requantize, and ReLU / ReLU6 fused as the requantize clamp. Results are then
 comparable with published MLPerf Tiny int8 numbers.

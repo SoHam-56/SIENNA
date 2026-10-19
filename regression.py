@@ -2758,16 +2758,16 @@ def clog2(x: int) -> int:
     return max(0, (x - 1).bit_length())
 
 
-def model(cfg: dict, collapse: bool = True) -> dict:
-    """Cycles each stage should take per set, from the RTL's structure."""
-    P = pkg()
+def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -> dict:
+    """Cycles each stage should take per set, from the RTL's structure; P and words (matrix_west_0's) default to the generated test's."""
+    P = P or pkg()
     N, T, lanes = P["N"], P["TILE_SIZE"], P["NUM_LANES"]
     per_lane = P["SRAM_DEPTH"] // lanes
     K = N if collapse else T  # depth each array multiplies
     U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (6 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
     LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
-    words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split())
+    words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split()) if words is None else words
     rows = -(-words // P["HOST_WORDS"])
     m = dict(
         # TB_sienna_top: one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
@@ -2786,10 +2786,10 @@ def model(cfg: dict, collapse: bool = True) -> dict:
         m["act"] = packed_stage(P, collapse)
     elif (cfg.get("residual") or cfg.get("residual_every")) and not cfg.get("mixed_acts"):  # the add set's stage
         # A lane set's beats reach the lanes qadd_lat() later through add_lanes; a ReLU or linear set leaves at byp_all_in, before add_lanes drains.
-        m["act"] = per_lane + 4 if act in ("relu", "linear") else lane_stage(act, P, collapse) + QADD_LAT
-        m["hold"] = per_lane + 4  # a hold set passes the stage into hold_mem
+        m["act"] = per_lane + 1 if act in ("relu", "linear") else lane_stage(act, P, collapse) + QADD_LAT
+        m["hold"] = per_lane + 1  # a hold set passes the stage into hold_mem
     elif act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
-        m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done; int8 leaves while the requantize drains
+        m["act"] = per_lane + 1  # from the first beat (TB g_eff): per_lane wide reads, g_done at byp_all_in, idle; FEED/LATCH precede or overlap the reads (per_lane >= 2)
     elif act in DEGREE and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = lane_stage(act, P, collapse)
     return m
@@ -2914,7 +2914,7 @@ def packed_stage(P: dict, collapse: bool = True) -> int:
         sw = _set_words(k, knobs, N, FMT)
         acts = [sw["ents"][int(sw["col_ent"][L % N])]["act"] for L in range(lanes)]
         if not any(a in DEGREE for a in acts):  # every lane ReLU or linear: the bypass path
-            out.append(per_lane + 4)
+            out.append(per_lane + 1)
             continue
         xs = [0.0] * (N * N) if FMT == "int8" else lane_inputs(k, P, collapse)  # int8 has no tail path: data-free
         col = lambda L: [xs[((L // N) * per_lane + i) * N + L % N] for i in range(per_lane)]  # sienna_top's elem() for a packed set
@@ -5080,6 +5080,22 @@ def test_residual_hold_add_pairs():
     assert all(x["act"] is None and x["latency"] is None and x["mesh"] == 26 for x in a["sets"][0::2])  # a hold set outputs nothing
     assert a["first_latency"] == 146 - 85 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion
     assert a["steady"] and all(g == 11.0 for g in a["steady"])  # 22 cycles per hold/add pair
+
+
+PERF_P8 = dict(N=8, TILE_SIZE=2, NUM_LANES=32, HOST_WORDS=8, SRAM_DEPTH=64, IN_ROWS=8, IN_COLS=8, POOL_H=1, POOL_W=1, STRIDE_ROWS=1,
+               STRIDE_COLS=1, PADDING=0, NUM_SETS=18)  # rs2_perf2_int8_n8_t2's test_config_pkg
+
+
+@perf_selftest
+def test_bypass_stage():
+    with perf_fmt("int8"):  # the ReLU fixture's G intervals (hold 115-118, add 126-129) are the model's bypass stage, plain or residual
+        a = pa.analyse(pa.events(open(os.path.join(PERF_FIX, "int8_residual_relu_N8_T2_int8.trace")).read()), 18, 1, [0x56, 0x58] * 9)
+        plain, res = pa.model({"act": "relu"}, True, PERF_P8, 64), pa.model({"act": "relu", "residual": True}, True, PERF_P8, 64)
+        assert plain["act"] == res["act"] == res["hold"] == a["hold"][0] == a["sets"][1]["act"] == 3, (plain, res)
+    with perf_fmt("bf16"):  # matmul_relu_nopool at N16 T4 on today's TB (rs2_perf2_bf16_n16_t4): G from the first beat to idle, 9 = per_lane 8 + 1
+        g_up, g_dn = pa.leaves(pa.events(open(os.path.join(PERF_FIX, "matmul_relu_nopool_N16_T4_bf16_geff.trace")).read()), "G", 0)
+        assert pa.model({"act": "relu"}, True, {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}, 256)["act"] == \
+            statistics.median(d - u for u, d in zip(g_up, g_dn)) == 9
 
 
 @contextlib.contextmanager

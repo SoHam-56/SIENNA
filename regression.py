@@ -4344,6 +4344,29 @@ def test_unit_points():
 
 
 @selftest
+def test_add_lanes_real_clamp():
+    """add-lanes' check keeps the fused activation's real clamp: in add-vectors' set 2 (ReLU6, hi -56.426 codes) an output one code above the rail fails."""
+    with tempfile.TemporaryDirectory() as d:
+        mem, tj, out = (os.path.join(d, x) for x in ("add.mem", "add.json", "out.mem"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            add_vectors_main(["--action", "add-vectors", mem, "--truth", tj])
+        hi = json.load(open(tj))["sets"][2]["hi"]
+        assert abs(hi + 56.426) < 1e-3, hi
+        want = [[int(x[4:6], 16) for x in ln.split()[1:]] for ln in open(mem) if len(ln.split()[0]) == 4]  # each beat's bit-exact codes
+
+        def check(codes):
+            open(out, "w").write("".join(" ".join(f"{c:02x}" for c in r) + "\n" for r in codes))
+            return subprocess.run([sys.executable, os.path.join(ROOT, "regression.py"), "--action", "add-vectors", "--check", out, "--truth", tj],
+                                  capture_output=True, text=True)
+        r = check(want)
+        assert r.returncode == 0 and "ADD LANES: PASS" in r.stdout, r.stdout[-300:]
+        rail = [(b, k) for b in range(2 * ADD_PER, 3 * ADD_PER) for k in range(ADD_LANES) if truth.int8_codes(want[b][k]) == -56]
+        bumped = [[(c + 1) & 0xFF if (b, k) in rail else c for k, c in enumerate(row)] for b, row in enumerate(want)]
+        r = check(bumped)
+        assert rail and r.returncode == 1 and f"ADD LANES: FAIL (1536 outputs, {len(rail)} over the bound)" in r.stdout, (len(rail), r.stdout[-400:])
+
+
+@selftest
 def test_model_points_need_model_dir():
     with tempfile.TemporaryDirectory() as d:
         o = lambda md: type("O", (), {"model_dir": md})()

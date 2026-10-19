@@ -16,7 +16,7 @@ No Verilator internal-error retry ([RETRY]) in any run. Verilation at -j 1 (unch
 SIENNA  SMALL=1, fp32 bf16 int8   SIENNA REGRESSION PASS: 199 of 199 gated points passed; RESIDUAL CROSSES: PASS
         runs rs2_g4_reg_* (18 nodes, the rs2_t210b_fin split: selftest; {fp32,bf16,int8}_n{8,16}; lck0_*; ck0solo_*, ck0b2bsolo_*
         (fp32/bf16 N16_T2 pipeline-ck0 and -ck0-b2b alone); res = add-lanes, rq-lanes and the 7 int8 residual points), merged
-        and judged by regression.py --action summary --small (table: rs2_g4/sienna_small1_table.log). Longest node 1:24:43.
+        and judged by regression.py --action summary --small (table: rs2_g4/sienna_small1_table.log; its per-point log paths point at the rs2_g4_reg_* run directories). Longest node 1:24:43.
 GPNAE   make -j8 -k regression        GPNAE REGRESSION PASS: 10 of 10 gated points passed (rs2_g4_gpnae, 8:54)
 SystolicMesh make -j8 -k SMALL=1 regression  SYSTOLICMESH REGRESSION PASS: 45 of 45 gated points passed (rs2_g4_sm, 48:32)
 ArithmeticLibrary make -j8 -k regression     ARITHMETICLIBRARY REGRESSION PASS: 43 of 43 gated points passed (rs2_g4_aril, 2:47)
@@ -133,7 +133,11 @@ totals: req_random 157649, sigmoid/selu 14053, other 1030
 F4 split totals (res_cmp_points --split req_random): N8 req_random 6 tests, 18 test-points, 26,253 words; others 24 tests, 72
 test-points, 3,747 words (max 301, matmul_large_sigm). N16 req_random 6 tests, 24 test-points, 131,396 words; others 31 tests, 124
 test-points, 11,336 words (max 564, matmul_large_sigm). Outside the sigmoid and SELU tests the most in one test-point is 39
-(packed_all_bypass_nopool N16). Every changed word is judged by the run's own true-function gates (section 2: all PASS).
+(packed_all_bypass_nopool N16). Every changed word is judged by the run's own true-function gates: each int8 pipeline log of rs2_g4_int8_n{8,16}
+(results/res/pipeline/N*_T*.log) prints 'TRUTH: 50 tests gated, 0 with misses' and no [FAIL] truth line, and so do the int8 pipeline,
+-b2b, -ck0 and -ck0-b2b point logs of rs2_g4_reg_int8_n* (46 tests in the -ck0 kinds, which omit the packed tests).
+Not checked here (deferred Minor): that each changed word outside the req_random, sigmoid and SELU tests moved by at most one code
+against the base; those words are bounded by the true-function gate only.
 Allowances are per test, not per set: in an allowed mixed or packed test a set's words could move unnoticed by this comparison; each run
 still gates every set on the true function and on its regenerated golden.
 

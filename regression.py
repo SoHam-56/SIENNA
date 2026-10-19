@@ -4229,8 +4229,9 @@ def test_point_commands():
         assert pe(b2b) == pe(plain) == ("-O0" if n >= 32 else None), (n, pe(b2b), pe(plain))
         assert SPEC.argv(b2b, opts) == SPEC.argv(plain, opts) + ["EXTRA_FLAGS=-DBACK_TO_BACK"] and not any("LARGE_CODE" in a for a in SPEC.argv(b2b, opts)), n
     cores = regress._cores()
-    for args in ((), ("-C", "SystolicMesh"), ("-C", "GPNAE")):
-        assert f"-j {cores} --build-jobs {cores} " in make_n(*args, "verilator").stdout, args  # Verilator takes every core in all three repos
+    assert f"-j 1 --build-jobs {cores} " in make_n("verilator").stdout  # one verilation thread (-j 8 segfaulted 3 of 63 times on od-r7a-2xl), every core for the C++ build
+    for args in (("-C", "SystolicMesh"), ("-C", "GPNAE")):
+        assert f"-j {cores} --build-jobs {cores} " in make_n(*args, "verilator").stdout, args  # Verilator takes every core in the submodules
     for args in (("lint", "GEN_PKG=0"), ("-C", "SystolicMesh", "lint"), ("-C", "GPNAE", "verilator")):  # every Verilator build of this tree takes SIM_THREADS
         out = make_n(*args, "SIM_THREADS=3").stdout
         assert "--threads 3" in out and "--threads 8" not in out, (args, out[:300])

@@ -165,7 +165,7 @@ How `make regression` works:
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
 - `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
 - The model points (the four MLPerf Tiny models, in fp32 and bf16) need `MODEL_DIR`. Without it they show NOT RUN and the regression fails.
-- Run times, measured on 8-core machines on 2026-10-12, for the 148 points of `SMALL=1`: split by format and kind over 10 machines, each running `make -k -j8` over its points, with the four collapse-k 0 points at N = 16, tile size 2 alone on their own machines, the whole run took 66 minutes. The longest point, `fp32/N16_T2/pipeline-ck0` alone with every core, took 50 minutes. The points' own times add up to 32 hours, but most points shared their machine with seven others, so that sum is not the time of a run one point at a time. N = 32 and 64 have not been timed with the current points.
+- Run time, measured on 8-core machines on 2026-10-18 for the 199 points of `SMALL=1`: split by format and kind over 18 machines, each running `make -k -j8` over its points, with the four collapse-k 0 points at N = 16, tile size 2 alone on their own machines, the whole run took 85 minutes (its longest machine). The points' own times add up to 43 hours, but most points shared their machine with seven others, so that sum is not the time of a run one point at a time. N = 32 and 64 have not been timed with the current points.
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.

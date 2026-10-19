@@ -141,7 +141,12 @@ unit bench and model check once, each lint on its count lines) have their own, o
   assertion that makes it unreachable (`RESIDUAL_CROSS_UNREACHABLE`).
 - Self-tests: `test_regression_points`, `test_point_commands`, `test_point_verdicts`, `test_model_points_need_model_dir`,
   `test_regression_target` (make -n).
-- **Run times** (measured 2026-10-10, 8-core machines, one build per group): SIENNA SMALL=1 (85 points) 3.4 h one point
+- **Run times, today's points** (measured 2026-10-18, run rs2_g4, SIENNA 307e4d1, 8-core machines): SIENNA SMALL=1, 199 points,
+  split over 18 machines each running `make -k -j8` over its points (the rs2_t210b_fin split; the four collapse-k 0 points at
+  N = 16, T = 2 alone), longest machine 1 h 24 min 43 s; the point times add up to 43.2 h (points shared their machine, so
+  that is not a one-at-a-time time). SystolicMesh SMALL=1 48 min on one machine (make -j8), ArithmeticLibrary 3 min, GPNAE
+  9 min. N = 32 and 64 were not timed with today's points; they run in the final sweep.
+- **Run times, 85-point era** (measured 2026-10-10, before the -ck0, -b2b, residual and unit points; 8-core machines, one build per group): SIENNA SMALL=1 (85 points) 3.4 h one point
   at a time, 20 min with every point in parallel, model points the largest share (108 of 203 min); a fresh clone's
   `make -j4 regression SMALL=1 FMT=int8` on one machine 12 min. N = 32 T = 8: pipeline fp32 29 min, bf16 19, int8 7;
   model fp32 11, bf16 8. N = 64 T = 16: pipeline fp32 3 h 57 min, bf16 1 h 59 min, int8 55 min; model fp32 48 min,

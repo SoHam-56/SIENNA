@@ -34,6 +34,8 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 ## Performance
 
 > All numbers are measured in cycle-accurate Verilator simulation of the RTL. Times assume a **950 MHz** clock, the frequency the published TYTAN activation engine reached in a 45 nm process ([paper](#publication)). Synthesis of the full SIENNA pipeline is planned.
+>
+> The throughput, model, packing and comparison figures below, the headline numbers and every 32 × 32 and 64 × 64 figure were measured from 2026-10-05 to 2026-10-10 on the main branch (up to SIENNA 9fa414e), before the generic int8 units, the int8 sigmoid ladder and int8 residual layers. They are measured again in the final sweep after the planned restructure.
 
 **How a set is timed.** A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 
@@ -129,7 +131,7 @@ Read them as an indication of where the architecture stands.
 ## Verification
 
 - `make regression` runs SIENNA's tests (the pipeline, the models, packed layers, the GEMM sweep and the int8 TFLite layers) at every size: N = 8, 16, 32 and 64, every tile size each N allows, in fp32, bf16 and int8, then prints one table of verdicts. SystolicMesh, GPNAE and ArithmeticLibrary each have their own `make regression` for their parts.
-- The pipeline regression runs 32 tests in fp32, 33 in bf16 and 50 in int8 (nine of them residual layers), on 8 × 8 to 64 × 64 meshes at every tile size. Each test streams several sets, and every element of every stage is checked.
+- The pipeline regression runs 32 tests in fp32, 33 in bf16 and 50 in int8 (nine of them residual layers) at every tile size. They have passed on 8 × 8 and 16 × 16 meshes on today's tree, and on 8 × 8 to 64 × 64 before the int8 residual work (the final sweep covers 32 × 32 and 64 × 64 again). Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32 at every tile size, and at 64 × 64 in fp32 at every tile size and in bf16 and int8 at tile size 16 (SystolicMesh's `make regression`).
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
 - Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (10% for activations), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it.

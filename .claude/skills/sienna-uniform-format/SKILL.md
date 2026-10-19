@@ -128,7 +128,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
 
 - **bf16 activation accuracy: decided and fixed (Soham 2026-10-10 and 2026-10-11, sienna-int8-residual Decisions 4 and 5;
   Tasks 1.14a and 1.16 of its plan).** Worst relative error of the RTL's words against numpy float64 over every finite bf16
-  input (GPNAE `bf16/lane`, pattern `bf16_all`):
+  input (GPNAE `bf16/lane`, pattern `bf16_all`; measured in Tasks 1.14a and 1.16, 2026-10-10 to 2026-10-12, not rerun at G4):
   - sigmoid 106.55% (x = -59.75; 18.06% within [-8, 8], 698 inputs over 1%) -> **0.772%** (x = 0.0156, 0 over 1%): every
     x < 0 takes the tail in fp32 with two Newton steps for 1/(1 + e^-|x|), rounded to bf16 once (runs rs1_b16_* RED,
     rs1_b16f_green2). **Hard gate at 1%** (`SIGMOID GATE`, wherever |exact| >= 2^-126). Cost: all-negative inputs take

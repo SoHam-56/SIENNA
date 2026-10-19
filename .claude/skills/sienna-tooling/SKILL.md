@@ -26,7 +26,7 @@ software team builds its own layer from ("this model runner is supposed to be th
 | tflite_oracle.py | 283 | gate G0: TFLite interpreter vs reference kernels, pins rounding, saves models |
 | gemm_sweep.py | 213 | GEMM shape sweep on the layer engine |
 | test_*.py (5 files) | 505 | tool self-tests (pack_jobs, parsers, Makefile FMT flow, perf analysis, tflite_ref) |
-| tflite_int8_run.py | 161 | single-layer int8 TFLite models on the RTL, bit-exact |
+| tflite_int8_run.py | 161 | (former) single-layer int8 TFLite models on the RTL, bit-exact against the interpreter before Task 2.6b |
 | pack_regression.py | 153 | packed layers vs each job alone |
 | tflite_ref.py | 88 | TFLite reference integer kernels (QuantizeMultiplier, activation range) |
 | tflite_pack_run.py, tflite_pack_models.py, gpnae_int8_tflite.py | 134 | packed TFLite runs, packed test models, GPNAE int8 vs TFLite |

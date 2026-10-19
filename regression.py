@@ -2652,8 +2652,8 @@ def leaves(ev: dict, kind: str, idle: int) -> tuple:
     return up, down
 
 
-def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
-    """Per-set stage times; with passes > 1 only every passes-th set outputs (the others are partial sums)."""
+def analyse(ev: dict, k_sets: int, passes: int = 1, flags: list = None) -> dict:
+    """Per-set stage times; with passes > 1 only every passes-th set outputs (the others are partial sums); with flags, analyse_res."""
     load, start = [c for c, _, _ in ev["HOST_LOAD"]], [c for c, _, _ in ev["HOST_START"]]
     launch = [c for c, a, _ in ev.get("MESH", []) if a == 1]
     written = [c for c, a, _ in ev.get("MESH", []) if a == 7]
@@ -2661,6 +2661,8 @@ def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
     g_up, g_dn = leaves(ev, "G", 0)
     p_up, p_dn = leaves(ev, "P", 0)
     done = [c for c, _, _ in ev["DONE"]]
+    if flags is not None:
+        return analyse_res(ev, k_sets, flags, load, start, launch, written, reduce, g_up, g_dn, p_up, p_dn, done)
     n = min(k_sets, len(done), len(start), len(launch), passes * min(len(written), len(g_dn)))
     n -= n % passes  # whole outputs only
     sets = []
@@ -2685,13 +2687,39 @@ def analyse(ev: dict, k_sets: int, passes: int = 1) -> dict:
                 act_gaps=gap(g_up), pool=pool, lanes=lanes, reduce_to_written=[w - r for r, w in zip(reduce, written)])
 
 
+def analyse_res(ev, k_sets, flags, load, start, launch, written, reduce, g_up, g_dn, p_up, p_dn, done) -> dict:
+    """analyse() for a residual test: written, g_up and g_dn index the staged sets (no partial bit); a hold set's stage interval goes to hold."""
+    staged = [k for k in range(k_sets) if not flags[k] & 1]
+    m = min(len(written), len(g_dn), len(staged))
+    n = min(k_sets, len(done), len(start), len(launch), staged[m - 1] + 1 if m else 0)
+    sets, hold, outs, j, pf, gf = [], [], [], 0, 0, 0  # pf: the first pass of the set's depth group; gf: of its output (a hold set's group included)
+    for k in range(n):
+        s = dict(load=start[k] - load[k], wait_mesh=launch[k] - start[k], mesh=None, wait_act=None, act=None, out=None, latency=None)
+        if not flags[k] & 1:
+            s.update(mesh=written[j] - launch[pf], wait_act=g_up[j] - written[j])
+            if flags[k] & 4:  # a hold set: its beats wait in hold_mem for the add set, pooling passes it as a null
+                hold.append(g_dn[j] - g_up[j])
+            else:
+                s.update(act=g_dn[j] - g_up[j], out=done[k] - g_dn[j], latency=done[k] - start[gf], add=bool(flags[k] & 8))
+                outs.append(k)
+                gf = k + 1
+            j, pf = j + 1, k + 1
+        sets.append(s)
+    gap = lambda xs: [xs[k] - xs[k - 1] for k in range(1, min(n, len(xs)))]
+    per_set = [(done[b] - done[a]) / (b - a) for a, b in zip(outs, outs[1:])]  # an output's completion interval over its group's sets
+    return dict(sets=sets, gaps=gap(done), steady=per_set[len(per_set) // 2:], n=n, launch_gaps=gap(launch), host_gaps=gap(start),
+                first_latency=next((x["latency"] for x in sets if x["latency"] is not None), 0), act_gaps=gap(g_up),
+                pool=[d - u for u, d in zip(p_up, p_dn)], lanes=[a / (GEOM["lanes"] * b) for _, a, b in ev.get("LANES", []) if b],
+                reduce_to_written=[w - r for r, w in zip(reduce, written)], hold=hold)
+
+
 DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
 FMT_KNOBS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # (EXP_W, MAN_W) of each build
 FMT_PKG = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
 
 
 def rtl_lat() -> tuple:
-    """sienna_fmt_pkg's unit latencies, parsed from the RTL: ({fmt: (mul_lat, add_lat)}, fx_lat, req_lat)."""
+    """sienna_fmt_pkg's unit latencies, parsed from the RTL: ({fmt: (mul_lat, add_lat)}, fx_lat, req_lat, qadd_lat)."""
     raw = open(FMT_PKG).read()
 
     def body(fn: str, form: str) -> tuple:
@@ -2704,10 +2732,10 @@ def rtl_lat() -> tuple:
     mi, mw, mhi, mlo = body("mul_lat", r"if \(is_int\(exp_w\)\) return (\d+);\s*return \(man_w \+ 1 > (\d+)\) \? (\d+) : (\d+);")
     ai, af = body("add_lat", r"return is_int\(exp_w\) \? (\d+) : (\d+);")
     unit = {f: ((mi if e == 0 else mhi if m + 1 > mw else mlo), (ai if e == 0 else af)) for f, (e, m) in FMT_KNOBS.items()}
-    return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0]
+    return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0], body("qadd_lat", r"return (\d+);")[0]
 
 
-UNIT_LAT = FX_LAT = REQ_LAT = None  # mul_lat and add_lat per format, fxMac, int8Requantizer; perf_init() parses them
+UNIT_LAT = FX_LAT = REQ_LAT = QADD_LAT = None  # mul_lat and add_lat per format, fxMac, int8Requantizer, add_lanes' ADD; perf_init() parses them
 MUL_LAT = ADD_LAT = None  # valid in to done out; perf_init() sets fp32's, perf_main() the build's format's values
 MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
 FMT = "fp32"  # the build's format; perf_main() sets it
@@ -2754,7 +2782,11 @@ def model(cfg: dict, collapse: bool = True) -> dict:
     windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
     m["pool_dispatch"] = -(-windows // lanes) * P["POOL_H"] * P["POOL_W"]  # every lane takes a window element per cycle
-    if act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+    if (cfg.get("residual") or cfg.get("residual_every")) and not cfg.get("mixed_acts"):  # the add set's stage
+        # A lane set's beats reach the lanes qadd_lat() later through add_lanes; a ReLU or linear set leaves at byp_all_in, before add_lanes drains.
+        m["act"] = per_lane + 4 if act in ("relu", "linear") else lane_stage(act, P, collapse) + QADD_LAT
+        m["hold"] = per_lane + 4  # a hold set passes the stage into hold_mem
+    elif act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = per_lane + 4  # FEED, LATCH, one wide beat per cycle plus a cycle of read latency, then done; int8 leaves while the requantize drains
     elif act in DEGREE and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = lane_stage(act, P, collapse)
@@ -2777,8 +2809,8 @@ GROUP_K = TAIL_CTX = TAIL_NEWTON = None  # gpnae_poly's K, TAIL_CONTEXTS and bf1
 
 def perf_init() -> None:
     """Parses the RTL's unit latencies and lane parameters for the perf model; at perf's entry, not at import, so an unparsable RTL fails only perf."""
-    global UNIT_LAT, FX_LAT, REQ_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX, TAIL_NEWTON
-    UNIT_LAT, FX_LAT, REQ_LAT = rtl_lat()
+    global UNIT_LAT, FX_LAT, REQ_LAT, QADD_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX, TAIL_NEWTON
+    UNIT_LAT, FX_LAT, REQ_LAT, QADD_LAT = rtl_lat()
     MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]
     GROUP_K, TAIL_CTX, TAIL_NEWTON = lane_params()
 DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
@@ -2898,15 +2930,18 @@ def one_config(name: str, args) -> tuple:
     rate = lambda s: flop / s * args.clock_mhz / (1e6 if FMT == "int8" else 1000)  # TOPS in int8, GFLOPS otherwise
     rate_s = lambda s: f"{rate(s):.3f} TOPS" if FMT == "int8" else f"{rate(s):.1f} GFLOPS"
     cfg = next(t for t in PIPELINE_TESTS if t["name"] == name)
+    res = bool(cfg.get("residual") or cfg.get("residual_every"))
+    sets = cfg.get("num_sets") if res else args.sets  # a residual test keeps its own set count: its groups need not divide args.sets
     if args.reparse:  # the saved trace; only the stimulus is regenerated, for the model's geometry
-        generate_vectors({**GEOM, **cfg, "num_sets": args.sets})
+        generate_vectors({**GEOM, **cfg, "num_sets": sets})
         raw = open(os.path.join(args.reparse, f"{name}_N{args.n}.log"), errors="ignore").read()
     else:
-        raw = run(name, args.sets, args.build_dir)
+        raw = run(name, sets, args.build_dir)
+    flags = [int(_tb_words(f"add_{k}.mem")[0]) for k in range(_tb_knobs()["num_sets"])] if res else None  # files past num_sets may be an earlier test's
     mdl = model(cfg, not args.slices)
     if "RESULT: PASSED" not in raw or re.search(r"Assertion failed|%Error|%Fatal", raw):
         return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
-    a = analyse(events(raw), args.sets, cfg.get("accum_passes", 1))
+    a = analyse(events(raw), len(flags) if res else args.sets, cfg.get("accum_passes", 1), flags)
     s = a["sets"]
     P = cfg.get("accum_passes", 1)
     first = next(x for x in s if x["mesh"] is not None)  # the first output's last set
@@ -2916,6 +2951,8 @@ def one_config(name: str, args) -> tuple:
     # pooling run once per output, so an accumulate config spreads them over its P sets.
     stage = {"host": min(a["host_gaps"] or [0]), "mesh": min(a["launch_gaps"] or [0]),
              "activation": round(med([x["act"] for x in s if x["act"] is not None]) / P), "pooling": round(med(a["pool"]) / P)}
+    if res:  # the add sets' own stage, which the model gives, not spread over the group's passes
+        stage["activation"] = med([x["act"] for x in s if x.get("add")])
     lim = max(stage, key=stage.get)
     L = [f"--- {name}", ""]
     dash = lambda v: "-" if v is None else v  # a partial-sum set has no output of its own
@@ -2936,13 +2973,14 @@ def one_config(name: str, args) -> tuple:
           f"{stage['mesh']}, host-bound), mesh latency {mdl['mesh_lat']} (measured {first['mesh']} on the first output"
           + (f", over its {P} depth passes" if P > 1 else "") + "), "
           + f"activation {mdl.get('act', '-')} (measured {stage['activation']})"
-          + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}",
+          + f", pooling dispatch {mdl['pool_dispatch']} of the measured {stage['pooling']}"
+          + (f", hold set {mdl['hold']} (measured {med(a['hold'])})" if res and "hold" in mdl else ""),
           f"  Matmul rate  : {flop} {op} per set -> {flop / steady:.1f} {op}/cycle, {rate_s(steady)}"
           f" at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
           f" {args.n ** 2} MAC/cycle" if steady else "", ""]
-    row = [name, a["first_latency"], f"{steady:.1f}", f"{flop / steady:.1f}", f"{rate(steady):.3f}" if FMT == "int8" else f"{rate(steady):.1f}",
-           f"{100 * flop / 2 / steady / args.n ** 2:.0f}%", lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"],
-           first["mesh"], "pass"]
+    rates = [f"{steady:.1f}", f"{flop / steady:.1f}", f"{rate(steady):.3f}" if FMT == "int8" else f"{rate(steady):.1f}",
+             f"{100 * flop / 2 / steady / args.n ** 2:.0f}%"] if steady else ["-"] * 4  # one output (int8_residual_one_pair): no interval
+    row = [name, a["first_latency"], *rates, lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"], first["mesh"], "pass"]
     return L, row
 
 
@@ -2953,7 +2991,7 @@ def header(args) -> list:
             " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
             " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
             " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.",
-            " residual tests (int8 ADD) are not modelled and not run here", ""]
+            " A residual test's hold set passes the stage into hold_mem with no output; its activation is the add sets' stage.", ""]
 
 
 def footer(args, summary: list) -> list:
@@ -2994,8 +3032,6 @@ def perf_main(argv=None) -> None:
     FMT = args.fmt_name
     fmts = {t["name"]: t.get("formats", tuple(UNIT_LAT)) for t in PIPELINE_TESTS}
     args.configs = [c for c in args.configs if args.fmt_name in fmts[c]]  # int8-only tests run only in int8
-    cfgs = {t["name"]: t for t in PIPELINE_TESTS}
-    args.configs = [c for c in args.configs if not (cfgs[c].get("residual") or cfgs[c].get("residual_every"))]  # P-9: not modelled yet
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
     os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
     if args.merge:
@@ -5018,6 +5054,16 @@ def test_single_pass_unchanged():
     assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
 
 
+@perf_selftest
+def test_residual_hold_add_pairs():
+    ev = pa.events(open(os.path.join(PERF_FIX, "int8_residual_relu_N8_T2_int8.trace")).read())
+    a = pa.analyse(ev, 18, 1, [0x56, 0x58] * 9)  # add_<k>.mem's flags: hold sets and add sets in turn, ReLU, bias on the hold set
+    assert a["hold"] == [3] * 9 and [x["act"] for x in a["sets"][1::2]] == [3] * 9  # G 115-118 (hold), 126-129 (add), off the trace by hand
+    assert all(x["act"] is None and x["latency"] is None and x["mesh"] == 26 for x in a["sets"][0::2])  # a hold set outputs nothing
+    assert a["first_latency"] == 146 - 85 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion
+    assert a["steady"] and all(g == 11.0 for g in a["steady"])  # 22 cycles per hold/add pair
+
+
 @contextlib.contextmanager
 def perf_fmt(f):
     """The perf section's build format for the block, restored afterwards so no test depends on the order they run in."""
@@ -5032,7 +5078,7 @@ def perf_fmt(f):
 @perf_selftest
 def test_rtl_lat():
     assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's mul_lat, add_lat, as parsed
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 16, 4)  # fx_lat, req_lat, gpnae_poly's K, TAIL_CONTEXTS
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 4)  # fx_lat, req_lat, qadd_lat, gpnae_poly's K, TAIL_CONTEXTS
 
 
 @perf_selftest

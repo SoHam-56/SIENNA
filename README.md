@@ -8,7 +8,7 @@ SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid o
 |---|---|
 | **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
 | **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
-| **0 of 198 656** int8 outputs off | int8 layers within one output step of the exact result; 447 (0.2%) differ from the TensorFlow Lite interpreter |
+| **0 of 198 656** int8 outputs off | int8 layers converted from TensorFlow Lite, each output within 1% or one output step of the exact result (10% for activation functions; measured worst: half a step) |
 | **35× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 21 cycles for tanh) |
 | **up to 16× faster** on small layers | by packing many small matrix multiplies into one |
 
@@ -134,7 +134,7 @@ Read them as an indication of where the architecture stands.
 - The pipeline regression runs 32 tests in fp32, 33 in bf16 and 50 in int8 (nine of them residual layers) at every tile size. They have passed on 8 × 8 and 16 × 16 meshes on today's tree, and on 8 × 8 to 64 × 64 before the int8 residual work (the final sweep covers 32 × 32 and 64 × 64 again). Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model in all three formats from 8 × 8 to 32 × 32 at every tile size, and at 64 × 64 in fp32 at every tile size and in bf16 and int8 at tile size 16 (SystolicMesh's `make regression`).
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
-- Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (10% for activations), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it.
+- Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (10% for activations), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it, not gated: 447 of the 198 656 layer outputs differ from it.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random and held for 500 cycles mid-stream.
 
 ---

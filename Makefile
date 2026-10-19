@@ -632,11 +632,11 @@ ADDL_DIR = $(VERILATOR_DIR)/add_lanes
 add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
-	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
+	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SRC_DIR)/sienna_add_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv \
 	  $(TB_DIR)/TB_add_lanes.sv -o sim
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
-	  ! command grep -qE '%[E]rror|%[F]atal|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
+	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
 	$(PYTHON) regression.py --action add-vectors --check $(TB_DIR)/add_lanes_out.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 
 # requant_lanes on regression.py --action rq-vectors: fails unless the log has RESULT: PASSED and no error or failed assertion (patterns bracketed against make's echo), then gates its outputs on the true function

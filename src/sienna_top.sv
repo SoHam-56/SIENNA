@@ -73,6 +73,12 @@ module sienna_top #(
     $fatal(1, "sienna_top: OUT_W=%0d, but the format's mesh results are %0d bits", OUT_W, sienna_fmt_pkg::out_w(EXP_W, MAN_W));
   end else if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
     $fatal(1, "sienna_top: SRAM_DEPTH %0d must be N*N (%0d)", SRAM_DEPTH, N * N);
+  end else if (EXP_W != sienna_fmt_pkg::EXPONENT_WIDTH || MAN_W != sienna_fmt_pkg::MANTISSA_WIDTH || DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH ||
+               ACC_W != sienna_fmt_pkg::ACC_DATA_WIDTH || OUT_W != sienna_fmt_pkg::RESULT_DATA_WIDTH) begin : G_BAD_DEFINE
+    // The mesh's widths follow the build's define, and WIDTH warnings are off in the Makefile: a mismatch would truncate silently.
+    $fatal(1, "sienna_top: EXP_W %0d MAN_W %0d DATA_WIDTH %0d ACC_W %0d OUT_W %0d, but the %s define gives %0d %0d %0d %0d %0d", EXP_W, MAN_W,
+           DATA_WIDTH, ACC_W, OUT_W, sienna_fmt_pkg::FORMAT_NAME, sienna_fmt_pkg::EXPONENT_WIDTH, sienna_fmt_pkg::MANTISSA_WIDTH,
+           sienna_fmt_pkg::DATA_WIDTH, sienna_fmt_pkg::ACC_DATA_WIDTH, sienna_fmt_pkg::RESULT_DATA_WIDTH);
   end
 
   localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;

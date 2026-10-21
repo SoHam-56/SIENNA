@@ -100,9 +100,10 @@ module sienna_layer #(
   localparam int ID_W = $clog2(SETS_IN_FLIGHT + 1);
   localparam int ADDR_LINES = $clog2(N * N);
   localparam int RW = (N > 1) ? $clog2(N) : 1;  // row within a tile
-  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);
-  localparam logic [DATA_WIDTH-1:0] ONE = IS_INT ? DATA_WIDTH'(1)  // int8: the identity pass gives the residual's codes exactly in int32
-                                                 : DATA_WIDTH'(((1 << (EXP_W > 0 ? EXP_W - 1 : 0)) - 1) << MAN_W);  // 1.0 in the format
+  localparam logic [DATA_WIDTH-1:0] ONE = sienna_fmt_pkg::ONE_VALUE;  // the identity pass's 1: 1.0 in floats, 1 in int8 (the residual's codes exactly in int32)
+  // The bias rides the weight row when it is as wide as a word, else w_bias_i carries it; either way it widens exactly to the accumulator.
+  localparam bit BIAS_ROW = (sienna_fmt_pkg::BIAS_DATA_WIDTH == DATA_WIDTH);
+  localparam int BIAS_SHIFT = ACC_W - sienna_fmt_pkg::BIAS_DATA_WIDTH;  // the widening: low bits zero, 0 where BIAS_DATA_WIDTH == ACC_DATA_WIDTH
   localparam int RCW = $clog2(N + 1);  // row credits: a set's or a tile's N in one cycle
   localparam int TOW = $clog2(2 * N + 1);  // cache tile rows outstanding: at most two tiles
 
@@ -148,7 +149,7 @@ module sienna_layer #(
   endfunction
 
   logic int_res;  // an int8 residual layer: pass dt-1 holds, pass dt adds
-  assign int_res = IS_INT && res_q;
+  assign int_res = sienna_fmt_pkg::HAS_RESIDUAL_ADD && res_q;
 
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
@@ -273,8 +274,8 @@ module sienna_layer #(
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
   logic [N-1:0][ACC_W-1:0] bias_buf[2];
-  if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
-    $fatal(1, "sienna_layer: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
+  if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::ACC_DATA_WIDTH) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
+    $fatal(1, "sienna_layer: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::ACC_DATA_WIDTH);
   end
   logic [N-1:0][23:0] mult_buf[2];  // int8: the requantize words of the block each half holds
   logic [N-1:0][5:0] shift_buf[2];
@@ -434,7 +435,7 @@ module sienna_layer #(
         dt <= d;
         np <= d + DIM_W'(cfg_residual_i);
         res_q <= cfg_residual_i;
-        bias_q <= cfg_bias_i || IS_INT;  // int8: every block's bias beat carries its requantize words
+        bias_q <= cfg_bias_i || sienna_fmt_pkg::HAS_REQUANT_EPILOGUE;  // a requantizing build: every block's bias beat carries its requantize words
         cached <= (r > 1) && (d <= DIM_W'(HALF));
         train_q <= cfg_train_i;
         act_q <= cfg_act_i;
@@ -488,7 +489,7 @@ module sienna_layer #(
           automatic logic last_row = wl_take_tile && (wl_row == RW'(N - 1));
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
-            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= IS_INT ? w_bias_i[c] : sienna_fmt_pkg::widen(32'(w_data_i[c]), MAN_W);
+            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= BIAS_ROW ? (ACC_W'(w_data_i[c]) << BIAS_SHIFT) : w_bias_i[c];
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;
@@ -582,12 +583,12 @@ module sienna_layer #(
   a_w_one_grant: assert property (@(posedge clk_i) disable iff (!rstn_i) !(wgb_q && wgn_q))
     else $error("sienna_layer: a bias row's weight credit and a set's or tile's N in one cycle: the credit mux sent only N");
   // A float bias row word must land in bias_buf as the word followed by zeros, -0 and subnormals included.
-  logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias), float builds
+  logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias) where the bias rides the row
   logic chk_bias_h;
   logic [N-1:0][DATA_WIDTH-1:0] chk_bias_row;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) chk_bias_v <= 1'b0;
-    else chk_bias_v <= active && wl_take_bias && !IS_INT;
+    else chk_bias_v <= active && wl_take_bias && BIAS_ROW;
   always_ff @(posedge clk_i) begin  // no reset: read only with chk_bias_v
     chk_bias_h <= wl_blk[0];
     chk_bias_row <= w_data_i;

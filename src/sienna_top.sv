@@ -82,8 +82,6 @@ module sienna_top #(
   end
 
   localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
-  localparam logic [DATA_WIDTH-1:0] NEG_INF = IS_INT ? {1'b1, {(DATA_WIDTH - 1) {1'b0}}}  // pooling pad: -128 in int8
-                                                     : DATA_WIDTH'({DATA_WIDTH{1'b1}} << MAN_W);  // -infinity in a float format
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
@@ -631,7 +629,7 @@ module sienna_top #(
     if (!IS_INT && g_state != G_IDLE && act_bypass && fill_v)
       for (int k = 0; k < NUM_LANES; k++)
         gpnae_out_mem[act_wr_base + elem(k, int'(fill_count[k]), g_pack)] <=
-            (lane_act[k] == CONTROL_WIDTH'(3'b100) && fill_d[k][DATA_WIDTH-1]) ? '0 : fill_d[k];
+            (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];  // floats: +0 for a negative word
     if (IS_INT && byp_wr)  // int8: a beat lands where its own tag says, so it may leave the requantize pipeline after its set left the stage
       for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + elem(k, int'(byp_idx), byp_pack)] <= fill_d[k];
     // L5 collector: a lane's result is written to the bank the cycle it arrives, so its credit goes back the next cycle.
@@ -670,7 +668,7 @@ module sienna_top #(
       automatic logic signed [31:0] ic = signed'(lane_c[L] * STRIDE_COLS + disp_pc) - signed'(PADDING);
       lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
       lane_val[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS))
-                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : NEG_INF;
+                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : sienna_fmt_pkg::LOWEST_VALUE;  // the pad: -infinity in floats, -128 in int8
     end
   end
 

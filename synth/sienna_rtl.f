@@ -16,6 +16,14 @@ SystolicMesh/ArithmeticLibrary/Converters/FPNarrow/src/fpNarrow.sv
 SystolicMesh/ArithmeticLibrary/Multipliers/Fx/src/fxMac.sv
 SystolicMesh/ArithmeticLibrary/Requantizer/src/int8Requantizer.sv
 SystolicMesh/ArithmeticLibrary/QuantizedAdder/src/int8QuantizedAdder.sv
+SystolicMesh/ArithmeticLibrary/Fmt/src/fmt_mul.sv
+SystolicMesh/ArithmeticLibrary/Fmt/src/fmt_add.sv
+SystolicMesh/ArithmeticLibrary/Multipliers/BF16/src/bf16Multiplier.sv
+SystolicMesh/ArithmeticLibrary/Multipliers/BF16Wide/src/bf16WideMultiplier.sv
+SystolicMesh/ArithmeticLibrary/Multipliers/Int8/src/int8Multiplier.sv
+SystolicMesh/ArithmeticLibrary/Adders/BF16/src/bf16Adder.sv
+SystolicMesh/ArithmeticLibrary/Adders/Int32/src/int32Adder.sv
+SystolicMesh/ArithmeticLibrary/Converters/FP32ToBF16/src/fp32ToBf16.sv
 SystolicMesh/src/engine/ProcessingElement.sv
 SystolicMesh/src/engine/AccumulationUnit.sv
 SystolicMesh/src/mem/MeshOutputSram.sv

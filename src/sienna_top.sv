@@ -63,8 +63,6 @@ module sienna_top #(
     output logic dropout_busy_o
 );
 
-  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: int32 sums, requantized at the lane feed
-
   if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
     $fatal(1, "sienna_top: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
   end else if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC
@@ -158,7 +156,7 @@ module sienna_top #(
   logic fill_add;  // int8: the fill beat this cycle came through add_lanes
 `ifndef SYNTHESIS
   logic add_in_s, hold_wr_s;
-  logic [NUM_LANES-1:0][7:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
   logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_model_run's +hold_check)
 `endif
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
@@ -809,8 +807,8 @@ module sienna_top #(
         set_ents[host_next_id] <= side.act;
         set_train[host_next_id] <= side.train;
         set_seed[host_next_id]  <= side.seed;
-        set_hold[host_next_id] <= IS_INT && side.res_hold;
-        set_add[host_next_id]  <= IS_INT && side.res_add;
+        set_hold[host_next_id] <= sienna_fmt_pkg::HAS_RESIDUAL_ADD && side.res_hold;  // no hold or add set where the build has no ADD
+        set_add[host_next_id]  <= sienna_fmt_pkg::HAS_RESIDUAL_ADD && side.res_add;
         host_next_id <= host_next_id + 1'b1;
       end
       if (l3_grant) l3_armed <= 1'b1;
@@ -1009,25 +1007,75 @@ module sienna_top #(
       for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
     end
     assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last beat is in: the stage may leave while it drains
-    // int8 residual: hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
+    // The residual ADD (HAS_RESIDUAL_ADD): hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
     localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
-    localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
-    logic [NUM_LANES-1:0][7:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 bytes); no reset, read only after its own write
     logic hold_wr, add_in, rq_out, add_v, add_busy;
-    logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
-    logic [NUM_LANES-1:0][7:0] add_d;
+    logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_d;
     logic [ATW-1:0] add_tag;
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
-    assign hold_idx    = HMW'(tg_idx[RQL-1]);
-    assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
-    assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
-    always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index (hold_idx)
-    add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
-        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[add_idx]), .q2_i(rq_d),
-        .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),
-        .valid_o(add_v), .result_o(add_d), .tag_o(add_tag), .busy_o(add_busy));
+    if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_ADD
+      localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
+      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 words); no reset, read only after its own write
+      logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
+      assign hold_idx    = HMW'(tg_idx[RQL-1]);
+      assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
+      assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
+      always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index (hold_idx)
+      add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
+          .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[add_idx]), .q2_i(rq_d),
+          .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),
+          .valid_o(add_v), .result_o(add_d), .tag_o(add_tag), .busy_o(add_busy));
+`ifndef SYNTHESIS
+      assign add_q1_s = hold_mem[add_idx];
+      // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
+      a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
+        else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");
+      logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
+      always_ff @(posedge clk_i or negedge rstn_i)
+        if (!rstn_i) hm_v <= '0;
+        else begin
+          if (hold_wr) hm_v[hold_idx] <= 1'b1;
+          if (add_in) hm_v[add_idx] <= 1'b0;
+        end
+      assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window
+      logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
+      assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
+      a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
+        else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
+      a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i)
+                                       add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[add_idx] && (hm_below == '0))
+        else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
+                    tg_idx[RQL-1], add_idx);
+      logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
+      sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge
+      always_ff @(posedge clk_i or negedge rstn_i)
+        if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
+        else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
+      always_ff @(posedge clk_i) g_add_w_q <= g_add_w;
+      a_hold_no_lane: assert property (@(posedge clk_i) disable iff (!rstn_i) !((g_state != G_IDLE) && g_hold && !act_bypass))
+        else $error("sienna_top: a_hold_no_lane: a hold set runs a lane activation");
+      a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_wr && byp_wr))
+        else $error("sienna_top: a_hold_no_bank: a hold beat met a bank write");
+      a_hold_keeps_act_wr: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_left_q && (act_wr != act_wr_q)))
+        else $error("sienna_top: a_hold_keeps_act_wr: act_wr toggled as a hold set left the stage");
+      a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
+        else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
+      a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))
+        else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
+`endif
+    end else begin : G_NO_ADD  // no hold or add set is ever accepted (set_hold, set_add)
+      assign hold_done = 1'b0;
+      assign add_v     = 1'b0;
+      assign add_d     = '0;
+      assign add_tag   = '0;
+      assign add_busy  = 1'b0;
+`ifndef SYNTHESIS
+      assign add_q1_s = '0;
+      assign hm_any   = 1'b0;
+`endif
+    end
     // The fill sees one source a cycle (Task 2.7's a_fill_one_source checks it): requantize's non-ADD beats, or add_lanes' beats with their own tags.
     logic f_byp, f_bank, f_pack;
     logic [FCNT_W-1:0] f_idx;
@@ -1052,11 +1100,8 @@ module sienna_top #(
     assign bank_sel   = byp_wr ? f_bank : act_wr;
 `ifndef SYNTHESIS
     assign {add_in_s, hold_wr_s} = {add_in, hold_wr};
-    assign add_q1_s = hold_mem[add_idx];
     assign add_q2_s = rq_d;
     assign hold_d_s = rq_d;
-`endif
-`ifndef SYNTHESIS
     a_rq_tag_aligned: assert property (@(posedge clk_i) disable iff (!rstn_i) rq_v == tg_v[RQL-1])
       else $error("sienna_top: the requantize sideband is out of step with requant_lanes");
     a_rq_bank_once: assert property (@(posedge clk_i) disable iff (!rstn_i) !(byp_wr && g_done && !act_bypass))
@@ -1065,43 +1110,8 @@ module sienna_top #(
       else $error("sienna_top: a set completed into a full activation bank");
     a_rq_one_set: assert property (@(posedge clk_i) disable iff (!rstn_i) (wide_rd_valid && rq_in == '0) |-> !rq_drain)
       else $error("sienna_top: a set's first beat entered the requantize pipeline while an earlier beat was still in it");
-    // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
-    a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
-      else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");
-    logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
-    always_ff @(posedge clk_i or negedge rstn_i)
-      if (!rstn_i) hm_v <= '0;
-      else begin
-        if (hold_wr) hm_v[hold_idx] <= 1'b1;
-        if (add_in) hm_v[add_idx] <= 1'b0;
-      end
-    assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_model_run's hold window
-    logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
-    assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
-    a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
-      else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
-    a_add_pop_full: assert property (@(posedge clk_i) disable iff (!rstn_i)
-                                     add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[add_idx] && (hm_below == '0))
-      else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
-                  tg_idx[RQL-1], add_idx);
     a_fill_one_source: assert property (@(posedge clk_i) disable iff (!rstn_i) !(rq_out && add_v))
       else $error("sienna_top: a_fill_one_source: a requantized beat and an add beat reached the fill in the same cycle");
-    logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
-    sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge
-    always_ff @(posedge clk_i or negedge rstn_i)
-      if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
-      else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
-    always_ff @(posedge clk_i) g_add_w_q <= g_add_w;
-    a_hold_no_lane: assert property (@(posedge clk_i) disable iff (!rstn_i) !((g_state != G_IDLE) && g_hold && !act_bypass))
-      else $error("sienna_top: a_hold_no_lane: a hold set runs a lane activation");
-    a_hold_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_wr && byp_wr))
-      else $error("sienna_top: a_hold_no_bank: a hold beat met a bank write");
-    a_hold_keeps_act_wr: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_left_q && (act_wr != act_wr_q)))
-      else $error("sienna_top: a_hold_keeps_act_wr: act_wr toggled as a hold set left the stage");
-    a_add_par_stable: assert property (@(posedge clk_i) disable iff (!rstn_i) (|(tg_v & tg_add)) |-> (g_add_w == g_add_w_q))
-      else $error("sienna_top: a_add_par_stable: the ADD words changed under an add beat still in requantize");
-    a_add_last_no_accept: assert property (@(posedge clk_i) disable iff (!rstn_i) g_accept |-> (!add_busy && !(|(tg_v & tg_add))))
-      else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
 `endif
   end else begin : G_NO_REQ
     requant_lanes #(  // a pass-through: the lanes take the mesh's result words as they are
@@ -1403,7 +1413,7 @@ module sienna_top #(
     else $error("sienna_top: pack shift %0d leaves blocks narrower than 2 of N=%0d", acc_shift_q, N);
   a_pack_one_pass: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> !acc_accum_q && !acc_prev_accum_q)
     else $error("sienna_top: a packed set cannot be a partial sum or continue one");
-  if (IS_INT) begin : G_HOLD_PAIRS
+  if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_HOLD_PAIRS
     logic acc_prev_hold_q, last_hold;  // the accept before this one was a hold set
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) {acc_prev_hold_q, last_hold} <= '0;
@@ -1416,9 +1426,9 @@ module sienna_top #(
                                                 !((acc_hold_q || acc_add_q) && (acc_accum_q || acc_shift_q != '0)))
       else $error("sienna_top: a_hold_then_add: hold and add sets come in pairs, hold first, neither a partial sum nor packed");
   end
-  if (!IS_INT) begin : G_FLOAT_NO_ADD
-    a_float_no_add: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> !(acc_hold_q || acc_add_q))
-      else $error("sienna_top: a_float_no_add: a float set was put as a hold or add set; the residual ADD is int8 only");
+  if (!sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_NO_RESIDUAL_ADD
+    a_no_residual_add: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> !(acc_hold_q || acc_add_q))
+      else $error("sienna_top: a_no_residual_add: a set was put as a hold or add set, but this build has no residual ADD");
   end
 `ifdef ASSERT_SELFTEST
   a_selftest: assert property (@(posedge clk_i) disable iff (!rstn_i) 1'b0)

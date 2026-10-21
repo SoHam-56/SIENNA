@@ -14,11 +14,6 @@ module sienna_multi #(
     parameter int RESULT_BANKS      = 4,
     parameter int SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // credits per copy, as sienna_top
     parameter int WC_TILES          = 128,  // weight cache tiles per copy; every copy holds the same weights
-    parameter int EXP_W             = 8,   // the build's number format, as sienna_top
-    parameter int MAN_W             = 23,
-    parameter int DATA_WIDTH        = 1 + EXP_W + MAN_W,
-    parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),
-    parameter int OUT_W             = sienna_fmt_pkg::out_w(EXP_W, MAN_W),  // each copy's mesh result words, as sienna_top
     parameter int SRAM_DEPTH        = N * N,
     parameter int FIFO_DEPTH        = N * N,
     parameter int ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -40,15 +35,15 @@ module sienna_multi #(
     input logic rstn_i,
 
     credit_link_if.consumer         host[COPIES],  // L0 per copy, as sienna_top's: put only the copy whose turn it is (copy_sel_o), its rows went there
-    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with a put, to the copy put; float builds: fp32 bits, as sienna_top
+    input logic [N-1:0][sienna_fmt_pkg::ACC_DATA_WIDTH-1:0] bias_i,  // with a put, to the copy put; float builds: fp32 bits, as sienna_top
     credit_link_if.consumer         wc_region[2],  // L2: a put opens a fill of that region in every copy; its credit returns once every copy's has
     input logic                     wc_write_enable_i,  // written into every copy's cache
     input logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i,
     input logic                     north_write_enable_i,  // the row buses reach only the copy whose turn it is
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] north_write_data_i,
+    input logic [HOST_WORDS-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i,
+    input logic [HOST_WORDS-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
 
     input logic                     drained_i,  // checks only: the host has put its last set; no fill may be left reaching only some copies
@@ -57,6 +52,7 @@ module sienna_multi #(
     output logic [COPIES-1:0]                                pipeline_complete_o,
     output logic [COPIES-1:0][$clog2(SETS_IN_FLIGHT+1)-1:0]  done_set_id_o
 );
+  localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH;
   localparam int SW = $clog2(COPIES + 1);
   localparam int PACK_ENTRIES = 8;  // sienna_top's default; sienna_multi never packs
   localparam int WCTW = $clog2(WC_TILES);
@@ -126,11 +122,6 @@ module sienna_multi #(
         .ACC_BANKS        (ACC_BANKS),
         .RESULT_BANKS     (RESULT_BANKS),
         .WC_TILES         (WC_TILES),
-        .EXP_W            (EXP_W),
-        .MAN_W            (MAN_W),
-        .DATA_WIDTH       (DATA_WIDTH),
-        .ACC_W            (ACC_W),
-        .OUT_W            (OUT_W),
         .SRAM_DEPTH       (SRAM_DEPTH),
         .FIFO_DEPTH       (FIFO_DEPTH),
         .ADDR_LINES       (ADDR_LINES),

@@ -20,10 +20,6 @@ module sienna_layer #(
     parameter int RESULT_BANKS      = 4,
     parameter int SETS_IN_FLIGHT    = 2 + 2 + ACC_BANKS + RESULT_BANKS + 2 + 1,  // as sienna_top: every set the banks can hold
     parameter int WC_TILES          = 128,
-    parameter int EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
-    parameter int MAN_W             = 23,
-    parameter int DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, bias, results
-    parameter int ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // bias and sums: int32 in int8, fp32 in every float format (the bias row widened exactly)
     parameter int CONTROL_WIDTH     = 3,
     parameter int LFSR_WIDTH        = 32,
     parameter int POOL_H            = 1,
@@ -87,13 +83,15 @@ module sienna_layer #(
     credit_link_if.consumer          a_rows,  // L10: one row of N words per put; a set's N credits may come with the last row's put (count 1 + N - 1 = N after it), so the producer counter needs MAX >= N
     credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
-    input  logic [N-1:0][ACC_W-1:0]  w_bias_i,
+    input  logic [N-1:0][sienna_fmt_pkg::ACC_DATA_WIDTH-1:0] w_bias_i,
     input  logic [N-1:0][23:0]       w_req_mult_i,   // per channel: requantize scale's 24-bit mantissa and right shift
     input  logic [N-1:0][5:0]        w_req_shift_i,
 
     credit_link_if.producer          out[NUM_LANES],  // L9: lane k's results, one word per put while the consumer's credit is held
     output logic                     set_done_o  // a set left the pipeline with its last word (partial sums leave with no results)
 );
+  localparam int DATA_WIDTH     = sienna_fmt_pkg::DATA_WIDTH;  // every word: operands, bias rows, results
+  localparam int ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;  // bias and sums: int32 in int8, fp32 in every float format
   localparam int HALF = WC_TILES / 2;  // cache tiles per column block; the other half fills with the next block
   localparam int WCTW = $clog2(WC_TILES);
   localparam int WCAW = $clog2(WC_TILES * N * N);
@@ -103,7 +101,7 @@ module sienna_layer #(
   localparam logic [DATA_WIDTH-1:0] ONE = sienna_fmt_pkg::ONE_VALUE;  // the identity pass's 1: 1.0 in floats, 1 in int8 (the residual's codes exactly in int32)
   // The bias rides the weight row when it is as wide as a word, else w_bias_i carries it; either way it widens exactly to the accumulator.
   localparam bit BIAS_ROW = (sienna_fmt_pkg::BIAS_DATA_WIDTH == DATA_WIDTH);
-  localparam int BIAS_SHIFT = ACC_W - sienna_fmt_pkg::BIAS_DATA_WIDTH;  // the widening: low bits zero, 0 where BIAS_DATA_WIDTH == ACC_DATA_WIDTH
+  localparam int BIAS_SHIFT = ACC_DATA_WIDTH - sienna_fmt_pkg::BIAS_DATA_WIDTH;  // the widening: low bits zero, 0 where BIAS_DATA_WIDTH == ACC_DATA_WIDTH
   localparam int RCW = $clog2(N + 1);  // row credits: a set's or a tile's N in one cycle
   localparam int TOW = $clog2(2 * N + 1);  // cache tile rows outstanding: at most two tiles
 
@@ -153,7 +151,7 @@ module sienna_layer #(
 
   // ── The pipeline this layer runs on ───────────────────────────────────
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
-  logic [N-1:0][ACC_W-1:0]       p_bias;
+  logic [N-1:0][ACC_DATA_WIDTH-1:0]       p_bias;
   logic [N-1:0][23:0]            p_mult;   // int8: the requantize words of the set being started
   logic [N-1:0][5:0]             p_shift;
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
@@ -230,10 +228,6 @@ module sienna_layer #(
       .ACC_BANKS        (ACC_BANKS),
       .RESULT_BANKS     (RESULT_BANKS),
       .WC_TILES         (WC_TILES),
-      .EXP_W            (EXP_W),
-      .MAN_W            (MAN_W),
-      .DATA_WIDTH       (DATA_WIDTH),
-      .ACC_W            (ACC_W),
       .CONTROL_WIDTH    (CONTROL_WIDTH),
       .IN_ROWS          (N),
       .IN_COLS          (N),
@@ -273,7 +267,7 @@ module sienna_layer #(
   assign set_done_o = p_complete;
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
-  logic [N-1:0][ACC_W-1:0] bias_buf[2];
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_buf[2];
   if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::ACC_DATA_WIDTH) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
     $fatal(1, "sienna_layer: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::ACC_DATA_WIDTH);
   end
@@ -489,7 +483,7 @@ module sienna_layer #(
           automatic logic last_row = wl_take_tile && (wl_row == RW'(N - 1));
           automatic logic [DIM_W-1:0] tiles_now = wl_tile + DIM_W'(last_row);
           if (wl_take_bias) begin
-            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= BIAS_ROW ? (ACC_W'(w_data_i[c]) << BIAS_SHIFT) : w_bias_i[c];
+            for (int c = 0; c < N; c++) bias_buf[wl_blk[0]][c] <= BIAS_ROW ? (ACC_DATA_WIDTH'(w_data_i[c]) << BIAS_SHIFT) : w_bias_i[c];
             bias_in[wl_blk[0]] <= 1'b1;
           end
           if (last_row) tiles_in[wl_blk[0]] <= tiles_now;
@@ -595,9 +589,9 @@ module sienna_layer #(
   end
   for (genvar c = 0; c < N; c++) begin : G_A_BIAS
     a_bias_widened: assert property (@(posedge clk_i) disable iff (!rstn_i)
-                                     chk_bias_v |-> bias_buf[chk_bias_h][c] == (ACC_W'(chk_bias_row[c]) << (ACC_W - DATA_WIDTH)))
+                                     chk_bias_v |-> bias_buf[chk_bias_h][c] == (ACC_DATA_WIDTH'(chk_bias_row[c]) << (ACC_DATA_WIDTH - DATA_WIDTH)))
       else $error("sienna_layer: bias column %0d holds %h, the row word %h widened is %h", c, bias_buf[chk_bias_h][c], chk_bias_row[c],
-                  ACC_W'(chk_bias_row[c]) << (ACC_W - DATA_WIDTH));
+                  ACC_DATA_WIDTH'(chk_bias_row[c]) << (ACC_DATA_WIDTH - DATA_WIDTH));
   end
 `endif
 

@@ -13,11 +13,6 @@ module sienna_top #(
     parameter int    WC_TILES          = 128,  // weight cache tiles in the mesh
     parameter int    WCTW              = $clog2(WC_TILES),
     parameter int    WCAW              = $clog2(WC_TILES * N * N),
-    parameter int    EXP_W             = 8,   // the build's number format: fp32 8/23, bf16 8/7
-    parameter int    MAN_W             = 23,
-    parameter int    DATA_WIDTH        = 1 + EXP_W + MAN_W,  // every word: operands, results, activations
-    parameter int    ACC_W             = sienna_fmt_pkg::acc_w(EXP_W, MAN_W),  // sums and bias: int32 in int8, fp32 in every float format
-    parameter int    OUT_W             = sienna_fmt_pkg::out_w(EXP_W, MAN_W),  // mesh result words: int32 in int8, DATA_WIDTH in floats
     parameter int    SRAM_DEPTH        = N * N,
     parameter int    FIFO_DEPTH        = N * N,
     parameter int    ADDR_LINES        = $clog2(FIFO_DEPTH),
@@ -41,15 +36,15 @@ module sienna_top #(
     input logic rstn_i,
 
     credit_link_if.consumer         host,  // L0: a put per set, data its sideband (sienna_set_side.svh); credits are free staging banks, withheld while SETS_IN_FLIGHT sets are in flight
-    input logic [N-1:0][ACC_W-1:0]  bias_i,  // with the put: added to column c when the sideband's bias_valid is set; float builds: the row widened to fp32 bits
+    input logic [N-1:0][sienna_fmt_pkg::ACC_DATA_WIDTH-1:0] bias_i,  // with the put: added to column c when the sideband's bias_valid is set; float builds: the row widened to fp32 bits
     credit_link_if.consumer         wc_region[2],  // L2, to the mesh: a put opens a fill of that cache region; its credit returns once the fill's last set is broadcast
     input logic                     wc_write_enable_i,  // weight cache write of north_write_data_i at word wc_write_addr_i
     input logic [WCAW-1:0]          wc_write_addr_i,
     input logic                     north_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0]       north_write_data_i,
+    input logic [HOST_WORDS-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] north_write_data_i,
     input logic                     north_write_reset_i,
     input logic                     west_write_enable_i,
-    input logic [HOST_WORDS-1:0][DATA_WIDTH-1:0]       west_write_data_i,
+    input logic [HOST_WORDS-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
 
     credit_link_if.producer         out[NUM_LANES],  // L9: lane k's pooled, dropped-out results, one word per put, while the consumer's credit is held
@@ -63,23 +58,15 @@ module sienna_top #(
     output logic dropout_busy_o
 );
 
-  if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
-    $fatal(1, "sienna_top: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
-  end else if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC
-    $fatal(1, "sienna_top: ACC_W=%0d, but the format accumulates in %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
-  end else if (OUT_W != sienna_fmt_pkg::out_w(EXP_W, MAN_W)) begin : G_BAD_OUT_W  // L3 and the lane feed would truncate or pad silently
-    $fatal(1, "sienna_top: OUT_W=%0d, but the format's mesh results are %0d bits", OUT_W, sienna_fmt_pkg::out_w(EXP_W, MAN_W));
-  end else if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
+  // The build's widths, from the define through sienna_fmt_pkg: no parameter can disagree with the mesh's.
+  localparam int DATA_WIDTH        = sienna_fmt_pkg::DATA_WIDTH;  // every word: operands, results, activations
+  localparam int ACC_DATA_WIDTH    = sienna_fmt_pkg::ACC_DATA_WIDTH;  // sums and bias: int32 in int8, fp32 in every float format
+  localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;  // mesh result words: int32 in int8, DATA_WIDTH in floats
+
+  if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
     $fatal(1, "sienna_top: SRAM_DEPTH %0d must be N*N (%0d)", SRAM_DEPTH, N * N);
-  end else if (EXP_W != sienna_fmt_pkg::EXPONENT_WIDTH || MAN_W != sienna_fmt_pkg::MANTISSA_WIDTH || DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH ||
-               ACC_W != sienna_fmt_pkg::ACC_DATA_WIDTH || OUT_W != sienna_fmt_pkg::RESULT_DATA_WIDTH) begin : G_BAD_DEFINE
-    // The mesh's widths follow the build's define, and WIDTH warnings are off in the Makefile: a mismatch would truncate silently.
-    $fatal(1, "sienna_top: EXP_W %0d MAN_W %0d DATA_WIDTH %0d ACC_W %0d OUT_W %0d, but the %s define gives %0d %0d %0d %0d %0d", EXP_W, MAN_W,
-           DATA_WIDTH, ACC_W, OUT_W, sienna_fmt_pkg::FORMAT_NAME, sienna_fmt_pkg::EXPONENT_WIDTH, sienna_fmt_pkg::MANTISSA_WIDTH,
-           sienna_fmt_pkg::DATA_WIDTH, sienna_fmt_pkg::ACC_DATA_WIDTH, sienna_fmt_pkg::RESULT_DATA_WIDTH);
   end
 
-  localparam int GPNAE_DATA_WIDTH = DATA_WIDTH;
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
@@ -198,7 +185,7 @@ module sienna_top #(
   logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:2*SRAM_DEPTH-1];
 
 
-  logic [NUM_LANES-1:0][OUT_W-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
+  logic [NUM_LANES-1:0][RESULT_DATA_WIDTH-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
   logic                                 wide_rd_valid;  // a result beat arrives on L3
   logic                  systolic_mult_complete;
   logic north_queue_empty, west_queue_empty;
@@ -212,7 +199,7 @@ module sienna_top #(
   assign g_add_zpo = g_add_w.zpo;
   localparam int SIDE_W = $bits(set_side_t);
   localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
-  localparam int L3_W   = NUM_LANES * OUT_W + 3;  // a result beat: {packed, last, first, one word per lane}
+  localparam int L3_W   = NUM_LANES * RESULT_DATA_WIDTH + 3;  // a result beat: {packed, last, first, one word per lane}
   localparam int L3_CRW = $clog2(PER_LANE + 1);  // a set's beats granted in one cycle
 `ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the host and output links are checked at time 0
   initial
@@ -261,12 +248,12 @@ module sienna_top #(
 
   // Rows, cache writes and bias pass as many stages as the put (L0 then L1), so a set's rows reach its bank before its put.
   localparam int BUS_STAGES = 2 * LINK_STAGES;
-  localparam int BUS_W = 5 + 2 * HOST_WORDS * DATA_WIDTH + WCAW + N * ACC_W;
+  localparam int BUS_W = 5 + 2 * HOST_WORDS * DATA_WIDTH + WCAW + N * ACC_DATA_WIDTH;
   logic [BUS_W-1:0] bus_in, bus_out;
   logic m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we;
   logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] m_north, m_west;
   logic [WCAW-1:0] m_wc_addr;
-  logic [N-1:0][ACC_W-1:0] m_bias;
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] m_bias;
   assign bus_in = {north_write_enable_i, west_write_enable_i, north_write_reset_i, west_write_reset_i, wc_write_enable_i,
                    north_write_data_i, west_write_data_i, wc_write_addr_i, bias_i};
   if (BUS_STAGES == 0) begin : G_BUS_WIRE
@@ -299,7 +286,7 @@ module sienna_top #(
   assign l3_grant = live && (g_state == G_IDLE) && !l3_armed && l6_room && rq_room && l4_room && !(mesh_sets != 0 && set_accum[g_next_id]);
   assign l3c.credit = l3_grant ? L3_CRW'(PER_LANE) : '0;
   assign wide_rd_valid = l3c.put;
-  assign wide_rd_data = l3c.data[NUM_LANES*OUT_W-1:0];
+  assign wide_rd_data = l3c.data[NUM_LANES*RESULT_DATA_WIDTH-1:0];
   assign {l3_pk, l3_last, l3_first} = l3c.data[L3_W-1-:3];
 
   // L6: activation bank link inside this module; the activation stage spends a credit per bank it fills, pooling returns one per release.
@@ -464,15 +451,12 @@ module sienna_top #(
       assign gpnae_result[g] = l5.data;
       assign l5.credit       = l5_cr[g];
 
-      gpnae_poly #(
-          .EXP_W        (EXP_W),
-          .MAN_W        (MAN_W),
-          .DATA_WIDTH   (GPNAE_DATA_WIDTH),
+      gpnae_lane #(
           .ADDR_LINES   (GPNAE_ADDR_LINES),
           .CONTROL_WIDTH(GPNAE_CTRL_WIDTH),
           .OUT_MAX      (L5_MAX),
           .OUT_CRW      (1)
-      ) gpnae_inst (
+      ) gpnae (
           .clk_i         (clk_i),
           .rstn_i        (rstn_i),
           .in            (l4),
@@ -561,8 +545,8 @@ module sienna_top #(
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;
       dropout #(
-          .EXP_W            (EXP_W),
-          .MAN_W            (MAN_W),
+          .EXP_W            (sienna_fmt_pkg::EXPONENT_WIDTH),
+          .MAN_W            (sienna_fmt_pkg::MANTISSA_WIDTH),
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
           .LFSR_WIDTH       (LFSR_WIDTH)

@@ -74,6 +74,7 @@ PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 TOP_FILES = \
 	sienna_add_pkg.sv \
 	sienna_top.sv \
+	gpnae_lane.sv \
 	requant_lanes.sv \
 	add_lanes.sv \
 	fwft.sv \

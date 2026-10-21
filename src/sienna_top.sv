@@ -608,7 +608,8 @@ module sienna_top #(
 
   always_comb begin
     for (int i = 0; i < NUM_LANES; i++) begin
-      gpnae_ctrl[i] = (IS_INT && lane_act[i] == CONTROL_WIDTH'(3'b100) && !act_bypass) ? CONTROL_WIDTH'(3'b101) : lane_act[i];  // int8 ReLU is the clamp's
+      gpnae_ctrl[i] = (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && lane_act[i] == CONTROL_WIDTH'(3'b100) && !act_bypass) ? CONTROL_WIDTH'(3'b101)
+                                                                                                                  : lane_act[i];  // the requantize clamp applies ReLU
     end
   end
 
@@ -626,11 +627,11 @@ module sienna_top #(
   // =========================================================================
   always_ff @(posedge clk_i) begin
     // Beat b of the wide read holds element elem(k, b) in word k, the element lane k would have taken.
-    if (!IS_INT && g_state != G_IDLE && act_bypass && fill_v)
+    if (!sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && g_state != G_IDLE && act_bypass && fill_v)
       for (int k = 0; k < NUM_LANES; k++)
         gpnae_out_mem[act_wr_base + elem(k, int'(fill_count[k]), g_pack)] <=
             (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];  // floats: +0 for a negative word
-    if (IS_INT && byp_wr)  // int8: a beat lands where its own tag says, so it may leave the requantize pipeline after its set left the stage
+    if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && byp_wr)  // a requantized beat lands where its own tag says, so it may leave the pipeline after its set left the stage
       for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + elem(k, int'(byp_idx), byp_pack)] <= fill_d[k];
     // L5 collector: a lane's result is written to the bank the cycle it arrives, so its credit goes back the next cycle.
     for (int i = 0; i < NUM_LANES; i++)
@@ -859,8 +860,8 @@ module sienna_top #(
     end
   end
 
-  // int8 (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
-  if (IS_INT) begin : G_REQ_SETS
+  // Requantizing builds (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
+  if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ_SETS
     logic [N-1:0][23:0] s_mult [NUM_IDS];
     logic [N-1:0][5:0]  s_shift[NUM_IDS];
     logic [PACK_ENTRIES-1:0][7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_zout[NUM_IDS];
@@ -955,10 +956,10 @@ module sienna_top #(
   // =========================================================================
   logic fill_v;
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
-  // int8: the lanes, the bypass write and every fill counter see requantized int8 beats, REQ_LAT cycles after the wide read.
-  if (IS_INT) begin : G_REQ
+  // Requantizing builds: the lanes, the bypass write and every fill counter see requantized beats, REQUANT_LATENCY cycles after the wide read.
+  if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ
     logic rq_v;  // requantize's output beat
-    logic [NUM_LANES-1:0][7:0] rq_d;
+    logic [NUM_LANES-1:0][DATA_WIDTH-1:0] rq_d;
     requant_lanes #(
         .NUM_LANES(NUM_LANES),
         .N        (N),
@@ -979,7 +980,10 @@ module sienna_top #(
         .result_o(rq_d)
     );
     // Each beat's destination rides beside int8Requantizer, which takes its own mult, shift, zp, min and max at stage 1.
-    localparam int RQL = sienna_fmt_pkg::req_lat();
+    localparam int RQL = sienna_fmt_pkg::REQUANT_LATENCY;
+    if (RQL < 2) begin : G_BAD_RQL  // the tag line below shifts RQL-1 stages behind a registered first one
+      $fatal(1, "sienna_top: REQUANT_LATENCY %0d; the requantize tag line needs at least 2", RQL);
+    end
     logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
     logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
     logic [RQL-1:0] tg_byp, tg_bank, tg_hold, tg_add;
@@ -1100,11 +1104,25 @@ module sienna_top #(
       else $error("sienna_top: a_add_last_no_accept: a set was accepted while add beats were still in add_lanes or requantize");
 `endif
   end else begin : G_NO_REQ
-    if ($bits(fill_d[0]) != OUT_W) begin : G_BAD_FILL  // float lanes take the mesh's result words as they are
-      $fatal(1, "sienna_top: the lanes take %0d-bit words, the mesh gives %0d-bit results", $bits(fill_d[0]), OUT_W);
-    end
-    assign fill_v     = wide_rd_valid;
-    assign fill_d     = wide_rd_data;
+    requant_lanes #(  // a pass-through: the lanes take the mesh's result words as they are
+        .NUM_LANES(NUM_LANES),
+        .N        (N),
+        .PER_LANE (PER_LANE)
+    ) rq (
+        .clk_i   (clk_i),
+        .rstn_i  (rstn_i),
+        .clear_i (g_state == G_IDLE),
+        .valid_i (wide_rd_valid),
+        .acc_i   (wide_rd_data),
+        .mult_i  (g_mult),
+        .shift_i (g_shift),
+        .packed_i(g_pack),
+        .zp_i    (g_zp),
+        .min_i   (g_min),
+        .max_i   (g_max),
+        .valid_o (fill_v),
+        .result_o(fill_d)
+    );
     assign lane_v     = fill_v;
     assign byp_wr     = 1'b0;
     assign byp_bank   = 1'b0;

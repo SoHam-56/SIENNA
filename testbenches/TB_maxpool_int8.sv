@@ -1,10 +1,13 @@
 `timescale 1ns / 1ps
 
-// Maxpool_2D in int8, streaming window and padded batch path, on credit links with checkers bound and 0% then 30% stalls; EXP_W = 0 must decide the order.
+// Maxpool_2D in int8, streaming window and padded batch path, on credit links with checkers bound and 0% then 30% stalls; the int8 build's signed compare must decide the order (FMT=int8).
 module TB_maxpool_int8 #(
     parameter int FAULT = 0  // 2: elements put with no credit granted (a_mp_in_credit); 5: the batch path's OUT_MAX below its 4 results
 );
   localparam int W = 8;
+  if (!(sienna_fmt_pkg::EXPONENT_WIDTH == 0)) begin : G_BAD_FORMAT  // the bench's vectors are int8 words
+    $fatal(1, "TB_maxpool_int8: build with FMT=int8 (+define+FMT_INT8), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
 
@@ -14,10 +17,10 @@ module TB_maxpool_int8 #(
   credit_link_if #(.DATA_W(W), .CRW(4)) b_in ();
   credit_link_if #(.DATA_W(W), .CRW(1)) b_out ();
   Maxpool_2D #(.DATA_WIDTH(W), .IN_ROWS(2), .IN_COLS(2), .SEG_ROWS(2), .SEG_COLS(2), .STRIDE_ROWS(2), .STRIDE_COLS(2),
-               .PADDING(0), .IS_FP32(1), .EXP_W(0), .MAN_W(7), .AHEAD(2), .OUT_MAX(1), .OUT_CRW(1), .IN_CRW(3)) dut (
+               .PADDING(0), .AHEAD(2), .OUT_MAX(1), .OUT_CRW(1), .IN_CRW(3)) dut (
       .clk(clk), .rst_n(rst_n), .in(s_in), .out(s_out));
   Maxpool_2D #(.DATA_WIDTH(W), .IN_ROWS(3), .IN_COLS(3), .SEG_ROWS(2), .SEG_COLS(2), .STRIDE_ROWS(2), .STRIDE_COLS(2),
-               .PADDING(1), .IS_FP32(1), .EXP_W(0), .MAN_W(7), .OUT_MAX((FAULT == 5) ? 2 : 4), .OUT_CRW(1), .IN_CRW(4)) dut_b (
+               .PADDING(1), .OUT_MAX((FAULT == 5) ? 2 : 4), .OUT_CRW(1), .IN_CRW(4)) dut_b (
       .clk(clk), .rst_n(rst_n), .in(b_in), .out(b_out));
 
   logic drained = 0;

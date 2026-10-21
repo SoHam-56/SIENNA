@@ -1,10 +1,13 @@
 `timescale 1ns / 1ps
 
-// Maxpool_2D behind a 16-word FIFO2, as sienna_top uses it, in bf16 on credit links with checkers bound: sign-magnitude order, +0/-0 ties keep the first.
+// Maxpool_2D behind a 16-word FIFO2, as sienna_top uses it, in bf16 (FMT=bf16) on credit links with checkers bound: sign-magnitude order, +0/-0 ties keep the first.
 module TB_maxpool_fmt #(
     parameter int FAULT = 0  // 1: puts with no credit, results withheld (a_fifo_room); 3: FIFO2's input link one bit wider; 4: maxpool's output link
 );
-  localparam int EXP_W = 8, MAN_W = 7, W = 16;
+  localparam int W = 16;
+  if (!(sienna_fmt_pkg::DATA_WIDTH == 16 && sienna_fmt_pkg::EXPONENT_WIDTH == 8)) begin : G_BAD_FORMAT  // the bench's vectors are bf16 words
+    $fatal(1, "TB_maxpool_fmt: build with FMT=bf16 (+define+FMT_BF16), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
   localparam int OUT_SLOTS = 2;  // results the TB takes ahead; maxpool reserves one per window it grants
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
@@ -14,7 +17,7 @@ module TB_maxpool_fmt #(
   credit_link_if #(.DATA_W(W + ((FAULT == 4) ? 1 : 0)), .CRW(1)) out_l ();  // maxpool -> TB
   fwft #(.DATA_WIDTH(W), .FIFO_DEPTH(16), .OUT_MAX(8), .OUT_CRW(3)) fifo (.clk_i(clk), .rstn_i(rst_n), .in(in_l), .out(mid), .count_o());
   Maxpool_2D #(.DATA_WIDTH(W), .IN_ROWS(2), .IN_COLS(2), .SEG_ROWS(2), .SEG_COLS(2), .STRIDE_ROWS(2), .STRIDE_COLS(2),
-               .PADDING(0), .IS_FP32(1), .EXP_W(EXP_W), .MAN_W(MAN_W), .AHEAD(2), .OUT_MAX(4), .OUT_CRW(1), .IN_CRW(3)) dut (
+               .PADDING(0), .AHEAD(2), .OUT_MAX(4), .OUT_CRW(1), .IN_CRW(3)) dut (
       .clk(clk), .rst_n(rst_n), .in(mid), .out(out_l));
 
   // Producer side of FIFO2's link, consumer side of maxpool's; every link signal changes on the falling edge.

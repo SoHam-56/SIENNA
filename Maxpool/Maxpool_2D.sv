@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 module Maxpool_2D #(
-    parameter     DATA_WIDTH  = 32,
+    parameter     DATA_WIDTH  = sienna_fmt_pkg::DATA_WIDTH,  // the build's words; the compare and the floor are the define's
     parameter     IN_ROWS     = 5,
     parameter     IN_COLS     = 5,
     parameter     SEG_ROWS    = 2,
@@ -9,9 +9,6 @@ module Maxpool_2D #(
     parameter     STRIDE_ROWS = 2,
     parameter     STRIDE_COLS = 2,
     parameter     PADDING     = 1,
-    parameter bit IS_FP32     = 1,   // float sign-magnitude compare given EXP_W > 0; EXP_W = 0 (int8) always compares signed integers
-    parameter int EXP_W       = 8,
-    parameter int MAN_W       = 23,
     parameter int AHEAD       = 2,   // streaming: windows whose input credits are granted before their results are out
     parameter int OUT_MAX     = 64,  // the most output credits the downstream consumer may grant
     parameter int OUT_CRW     = 1,   // out.credit width
@@ -41,9 +38,7 @@ module Maxpool_2D #(
 
   state_t state, next_state;
 
-  localparam bit FLOAT = IS_FP32 && (EXP_W > 0) && (DATA_WIDTH == 1 + EXP_W + MAN_W);  // EXP_W = 0 is int8
-  localparam logic [DATA_WIDTH-1:0] FLOOR = FLOAT ? DATA_WIDTH'({DATA_WIDTH{1'b1}} << MAN_W)  // -infinity: sign and exponent all ones
-                                                  : {1'b1, {(DATA_WIDTH - 1) {1'b0}}};  // most negative integer, -128 in int8
+  localparam logic [DATA_WIDTH-1:0] FLOOR = sienna_fmt_pkg::LOWEST_VALUE;  // the format's lowest value: -infinity in floats, -128 in int8
 
   logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
   logic [$clog2(IN_SIZE+1)-1:0] input_count;
@@ -56,19 +51,9 @@ module Maxpool_2D #(
   logic [$clog2(OUT_ROWS+1)-1:0] out_r;
   logic [$clog2(OUT_COLS+1)-1:0] out_c;
 
-  // ---------------------------------------------------------
-  // Float (sign-magnitude) or signed-integer compare
-  // ---------------------------------------------------------
-  function automatic logic is_greater(input logic [DATA_WIDTH-1:0] a,
-                                      input logic [DATA_WIDTH-1:0] b);
-    if (FLOAT) begin
-      if ((a[DATA_WIDTH-2:0] == 0) && (b[DATA_WIDTH-2:0] == 0)) return 1'b0;
-      if (a[DATA_WIDTH-1] != b[DATA_WIDTH-1]) return !a[DATA_WIDTH-1];
-      if (!a[DATA_WIDTH-1]) return a[DATA_WIDTH-2:0] > b[DATA_WIDTH-2:0];
-      return a[DATA_WIDTH-2:0] < b[DATA_WIDTH-2:0];
-    end else begin
-      return $signed(a) > $signed(b);
-    end
+  // a > b in the build's format: the package's compare (floats sign-magnitude with +0 equal to -0, int8 signed codes)
+  function automatic logic is_greater(input logic [DATA_WIDTH-1:0] a, input logic [DATA_WIDTH-1:0] b);
+    return sienna_fmt_pkg::fmt_greater_than(a, b);
   endfunction
 
   // Links: elements arrive on in, results leave on out; an input is granted only with output credits reserved for all its results.
@@ -82,6 +67,9 @@ module Maxpool_2D #(
   assign out.put  = out_valid;
   assign out.data = out_data;
 
+  if (DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH) begin : G_BAD_DATA_WIDTH  // the package's compare and floor are at its width
+    $fatal(1, "Maxpool_2D: DATA_WIDTH %0d, but the build's words are %0d bits", DATA_WIDTH, sienna_fmt_pkg::DATA_WIDTH);
+  end
   if (OUT_MAX < OUT_SIZE || AHEAD < 1) begin : G_BAD_OUT_MAX
     $fatal(1, "Maxpool_2D: OUT_MAX %0d is below the %0d results of one input (or AHEAD %0d < 1), so no input could be granted", OUT_MAX,
            OUT_SIZE, AHEAD);

@@ -832,7 +832,7 @@ module TB_sienna_top #(
       assign tr_addr[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_addr_agg[ti*TR_TPD+tj];
       assign tr_word[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj];
       if (EXP_W == 8 && MAN_W == 7) begin : G_BF16  // bf16: the fp32 sum going into the reducer's fpNarrow
-        assign tr_sum[ti*TR_TPD+tj] = dut.systolic_array_inst.ROW[ti].COL[tj].acc_unit.G_NARROW.NARROW.x_i;
+        assign tr_sum[ti*TR_TPD+tj] = dut.systolic_array_inst.ROW[ti].COL[tj].acc_unit.G_NARROW.NARROW.fp32_i;
       end else begin : G_SAME  // fp32 and int8 write the sum itself
         assign tr_sum[ti*TR_TPD+tj] = ACC_W'(dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj]);
       end

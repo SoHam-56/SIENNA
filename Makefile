@@ -101,7 +101,15 @@ SM_LIB_FILES = \
 	Converters/FPNarrow/src/fpNarrow.sv \
 	Multipliers/Fx/src/fxMac.sv \
 	Requantizer/src/int8Requantizer.sv \
-	QuantizedAdder/src/int8QuantizedAdder.sv
+	QuantizedAdder/src/int8QuantizedAdder.sv \
+	Fmt/src/fmt_mul.sv \
+	Fmt/src/fmt_add.sv \
+	Multipliers/BF16/src/bf16Multiplier.sv \
+	Multipliers/BF16Wide/src/bf16WideMultiplier.sv \
+	Multipliers/Int8/src/int8Multiplier.sv \
+	Adders/BF16/src/bf16Adder.sv \
+	Adders/Int32/src/int32Adder.sv \
+	Converters/FP32ToBF16/src/fp32ToBf16.sv
 
 # gpnae_poly's lane only: the published gpnae.sv and its InputFIFO / SeLu / sigtan build in GPNAE's own Makefile.
 GPNAE_FILES = \
@@ -235,6 +243,10 @@ VERILATOR_FLAGS = \
 	--Wno-TIMESCALEMOD \
 	--Wno-UNSIGNED
 
+# The build's precision define, which sienna_fmt_pkg's map and the mesh's math modules read.
+FMT_DEF = +define+FMT_$(shell echo $(FMT) | tr a-z A-Z)
+VERILATOR_FLAGS += $(FMT_DEF)
+
 # Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK; SIM_ARGS go to the simulator (e.g. +verilator+rand+reset+2)
 VERILATOR_FLAGS += $(EXTRA_FLAGS)
 ifneq ($(LINK_STAGES),0)
@@ -260,7 +272,8 @@ VCS_FLAGS = \
 	+incdir+$(GPNAE_DIR) \
 	+incdir+$(MAXPOOL_DIR) \
 	+incdir+$(DROPOUT_DIR) \
-	+define+VCS
+	+define+VCS \
+	$(FMT_DEF)
 
 ifeq ($(TRACE),vcd)
 VCS_FLAGS += -debug_all +define+ENABLE_TRACE

@@ -8,7 +8,7 @@ import test_config_pkg::*;
 // as the layer grants credits, and writes every result taken from the output links (L9) to +out=<file>.
 // Layer file: "L m kb n residual bias act train seed a_rows w_rows packed", then a_rows and w_rows rows of N hex words.
 // packed: a "P sh m0 .. m(N/2-1)" line and seven "E act zp min max mx shx mout shout zout" lines after L (and Q).
-// int8 (IS_INT): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
+// Requantizing builds (int8): a "Q zp min max mx shx mout shout zout" line after it; after the rows, per column block N biases, N multipliers, N shifts (hex).
 // int8 residual: an "A zp2 m1 m2 shift zpo amin amax" line after Q (zp1 is Q's zp).
 // int8 +dump=<file>: per stage "X k e code" (activation input), "R k e code" (hold beat), "Q k e q1 q2 y" (ADD); k the set in issue order, e its tile element.
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
@@ -20,7 +20,7 @@ module TB_model_run #(
     parameter int FAULT       = 0,
     parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
 );
-  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
   localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
   localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
@@ -210,11 +210,11 @@ module TB_model_run #(
   longint first_hold = -1;  // cycles from t0 to the first hold set's last beat into hold_mem
   always @(posedge clk_i)
     if (meas_clr) first_hold <= -1;
-    else if (IS_INT != 0 && streaming && dut.G_LAYER.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
+    else if (sienna_fmt_pkg::HAS_RESIDUAL_ADD && streaming && dut.G_LAYER.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
   longint first_free = -1;  // cycles from t0 to the first cycle after first_hold with hold_mem read out: the first hold window has closed
   always @(posedge clk_i)
     if (meas_clr) first_free <= -1;
-    else if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.G_LAYER.pipe.hm_any) first_free <= cycle - t0;
+    else if (sienna_fmt_pkg::HAS_RESIDUAL_ADD && streaming && first_hold >= 0 && first_free < 0 && !dut.G_LAYER.pipe.hm_any) first_free <= cycle - t0;
   int hb_wr = 0, hb_rd = 0;  // this pass's hold beats written into and read from hold_mem
   always @(posedge clk_i)
     if (meas_clr) {hb_wr, hb_rd} <= '0;
@@ -262,7 +262,7 @@ module TB_model_run #(
         h_i.delete();
         a_q1.delete();
         a_q2.delete();
-      end else if (IS_INT != 0 && dump_fd != 0) begin
+      end else if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && dump_fd != 0) begin
         if (sd_hacc) tr_k[int'(sd_hid)] = put_seq++;
         if (sd_gacc) beat[int'(sd_gnid)] = 0;
         if (sd_rd) begin  // a beat leaves the mesh into requantize
@@ -342,7 +342,7 @@ module TB_model_run #(
   int ei = 0;
   always_ff @(posedge clk_i)
     if (!rstn_i) ei <= 0;
-    else if (IS_INT && dut.G_LAYER.sched.wl_take_bias) ei <= ei + 1;
+    else if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && dut.G_LAYER.sched.wl_take_bias) ei <= ei + 1;
 
   // Output of any kind while the mid-stream reset's home check watches is stray.
   bit mid_check = 0;
@@ -467,7 +467,7 @@ module TB_model_run #(
       $finish;
     end
     {qzp, qmin, qmax, qmx, qshx, qmout, qshout, qzout} = '0;  // fp32 and bf16 keep every int8 input at 0
-    if (IS_INT) begin
+    if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin
       rc = $fscanf(fin, "%s %d %d %d %d %d %d %d %d", kind, qzp, qmin, qmax, qmx, qshx, qmout, qshout, qzout);
       if (rc != 9 || kind != "Q") begin
         $display("[FATAL] %s: an int8 layer file needs its Q line", layer_f);
@@ -475,7 +475,7 @@ module TB_model_run #(
       end
     end
     {azp2, am1, am2, ash, azpo, aamin, aamax} = '0;
-    if (IS_INT != 0 && res != 0) begin
+    if (sienna_fmt_pkg::HAS_RESIDUAL_ADD && res != 0) begin
       rc = $fscanf(fin, "%s %d %d %d %d %d %d %d", kind, azp2, am1, am2, ash, azpo, aamin, aamax);
       if (rc != 8 || kind != "A") begin
         $display("[FATAL] %s: an int8 residual layer file needs its A line", layer_f);
@@ -519,13 +519,13 @@ module TB_model_run #(
       if (i < na * N) a_rows.push_back(v);
       else w_rows.push_back(v);
     end
-    ne = IS_INT ? (n + N - 1) / N : 0;  // one epilogue per column block
+    ne = sienna_fmt_pkg::HAS_REQUANT_EPILOGUE ? (n + N - 1) / N : 0;  // one epilogue per column block
     for (int i = 0; i < ne * 3 * N; i++) begin
       rc = $fscanf(fin, "%h", w32);
       ep.push_back(w32);
     end
     $fclose(fin);
-    if (IS_INT != 0 && $value$plusargs("dump=%s", dump_f)) begin
+    if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && $value$plusargs("dump=%s", dump_f)) begin
       dump_fd = $fopen(dump_f, "w");
       if (dump_fd == 0) $fatal(1, "TB_model_run: cannot open %s", dump_f);
     end
@@ -601,7 +601,7 @@ module TB_model_run #(
         end
         $display("  [Reset] mid-stream, %0d cycles into the layer: %0d/%0d A rows, %0d/%0d W rows, %0d sets done, A %0d and W %0d credits held",
                  cycle - t0, ai, na, wi, nw, bounds.size(), a_cnt, w_cnt);
-        if (IS_INT != 0)
+        if (sienna_fmt_pkg::HAS_RESIDUAL_ADD)
           $display("[RES] reset %0d cycles into the layer, %0s the hold window, %0d of %0d hold beats unread", cycle - t0,
                    dut.G_LAYER.pipe.hm_any ? "inside" : "outside", hb_wr - hb_rd, PER_LANE);
         if (hold_check != 0 && !dut.G_LAYER.pipe.hm_any) begin

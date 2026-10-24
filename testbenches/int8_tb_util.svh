@@ -37,10 +37,10 @@
     end
   endtask
 
-  // int8: set k's requantize and GPNAE parameters from requant_<k>.mem; nothing in other formats.
+  // Requantizing builds (int8): set k's requantize and GPNAE parameters from requant_<k>.mem; nothing in others.
   task automatic apply_requant(input int k);
     logic [31:0] q[$];
-    if (!IS_INT) return;
+    if (!sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) return;
     read_word_file($sformatf("requant_%0d.mem", k), q);
     if (q.size() != 8 + 2 * N) begin
       $display("[FATAL] requant_%0d.mem holds %0d words, expected %0d", k, q.size(), 8 + 2 * N);

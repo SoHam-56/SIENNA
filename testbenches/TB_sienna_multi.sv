@@ -16,7 +16,7 @@ module TB_sienna_multi #(
     parameter int COLLAPSE_K  = 1,
     parameter int LINK_STAGES = 0  // each copy's register stages on L0, L1, L3 and L9
 );
-  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
   localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
   localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
@@ -317,7 +317,7 @@ module TB_sienna_multi #(
     if (HAS_BIAS != 0) begin  // this TB streams no accumulate groups: every set carries its own bias
       logic [31:0] bw[$];
       read_word_file($sformatf("bias_%0d.mem", k), bw);
-      for (int j = 0; j < N; j++) bias_i[j] = IS_INT ? ACC_DATA_WIDTH'(bw[j]) : (ACC_DATA_WIDTH'(bw[j]) << (ACC_DATA_WIDTH - DATA_WIDTH));
+      for (int j = 0; j < N; j++) bias_i[j] = !(sienna_fmt_pkg::BIAS_DATA_WIDTH == sienna_fmt_pkg::DATA_WIDTH) ? ACC_DATA_WIDTH'(bw[j]) : (ACC_DATA_WIDTH'(bw[j]) << (ACC_DATA_WIDTH - DATA_WIDTH));
     end
     apply_requant(k);
     side               = '0;

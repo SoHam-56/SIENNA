@@ -4167,6 +4167,22 @@ def test_parse_time_rejections():
 
 
 @selftest
+def test_default_point():
+    pts = reg.SPEC.points(True, ["fp32"])
+    assert reg.DEFAULT_POINT in pts and reg.DEFAULT_POINT not in reg.SPEC.points(True, ["bf16", "int8"]), pts[:6]
+    argv = reg.SPEC.argv(reg.DEFAULT_POINT, argparse.Namespace())
+    assert argv[:3] == ["make", "pipeline", "FMT=fp32"] and argv[-1] == "FMT_DEF=" and "FMT_DEF=" not in reg.SPEC.argv(reg.DEFAULT_TWIN, argparse.Namespace())
+    r = make_n("lint", "GEN_PKG=0", "FMT_DEF=")
+    assert r.returncode == 0 and "+define+FMT_" not in r.stdout and "+define+FMT_FP32" in make_n("lint", "GEN_PKG=0").stdout, r.stdout[-300:]
+    log = "  Passed : 4 / 4\n  Sanity Clean\npipeline_complete_o asserted @ 100  (311 cycles)\n  Exact     : 512\n"
+    assert reg.compared_lines("# command: x\n" + log) == reg.compared_lines(log) and len(reg.compared_lines(log)) == 3
+    assert reg.twin_verdict(log, "# other host\n" + log) == "PASS"
+    assert reg.twin_verdict(log.replace("311", "312"), log).startswith("FAIL (differs from fp32/N8_T2/pipeline at result line 2")
+    assert reg.twin_verdict(log, log.replace("512", "511")).startswith("FAIL (differs")
+    assert reg.SPEC.verdict(reg.DEFAULT_POINT, "nothing\n", 0).startswith("FAIL"), "a failing pipeline verdict decides first"
+
+
+@selftest
 def test_pack_target():
     r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
     assert r.returncode == 0 and r.stdout.split() == "py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
@@ -5637,6 +5653,28 @@ LAYER_CK0 = KINDS[-4:-1]  # the layer contract's kinds on the collapse-k 0 mesh,
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected
+DEFAULT_POINT = "default/N8_T2/pipeline"  # fp32's N8_T2 pipeline built with no precision define (FMT_DEF=): words and cycles must equal fp32's
+DEFAULT_TWIN = "fp32/N8_T2/pipeline"
+COMPARED = re.compile(r"cycles|^\s*(Total|Exact|Tol pass|Failed|Passed)\s*:|TRUTH:|stall|RESULT:")  # the lines whose words and cycles a twin must repeat
+
+
+def twin_verdict(text: str, twin_text: str) -> str:
+    """PASS when the default point's result lines equal its twin's, else the first line that differs."""
+    a, b = compared_lines(text), compared_lines(twin_text)
+    if a == b:
+        return "PASS"
+    d = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    return f"FAIL (differs from {DEFAULT_TWIN} at result line {d + 1}: {(a[d:d+1] or ['<none>'])[0][:60]!r} against {(b[d:d+1] or ['<none>'])[0][:60]!r})"
+
+
+def compared_lines(text: str) -> list:
+    """A pipeline point's result lines (counts, cycles, verdicts) without its command, host and paths: what the default point and its twin must share."""
+    out = []
+    for ln in regress.ANSI.sub("", text).splitlines():
+        if ln.startswith("#") or not COMPARED.search(ln):
+            continue
+        out.append(re.sub(r"/tmp/\S+|\d+(\.\d+)? s\b", "<run>", ln).rstrip())
+    return out
 
 
 def reg_lanes(n: int) -> int:
@@ -5650,10 +5688,12 @@ class SiennaSpec(regress.Spec):
     sized = True
     drop = ("GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES")
 
+    results_dir = None  # the --results a point or summary run names; the default point reads its twin's log there
+
     def points(self, small, formats):
         if not formats:
             return []
-        return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
+        return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + ([DEFAULT_POINT] if "fp32" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
                                for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)]
 
     @staticmethod
@@ -5667,6 +5707,8 @@ class SiennaSpec(regress.Spec):
     def parse(self, name):
         if name == "selftest" or name in UNIT_POINTS:
             return {"n": 0, "kind": name}
+        if name == DEFAULT_POINT:
+            return {"fmt": "fp32", "n": 8, "tile": 2, "lanes": reg_lanes(8), "kind": "pipeline", "ck": 1, "b2b": False, "no_define": True}
         m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z0-9-]+)", name)
         if not m or m.group(1) not in FORMATS or m.group(4) not in KINDS:
             raise ValueError(f"{name}: points are selftest, {', '.join(UNIT_POINTS)} and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
@@ -5692,9 +5734,20 @@ class SiennaSpec(regress.Spec):
         k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"].removesuffix("-ck0")
         mk = ["make", k, f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
         return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(k, []) \
-            + (["COLLAPSE_K=0"] if p["ck"] == 0 else []) + (["EXTRA_FLAGS=-DBACK_TO_BACK"] if p["b2b"] else [])
+            + (["COLLAPSE_K=0"] if p["ck"] == 0 else []) + (["EXTRA_FLAGS=-DBACK_TO_BACK"] if p["b2b"] else []) \
+            + (["FMT_DEF="] if p.get("no_define") else [])
 
     def verdict(self, name, text, rc):
+        if name == DEFAULT_POINT:  # fp32's verdict, built with no define, and the same results as fp32's own point
+            v = self.verdict(DEFAULT_TWIN, text, rc)
+            if v != "PASS":
+                return v
+            if re.search(r"verilator --binary.*\+define\+FMT_", regress.ANSI.sub("", text)):
+                return "FAIL (the build named a precision define)"
+            twin = os.path.join(self.results_dir or self.results, DEFAULT_TWIN + ".log")
+            if not os.path.exists(twin):
+                return f"FAIL (no {DEFAULT_TWIN} result to compare with in {os.path.dirname(os.path.dirname(os.path.dirname(twin)))})"
+            return twin_verdict(text, open(twin, errors="replace").read())
         k = self.parse(name)["kind"]
         k = k if k in PIPELINE_KINDS else k.removesuffix("-ck0")  # a LAYER_CK0 point is judged as its base kind
         v = regress.common_verdict(text, rc)
@@ -5762,6 +5815,8 @@ class SiennaSpec(regress.Spec):
 
 
 SPEC = SiennaSpec(ROOT, os.path.join(ROOT, "testbenches", "results", "regression"))
+if "--results" in sys.argv[:-1]:  # point and summary runs: where the default point's twin is
+    SPEC.results_dir = os.path.abspath(sys.argv[sys.argv.index("--results") + 1])
 
 
 MAINS = {"pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,

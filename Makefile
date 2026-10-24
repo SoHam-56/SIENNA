@@ -74,12 +74,12 @@ PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 TOP_FILES = \
 	sienna_add_pkg.sv \
 	sienna_top.sv \
+	sienna_sched.sv \
+	sienna_pipe.sv \
 	gpnae_lane.sv \
 	requant_lanes.sv \
 	add_lanes.sv \
-	fwft.sv \
-	sienna_multi.sv \
-	sienna_layer.sv
+	fwft.sv
 
 SM_FILES = \
 	top/SystolicMesh.sv \

@@ -46,5 +46,6 @@ src/fwft.sv
 src/gpnae_lane.sv
 src/requant_lanes.sv
 src/add_lanes.sv
+src/sienna_pipe.sv
+src/sienna_sched.sv
 src/sienna_top.sv
-src/sienna_layer.sv

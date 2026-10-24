@@ -4,7 +4,7 @@ import test_config_pkg::*;
 
 `include "tb_l9_sink.svh"
 
-// Streams NUM_SETS distinct sets through sienna_multi, checks every set against its golden output, and measures throughput.
+// Streams NUM_SETS distinct sets through sienna_top at COPIES copies (SET_PORT = 1), checks every set against its golden output, and measures throughput.
 // The host is the producer of every copy's L0 link and of both cache regions (L2), and the consumer of every copy's L9 links.
 // +cached: sets go in fills of each region's cache (COPIES to COPIES+2 sets, B from the cache, each copy's last set of a fill marked), an uncached set after every second fill.
 // +out_slots=S (1..64) and +out_stall_pct=P on L9; +fault=1 a fill of one set, 2 a copy's first set of a fill marked, 3 a put to a copy whose turn it is not,
@@ -16,6 +16,10 @@ module TB_sienna_multi #(
     parameter int COLLAPSE_K  = 1,
     parameter int LINK_STAGES = 0  // each copy's register stages on L0, L1, L3 and L9
 );
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
+  localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
+  localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int TIMEOUT_CYCLES = 400_000;
   localparam int WAIT_CYCLES = 20_000;  // a credit this long in coming is a hang
@@ -28,15 +32,18 @@ module TB_sienna_multi #(
   localparam int OUT_CAP = 64;  // sienna_top's OUT_MAX
   localparam int SW = $clog2(COPIES + 1);
   `include "sienna_set_side.svh"
+  // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
+  credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
+  for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
+    assign idle_rows[r].put  = 1'b0;
+    assign idle_rows[r].data = '0;
+  end
 
   logic clk_i = 0, rstn_i = 0;
   always #5 clk_i = ~clk_i;
   logic por_n = 0;  // the power-on reset only: TB_STALE_HOME's copy 0 staging counter ignores the mid-stream reset
 
-  logic [N-1:0][ACC_W-1:0] bias_i = '0;  // int32 in int8; fp32 bits in floats, the bias row widened exactly
-  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
-    $fatal(1, "TB_sienna_multi: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
-  end
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_i = '0;  // int32 in int8; fp32 bits in floats, the bias row widened exactly
   logic [N-1:0][23:0] req_mult_i = '0;  // int8 (D-2)
   logic [N-1:0][5:0] req_shift_i = '0;
   logic [7:0] req_zp_i = '0, req_min_i = '0, req_max_i = '0, gp_zout_i = '0;
@@ -96,7 +103,8 @@ module TB_sienna_multi #(
                                                                 .home_o(lane_home[i]));
   end
 
-  sienna_multi #(
+  sienna_top #(
+      .SET_PORT         (1),  // the set contract, COPIES pipelines in turn
       .COPIES           (COPIES),
       .NUM_LANES        (NUM_LANES),
       .N                (N),
@@ -122,6 +130,50 @@ module TB_sienna_multi #(
   ) dut (
       .clk_i               (clk_i),
       .rstn_i              (rstn_i),
+      // The layer contract, unused at SET_PORT = 1: tied off
+      .cfg_load_i          (1'b0),
+      .cfg_m_i             ('0),
+      .cfg_kb_i            ('0),
+      .cfg_n_i             ('0),
+      .cfg_residual_i      (1'b0),
+      .cfg_bias_i          (1'b0),
+      .cfg_act_i           ('0),
+      .cfg_train_i         (1'b0),
+      .cfg_seed_i          ('0),
+      .cfg_req_zp_i        ('0),
+      .cfg_req_min_i       ('0),
+      .cfg_req_max_i       ('0),
+      .cfg_gp_mx_i         ('0),
+      .cfg_gp_shx_i        ('0),
+      .cfg_gp_mout_i       ('0),
+      .cfg_gp_shout_i      ('0),
+      .cfg_gp_zout_i       ('0),
+      .cfg_add_zp2_i       ('0),
+      .cfg_add_m1_i        ('0),
+      .cfg_add_m2_i        ('0),
+      .cfg_add_shift_i     ('0),
+      .cfg_add_zpo_i       ('0),
+      .cfg_add_amin_i      ('0),
+      .cfg_add_amax_i      ('0),
+      .cfg_pack_shift_i    ('0),
+      .cfg_pack_map_i      ('0),
+      .cfg_pack_act_i      ('0),
+      .cfg_pack_zp_i       ('0),
+      .cfg_pack_min_i      ('0),
+      .cfg_pack_max_i      ('0),
+      .cfg_pack_mx_i       ('0),
+      .cfg_pack_shx_i      ('0),
+      .cfg_pack_mout_i     ('0),
+      .cfg_pack_shout_i    ('0),
+      .cfg_pack_zout_i     ('0),
+      .busy_o              (),
+      .done_o              (),
+      .a_rows              (idle_rows[0]),
+      .w_rows              (idle_rows[1]),
+      .w_bias_i            ('0),
+      .w_req_mult_i        ('0),
+      .w_req_shift_i       ('0),
+      .set_done_o          (),
       .host                (host),
       .bias_i              (bias_i),
       .wc_region           (wc_region),
@@ -137,7 +189,11 @@ module TB_sienna_multi #(
       .copy_sel_o          (copy_sel_o),
       .out                 (out_lnk),
       .pipeline_complete_o (pipeline_complete_o),
-      .done_set_id_o       (done_set_id_o)
+      .done_set_id_o       (done_set_id_o),
+      .systolic_busy_o     (),
+      .gpnae_busy_o        (),
+      .maxpool_busy_o      (),
+      .dropout_busy_o      ()
   );
 
   function automatic real f32(input logic [31:0] b);
@@ -281,7 +337,7 @@ module TB_sienna_multi #(
     if (HAS_BIAS != 0) begin  // this TB streams no accumulate groups: every set carries its own bias
       logic [31:0] bw[$];
       read_word_file($sformatf("bias_%0d.mem", k), bw);
-      for (int j = 0; j < N; j++) bias_i[j] = IS_INT ? ACC_W'(bw[j]) : sienna_fmt_pkg::widen(bw[j], MAN_W);
+      for (int j = 0; j < N; j++) bias_i[j] = IS_INT ? ACC_DATA_WIDTH'(bw[j]) : (ACC_DATA_WIDTH'(bw[j]) << (ACC_DATA_WIDTH - DATA_WIDTH));
     end
     apply_requant(k);
     side               = '0;
@@ -373,11 +429,11 @@ module TB_sienna_multi #(
       if (ov != '0 || pipeline_complete_o != '0) stray++;
     end
     begin
-      automatic bit home = (lane_home == '1) && wcnt[0] && wcnt[1] && copy_sel_o == '0 && dut.wc_got[0] == '0 && dut.wc_got[1] == '0 && stray == 0;
+      automatic bit home = (lane_home == '1) && wcnt[0] && wcnt[1] && copy_sel_o == '0 && dut.G_SET.G_MULTI.wc_got[0] == '0 && dut.G_SET.G_MULTI.wc_got[1] == '0 && stray == 0;
       for (int c = 0; c < COPIES; c++) if (hcnt[c] != 2'd2) home = 0;
       if (!home) begin
         $display("[FAIL] not home after the mid-stream reset: copy 0 staging %0d (2), copy %0d staging %0d (2), regions %0d %0d (1 1), turn %0d (0), region returns %b %b (0 0), lanes home %0d of %0d, %0d stray output cycles",
-                 hcnt[0], COPIES - 1, hcnt[COPIES-1], wcnt[0], wcnt[1], copy_sel_o, dut.wc_got[0], dut.wc_got[1], $countones(lane_home), NL,
+                 hcnt[0], COPIES - 1, hcnt[COPIES-1], wcnt[0], wcnt[1], copy_sel_o, dut.G_SET.G_MULTI.wc_got[0], dut.G_SET.G_MULTI.wc_got[1], $countones(lane_home), NL,
                  stray);
         $display("RESULT: FAILED");
         $finish;

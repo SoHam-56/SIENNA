@@ -8,6 +8,10 @@ import test_config_pkg::*;
 // int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
 // +out_slots=S (1..64) L9 slots per lane and +out_stall_pct=P random output stalls (-DTB_OUT_STALL_PCT sets the default); +fault_put puts with no credit once.
 module TB_sienna_model;
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
+  localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
+  localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
 
   localparam ADDR_LINES = $clog2(FIFO_DEPTH);
   localparam int STALL_CYCLES = 50_000;  // this long with no completion is a hang
@@ -19,10 +23,7 @@ module TB_sienna_model;
   logic                     training_mode_i;
   logic                     accumulate_i;
   logic                     bias_valid_i;
-  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
-  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
-    $fatal(1, "TB_sienna_model: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
-  end
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
   logic [N-1:0][23:0] req_mult_i;
   logic [N-1:0][5:0]  req_shift_i;
@@ -42,11 +43,17 @@ module TB_sienna_model;
   // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
   localparam int PACK_ENTRIES = 8;
   `include "sienna_set_side.svh"
-  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk ();
+  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
+  // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
+  credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
+  for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
+    assign idle_rows[r].put  = 1'b0;
+    assign idle_rows[r].data = '0;
+  end
   credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
   logic [1:0] host_cnt;
   set_side_t side;
-  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
+  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk[0].put), .credit_i(host_lnk[0].credit),
                                               .has_credit_o(), .count_o(host_cnt));
   always_comb begin
     side               = '0;
@@ -72,9 +79,9 @@ module TB_sienna_model;
   logic drain_chk = 1'b0;
   bit fault_put = 0;
   longint cycle = 0;
-  assign host_lnk.put = start_pipeline_i;
-  assign host_lnk.data = side;
-  credit_link_checker #(.SLOTS(2)) host_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk), .lnk(host_lnk));
+  assign host_lnk[0].put = start_pipeline_i;
+  assign host_lnk[0].data = side;
+  credit_link_checker #(.SLOTS(2)) host_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drain_chk), .lnk(host_lnk[0]));
   always @(negedge clk_i)  // just before the edge that samples the put, so it reports ahead of the DUT's own checks
     #4 if (rstn_i && start_pipeline_i && host_cnt == 0) begin
       $display("[FATAL] a host put with no staging credit held at cycle %0d", cycle);
@@ -121,6 +128,7 @@ module TB_sienna_model;
   end
 
   sienna_top #(
+      .SET_PORT         (1),  // the set contract: this bench is the host on L0
       .NUM_LANES        (NUM_LANES),
       .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
       .N                (N),
@@ -141,6 +149,50 @@ module TB_sienna_model;
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
+      // The layer contract, unused at SET_PORT = 1: tied off
+      .cfg_load_i          (1'b0),
+      .cfg_m_i             ('0),
+      .cfg_kb_i            ('0),
+      .cfg_n_i             ('0),
+      .cfg_residual_i      (1'b0),
+      .cfg_bias_i          (1'b0),
+      .cfg_act_i           ('0),
+      .cfg_train_i         (1'b0),
+      .cfg_seed_i          ('0),
+      .cfg_req_zp_i        ('0),
+      .cfg_req_min_i       ('0),
+      .cfg_req_max_i       ('0),
+      .cfg_gp_mx_i         ('0),
+      .cfg_gp_shx_i        ('0),
+      .cfg_gp_mout_i       ('0),
+      .cfg_gp_shout_i      ('0),
+      .cfg_gp_zout_i       ('0),
+      .cfg_add_zp2_i       ('0),
+      .cfg_add_m1_i        ('0),
+      .cfg_add_m2_i        ('0),
+      .cfg_add_shift_i     ('0),
+      .cfg_add_zpo_i       ('0),
+      .cfg_add_amin_i      ('0),
+      .cfg_add_amax_i      ('0),
+      .cfg_pack_shift_i    ('0),
+      .cfg_pack_map_i      ('0),
+      .cfg_pack_act_i      ('0),
+      .cfg_pack_zp_i       ('0),
+      .cfg_pack_min_i      ('0),
+      .cfg_pack_max_i      ('0),
+      .cfg_pack_mx_i       ('0),
+      .cfg_pack_shx_i      ('0),
+      .cfg_pack_mout_i     ('0),
+      .cfg_pack_shout_i    ('0),
+      .cfg_pack_zout_i     ('0),
+      .busy_o              (),
+      .done_o              (),
+      .a_rows              (idle_rows[0]),
+      .w_rows              (idle_rows[1]),
+      .w_bias_i            ('0),
+      .w_req_mult_i        ('0),
+      .w_req_shift_i       ('0),
+      .set_done_o          (),
       .host                       (host_lnk),  // unpacked sets: the sideband's pack fields and entries 1.. stay zero
       .bias_i                     (bias_i),
       .wc_region                  (wc_lnk),
@@ -152,6 +204,8 @@ module TB_sienna_model;
       .west_write_enable_i        (west_write_enable_i),
       .west_write_data_i          (west_write_data_i),
       .west_write_reset_i         (west_write_reset_i),
+      .drained_i                  (1'b0),
+      .copy_sel_o                 (),
       .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),
@@ -199,22 +253,22 @@ module TB_sienna_model;
   initial trace_on = $test$plusargs("trace");
   always_ff @(posedge clk_i) begin
     if (trace_on && rstn_i) begin
-      if (dut.host_accept) $display("EV %0d host", cycle);
-      if (dut.systolic_array_inst.set_launch) $display("EV %0d bcast", cycle);
-      if (dut.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("EV %0d feed", cycle);
-      if (dut.systolic_array_inst.arrays_final && !$past(dut.systolic_array_inst.arrays_final)) $display("EV %0d final", cycle);
-      if (dut.systolic_array_inst.reduce_start) $display("EV %0d reduce", cycle);
-      if (dut.systolic_array_inst.set_done) $display("EV %0d written", cycle);
-      if (dut.g_accept) $display("EV %0d act", cycle);
-      if (dut.p_accept || dut.p_null) $display("EV %0d pool", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.host_accept) $display("EV %0d host", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.set_launch) $display("EV %0d bcast", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("EV %0d feed", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.arrays_final && !$past(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.arrays_final)) $display("EV %0d final", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reduce_start) $display("EV %0d reduce", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.set_done) $display("EV %0d written", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.g_accept) $display("EV %0d act", cycle);
+      if (dut.G_SET.G_COPY[0].pipe.p_accept || dut.G_SET.G_COPY[0].pipe.p_null) $display("EV %0d pool", cycle);
       if (pipeline_complete_o) $display("EV %0d done", cycle);
-      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, !dut.entry_full, dut.l1_cnt > dut.l0_out);
-      if (dut.systolic_array_inst.arrays_final && !dut.systolic_array_inst.reduce_start)
-        $display("EV %0d blocked red%0d bank%0d", cycle, dut.systolic_array_inst.reducers_ready,
-                 dut.systolic_array_inst.out_state[dut.systolic_array_inst.out_wr]);
-      if (dut.systolic_array_inst.in_full[dut.systolic_array_inst.in_rd] && !dut.systolic_array_inst.set_launch &&
-          dut.systolic_array_inst.bstate == 0)
-        $display("EV %0d bwait ready%0d", cycle, dut.systolic_array_inst.arrays_load_ready);
+      if (!pipeline_ready_o) $display("EV %0d notready c%0d m%0d", cycle, !dut.G_SET.G_COPY[0].pipe.entry_full, dut.G_SET.G_COPY[0].pipe.l1_cnt > dut.G_SET.G_COPY[0].pipe.l0_out);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.arrays_final && !dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reduce_start)
+        $display("EV %0d blocked red%0d bank%0d", cycle, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reducers_ready,
+                 dut.G_SET.G_COPY[0].pipe.systolic_array_inst.out_state[dut.G_SET.G_COPY[0].pipe.systolic_array_inst.out_wr]);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.in_full[dut.G_SET.G_COPY[0].pipe.systolic_array_inst.in_rd] && !dut.G_SET.G_COPY[0].pipe.systolic_array_inst.set_launch &&
+          dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bstate == 0)
+        $display("EV %0d bwait ready%0d", cycle, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.arrays_load_ready);
     end
   end
 
@@ -352,7 +406,7 @@ module TB_sienna_model;
       if (has_bias != 0)
         for (int c = 0; c < N; c++) begin
           rc = $fscanf(fin, "%h", w32);
-          bias_i[c] = IS_INT ? ACC_W'(w32) : sienna_fmt_pkg::widen(w32, MAN_W);
+          bias_i[c] = IS_INT ? ACC_DATA_WIDTH'(w32) : (ACC_DATA_WIDTH'(w32) << (ACC_DATA_WIDTH - DATA_WIDTH));
         end
       if (IS_INT) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
         logic [31:0] q[$];
@@ -409,12 +463,12 @@ module TB_sienna_model;
       $finish;
     end
     // sienna_top's own link checkers judge only when it is drained: it must drain after the last set.
-    for (int w = 0; w < 200 && !dut.drained; w++) @(posedge clk_i);
-    if (!dut.drained) begin
-      $display("[FATAL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.drain_n);
+    for (int w = 0; w < 200 && !dut.G_SET.G_COPY[0].pipe.drained; w++) @(posedge clk_i);
+    if (!dut.G_SET.G_COPY[0].pipe.drained) begin
+      $display("[FATAL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.G_SET.G_COPY[0].pipe.drain_n);
       $finish;
     end
-    $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
+    $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.G_SET.G_COPY[0].pipe.drain_n);
 
     // Sets complete in issue order, so set k's id is k mod 2^ID_W.
     bad_ids = 0;

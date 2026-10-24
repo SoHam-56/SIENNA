@@ -1126,7 +1126,7 @@ def write_sv_package(path: str, items: list) -> None:
 
 def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: int, passes: int, mixed: list,
                   use_bias: bool, drop_seed: int) -> list:
-    """test_config_pkg's items: geometry, the build's format, activation, pooling, dropout and the streamed sets."""
+    """test_config_pkg's items: geometry, activation, pooling, dropout and the streamed sets; the format and its widths are the build's define's."""
     N = cfg.get("n", 16)
     sram_depth = N * N
     return [
@@ -1134,13 +1134,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("TILE_SIZE", cfg.get("tile_size", 4), "int"),
         ("NUM_LANES", cfg.get("lanes", 32), "int"),
         ("HOST_WORDS", cfg.get("host_words", N), "int"),
-        ("EXP_W", FORMATS[fmt][0], "int"),
-        ("MAN_W", FORMATS[fmt][1], "int"),
-        ("DATA_WIDTH", 1 + sum(FORMATS[fmt]), "int"),
-        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),
-        ("IS_INT", int(fmt == "int8"), "int"),
-        ("ACC_W", 32, "int"),  # sums and bias: int32 in int8, fp32 in every float format (sienna_fmt_pkg::acc_w)
-        ("OUT_W", 32 if fmt == "int8" else 1 + sum(FORMATS[fmt]), "int"),  # mesh result words (sienna_fmt_pkg::out_w)
+        ("EXACT_GOLDEN", int(fmt != "fp32"), "int"),  # the bench's golden: bit-exact in narrow formats; widths and the format are the define's
         ("SRAM_DEPTH", sram_depth, "int"),
         ("FIFO_DEPTH", cfg.get("fifo_depth", sram_depth), "int"),
         ("ACTIVATION_CODE", activation_to_code(act_type), "int"),

@@ -260,13 +260,13 @@ def add_lane_params(add: dict, s_out: float, y) -> dict:
 
 
 def int8_residual_exact(A_q, B_q, hw_bias, rq: dict, R_q, add: dict, ra: dict, act: str) -> np.ndarray:
-    """sienna_layer's int8 residual output for one product, bit-exact: the conv's requantize (q1), the ADD with the residual codes R_q, the lane."""
+    """the layer contract's int8 residual output for one product, bit-exact: the conv's requantize (q1), the ADD with the residual codes R_q, the lane."""
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
     return activate_int8(qadd_codes(requantize(acc, rq), R_q, add), act, ra)
 
 
 def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
-    """sienna_layer's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
+    """the layer contract's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
     assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
                for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
@@ -291,7 +291,7 @@ def exact_sum(passes, bias, act: str, N: int, fmt: str, T: int, collapse_k=None)
 
 
 def exact_layer(A, B, bias, act, N, fmt, T=4):
-    """Bit-exact output of sienna_layer for one product in a float format: per output tile, the depth blocks as passes in
+    """Bit-exact output of the layer contract for one product in a float format: per output tile, the depth blocks as passes in
     order (format_layer's order), the bias with the first, then the lane; T is the build's tile size."""
     M, K = A.shape
     C = B.shape[1]
@@ -873,11 +873,11 @@ def tile_job(job, N):
     return groups, (P, C, rt, ct)
 
 
-WC_TILES = 128  # sienna_layer's weight cache; a column block with more than half of it is streamed with its sets
+WC_TILES = 128  # the weight cache (sienna_top's WC_TILES); a column block with more than half of it is streamed with its sets
 
 
 def format_layer(job, N):
-    """The configuration and the two input streams sienna_layer expects for a job, in its fixed order.
+    """The configuration and the two input streams sienna_top's layer contract (sienna_sched) expects for a job, in its fixed order.
 
     Terms whose weight is an identity become the residual input; the rest are one product with their depths side by side.
     A depthwise layer gives each column block only its own channels' depth.
@@ -992,7 +992,7 @@ def unpack(Y: np.ndarray, recipe: list) -> list:
 
 
 def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
-    """Refuses a packed layer sienna_layer cannot run: in silicon (no assertions) it would compute it silently wrong."""
+    """Refuses a packed layer the layer contract cannot run: in silicon (no assertions) it would compute it silently wrong."""
     M, C, rt = shape
     if C != N or cfg["kb"] != N or rt * N != M:
         raise ValueError(f"{tag}: a packed layer is a whole number of row tiles, N columns and N deep")
@@ -1402,9 +1402,9 @@ class RtlLayer:
         N, fmt = self.N, self.fmt_name
         cfg, a, w, (M, C, rt, ct) = format_layer(job, N)
         dt = -(-cfg["kb"] // N)
-        cached = rt > 1 and dt <= WC_TILES // 2  # sienna_layer's rule: a cached block's weight tiles are sent once
+        cached = rt > 1 and dt <= WC_TILES // 2  # sienna_sched's rule: a cached block's weight tiles are sent once
         ab, wb = fmt_bits(a, fmt), fmt_bits(w, fmt)
-        eye = fmt_bits(np.eye(N, dtype=np.float32), fmt)  # the residual pass's B, sienna_layer's ONE on the diagonal
+        eye = fmt_bits(np.eye(N, dtype=np.float32), fmt)  # the residual pass's B, sienna_sched's ONE_VALUE on the diagonal
         Y = np.zeros((rt * N, ct * N), np.int64)
         ai = wi = 0
         for c in range(ct):
@@ -1783,7 +1783,7 @@ def model_main(argv=None):
     ap.add_argument("--no-sim", action="store_true", help="float reference only")
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL, to check the lowering")
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
-                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
+                    help="layer: sienna_top's layer contract (sienna_sched) schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
     ap.add_argument("--fault", default=None, help="TEST ONLY, to prove the gate fails: word:MODEL:LAYER:INDEX[:BIT] (flip a hardware output bit), "
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
@@ -1905,7 +1905,7 @@ def model_main(argv=None):
 
 
 def tflite_main(argv=None):
-    """Runs testbenches/tflite_int8/'s single-layer int8 models (TFLite importer) through sienna_layer in int8, each output gated on the true
+    """Runs testbenches/tflite_int8/'s single-layer int8 models (TFLite importer) through sienna_top's layer contract in int8, each output gated on the true
     function of its exact int32 sum and the layer's real scales; agreement with the interpreter and the bit-exact model is reported, not gated."""
     ap = argparse.ArgumentParser(description=tflite_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="tflite")
@@ -1993,7 +1993,7 @@ def layer_truth(job, got):
 
 
 def tflite_pack_main(argv=None):
-    """Groups of TFLite layers share one packed sienna_layer layer; every model's outputs are gated on the true function, as each alone;
+    """Groups of TFLite layers share one packed layer on the layer contract; every model's outputs are gated on the true function, as each alone;
     agreement with the interpreter is reported."""
     ap = argparse.ArgumentParser(description=tflite_pack_main.__doc__)
     ap.add_argument("--n", type=int, default=32)

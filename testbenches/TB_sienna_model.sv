@@ -8,7 +8,7 @@ import test_config_pkg::*;
 // int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
 // +out_slots=S (1..64) L9 slots per lane and +out_stall_pct=P random output stalls (-DTB_OUT_STALL_PCT sets the default); +fault_put puts with no credit once.
 module TB_sienna_model;
-  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
   localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
   localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
@@ -379,9 +379,9 @@ module TB_sienna_model;
       if (has_bias != 0)
         for (int c = 0; c < N; c++) begin
           rc = $fscanf(fin, "%h", w32);
-          bias_i[c] = IS_INT ? ACC_DATA_WIDTH'(w32) : (ACC_DATA_WIDTH'(w32) << (ACC_DATA_WIDTH - DATA_WIDTH));
+          bias_i[c] = !(sienna_fmt_pkg::BIAS_DATA_WIDTH == sienna_fmt_pkg::DATA_WIDTH) ? ACC_DATA_WIDTH'(w32) : (ACC_DATA_WIDTH'(w32) << (ACC_DATA_WIDTH - DATA_WIDTH));
         end
-      if (IS_INT) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
+      if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin  // int8: the set's requantize and GPNAE words, laid out as requant_<k>.mem
         logic [31:0] q[$];
         q.delete();  // a static block: the queue would otherwise keep the previous set's words
         for (int i = 0; i < 8 + 2 * N; i++) begin

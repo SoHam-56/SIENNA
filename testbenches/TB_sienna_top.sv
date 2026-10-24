@@ -7,7 +7,7 @@ module TB_sienna_top #(
     parameter int LINK_STAGES = 0,
     parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider; 8: a put on the unused A row link (a_idle_contract)
 );
-  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
   localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
   localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
@@ -1076,8 +1076,8 @@ module TB_sienna_top #(
     bias_i = '0;
     if (bias_valid_i) begin
       read_word_file($sformatf("bias_%0d.mem", k), q);
-      for (int c = 0; c < N; c++) bias_i[c] = IS_INT ? ACC_DATA_WIDTH'(q[c]) : (ACC_DATA_WIDTH'(q[c]) << (ACC_DATA_WIDTH - DATA_WIDTH));
-      for (int c = 0; c < N; c++) bias_want[c] = IS_INT ? q[c] : ACC_DATA_WIDTH'(q[c][DATA_WIDTH-1:0]) << (ACC_DATA_WIDTH - DATA_WIDTH);
+      for (int c = 0; c < N; c++) bias_i[c] = !(sienna_fmt_pkg::BIAS_DATA_WIDTH == sienna_fmt_pkg::DATA_WIDTH) ? ACC_DATA_WIDTH'(q[c]) : (ACC_DATA_WIDTH'(q[c]) << (ACC_DATA_WIDTH - DATA_WIDTH));
+      for (int c = 0; c < N; c++) bias_want[c] = !(sienna_fmt_pkg::BIAS_DATA_WIDTH == sienna_fmt_pkg::DATA_WIDTH) ? q[c] : ACC_DATA_WIDTH'(q[c][DATA_WIDTH-1:0]) << (ACC_DATA_WIDTH - DATA_WIDTH);
     end
   endtask
 

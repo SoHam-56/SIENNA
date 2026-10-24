@@ -5,7 +5,7 @@ import test_config_pkg::*;
 // LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide.
 module TB_sienna_top #(
     parameter int LINK_STAGES = 0,
-    parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider
+    parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider; 8: a put on the unused A row link (a_idle_contract)
 );
   // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
@@ -108,8 +108,9 @@ module TB_sienna_top #(
   credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
   // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
   credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
+  logic idle_fault_put = 1'b0;  // FAULT 8: one put on the unused A row link out of reset
   for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
-    assign idle_rows[r].put  = 1'b0;
+    assign idle_rows[r].put  = (r == 0) && idle_fault_put;
     assign idle_rows[r].data = '0;
   end
   credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
@@ -201,6 +202,16 @@ module TB_sienna_top #(
   // ── L9: this TB is the downstream consumer of every lane's output link ──
   localparam int OUT_CAP = 64;  // sienna_top's OUT_MAX: the most slots a lane's consumer may advertise
   credit_link_if #(.DATA_W(DATA_WIDTH + ((FAULT == 7) ? 1 : 0)), .CRW(1)) out_lnk[NUM_LANES] ();
+
+  if (FAULT == 8) begin : G_FAULT_IDLE  // sienna_top's a_idle_contract must fire on it
+    initial begin
+      wait (rstn_i === 1'b1);
+      repeat (4) @(negedge clk_i);
+      idle_fault_put = 1'b1;
+      $display("[FAULT 8] a put on the unused layer contract's A row link");
+      @(negedge clk_i) idle_fault_put = 1'b0;
+    end
+  end
 
   // ── DUT ───────────────────────────────────────────────────────────────
   sienna_top #(

@@ -4,7 +4,7 @@ import test_config_pkg::*;
 
 `include "tb_l9_sink.svh"
 
-// Runs one layer on sienna_layer: writes the configuration, streams the two inputs from +layer=<file> on the row links (L10)
+// Runs one layer on sienna_top's layer contract (SET_PORT = 0): writes the configuration, streams the two inputs from +layer=<file> on the row links (L10)
 // as the layer grants credits, and writes every result taken from the output links (L9) to +out=<file>.
 // Layer file: "L m kb n residual bias act train seed a_rows w_rows packed", then a_rows and w_rows rows of N hex words.
 // packed: a "P sh m0 .. m(N/2-1)" line and seven "E act zp min max mx shx mout shout zout" lines after L (and Q).
@@ -12,7 +12,7 @@ import test_config_pkg::*;
 // int8 residual: an "A zp2 m1 m2 shift zpo amin amax" line after Q (zp1 is Q's zp).
 // int8 +dump=<file>: per stage "X k e code" (activation input), "R k e code" (hold beat), "Q k e q1 q2 y" (ADD); k the set in issue order, e its tile element.
 // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
-// FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many.
+// FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many; 4: a put on the unused set contract's L0 (a_idle_contract).
 // +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
 // int8 +hold_wait: the reset waits, from C, for a cycle at which hold_mem holds unread hold beats; +hold_check: a reset outside that window fails.
 // -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
@@ -20,6 +20,12 @@ module TB_model_run #(
     parameter int FAULT       = 0,
     parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
 );
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
+  localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
+  localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
+  localparam int PACK_ENTRIES = 8, WC_TILES = 128;
+  `include "sienna_set_side.svh"
 
   localparam int STALL_CYCLES = 50_000;  // this long with nothing moving is a hang
   localparam int RCW = $clog2(N + 1);  // a set's N row credits in one cycle
@@ -42,7 +48,7 @@ module TB_model_run #(
   logic [7:0] cfg_add_zp2_i = '0, cfg_add_zpo_i = '0, cfg_add_amin_i = '0, cfg_add_amax_i = '0;  // int8 residual: the A line
   logic [31:0] cfg_add_m1_i = '0, cfg_add_m2_i = '0;
   logic [5:0] cfg_add_shift_i = '0;
-  logic [N-1:0][ACC_W-1:0] w_bias_i = '0;  // int8: with each block's bias row
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] w_bias_i = '0;  // int8: with each block's bias row
   logic [N-1:0][23:0] w_req_mult_i = '0;
   logic [N-1:0][5:0] w_req_shift_i = '0;
   logic [2:0] cfg_pack_shift_i = '0;  // packing: the P and E lines
@@ -101,7 +107,27 @@ module TB_model_run #(
                                                                 .home_o(lane_home[l]));
   end
 
-  sienna_layer #(
+  // The set contract, unused at SET_PORT = 0: its L0 and cache regions are idle but for FAULT 4's one put.
+  credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) idle_host[1] ();
+  credit_link_if #(.DATA_W(1), .CRW(1)) idle_wc[2] ();
+  logic idle_put = 1'b0;
+  assign idle_host[0].put  = idle_put;
+  assign idle_host[0].data = '0;
+  for (genvar r = 0; r < 2; r++) begin : G_IDLE_WC
+    assign idle_wc[r].put  = 1'b0;
+    assign idle_wc[r].data = 1'b0;
+  end
+  if (FAULT == 4) begin : G_FAULT_IDLE  // one put on the unused L0 out of reset: sienna_top's a_idle_contract must fire
+    initial begin
+      wait (rstn_i);
+      repeat (4) @(negedge clk_i);
+      idle_put = 1'b1;
+      $display("[FAULT 4] a put on the unused set contract's L0");
+      @(negedge clk_i) idle_put = 1'b0;
+    end
+  end
+  sienna_top #(
+      .SET_PORT      (0),  // the layer contract: configuration and rows on L10
       .NUM_LANES     (NUM_LANES),
       .N             (N),
       .TILE_SIZE     (TILE_SIZE),
@@ -157,8 +183,28 @@ module TB_model_run #(
       .w_bias_i        (w_bias_i),
       .w_req_mult_i    (w_req_mult_i),
       .w_req_shift_i   (w_req_shift_i),
-      .out             (out_lnk),
-      .set_done_o      (set_done_o)
+      .set_done_o      (set_done_o),
+      // The set contract, unused at SET_PORT = 0: tied off
+      .host                (idle_host),
+      .bias_i              ('0),
+      .wc_region           (idle_wc),
+      .wc_write_enable_i   (1'b0),
+      .wc_write_addr_i     ('0),
+      .north_write_enable_i(1'b0),
+      .north_write_data_i  ('0),
+      .north_write_reset_i (1'b0),
+      .west_write_enable_i (1'b0),
+      .west_write_data_i   ('0),
+      .west_write_reset_i  (1'b0),
+      .drained_i           (1'b0),
+      .copy_sel_o          (),
+      .pipeline_complete_o (),
+      .done_set_id_o       (),
+      .systolic_busy_o     (),
+      .gpnae_busy_o        (),
+      .maxpool_busy_o      (),
+      .dropout_busy_o      (),
+      .out                 (out_lnk)
   );
 
   longint cycle = 0;
@@ -169,15 +215,15 @@ module TB_model_run #(
   longint first_hold = -1;  // cycles from t0 to the first hold set's last beat into hold_mem
   always @(posedge clk_i)
     if (meas_clr) first_hold <= -1;
-    else if (IS_INT != 0 && streaming && dut.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
+    else if (IS_INT != 0 && streaming && dut.G_LAYER.pipe.hold_done && first_hold < 0) first_hold <= cycle - t0;
   longint first_free = -1;  // cycles from t0 to the first cycle after first_hold with hold_mem read out: the first hold window has closed
   always @(posedge clk_i)
     if (meas_clr) first_free <= -1;
-    else if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.pipe.hm_any) first_free <= cycle - t0;
+    else if (IS_INT != 0 && streaming && first_hold >= 0 && first_free < 0 && !dut.G_LAYER.pipe.hm_any) first_free <= cycle - t0;
   int hb_wr = 0, hb_rd = 0;  // this pass's hold beats written into and read from hold_mem
   always @(posedge clk_i)
     if (meas_clr) {hb_wr, hb_rd} <= '0;
-    else if (streaming) {hb_wr, hb_rd} <= {hb_wr + int'(dut.pipe.hold_wr_s), hb_rd + int'(dut.pipe.add_in_s)};
+    else if (streaming) {hb_wr, hb_rd} <= {hb_wr + int'(dut.G_LAYER.pipe.hold_wr_s), hb_rd + int'(dut.G_LAYER.pipe.add_in_s)};
 
   // int8 per-stage dump: each set's number in issue order by its id, beats in order from the mesh, requantize and add_lanes.
   localparam int PER_LANE = N * N / NUM_LANES;
@@ -195,11 +241,11 @@ module TB_model_run #(
   always_ff @(posedge clk_i) begin
     sd_rst <= !rstn_i;
     {sd_hacc, sd_gacc, sd_rd, sd_ghold, sd_gpack, sd_hwr, sd_fv, sd_fadd, sd_ain} <=
-        {dut.pipe.host_accept, dut.pipe.g_accept, dut.pipe.wide_rd_valid, dut.pipe.g_hold, dut.pipe.g_pack, dut.pipe.hold_wr_s,
-         dut.pipe.fill_v, dut.pipe.fill_add, dut.pipe.add_in_s};
-    {sd_hid, sd_gnid, sd_gsid} <= {dut.pipe.host_next_id, dut.pipe.g_next_id, dut.pipe.g_set_id};
-    for (int k = 0; k < NUM_LANES; k++) sd_fd[k] <= dut.pipe.fill_d[k][7:0];
-    {sd_hd, sd_q1, sd_q2} <= {dut.pipe.hold_d_s, dut.pipe.add_q1_s, dut.pipe.add_q2_s};
+        {dut.G_LAYER.pipe.host_accept, dut.G_LAYER.pipe.g_accept, dut.G_LAYER.pipe.wide_rd_valid, dut.G_LAYER.pipe.g_hold, dut.G_LAYER.pipe.g_pack, dut.G_LAYER.pipe.hold_wr_s,
+         dut.G_LAYER.pipe.fill_v, dut.G_LAYER.pipe.fill_add, dut.G_LAYER.pipe.add_in_s};
+    {sd_hid, sd_gnid, sd_gsid} <= {dut.G_LAYER.pipe.host_next_id, dut.G_LAYER.pipe.g_next_id, dut.G_LAYER.pipe.g_set_id};
+    for (int k = 0; k < NUM_LANES; k++) sd_fd[k] <= dut.G_LAYER.pipe.fill_d[k][7:0];
+    {sd_hd, sd_q1, sd_q2} <= {dut.G_LAYER.pipe.hold_d_s, dut.G_LAYER.pipe.add_q1_s, dut.G_LAYER.pipe.add_q2_s};
   end
   initial begin : stage_dump  // reads the rising edge's copies at the falling edge, one cycle behind the DUT, in order
     int tr_k[TR_IDS];  // per set id: the set's number in issue order
@@ -301,7 +347,7 @@ module TB_model_run #(
   int ei = 0;
   always_ff @(posedge clk_i)
     if (!rstn_i) ei <= 0;
-    else if (IS_INT && dut.wl_take_bias) ei <= ei + 1;
+    else if (IS_INT && dut.G_LAYER.sched.wl_take_bias) ei <= ei + 1;
 
   // Output of any kind while the mid-stream reset's home check watches is stray.
   bit mid_check = 0;
@@ -312,12 +358,12 @@ module TB_model_run #(
   // Cycles with sets left but no A row taken, by cause, printed at the end.
   int st_credit = 0, st_staging = 0, st_bias = 0, st_tile = 0, st_input = 0, st_rows = 0, st_idle = 0;
   always_ff @(posedge clk_i) begin
-    if (rstn_i && dut.active && !a_lnk.put && dut.g_blk < dut.ct) begin
-      if (dut.pend) st_input++;  // the set's rows are granted and not all sent
-      else if (!dut.g_l0_ok && dut.pipe.entry_full) st_credit++;  // the entry withholds the staging credit
-      else if (!dut.g_l0_ok) st_staging++;
-      else if (!dut.g_bias_ok) st_bias++;
-      else if (!dut.g_tile_ok) st_tile++;
+    if (rstn_i && dut.G_LAYER.sched.active && !a_lnk.put && dut.G_LAYER.sched.g_blk < dut.G_LAYER.sched.ct) begin
+      if (dut.G_LAYER.sched.pend) st_input++;  // the set's rows are granted and not all sent
+      else if (!dut.G_LAYER.sched.g_l0_ok && dut.G_LAYER.pipe.entry_full) st_credit++;  // the entry withholds the staging credit
+      else if (!dut.G_LAYER.sched.g_l0_ok) st_staging++;
+      else if (!dut.G_LAYER.sched.g_bias_ok) st_bias++;
+      else if (!dut.G_LAYER.sched.g_tile_ok) st_tile++;
       else st_idle++;
     end
     if (rstn_i && a_lnk.put) st_rows++;
@@ -325,20 +371,20 @@ module TB_model_run #(
   // Downstream: cycles a stage holds a ready set but cannot pass it on, and why.
   int dn_accbank = 0, dn_resbank = 0, dn_actbusy = 0, dn_actbank = 0, dn_poolbusy = 0, dn_bcast = 0;
   always_ff @(posedge clk_i) begin
-    if (rstn_i && dut.active) begin
-      if (dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ob_full[dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.fb] &&
-          dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_busy[dut.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_next])
+    if (rstn_i && dut.G_LAYER.sched.active) begin
+      if (dut.G_LAYER.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ob_full[dut.G_LAYER.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.fb] &&
+          dut.G_LAYER.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_busy[dut.G_LAYER.pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.ab_next])
         dn_accbank++;
-      if (dut.pipe.systolic_array_inst.in_full[dut.pipe.systolic_array_inst.in_rd] && !dut.pipe.systolic_array_inst.arrays_load_ready &&
-          dut.pipe.systolic_array_inst.bstate == 0)
+      if (dut.G_LAYER.pipe.systolic_array_inst.in_full[dut.G_LAYER.pipe.systolic_array_inst.in_rd] && !dut.G_LAYER.pipe.systolic_array_inst.arrays_load_ready &&
+          dut.G_LAYER.pipe.systolic_array_inst.bstate == 0)
         dn_bcast++;
-      if (dut.pipe.systolic_array_inst.arrays_final && !dut.pipe.systolic_array_inst.reduce_start &&
-          dut.pipe.systolic_array_inst.out_state[dut.pipe.systolic_array_inst.out_wr] != 0)
+      if (dut.G_LAYER.pipe.systolic_array_inst.arrays_final && !dut.G_LAYER.pipe.systolic_array_inst.reduce_start &&
+          dut.G_LAYER.pipe.systolic_array_inst.out_state[dut.G_LAYER.pipe.systolic_array_inst.out_wr] != 0)
         dn_resbank++;
-      if (dut.pipe.systolic_array_inst.out_full[dut.pipe.systolic_array_inst.out_rd] && dut.pipe.g_fed) dn_actbusy++;
-      if (dut.pipe.systolic_array_inst.out_full[dut.pipe.systolic_array_inst.out_rd] && dut.pipe.g_state == 0 &&
-          dut.pipe.act_full[dut.pipe.act_wr]) dn_actbank++;
-      if (dut.pipe.act_full[dut.pipe.act_rd] && dut.pipe.p_state != 0) dn_poolbusy++;
+      if (dut.G_LAYER.pipe.systolic_array_inst.out_full[dut.G_LAYER.pipe.systolic_array_inst.out_rd] && dut.G_LAYER.pipe.g_fed) dn_actbusy++;
+      if (dut.G_LAYER.pipe.systolic_array_inst.out_full[dut.G_LAYER.pipe.systolic_array_inst.out_rd] && dut.G_LAYER.pipe.g_state == 0 &&
+          dut.G_LAYER.pipe.act_full[dut.G_LAYER.pipe.act_wr]) dn_actbank++;
+      if (dut.G_LAYER.pipe.act_full[dut.G_LAYER.pipe.act_rd] && dut.G_LAYER.pipe.p_state != 0) dn_poolbusy++;
     end
   end
 `endif
@@ -376,7 +422,7 @@ module TB_model_run #(
         wi++;
       end
       for (int c = 0; c < N; c++) begin
-        w_bias_i[c]      = (ei < ne) ? ACC_W'(ep[(3*ei)*N+c]) : '0;
+        w_bias_i[c]      = (ei < ne) ? ACC_DATA_WIDTH'(ep[(3*ei)*N+c]) : '0;
         if (ei < ne && (ep[(3*ei+1)*N+c][31:24] != 0 || ep[(3*ei+2)*N+c][31:6] != 0))
           $fatal(1, "TB_model_run: channel %0d's requantize words %h %h are too wide", c, ep[(3*ei+1)*N+c], ep[(3*ei+2)*N+c]);
         w_req_mult_i[c]  = (ei < ne) ? ep[(3*ei+1)*N+c][23:0] : '0;
@@ -545,7 +591,7 @@ module TB_model_run #(
         last_ai = ai;
         last_wi = wi;
         last_sets = bounds.size();
-        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.pipe.hm_any)) break;  // mid-stream, A credits held (+hold_wait: hold_mem waiting)
+        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.G_LAYER.pipe.hm_any)) break;  // mid-stream, A credits held (+hold_wait: hold_mem waiting)
         if (idle > STALL_CYCLES) begin
           $display("[FATAL] nothing moved for %0d cycles: %0d/%0d activation rows, %0d/%0d weight rows, %0d sets done", idle, ai, na, wi,
                    nw, bounds.size());
@@ -562,8 +608,8 @@ module TB_model_run #(
                  cycle - t0, ai, na, wi, nw, bounds.size(), a_cnt, w_cnt);
         if (IS_INT != 0)
           $display("[RES] reset %0d cycles into the layer, %0s the hold window, %0d of %0d hold beats unread", cycle - t0,
-                   dut.pipe.hm_any ? "inside" : "outside", hb_wr - hb_rd, PER_LANE);
-        if (hold_check != 0 && !dut.pipe.hm_any) begin
+                   dut.G_LAYER.pipe.hm_any ? "inside" : "outside", hb_wr - hb_rd, PER_LANE);
+        if (hold_check != 0 && !dut.G_LAYER.pipe.hm_any) begin
           $display("[FAIL] +hold_check: the mid-stream reset at %0d cycles is outside the hold window", cycle - t0);
           $finish;
         end
@@ -576,10 +622,10 @@ module TB_model_run #(
         repeat (OUT_CAP + 64 + 8 * LINK_STAGES) @(posedge clk_i);
         mid_check = 0;
         // Home: no row credit held (the layer grants per set), both staging and region credits back, every L9 slot re-advertised.
-        if (a_cnt != 0 || w_cnt != 0 || int'(dut.l0_cnt) != 2 || !dut.wc_has[0] || !dut.wc_has[1] || lane_home != '1 || stray != 0 ||
+        if (a_cnt != 0 || w_cnt != 0 || int'(dut.G_LAYER.sched.l0_cnt) != 2 || !dut.G_LAYER.sched.wc_has[0] || !dut.G_LAYER.sched.wc_has[1] || lane_home != '1 || stray != 0 ||
             busy_o) begin
           $display("[FAIL] not home after the mid-stream reset: A %0d (0), W %0d (0), staging %0d (2), regions %0d %0d (1 1), lanes home %0d of %0d, %0d stray output cycles, busy %0d",
-                   a_cnt, w_cnt, dut.l0_cnt, dut.wc_has[0], dut.wc_has[1], $countones(lane_home), NUM_LANES, stray, busy_o);
+                   a_cnt, w_cnt, dut.G_LAYER.sched.l0_cnt, dut.G_LAYER.sched.wc_has[0], dut.G_LAYER.sched.wc_has[1], $countones(lane_home), NUM_LANES, stray, busy_o);
           $finish;
         end else
           $display("  [Reset] home: row credits 0 0, staging 2, regions 1 1, %0d lanes with %0d L9 slots each, no stray output", NUM_LANES,
@@ -602,13 +648,13 @@ module TB_model_run #(
       $display("[FAIL] L9 slots not all credited back after the layer: lanes home %b", lane_home);
     end
     // sienna_top's own link checkers judge only when it is drained: it must drain after the layer's last set.
-    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.pipe.drained; w++) @(posedge clk_i);
-    if (!dut.pipe.drained) begin
+    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.G_LAYER.pipe.drained; w++) @(posedge clk_i);
+    if (!dut.G_LAYER.pipe.drained) begin
       failed++;
       $display("[FAIL] sienna_top never drained after the layer's last set (%0d drains in the run): its link checkers never judged it",
-               dut.pipe.drain_n);
-    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.pipe.drain_n);
-    if (dut.pipe.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
+               dut.G_LAYER.pipe.drain_n);
+    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.G_LAYER.pipe.drain_n);
+    if (dut.G_LAYER.pipe.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
       failed++;
       $display("[FAIL] hold_mem still holds unread hold beats after the layer's last set: a hold set without its add set");
     end
@@ -628,7 +674,7 @@ module TB_model_run #(
     if (failed == 0)
       $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d epilogues=%0d/%0d out_stall=%0d in_stall=%0d collapse_k=%0d",
                bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct,
-               dut.pipe.systolic_array_inst.COLLAPSE_K);  // the elaborated mesh's mode, not the package's: run_job checks it
+               dut.G_LAYER.pipe.systolic_array_inst.COLLAPSE_K);  // the elaborated mesh's mode, not the package's: run_job checks it
     if (first_hold >= 0) $display("[RES] first hold_done %0d cycles into the layer", first_hold);
     if (first_free >= 0) $display("[RES] first hold window closed %0d cycles into the layer", first_free);
     if (dump_fd != 0) $fclose(dump_fd);

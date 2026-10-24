@@ -7,6 +7,10 @@ module TB_sienna_top #(
     parameter int LINK_STAGES = 0,
     parameter int FAULT       = 0  // also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider
 );
+  // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words in this bench.
+  localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
+  localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
+  localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
 
   // ── Localparams from generated SV package ─────────────────────────────
   localparam string WEST_INPUT_FILE = "matrix_west.mem";
@@ -30,12 +34,9 @@ module TB_sienna_top #(
   logic                     training_mode_i;
   logic                     accumulate_i;  // this set is a partial sum
   logic                     bias_valid_i;  // this set carries a bias row
-  logic [N-1:0][ACC_W-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
-  logic [N-1:0][ACC_W-1:0] bias_want;  // the bias the mesh must see with this set's put: the file's row, widened exactly
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_i;  // int32 in int8, where it carries the folded input zero point; fp32 bits in floats
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_want;  // the bias the mesh must see with this set's put: the file's row, widened exactly
   int bias_checked = 0;  // puts whose bias reached the mesh's bias queue and was compared
-  if (ACC_W != sienna_fmt_pkg::acc_w(EXP_W, MAN_W)) begin : G_BAD_ACC  // bias_i would truncate or pad at the DUT's port
-    $fatal(1, "TB_sienna_top: the package's ACC_W=%0d, but the DUT's bias input is %0d bits", ACC_W, sienna_fmt_pkg::acc_w(EXP_W, MAN_W));
-  end
   // int8: the requantize and GPNAE parameters of the set being started (D-2); zero in other formats
   logic [N-1:0][23:0] req_mult_i;
   logic [N-1:0][5:0]  req_shift_i;
@@ -62,7 +63,6 @@ module TB_sienna_top #(
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
   logic res_hold_i, res_add_i;  // int8 residual: the set's hold and add flags and its ADD's words (apply_add)
-  sienna_add_pkg::add_words_t add_words_i;
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;  // result beats per set
 
   // The test's TB-only settings, read from test_knobs.mem at time 0 (written with its stimulus): no build depends on them, so one build runs every test of its group.
@@ -102,8 +102,15 @@ module TB_sienna_top #(
 
   // ── Links: this TB is the host (L0) and the weight-cache writer (L2), each with a counter and a checker ──
   `include "sienna_set_side.svh"
+  sienna_add_pkg::add_words_t add_words_i;  // the set's ADD words (apply_add)
   localparam int SIDE_W = $bits(set_side_t);
-  credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk ();
+  credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
+  // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
+  credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
+  for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
+    assign idle_rows[r].put  = 1'b0;
+    assign idle_rows[r].data = '0;
+  end
   credit_link_if #(.DATA_W(1), .CRW(1)) wc_lnk[2] ();
   logic [1:0] host_cnt;  // staging credits this host holds
   logic       wc_cnt[2];  // per cache region: its credit is held
@@ -112,10 +119,10 @@ module TB_sienna_top #(
   int         tb_inflight, quiet_cyc;  // sets put and not complete; cycles with none
   int         tb_puts;  // sets put, counted on the same edge as tb_inflight
   localparam int QUIET_TB = 16 + 4 * LINK_STAGES;
-  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk.put), .credit_i(host_lnk.credit),
+  credit_counter #(.MAX(2), .CRW(1)) host_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host_lnk[0].put), .credit_i(host_lnk[0].credit),
                                               .has_credit_o(), .count_o(host_cnt));
   localparam int HOST_SLOTS = (SETS_IN_FLIGHT < 2) ? SETS_IN_FLIGHT : 2;  // the host holds both staging credits unless the entry admits fewer sets
-  credit_link_checker #(.SLOTS(HOST_SLOTS)) chk_host (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(host_lnk));
+  credit_link_checker #(.SLOTS(HOST_SLOTS)) chk_host (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(host_lnk[0]));
   for (genvar r = 0; r < 2; r++) begin : G_WC
     credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(wc_lnk[r].put), .credit_i(wc_lnk[r].credit),
                                            .has_credit_o(), .count_o(wc_cnt[r]));
@@ -123,7 +130,7 @@ module TB_sienna_top #(
   end
   logic sum_open;  // the last set put was a partial sum: it completes before the mesh frees its staging bank, so no drain until the sum ends
   set_side_t side_put;
-  assign side_put = set_side_t'(host_lnk.data[SIDE_W-1:0]);
+  assign side_put = set_side_t'(host_lnk[0].data[SIDE_W-1:0]);
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) begin
       tb_inflight <= 0;
@@ -131,10 +138,10 @@ module TB_sienna_top #(
       quiet_cyc   <= 0;
       sum_open    <= 1'b0;
     end else begin
-      tb_inflight <= tb_inflight + int'(host_lnk.put) - int'(pipeline_complete_o);
-      tb_puts     <= tb_puts + int'(host_lnk.put);
-      quiet_cyc   <= (tb_inflight != 0 || host_lnk.put || sum_open) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
-      if (host_lnk.put) sum_open <= side_put.accumulate;
+      tb_inflight <= tb_inflight + int'(host_lnk[0].put) - int'(pipeline_complete_o);
+      tb_puts     <= tb_puts + int'(host_lnk[0].put);
+      quiet_cyc   <= (tb_inflight != 0 || host_lnk[0].put || sum_open) ? 0 : (quiet_cyc < QUIET_TB) ? quiet_cyc + 1 : quiet_cyc;
+      if (host_lnk[0].put) sum_open <= side_put.accumulate;
     end
   assign drained = (quiet_cyc == QUIET_TB);
   bit acc_on = 0;  // the accumulate pass is running
@@ -196,6 +203,7 @@ module TB_sienna_top #(
 
   // ── DUT ───────────────────────────────────────────────────────────────
   sienna_top #(
+      .SET_PORT         (1),  // the set contract: this bench is the host on L0
       .COLLAPSE_K       (COLLAPSE_K),  // the package's mesh mode: 1 full-depth tiles, 0 depth slices and the reduce tree
       .NUM_LANES        (NUM_LANES),
       .SETS_IN_FLIGHT   (SETS_IN_FLIGHT),
@@ -222,6 +230,50 @@ module TB_sienna_top #(
   ) dut (
       .clk_i                      (clk_i),
       .rstn_i                     (rstn_i),
+      // The layer contract, unused at SET_PORT = 1: tied off
+      .cfg_load_i          (1'b0),
+      .cfg_m_i             ('0),
+      .cfg_kb_i            ('0),
+      .cfg_n_i             ('0),
+      .cfg_residual_i      (1'b0),
+      .cfg_bias_i          (1'b0),
+      .cfg_act_i           ('0),
+      .cfg_train_i         (1'b0),
+      .cfg_seed_i          ('0),
+      .cfg_req_zp_i        ('0),
+      .cfg_req_min_i       ('0),
+      .cfg_req_max_i       ('0),
+      .cfg_gp_mx_i         ('0),
+      .cfg_gp_shx_i        ('0),
+      .cfg_gp_mout_i       ('0),
+      .cfg_gp_shout_i      ('0),
+      .cfg_gp_zout_i       ('0),
+      .cfg_add_zp2_i       ('0),
+      .cfg_add_m1_i        ('0),
+      .cfg_add_m2_i        ('0),
+      .cfg_add_shift_i     ('0),
+      .cfg_add_zpo_i       ('0),
+      .cfg_add_amin_i      ('0),
+      .cfg_add_amax_i      ('0),
+      .cfg_pack_shift_i    ('0),
+      .cfg_pack_map_i      ('0),
+      .cfg_pack_act_i      ('0),
+      .cfg_pack_zp_i       ('0),
+      .cfg_pack_min_i      ('0),
+      .cfg_pack_max_i      ('0),
+      .cfg_pack_mx_i       ('0),
+      .cfg_pack_shx_i      ('0),
+      .cfg_pack_mout_i     ('0),
+      .cfg_pack_shout_i    ('0),
+      .cfg_pack_zout_i     ('0),
+      .busy_o              (),
+      .done_o              (),
+      .a_rows              (idle_rows[0]),
+      .w_rows              (idle_rows[1]),
+      .w_bias_i            ('0),
+      .w_req_mult_i        ('0),
+      .w_req_shift_i       ('0),
+      .set_done_o          (),
       .host                       (host_lnk),
       .bias_i                     (bias_i),
       .wc_region                  (wc_lnk),
@@ -233,6 +285,8 @@ module TB_sienna_top #(
       .west_write_enable_i        (west_write_enable_i),
       .west_write_data_i          (west_write_data_i),
       .west_write_reset_i         (west_write_reset_i),
+      .drained_i                  (1'b0),
+      .copy_sel_o                 (),
       .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),
@@ -242,8 +296,8 @@ module TB_sienna_top #(
       .dropout_busy_o             (dropout_busy_tb)
   );
 
-  wire [4:0] dut_stage = {dut.g_state, dut.p_state};  // activation and pooling stage states
-  wire res_ready = dut.systolic_array_inst.out_full[dut.systolic_array_inst.out_rd];  // the mesh holds a finished result
+  wire [4:0] dut_stage = {dut.G_SET.G_COPY[0].pipe.g_state, dut.G_SET.G_COPY[0].pipe.p_state};  // activation and pooling stage states
+  wire res_ready = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.out_full[dut.G_SET.G_COPY[0].pipe.systolic_array_inst.out_rd];  // the mesh holds a finished result
 
   // ── L9 consumer: out_adv slots per lane after each reset; a word frees its slot at once, its credit returned unless stalled or held ──
   int out_slots = OUT_CAP, out_stall_pct = 0;  // +out_slots=N (1..64) L9 slots per lane; +out_stall_pct=P of credit returns withheld at random
@@ -352,10 +406,10 @@ module TB_sienna_top #(
   function automatic bit lanes_home(output string why);
     automatic int pin = TB_POOL_BYPASS ? out_adv : 16;
     for (int l = 0; l < NUM_LANES; l++)
-      if (int'(dut.l4_cnt[l]) != 32 || int'(dut.l5_out[l]) != TB_L5 || int'(dut.pin_cnt[l]) != pin || out_held[l] != out_adv ||
+      if (int'(dut.G_SET.G_COPY[0].pipe.l4_cnt[l]) != 32 || int'(dut.G_SET.G_COPY[0].pipe.l5_out[l]) != TB_L5 || int'(dut.G_SET.G_COPY[0].pipe.pin_cnt[l]) != pin || out_held[l] != out_adv ||
           out_owed[l] != 0) begin
-        why = $sformatf("lane %0d: L4 %0d (32), L5 %0d (%0d), pool input %0d (%0d), L9 %0d (%0d), L9 owed %0d (0)", l, dut.l4_cnt[l],
-                        dut.l5_out[l], TB_L5, dut.pin_cnt[l], pin, out_held[l], out_adv, out_owed[l]);
+        why = $sformatf("lane %0d: L4 %0d (32), L5 %0d (%0d), pool input %0d (%0d), L9 %0d (%0d), L9 owed %0d (0)", l, dut.G_SET.G_COPY[0].pipe.l4_cnt[l],
+                        dut.G_SET.G_COPY[0].pipe.l5_out[l], TB_L5, dut.G_SET.G_COPY[0].pipe.pin_cnt[l], pin, out_held[l], out_adv, out_owed[l]);
         return 0;
       end
     why = $sformatf("lanes: L4 32, L5 %0d, pool input %0d, L9 %0d each", TB_L5, pin, out_adv);
@@ -390,7 +444,7 @@ module TB_sienna_top #(
     s.res_add       = res_add_i;
     s.add           = add_words_i;
 `ifdef TB_FLOAT_ADD
-    s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a float build fires a_float_no_add
+    s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a build without the residual ADD fires a_no_residual_add
 `endif
     return s;
   endfunction
@@ -407,40 +461,40 @@ module TB_sienna_top #(
       failed++;
       $display("  [FAIL] The host put a set with no staging credit");
     end
-    host_lnk.data = side_now();
-    host_lnk.put  = 1'b1;
+    host_lnk[0].data = side_now();
+    host_lnk[0].put  = 1'b1;
     tr_k[put_seq % TR_IDS] = tr_cur_k;
     put_seq++;
     if (bias_valid_i) check_mesh_bias(bias_want);
     @(negedge clk_i);
-    host_lnk.put  = 1'b0;
+    host_lnk[0].put  = 1'b0;
     if (wc_last_i) wc_open_tb[weight_tile_i[$clog2(WC_TILES)-1]] = 1'b0;
   endtask
 
   // The bias the mesh captures (bias_push into its bias queue, L0 and L1 stages after the host put) must be want: a zero-extended or flushed bf16 row reads wrong here even where the sums cannot show it.
-  task automatic check_mesh_bias(input logic [N-1:0][ACC_W-1:0] want);
+  task automatic check_mesh_bias(input logic [N-1:0][ACC_DATA_WIDTH-1:0] want);
     fork
       begin
         automatic int q;
         repeat (2 * LINK_STAGES) @(negedge clk_i);
         #1;  // after the put's combinational paths settle
-        if (!dut.systolic_array_inst.bias_push) begin
+        if (!dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bias_push) begin
           failed++;
           $display("  [FAIL] Bias check: the mesh captured no bias %0d cycles after the host put", 2 * LINK_STAGES);
         end else begin
-          q = int'(dut.systolic_array_inst.bq_wr);  // the queue entry this capture writes
+          q = int'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bq_wr);  // the queue entry this capture writes
           @(posedge clk_i);
           #1;  // the registered entry
           bias_checked++;
-          if (!dut.systolic_array_inst.bias_qv[q]) begin
+          if (!dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bias_qv[q]) begin
             failed++;
             $display("  [FAIL] Bias check: bias queue entry %0d was captured without its bias_valid", q);
           end
           for (int c = 0; c < N; c++)
-            if (dut.systolic_array_inst.bias_q[q][c] !== want[c]) begin
+            if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bias_q[q][c] !== want[c]) begin
               failed++;
               $display("  [FAIL] Bias check: the mesh's bias queue entry %0d column %0d is %h, the bias row widened is %h", q, c,
-                       dut.systolic_array_inst.bias_q[q][c], want[c]);
+                       dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bias_q[q][c], want[c]);
             end
         end
       end
@@ -569,7 +623,7 @@ module TB_sienna_top #(
     if (trace_states && dut_stage !== prev_state) begin
       $display("  [FSM] @%0t state %0d -> %0d  (res_ready=%0b mult_complete=%0b)",
                $time, prev_state, dut_stage,
-               res_ready, dut.systolic_mult_complete);
+               res_ready, dut.G_SET.G_COPY[0].pipe.systolic_mult_complete);
       prev_state = dut_stage;
     end
   end
@@ -586,8 +640,8 @@ module TB_sienna_top #(
     rstn_i = 0;
     put_seq = 0;
     out_cr = '0;  // the downstream consumer drops its L9 credits with the reset, as it does every other link signal
-    host_lnk.put = 1'b0;
-    host_lnk.data = '0;
+    host_lnk[0].put = 1'b0;
+    host_lnk[0].data = '0;
     wc_put_tb = '0;
     wc_open_tb[0] = 1'b0;
     wc_open_tb[1] = 1'b0;
@@ -625,20 +679,20 @@ module TB_sienna_top #(
     repeat (10) begin
       @(negedge clk_i);
       // Review Focus 1: while reset is held every producer count is 0 and no consumer advertises a credit.
-      if (host_cnt != 0 || wc_cnt[0] || wc_cnt[1] || dut.l1_cnt != 0 || dut.l6_cnt != 0 || dut.sets_out != 0 || dut.l0_out != 0 ||
-          dut.systolic_array_inst.res_cnt != 0 || host_lnk.credit || wc_lnk[0].credit || wc_lnk[1].credit || dut.l3_grant ||
-          dut.l6_credit || dut.systolic_array_inst.stg_credit) begin
+      if (host_cnt != 0 || wc_cnt[0] || wc_cnt[1] || dut.G_SET.G_COPY[0].pipe.l1_cnt != 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 0 || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l0_out != 0 ||
+          dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt != 0 || host_lnk[0].credit || wc_lnk[0].credit || wc_lnk[1].credit || dut.G_SET.G_COPY[0].pipe.l3_grant ||
+          dut.G_SET.G_COPY[0].pipe.l6_credit || dut.G_SET.G_COPY[0].pipe.systolic_array_inst.stg_credit) begin
         failed++;
         $display("  [FAIL] In reset: host %0d, regions %0d %0d, staging %0d, act banks %0d, sets %0d, granted %0d, results %0d; credits out %0b%0b%0b%0b%0b%0b",
-                 host_cnt, wc_cnt[0], wc_cnt[1], dut.l1_cnt, dut.l6_cnt, dut.sets_out, dut.l0_out, dut.systolic_array_inst.res_cnt,
-                 host_lnk.credit, wc_lnk[0].credit, wc_lnk[1].credit, dut.l3_grant, dut.l6_credit, dut.systolic_array_inst.stg_credit);
+                 host_cnt, wc_cnt[0], wc_cnt[1], dut.G_SET.G_COPY[0].pipe.l1_cnt, dut.G_SET.G_COPY[0].pipe.l6_cnt, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l0_out, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt,
+                 host_lnk[0].credit, wc_lnk[0].credit, wc_lnk[1].credit, dut.G_SET.G_COPY[0].pipe.l3_grant, dut.G_SET.G_COPY[0].pipe.l6_credit, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.stg_credit);
       end
       // The lane links too: no L4, L5, pooling-input or L9 count and no credit while reset is held.
       for (int l = 0; l < NUM_LANES; l++)
-        if (dut.l4_cnt[l] != 0 || dut.l5_out[l] != 0 || dut.pin_cnt[l] != 0 || dut.l4_cr[l] || dut.l5_cr[l] || dut.pin_cr[l]) begin
+        if (dut.G_SET.G_COPY[0].pipe.l4_cnt[l] != 0 || dut.G_SET.G_COPY[0].pipe.l5_out[l] != 0 || dut.G_SET.G_COPY[0].pipe.pin_cnt[l] != 0 || dut.G_SET.G_COPY[0].pipe.l4_cr[l] || dut.G_SET.G_COPY[0].pipe.l5_cr[l] || dut.G_SET.G_COPY[0].pipe.pin_cr[l]) begin
           failed++;
-          $display("  [FAIL] In reset: lane %0d L4 %0d, L5 %0d, pool input %0d; credits out %0b%0b%0b", l, dut.l4_cnt[l], dut.l5_out[l],
-                   dut.pin_cnt[l], dut.l4_cr[l], dut.l5_cr[l], dut.pin_cr[l]);
+          $display("  [FAIL] In reset: lane %0d L4 %0d, L5 %0d, pool input %0d; credits out %0b%0b%0b", l, dut.G_SET.G_COPY[0].pipe.l4_cnt[l], dut.G_SET.G_COPY[0].pipe.l5_out[l],
+                   dut.G_SET.G_COPY[0].pipe.pin_cnt[l], dut.G_SET.G_COPY[0].pipe.l4_cr[l], dut.G_SET.G_COPY[0].pipe.l5_cr[l], dut.G_SET.G_COPY[0].pipe.pin_cr[l]);
           break;
         end
     end
@@ -648,10 +702,10 @@ module TB_sienna_top #(
     west_write_reset_i = 0;
     if (FAULT == 1) begin  // a put with no credit and no rows, the cycle reset ends
       @(negedge clk_i);
-      host_lnk.data = side_now();
-      host_lnk.put = 1'b1;
+      host_lnk[0].data = side_now();
+      host_lnk[0].put = 1'b1;
       @(negedge clk_i);
-      host_lnk.put = 1'b0;
+      host_lnk[0].put = 1'b0;
       $display("  [FAULT 1] put with no credit and no rows @ %0t", $time);
     end
     repeat (5) @(posedge clk_i);
@@ -692,17 +746,17 @@ module TB_sienna_top #(
         print_status("at timeout");
         // Which stage is stuck is the whole diagnosis; sys_busy alone does not say.
         $display("  stage states {g,p} = %0d", dut_stage);
-        $display("  filled_total=%0d  total_elements=%0d  all_collected=%0b", dut.filled_total,
-                 dut.total_elements, dut.all_collected);
+        $display("  filled_total=%0d  total_elements=%0d  all_collected=%0b", dut.G_SET.G_COPY[0].pipe.filled_total,
+                 dut.G_SET.G_COPY[0].pipe.total_elements, dut.G_SET.G_COPY[0].pipe.all_collected);
         $display("  res_ready=%0b  result beat=%0b  l3_armed=%0b  disp_done=%0b",
-                 res_ready, dut.wide_rd_valid, dut.l3_armed, dut.disp_done);
+                 res_ready, dut.G_SET.G_COPY[0].pipe.wide_rd_valid, dut.G_SET.G_COPY[0].pipe.l3_armed, dut.G_SET.G_COPY[0].pipe.disp_done);
         // The host side of L0 and the mesh's staging side of L1.
         $display("  host credits=%0d sets_out=%0d granted=%0d staging=%0d north_queue_empty=%0b west_queue_empty=%0b",
-                 host_cnt, dut.sets_out, dut.l0_out, dut.l1_cnt, dut.north_queue_empty, dut.west_queue_empty);
+                 host_cnt, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l0_out, dut.G_SET.G_COPY[0].pipe.l1_cnt, dut.G_SET.G_COPY[0].pipe.north_queue_empty, dut.G_SET.G_COPY[0].pipe.west_queue_empty);
         for (int i = 0; i < 4; i++)
           $display("  lane %0d: fill_count=%0d done_count=%0d load_finalized=%0b collected=%0b",
-                   i, dut.fill_count[i], dut.done_count[i], dut.load_finalized[i],
-                   dut.lane_collected[i]);
+                   i, dut.G_SET.G_COPY[0].pipe.fill_count[i], dut.G_SET.G_COPY[0].pipe.done_count[i], dut.G_SET.G_COPY[0].pipe.load_finalized[i],
+                   dut.G_SET.G_COPY[0].pipe.lane_collected[i]);
         if (lane_fd) $fclose(lane_fd);
         $finish;
       end
@@ -778,9 +832,9 @@ module TB_sienna_top #(
     if (rstn_i) begin
       // Console Print: Dispatcher data entering Maxpool
       for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.fifo2_wr_valid[lane]) begin
+        if (dut.G_SET.G_COPY[0].pipe.fifo2_wr_valid[lane]) begin
           $display("[DEBUG %0t] Dispatcher -> Maxpool (Lane %0d) : dec=%.4f  hex=%08x", $time, lane,
-                   word_val(32'(dut.fifo2_wr_data[lane]), DATA_WIDTH), dut.fifo2_wr_data[lane]);
+                   word_val(32'(dut.G_SET.G_COPY[0].pipe.fifo2_wr_data[lane]), DATA_WIDTH), dut.G_SET.G_COPY[0].pipe.fifo2_wr_data[lane]);
         end
       end
       // Dropout -> Output lines are printed by the L9 consumer, a set at a time in window order, so stalls cannot reorder them.
@@ -789,23 +843,23 @@ module TB_sienna_top #(
 
   always @(posedge clk_i) begin
     if (rstn_i && trace_fd) begin
-      if (dut.wide_rd_valid) begin
+      if (dut.G_SET.G_COPY[0].pipe.wide_rd_valid) begin
         for (int lane = 0; lane < NUM_LANES; lane++)
           $fdisplay(trace_fd, "[%0t] Systolic -> GPNAE   : dec=%.6f  hex=%08x", $time,
-                    word_val(32'(dut.wide_rd_data[lane]), OUT_W), dut.wide_rd_data[lane]);
+                    word_val(32'(dut.G_SET.G_COPY[0].pipe.wide_rd_data[lane]), RESULT_DATA_WIDTH), dut.G_SET.G_COPY[0].pipe.wide_rd_data[lane]);
       end
       for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.fifo2_rd_ready[lane] && dut.fifo2_rd_valid[lane]) begin
+        if (dut.G_SET.G_COPY[0].pipe.fifo2_rd_ready[lane] && dut.G_SET.G_COPY[0].pipe.fifo2_rd_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] GPNAE -> Maxpool    lane=%0d : dec=%.6f  hex=%08x", $time,
-                    lane, word_val(32'(dut.fifo2_rd_data[lane]), DATA_WIDTH),
-                    dut.fifo2_rd_data[lane]);
+                    lane, word_val(32'(dut.G_SET.G_COPY[0].pipe.fifo2_rd_data[lane]), DATA_WIDTH),
+                    dut.G_SET.G_COPY[0].pipe.fifo2_rd_data[lane]);
         end
       end
       for (int lane = 0; lane < NUM_LANES; lane++) begin
-        if (dut.dropout_in_valid[lane]) begin
+        if (dut.G_SET.G_COPY[0].pipe.dropout_in_valid[lane]) begin
           $fdisplay(trace_fd, "[%0t] Maxpool -> Dropout  lane=%0d : dec=%.6f  hex=%08x", $time,
-                    lane, word_val(32'(dut.dropout_data_in[lane]), DATA_WIDTH),
-                    dut.dropout_data_in[lane]);
+                    lane, word_val(32'(dut.G_SET.G_COPY[0].pipe.dropout_data_in[lane]), DATA_WIDTH),
+                    dut.G_SET.G_COPY[0].pipe.dropout_data_in[lane]);
         end
       end
     end
@@ -821,23 +875,23 @@ module TB_sienna_top #(
   localparam logic [63:0] TR_THR = (((64'(1) << LFSR_WIDTH) - 64'(1)) * 64'(DROPOUT_P_PERCENT)) / 64'(100);  // dropout.sv's threshold
   logic [TR_TPD*TR_TPD-1:0] tr_we;
   logic [TR_TPD*TR_TPD-1:0][31:0] tr_addr;
-  logic [TR_TPD*TR_TPD-1:0][ACC_W-1:0] tr_sum;
-  logic [TR_TPD*TR_TPD-1:0][OUT_W-1:0] tr_word;
+  logic [TR_TPD*TR_TPD-1:0][ACC_DATA_WIDTH-1:0] tr_sum;
+  logic [TR_TPD*TR_TPD-1:0][RESULT_DATA_WIDTH-1:0] tr_word;
   for (genvar ti = 0; ti < TR_TPD; ti++) begin : TR_ROW
     for (genvar tj = 0; tj < TR_TPD; tj++) begin : TR_COL
-      assign tr_we[ti*TR_TPD+tj]   = dut.systolic_array_inst.sram_we_agg[ti*TR_TPD+tj];
-      assign tr_addr[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_addr_agg[ti*TR_TPD+tj];
-      assign tr_word[ti*TR_TPD+tj] = dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj];
-      if (EXP_W == 8 && MAN_W == 7) begin : G_BF16  // bf16: the fp32 sum going into the reducer's fpNarrow
-        assign tr_sum[ti*TR_TPD+tj] = dut.systolic_array_inst.ROW[ti].COL[tj].acc_unit.G_NARROW.NARROW.fp32_i;
+      assign tr_we[ti*TR_TPD+tj]   = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.sram_we_agg[ti*TR_TPD+tj];
+      assign tr_addr[ti*TR_TPD+tj] = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.sram_addr_agg[ti*TR_TPD+tj];
+      assign tr_word[ti*TR_TPD+tj] = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj];
+      if (RESULT_DATA_WIDTH != ACC_DATA_WIDTH) begin : G_NARROW  // the sum going into the reducer's fp32ToBf16, as AccumulationUnit picks it
+        assign tr_sum[ti*TR_TPD+tj] = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.ROW[ti].COL[tj].acc_unit.G_NARROW.NARROW.fp32_i;
       end else begin : G_SAME  // fp32 and int8 write the sum itself
-        assign tr_sum[ti*TR_TPD+tj] = ACC_W'(dut.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj]);
+        assign tr_sum[ti*TR_TPD+tj] = ACC_DATA_WIDTH'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.sram_data_agg[ti*TR_TPD+tj]);
       end
     end
   end
   logic [LFSR_WIDTH-1:0] tr_lfsr[NUM_LANES];
   for (genvar g = 0; g < NUM_LANES; g++) begin : TR_LANE
-    assign tr_lfsr[g] = dut.backend_lanes[g].dropout_inst.lfsr_next;  // the word this beat advances to decides keep
+    assign tr_lfsr[g] = dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.lfsr_next;  // the word this beat advances to decides keep
   end
   function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
     return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
@@ -880,19 +934,19 @@ module TB_sienna_top #(
             if (tr_on && tr_fd) $fdisplay(tr_fd, "M %s %0d %0d %h %h", tr_pass, wn[e], e, tr_sum[t], tr_word[t]);
             wn[e]++;
           end
-        if (dut.g_accept) beat[int'(dut.g_next_id)] = 0;
-        if (dut.wide_rd_valid) begin  // a beat leaves the mesh; floats fill with it, int8 after the requantize pipeline
-          if (!dut.g_hold) begin  // a hold set's beats go to hold_mem and never fill
-            q_id.push_back(int'(dut.g_set_id));
-            q_i.push_back(beat[int'(dut.g_set_id)]);
-            q_pk.push_back(dut.g_pack);
+        if (dut.G_SET.G_COPY[0].pipe.g_accept) beat[int'(dut.G_SET.G_COPY[0].pipe.g_next_id)] = 0;
+        if (dut.G_SET.G_COPY[0].pipe.wide_rd_valid) begin  // a beat leaves the mesh; floats fill with it, int8 after the requantize pipeline
+          if (!dut.G_SET.G_COPY[0].pipe.g_hold) begin  // a hold set's beats go to hold_mem and never fill
+            q_id.push_back(int'(dut.G_SET.G_COPY[0].pipe.g_set_id));
+            q_i.push_back(beat[int'(dut.G_SET.G_COPY[0].pipe.g_set_id)]);
+            q_pk.push_back(dut.G_SET.G_COPY[0].pipe.g_pack);
           end else begin
-            h_id.push_back(dut.g_set_id);
-            h_i.push_back(beat[int'(dut.g_set_id)]);
+            h_id.push_back(dut.G_SET.G_COPY[0].pipe.g_set_id);
+            h_i.push_back(beat[int'(dut.G_SET.G_COPY[0].pipe.g_set_id)]);
           end
-          beat[int'(dut.g_set_id)]++;
+          beat[int'(dut.G_SET.G_COPY[0].pipe.g_set_id)]++;
         end
-        if (dut.hold_wr_s) begin  // a hold beat into hold_mem: its requantized codes (R)
+        if (dut.G_SET.G_COPY[0].pipe.hold_wr_s) begin  // a hold beat into hold_mem: its requantized codes (R)
           if (h_id.size() == 0) begin
             failed++;
             $display("  [FAIL] truth dump: a hold_mem write with no hold beat in the requantize pipeline");
@@ -900,38 +954,38 @@ module TB_sienna_top #(
             automatic logic [$clog2(TR_IDS)-1:0] hid = h_id.pop_front();
             automatic int i = h_i.pop_front();
             if (tr_on && tr_fd != 0)
-              for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "R %s %0d %0d %h", tr_pass, tr_k[hid], tr_elem(k, i, 1'b0), dut.hold_d_s[k]);
+              for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "R %s %0d %0d %h", tr_pass, tr_k[hid], tr_elem(k, i, 1'b0), dut.G_SET.G_COPY[0].pipe.hold_d_s[k]);
           end
         end
-        if (dut.fill_v && q_id.size() != 0) begin
+        if (dut.G_SET.G_COPY[0].pipe.fill_v && q_id.size() != 0) begin
           automatic int id = q_id.pop_front(), i = q_i.pop_front();
           automatic bit pk = q_pk.pop_front();
-          if (dut.fill_add && a_q1.size() == 0) begin
+          if (dut.G_SET.G_COPY[0].pipe.fill_add && a_q1.size() == 0) begin
             failed++;
             $display("  [FAIL] truth dump: an add_lanes beat filled with no add beat entering add_lanes before it");
-          end else if (dut.fill_add) begin  // the ADD's inputs and output (Q)
+          end else if (dut.G_SET.G_COPY[0].pipe.fill_add) begin  // the ADD's inputs and output (Q)
             automatic logic [NUM_LANES-1:0][7:0] q1 = a_q1.pop_front(), q2 = a_q2.pop_front();
             if (tr_on && tr_fd != 0)
               for (int k = 0; k < NUM_LANES; k++)
-                $fdisplay(tr_fd, "Q %s %0d %0d %h %h %h", tr_pass, tr_k[id], tr_elem(k, i, pk), q1[k], q2[k], dut.fill_d[k][7:0]);
+                $fdisplay(tr_fd, "Q %s %0d %0d %h %h %h", tr_pass, tr_k[id], tr_elem(k, i, pk), q1[k], q2[k], dut.G_SET.G_COPY[0].pipe.fill_d[k][7:0]);
           end
           if (tr_on && tr_fd)
-            for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "X %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, pk), dut.fill_d[k]);
+            for (int k = 0; k < NUM_LANES; k++) $fdisplay(tr_fd, "X %s %0d %0d %h", tr_pass, tr_k[id], tr_elem(k, i, pk), dut.G_SET.G_COPY[0].pipe.fill_d[k]);
         end
-        if (dut.add_in_s) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
-          a_q1.push_back(dut.add_q1_s);
-          a_q2.push_back(dut.add_q2_s);
+        if (dut.G_SET.G_COPY[0].pipe.add_in_s) begin  // an add beat enters add_lanes with hold_mem's beat (q1) and requantize's (q2)
+          a_q1.push_back(dut.G_SET.G_COPY[0].pipe.add_q1_s);
+          a_q2.push_back(dut.G_SET.G_COPY[0].pipe.add_q2_s);
         end
-        if (dut.p_accept) begin
+        if (dut.G_SET.G_COPY[0].pipe.p_accept) begin
           for (int l = 0; l < NUM_LANES; l++) pj[l] = 0;
           if (tr_on && tr_fd)
             for (int e = 0; e < SRAM_DEPTH; e++)
-              $fdisplay(tr_fd, "A %s %0d %0d %h", tr_pass, tr_k[int'(dut.p_next_id)], e, dut.gpnae_out_mem[dut.act_rd_base+e]);
+              $fdisplay(tr_fd, "A %s %0d %0d %h", tr_pass, tr_k[int'(dut.G_SET.G_COPY[0].pipe.p_next_id)], e, dut.G_SET.G_COPY[0].pipe.gpnae_out_mem[dut.G_SET.G_COPY[0].pipe.act_rd_base+e]);
         end
         for (int l = 0; l < NUM_LANES; l++)
-          if (dut.dropout_in_valid[l]) begin
+          if (dut.G_SET.G_COPY[0].pipe.dropout_in_valid[l]) begin
             if (tr_on && tr_fd)
-              $fdisplay(tr_fd, "P %s %0d %0d %0d %h %0d", tr_pass, tr_k[int'(dut.p_set_id)], l, pj[l], dut.dropout_data_in[l],
+              $fdisplay(tr_fd, "P %s %0d %0d %0d %h %0d", tr_pass, tr_k[int'(dut.G_SET.G_COPY[0].pipe.p_set_id)], l, pj[l], dut.G_SET.G_COPY[0].pipe.dropout_data_in[l],
                         64'(tr_lfsr[l]) >= TR_THR);
             pj[l]++;
           end
@@ -960,14 +1014,14 @@ module TB_sienna_top #(
     if (!lane_fd) return;
     $fdisplay(lane_fd,
               "---- %0t  (%s)  current_state=%0d  all_collected=%0b  streaming_complete=%0b ----",
-              $time, reason, dut_stage, dut.all_collected, dut.streaming_complete);
+              $time, reason, dut_stage, dut.G_SET.G_COPY[0].pipe.all_collected, dut.G_SET.G_COPY[0].pipe.streaming_complete);
     for (int lane = 0; lane < NUM_LANES; lane++) begin
       $fdisplay(
           lane_fd,
           "  lane=%0d fill_count=%0d done_count=%0d load_finalized=%0b lane_collected=%0b | L4 %0d L5 %0d pool-in %0d | maxpool out %0d of %0d | dropout_out_count=%0d",
-          lane, dut.fill_count[lane], dut.done_count[lane], dut.load_finalized[lane],
-          dut.lane_collected[lane], dut.l4_cnt[lane], dut.l5_out[lane], dut.pin_cnt[lane],
-          dut.mp_out_count[lane], dut.lane_windows_total[lane], dut.dropout_out_count[lane]);
+          lane, dut.G_SET.G_COPY[0].pipe.fill_count[lane], dut.G_SET.G_COPY[0].pipe.done_count[lane], dut.G_SET.G_COPY[0].pipe.load_finalized[lane],
+          dut.G_SET.G_COPY[0].pipe.lane_collected[lane], dut.G_SET.G_COPY[0].pipe.l4_cnt[lane], dut.G_SET.G_COPY[0].pipe.l5_out[lane], dut.G_SET.G_COPY[0].pipe.pin_cnt[lane],
+          dut.G_SET.G_COPY[0].pipe.mp_out_count[lane], dut.G_SET.G_COPY[0].pipe.lane_windows_total[lane], dut.G_SET.G_COPY[0].pipe.dropout_out_count[lane]);
     end
   endtask
 
@@ -1035,8 +1089,8 @@ module TB_sienna_top #(
     bias_i = '0;
     if (bias_valid_i) begin
       read_word_file($sformatf("bias_%0d.mem", k), q);
-      for (int c = 0; c < N; c++) bias_i[c] = IS_INT ? ACC_W'(q[c]) : sienna_fmt_pkg::widen(q[c], MAN_W);
-      for (int c = 0; c < N; c++) bias_want[c] = IS_INT ? q[c] : ACC_W'(q[c][DATA_WIDTH-1:0]) << (ACC_W - DATA_WIDTH);
+      for (int c = 0; c < N; c++) bias_i[c] = IS_INT ? ACC_DATA_WIDTH'(q[c]) : (ACC_DATA_WIDTH'(q[c]) << (ACC_DATA_WIDTH - DATA_WIDTH));
+      for (int c = 0; c < N; c++) bias_want[c] = IS_INT ? q[c] : ACC_DATA_WIDTH'(q[c][DATA_WIDTH-1:0]) << (ACC_DATA_WIDTH - DATA_WIDTH);
     end
   endtask
 
@@ -1130,10 +1184,10 @@ module TB_sienna_top #(
   int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
   int pool_with_result = 0;  // pooling busy while a mesh result waited on an idle activation stage, so activation could have overlapped it
   int stream_id_base;  // sets started before the stream, which consumed ids
-  wire mesh_computing = dut.systolic_array_inst.mesh_busy;  // a set between staging and a written result
+  wire mesh_computing = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.mesh_busy;  // a set between staging and a written result
   // A finished set waits for a result bank: the mesh is held up by the consumer.
-  wire mesh_blocked = dut.systolic_array_inst.arrays_final && dut.systolic_array_inst.reducers_ready &&
-                      !dut.systolic_array_inst.reduce_start;
+  wire mesh_blocked = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.arrays_final && dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reducers_ready &&
+                      !dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reduce_start;
   int withheld = 0;  // cycles the full entry kept a free staging bank from the host
 
   initial forever begin
@@ -1142,9 +1196,9 @@ module TB_sienna_top #(
       if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
       if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
       // A finished result sits in the mesh, not being pushed, while pooling runs and the activation stage has neither taken it nor granted its beats.
-      if (maxpool_busy_tb && res_ready && !dut.wide_rd_valid && int'(dut.g_state) == 0 && !dut.l3_armed) pool_with_result++;
+      if (maxpool_busy_tb && res_ready && !dut.G_SET.G_COPY[0].pipe.wide_rd_valid && int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && !dut.G_SET.G_COPY[0].pipe.l3_armed) pool_with_result++;
       if (mesh_blocked) bp_mesh++;  // a finished set waits because no result bank is free
-      if (int'(dut.g_state) == 0 && res_ready && dut.act_full[dut.act_wr])
+      if (int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && res_ready && dut.G_SET.G_COPY[0].pipe.act_full[dut.G_SET.G_COPY[0].pipe.act_wr])
         bp_act++;  // a mesh result waits because both activation banks are full
       if (n_started - stream_bounds.size() > max_in_flight)
         max_in_flight = n_started - stream_bounds.size();
@@ -1156,7 +1210,7 @@ module TB_sienna_top #(
   int add_drain_hold = 0;  // cycles an add set's drain held the next grant, which it does by design
   int ov_rq = 0, rq_wait = 0;
   int ov_lane = 0, rq_hold = 0, rq_null_wait = 0, rq_null_pass = 0, rd_in = 0;  // rd_in: wide reads of the stage's set so far
-  wire next_ready = res_ready && dut.mesh_sets != 0 && !dut.set_accum[dut.g_next_id];  // the next set's result is ready to push
+  wire next_ready = res_ready && dut.G_SET.G_COPY[0].pipe.mesh_sets != 0 && !dut.G_SET.G_COPY[0].pipe.set_accum[dut.G_SET.G_COPY[0].pipe.g_next_id];  // the next set's result is ready to push
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0) begin
@@ -1169,46 +1223,46 @@ module TB_sienna_top #(
       end else begin
         if (stream_on && rq_id.size() != 0) begin
           // Overlap: set k's beats still in the requantize pipeline while the stage holds set k+1 or has granted its beats.
-          if ((int'(dut.g_state) != 0 && rq_id[0] != int'(dut.g_set_id)) || (int'(dut.g_state) == 0 && dut.l3_armed)) begin
+          if ((int'(dut.G_SET.G_COPY[0].pipe.g_state) != 0 && rq_id[0] != int'(dut.G_SET.G_COPY[0].pipe.g_set_id)) || (int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && dut.G_SET.G_COPY[0].pipe.l3_armed)) begin
             ov_rq++;
-            if (rq_byp[0] != 0 && int'(dut.g_state) != 0 && !dut.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
+            if (rq_byp[0] != 0 && int'(dut.G_SET.G_COPY[0].pipe.g_state) != 0 && !dut.G_SET.G_COPY[0].pipe.act_bypass) ov_lane++;  // a ReLU or linear beat drains while a lane set holds the stage
           end
           // A ReLU or linear set's beats are all in, the next result is ready with a free bank, yet no beats granted: the drain holds it.
-          else if (rq_add[0] == 0 && rq_byp[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready &&
-                   !dut.act_full[rq_bank[0] == 0])
+          else if (rq_add[0] == 0 && rq_byp[0] != 0 && int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && !dut.G_SET.G_COPY[0].pipe.l3_armed && !dut.G_SET.G_COPY[0].pipe.l3_grant && next_ready &&
+                   !dut.G_SET.G_COPY[0].pipe.act_full[rq_bank[0] == 0])
             rq_wait++;
-          else if (rq_add[0] != 0 && int'(dut.g_state) == 0 && !dut.l3_armed && !dut.l3_grant && next_ready && !dut.act_full[rq_bank[0] == 0])
+          else if (rq_add[0] != 0 && int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && !dut.G_SET.G_COPY[0].pipe.l3_armed && !dut.G_SET.G_COPY[0].pipe.l3_grant && next_ready && !dut.G_SET.G_COPY[0].pipe.act_full[rq_bank[0] == 0])
             add_drain_hold++;  // an add drain holds the next grant by design
           // The draining ReLU or linear set still holds the stage, not leaving this cycle, though the next set could start.
-          if (rq_add[0] == 0 && int'(dut.g_state) != 0 && rq_id[0] == int'(dut.g_set_id) && rq_byp[0] != 0 && dut.act_bypass &&
-              rd_in == SRAM_DEPTH / NUM_LANES && !dut.g_done && next_ready && !dut.act_full[!dut.act_wr])
+          if (rq_add[0] == 0 && int'(dut.G_SET.G_COPY[0].pipe.g_state) != 0 && rq_id[0] == int'(dut.G_SET.G_COPY[0].pipe.g_set_id) && rq_byp[0] != 0 && dut.G_SET.G_COPY[0].pipe.act_bypass &&
+              rd_in == SRAM_DEPTH / NUM_LANES && !dut.G_SET.G_COPY[0].pipe.g_done && next_ready && !dut.G_SET.G_COPY[0].pipe.act_full[!dut.G_SET.G_COPY[0].pipe.act_wr])
             rq_hold++;
           // A partial set that could pass the stage but for the drain, and one that passed during it.
-          if (int'(dut.g_state) == 0 && dut.mesh_sets != 0 && dut.set_accum[dut.g_next_id]) rq_null_wait++;
-          if (dut.g_null_done) rq_null_pass++;
+          if (int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && dut.G_SET.G_COPY[0].pipe.mesh_sets != 0 && dut.G_SET.G_COPY[0].pipe.set_accum[dut.G_SET.G_COPY[0].pipe.g_next_id]) rq_null_wait++;
+          if (dut.G_SET.G_COPY[0].pipe.g_null_done) rq_null_pass++;
         end
-        if (int'(dut.g_state) == 0) rd_in = 0;
-        else if (dut.wide_rd_valid) rd_in++;
-        if (dut.fill_v && dut.fill_add) begin  // add_lanes' beats, per add set, and any that came through it for a set not flagged add
+        if (int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0) rd_in = 0;
+        else if (dut.G_SET.G_COPY[0].pipe.wide_rd_valid) rd_in++;
+        if (dut.G_SET.G_COPY[0].pipe.fill_v && dut.G_SET.G_COPY[0].pipe.fill_add) begin  // add_lanes' beats, per add set, and any that came through it for a set not flagged add
           res_add_beats++;
           if (rq_add.size() == 0 || rq_add[0] == 0) res_add_stray++;
           else res_add_set[tr_k[rq_id[0]]]++;
         end
-        if (dut.fill_v && rq_id.size() == 0) begin  // a fill beat that no beat entering requantize accounts for
+        if (dut.G_SET.G_COPY[0].pipe.fill_v && rq_id.size() == 0) begin  // a fill beat that no beat entering requantize accounts for
           failed++;
           $display("  [FAIL] a fill beat with no beat in the requantize pipeline or add_lanes");
         end
-        if (dut.fill_v && rq_id.size() != 0) begin
+        if (dut.G_SET.G_COPY[0].pipe.fill_v && rq_id.size() != 0) begin
           void'(rq_id.pop_front());
           void'(rq_bank.pop_front());
           void'(rq_byp.pop_front());
           void'(rq_add.pop_front());
         end
-        if (dut.wide_rd_valid && !dut.g_hold) begin  // hold beats go to hold_mem and never reach fill_v
-          rq_id.push_back(int'(dut.g_set_id));
-          rq_bank.push_back(int'(dut.act_wr));
-          rq_byp.push_back(int'(dut.act_bypass));
-          rq_add.push_back(int'(dut.g_add));
+        if (dut.G_SET.G_COPY[0].pipe.wide_rd_valid && !dut.G_SET.G_COPY[0].pipe.g_hold) begin  // hold beats go to hold_mem and never reach fill_v
+          rq_id.push_back(int'(dut.G_SET.G_COPY[0].pipe.g_set_id));
+          rq_bank.push_back(int'(dut.G_SET.G_COPY[0].pipe.act_wr));
+          rq_byp.push_back(int'(dut.G_SET.G_COPY[0].pipe.act_bypass));
+          rq_add.push_back(int'(dut.G_SET.G_COPY[0].pipe.g_add));
         end
       end
     end
@@ -1220,9 +1274,9 @@ module TB_sienna_top #(
   initial forever begin
     @(negedge clk_i);
     if (EXP_W == 0 && stream_on && rstn_i) begin
-      res_holds += int'(dut.hold_done);
-      cross_rel_grant += int'(dut.hold_done && dut.l3_grant);
-      cross_hold_bank += int'(dut.hold_done && dut.bank_done);
+      res_holds += int'(dut.G_SET.G_COPY[0].pipe.hold_done);
+      cross_rel_grant += int'(dut.G_SET.G_COPY[0].pipe.hold_done && dut.G_SET.G_COPY[0].pipe.l3_grant);
+      cross_hold_bank += int'(dut.G_SET.G_COPY[0].pipe.hold_done && dut.G_SET.G_COPY[0].pipe.bank_done);
     end
   end
 
@@ -1345,14 +1399,14 @@ module TB_sienna_top #(
               if (overrun && k == SETS_IN_FLIGHT) begin
                 automatic int waited = 0, held = 0, free_bank = 0;
                 // The host cannot put without a credit: wait until every admitted set is in flight, then count the cycles it gets none.
-                while (!(host_cnt == 0 && dut.entry_full) && waited < 2000) begin
+                while (!(host_cnt == 0 && dut.G_SET.G_COPY[0].pipe.entry_full) && waited < 2000) begin
                   @(posedge clk_i);
                   waited++;
                 end
-                if (host_cnt == 0 && dut.entry_full) begin
+                if (host_cnt == 0 && dut.G_SET.G_COPY[0].pipe.entry_full) begin
                   while (host_cnt == 0) begin
                     held++;
-                    if (dut.l1_cnt > dut.l0_out) free_bank++;  // a staging bank the full entry keeps from the host
+                    if (dut.G_SET.G_COPY[0].pipe.l1_cnt > dut.G_SET.G_COPY[0].pipe.l0_out) free_bank++;  // a staging bank the full entry keeps from the host
                     @(posedge clk_i);
                   end
                   $display("  [Stream] entry full: the host held no credit for %0d cycles, %0d of them with a staging bank free", held,
@@ -1396,9 +1450,9 @@ module TB_sienna_top #(
                   @(negedge clk_i);
                   if (out_put == '0) hold_stalled++;
                   if (pipeline_complete_o) hold_completions++;
-                  if (host_cnt == 0 && dut.entry_full) hold_full++;
-                  if (host_cnt == 0 && !dut.entry_full && tb_puts - puts_s0 < k_num_sets) hold_blocked++;  // a set to put, no staging credit
-                  if (host_cnt == 0 && dut.entry_full && tb_puts - puts_s0 < k_num_sets) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
+                  if (host_cnt == 0 && dut.G_SET.G_COPY[0].pipe.entry_full) hold_full++;
+                  if (host_cnt == 0 && !dut.G_SET.G_COPY[0].pipe.entry_full && tb_puts - puts_s0 < k_num_sets) hold_blocked++;  // a set to put, no staging credit
+                  if (host_cnt == 0 && dut.G_SET.G_COPY[0].pipe.entry_full && tb_puts - puts_s0 < k_num_sets) hold_capped++;  // a set to put, the entry at SETS_IN_FLIGHT
                   if (tb_inflight > hold_inflight) hold_inflight = tb_inflight;
                 end
                 // With the output frozen no real set completes, so the entry admits SETS_IN_FLIGHT less those in flight at the start (plus any completion): more sets left must block the host.
@@ -1452,7 +1506,7 @@ module TB_sienna_top #(
       foreach (res_add_set[k]) whole += int'(res_add_set[k] == PER_LANE);
       $display("[HOLD/ADD] hold sets done %0d, add beats %0d, add sets of %0d beats %0d, add beats of other sets %0d, hold done with an L3 grant %0d, hold done with a bank done %0d, grants held for an add drain %0d",
                res_holds, res_add_beats, PER_LANE, whole, res_add_stray, cross_rel_grant, cross_hold_bank, add_drain_hold);
-      if (dut.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
+      if (dut.G_SET.G_COPY[0].pipe.hm_any) begin  // a hold set left without its add set (Task 2.7 review M5)
         failed++;
         $display("  [FAIL] Stream: hold_mem still holds unread hold beats after the last set: a hold set without its add set");
       end
@@ -1481,10 +1535,10 @@ module TB_sienna_top #(
         waited++;
       end
       repeat (40) @(posedge clk_i);
-      if (!drained || tb_inflight != 0 || host_cnt != HOST_SLOTS || dut.sets_out != 0 || dut.l0_out != HOST_SLOTS || !lanes_home(why)) begin
+      if (!drained || tb_inflight != 0 || host_cnt != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l0_out != HOST_SLOTS || !lanes_home(why)) begin
         failed++;
         $display("  [FAIL] Hold: not home after the drain: drained %0b, in flight %0d, host %0d (%0d), sets %0d, granted %0d; %s", drained,
-                 tb_inflight, host_cnt, HOST_SLOTS, dut.sets_out, dut.l0_out, why);
+                 tb_inflight, host_cnt, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l0_out, why);
       end else $display("  [Hold] drained: every completion counted (in flight 0), host credits %0d, %s", host_cnt, why);
     end
     $display("  [Stream] mesh computing while activation busy: %0d cycles", ov_mesh_g);
@@ -1562,16 +1616,16 @@ module TB_sienna_top #(
         end
       end
     join_none
-    while (!(gpnae_busy_tb && dut.sets_out >= HOST_SLOTS) && waited < TIMEOUT_CYCLES) begin
+    while (!(gpnae_busy_tb && dut.G_SET.G_COPY[0].pipe.sets_out >= HOST_SLOTS) && waited < TIMEOUT_CYCLES) begin
       @(posedge clk_i);
       waited++;
     end
-    if (!(gpnae_busy_tb && dut.sets_out >= HOST_SLOTS)) begin
+    if (!(gpnae_busy_tb && dut.G_SET.G_COPY[0].pipe.sets_out >= HOST_SLOTS)) begin
       failed++;
       $display("  [FAIL] Never reached two sets in flight before the reset");
     end
     disable fork;
-    $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.sets_out, host_cnt, dut_stage);
+    $display("  [Reset] resetting with %0d sets in flight, host credits %0d, stages {g,p}=%0d", dut.G_SET.G_COPY[0].pipe.sets_out, host_cnt, dut_stage);
     reset();
     activation_function_i = k_activation_code[CONTROL_WIDTH-1:0];
     training_mode_i       = k_training_mode[0];
@@ -1584,11 +1638,11 @@ module TB_sienna_top #(
       $display("  [FAIL] %0d cycles of output after reset with nothing started", stray);
     end
     // Review Focus 1: every consumer advertised its slots again and every producer counted them from 0.
-    if (host_cnt != HOST_SLOTS || dut.l1_cnt != 2 || dut.l0_out != HOST_SLOTS || dut.sets_out != 0 || dut.l6_cnt != 2 || !dut.l3_armed ||
-        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage != 0) begin
+    if (host_cnt != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.l1_cnt != 2 || dut.G_SET.G_COPY[0].pipe.l0_out != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
+        int'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt) != PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage != 0) begin
       failed++;
       $display("  [FAIL] Not idle after reset: host %0d (%0d), staging %0d (2), granted %0d (%0d), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
-               host_cnt, HOST_SLOTS, dut.l1_cnt, dut.l0_out, HOST_SLOTS, dut.sets_out, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE,
+               host_cnt, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.l1_cnt, dut.G_SET.G_COPY[0].pipe.l0_out, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l6_cnt, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt, PER_LANE,
                wc_cnt[0], wc_cnt[1], dut_stage);
     end else if (!lanes_home(why)) begin
       failed++;
@@ -1616,8 +1670,8 @@ module TB_sienna_top #(
   int acc_beats = 0, acc_banks = 0;
   always_ff @(posedge clk_i) begin
     if (acc_on) begin  // its words and boundaries come from the L9 consumer
-      if (dut.wide_rd_valid) acc_beats <= acc_beats + 1;
-      if (dut.bank_done) acc_banks <= acc_banks + 1;
+      if (dut.G_SET.G_COPY[0].pipe.wide_rd_valid) acc_beats <= acc_beats + 1;
+      if (dut.G_SET.G_COPY[0].pipe.bank_done) acc_banks <= acc_banks + 1;
     end
   end
 
@@ -1710,11 +1764,11 @@ module TB_sienna_top #(
       end
     end
     // Credits: one set of beats and one bank spent; drained, every link holds all its slots again.
-    if (acc_beats != PER_LANE || acc_banks != 1 || dut.l6_cnt != 2 || !dut.l3_armed ||
-        int'(dut.systolic_array_inst.res_cnt) != PER_LANE || dut.l1_cnt != 2 || host_cnt != HOST_SLOTS) begin
+    if (acc_beats != PER_LANE || acc_banks != 1 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
+        int'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt) != PER_LANE || dut.G_SET.G_COPY[0].pipe.l1_cnt != 2 || host_cnt != HOST_SLOTS) begin
       failed++;
       $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (%0d)",
-               acc_beats, PER_LANE, acc_banks, dut.l6_cnt, dut.systolic_array_inst.res_cnt, PER_LANE, dut.l1_cnt, host_cnt, HOST_SLOTS);
+               acc_beats, PER_LANE, acc_banks, dut.G_SET.G_COPY[0].pipe.l6_cnt, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt, PER_LANE, dut.G_SET.G_COPY[0].pipe.l1_cnt, host_cnt, HOST_SLOTS);
     end
     $display("  [Accum] %0d sets, %0d with outputs (%0d outputs, %0d exact, %0d mismatches); %0d result beats and %0d activation bank spent",
              acc_bounds.size(), (acc_bounds.size() > 0 && acc_results.size() > 0) ? 1 : 0, acc_results.size(), n_exact, errs, acc_beats,
@@ -1726,22 +1780,22 @@ module TB_sienna_top #(
   int perf_mesh_st = -1, perf_g_st = -1, perf_p_st = -1, perf_cred = -1, perf_mread = 0;
   int perf_lane_busy = 0, perf_round_cyc = 0;
   int g_eff, entry_free;
-  assign g_eff = (dut.g_fed || dut.wide_rd_valid) ? int'(dut.g_state) : 0;  // the stage's state once its set's beats arrive
-  assign entry_free = SETS_IN_FLIGHT - int'(dut.sets_out) - int'(dut.l0_out);  // sets the entry may still admit
+  assign g_eff = (dut.G_SET.G_COPY[0].pipe.g_fed || dut.G_SET.G_COPY[0].pipe.wide_rd_valid) ? int'(dut.G_SET.G_COPY[0].pipe.g_state) : 0;  // the stage's state once its set's beats arrive
+  assign entry_free = SETS_IN_FLIGHT - int'(dut.G_SET.G_COPY[0].pipe.sets_out) - int'(dut.G_SET.G_COPY[0].pipe.l0_out);  // sets the entry may still admit
   initial forever begin
     @(negedge clk_i);
     if (stream_on) begin
       automatic int c = int'($time / 10);
       automatic int busy = 0;
       // Mesh events, one of each per set and in set order: 2 broadcast start, 3 broadcast end, 4 feed start, 5 reduce start, 7 written.
-      if (dut.systolic_array_inst.set_launch) begin
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.set_launch) begin
         $display("PERF %0d MESH 1", c);
         $display("PERF %0d MESH 2", c);
       end
-      if (dut.systolic_array_inst.bcast_release) $display("PERF %0d MESH 3", c);
-      if (dut.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("PERF %0d MESH 4", c);
-      if (dut.systolic_array_inst.reduce_start) $display("PERF %0d MESH 5", c);
-      if (dut.systolic_array_inst.set_done) $display("PERF %0d MESH 7", c);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.bcast_release) $display("PERF %0d MESH 3", c);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.ROW[0].COL[0].DEPTH[0].S.tile.launch) $display("PERF %0d MESH 4", c);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.reduce_start) $display("PERF %0d MESH 5", c);
+      if (dut.G_SET.G_COPY[0].pipe.systolic_array_inst.set_done) $display("PERF %0d MESH 7", c);
       // The stage takes its credits ahead of the result; G counts from the set's first beat, as main's read did.
       if (g_eff != perf_g_st) begin
         $display("PERF %0d G %0d", c, g_eff);
@@ -1751,20 +1805,20 @@ module TB_sienna_top #(
           perf_round_cyc = 0;
         end
       end
-      if (int'(dut.p_state) != perf_p_st) $display("PERF %0d P %0d", c, dut.p_state);
+      if (int'(dut.G_SET.G_COPY[0].pipe.p_state) != perf_p_st) $display("PERF %0d P %0d", c, dut.G_SET.G_COPY[0].pipe.p_state);
       if (entry_free != perf_cred) $display("PERF %0d CREDITS %0d", c, entry_free);
-      if (int'(dut.wide_rd_valid) != perf_mread) $display("PERF %0d MREAD %0d", c, dut.wide_rd_valid);
+      if (int'(dut.G_SET.G_COPY[0].pipe.wide_rd_valid) != perf_mread) $display("PERF %0d MREAD %0d", c, dut.G_SET.G_COPY[0].pipe.wide_rd_valid);
       if (pipeline_complete_o) $display("PERF %0d DONE %0d", c, done_set_id_o);
       if (g_eff == 3) begin
-        for (int i = 0; i < NUM_LANES; i++) if (dut.load_finalized[i] && !dut.lane_collected[i]) busy++;
+        for (int i = 0; i < NUM_LANES; i++) if (dut.G_SET.G_COPY[0].pipe.load_finalized[i] && !dut.G_SET.G_COPY[0].pipe.lane_collected[i]) busy++;
         perf_lane_busy += busy;
         perf_round_cyc++;
       end
     end
     perf_g_st    = g_eff;
-    perf_p_st    = int'(dut.p_state);
+    perf_p_st    = int'(dut.G_SET.G_COPY[0].pipe.p_state);
     perf_cred    = entry_free;
-    perf_mread   = int'(dut.wide_rd_valid);
+    perf_mread   = int'(dut.G_SET.G_COPY[0].pipe.wide_rd_valid);
   end
 `endif
 
@@ -1863,14 +1917,14 @@ module TB_sienna_top #(
 
       @(posedge clk_i);
       $display("  [B2B] gate before put: state=%0d north_empty=%0b west_empty=%0b credits=%0d",
-               dut_stage, dut.north_queue_empty, dut.west_queue_empty, host_cnt);
+               dut_stage, dut.G_SET.G_COPY[0].pipe.north_queue_empty, dut.G_SET.G_COPY[0].pipe.west_queue_empty, host_cnt);
       tr_cur_k = 1;  // set 1 alone
       tr_pass = "B2B";
       tr_seq++;
       tr_on = 1;
       host_put();
       $display("  [B2B] gate at put    : state=%0d north_empty=%0b west_empty=%0b",
-               dut_stage, dut.north_queue_empty, dut.west_queue_empty);
+               dut_stage, dut.G_SET.G_COPY[0].pipe.north_queue_empty, dut.G_SET.G_COPY[0].pipe.west_queue_empty);
       @(posedge clk_i);
       $display("  [B2B] state after pulse: %0d", dut_stage);
 
@@ -1900,11 +1954,11 @@ module TB_sienna_top #(
     if (k_residual != 0) $display("[SKIP] accumulate pass: the residual stream's groups come from add_<k>.mem");
     else accum_null_pass();
     // sienna_top's own link checkers judge only when it is drained: it must drain after the last set.
-    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.drained; w++) @(posedge clk_i);
-    if (!dut.drained) begin
+    for (int w = 0; w < 200 + 8 * LINK_STAGES && !dut.G_SET.G_COPY[0].pipe.drained; w++) @(posedge clk_i);
+    if (!dut.G_SET.G_COPY[0].pipe.drained) begin
       failed++;
-      $display("  [FAIL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.drain_n);
-    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.drain_n);
+      $display("  [FAIL] sienna_top never drained after the last set (%0d drains in the run): its link checkers never judged it", dut.G_SET.G_COPY[0].pipe.drain_n);
+    end else $display("  [Drain] sienna_top drained after the last set, %0d drains in the run", dut.G_SET.G_COPY[0].pipe.drain_n);
 
     if (k_has_bias != 0 && bias_checked == 0) begin
       failed++;

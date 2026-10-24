@@ -1,8 +1,11 @@
 `timescale 1ns / 1ps
 
-// dropout in int8 (D-5) on credit links with checkers bound and 0% then 30% random stalls: inference passes beats, training keeps or drops to zero_point_i.
+// dropout in int8 (D-5, FMT=int8) on credit links with checkers bound and 0% then 30% random stalls: inference passes beats, training keeps or drops to zero_point_i.
 module TB_dropout_int8;
   localparam int W = 8;
+  if (!(sienna_fmt_pkg::EXPONENT_WIDTH == 0)) begin : G_BAD_FORMAT  // the bench's vectors are int8 words
+    $fatal(1, "TB_dropout_int8: build with FMT=int8 (+define+FMT_INT8), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
   localparam int SLOTS = 3;
   localparam logic [31:0] SEED = 32'h2ACE002A;
   localparam logic [31:0] THR = 32'((64'hFFFFFFFF * 64'd50) / 64'd100);  // dropout.sv's threshold at 50%
@@ -12,7 +15,7 @@ module TB_dropout_int8;
 
   credit_link_if #(.DATA_W(W), .CRW(1)) in_l ();
   credit_link_if #(.DATA_W(W), .CRW(1)) out_l ();
-  dropout #(.EXP_W(0), .MAN_W(7), .LFSR_WIDTH(32)) dut (
+  dropout #(.LFSR_WIDTH(32)) dut (
       .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(training), .reseed_i(reseed), .seed_i(SEED),
       .zero_point_i(zp));
 

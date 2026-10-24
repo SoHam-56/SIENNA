@@ -1,12 +1,12 @@
 `timescale 1ns / 1ps
 
+// Dropout in the build's format, from sienna_fmt_pkg: in training a kept word is x * CONST_SCALE on fmt_mul (DROPOUT_SCALE_LATENCY cycles), or x where
+// that latency is 0 (int8: the 1/keep factor is in the next layer's scale); a dropped word is the package's fmt_drop. Inference passes every word.
 module dropout #(
-    parameter int                    EXP_W             = 8,   // the build's format: fp32 8/23, bf16 8/7
-    parameter int                    MAN_W             = 23,
-    parameter int                    DATA_WIDTH        = 1 + EXP_W + MAN_W,
+    parameter int                    DATA_WIDTH        = sienna_fmt_pkg::DATA_WIDTH,
     parameter int                    DROPOUT_P_PERCENT = 50,
     parameter int                    LFSR_WIDTH        = 32,
-    parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W))
+    parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = sienna_fmt_pkg::DROPOUT_KEEP_SCALE  // 2.0, 1/(1-p) at p = 50%
 ) (
     input wire clk,
     input wire rst_n,
@@ -16,7 +16,7 @@ module dropout #(
     input wire                  training_mode,
     input wire                  reseed_i,  // load seed_i into the LFSR; only between sets
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
-    input wire [DATA_WIDTH-1:0] zero_point_i  // int8 training: a dropped beat becomes this (D-5); other formats ignore it
+    input wire [DATA_WIDTH-1:0] zero_point_i  // the dropped word where the format has a zero point (int8, D-5); floats ignore it
 );
 
   // The downstream credit is the upstream's: a beat is put here only on a slot already reserved past this unit's pipeline.
@@ -35,7 +35,7 @@ module dropout #(
              $bits(in.credit), $bits(out.data), $bits(out.credit));
 `endif
 
-  localparam bit IS_INT = sienna_fmt_pkg::is_int(EXP_W);  // int8: no multiplier, the 1/keep factor lives in the next layer's scale
+  localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
   localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
   localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
   localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
@@ -61,7 +61,7 @@ module dropout #(
   // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
 `ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial begin
-    if (!IS_INT && DROPOUT_P_PERCENT != 50 && CONST_SCALE == DATA_WIDTH'(sienna_fmt_pkg::from_fp32(32'h40000000, MAN_W)))
+    if (SCALES && DROPOUT_P_PERCENT != 50 && CONST_SCALE == sienna_fmt_pkg::DROPOUT_KEEP_SCALE)
       $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
   end
 `endif
@@ -72,7 +72,7 @@ module dropout #(
   logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
 
   // ---------------------------------------------------------
-  // MUX Bypass Logic 
+  // MUX Bypass Logic
   // ---------------------------------------------------------
   logic                  mult_valid_in;
   logic [DATA_WIDTH-1:0] mult_out;
@@ -87,15 +87,15 @@ module dropout #(
       // INFERENCE: Combinational bypass, starve the multiplier
       data_out  = data_in;
       valid_out = in_valid;
-    end else if (IS_INT) begin
-      // int8 training: in the same cycle, a kept beat unchanged, a dropped beat the zero point (D-5).
-      data_out  = (lfsr_next >= DROPOUT_THRESHOLD) ? data_in : zero_point_i;
+    end else if (!SCALES) begin
+      // Training with no scale: in the same cycle, a kept beat unchanged, a dropped beat the format's dropped word (int8: the zero point, D-5).
+      data_out  = (lfsr_next >= DROPOUT_THRESHOLD) ? data_in : sienna_fmt_pkg::fmt_drop(data_in, zero_point_i);
       valid_out = in_valid;
     end else begin
       mult_valid_in = in_valid;
       valid_out     = mult_done;
-      // A dropped beat is a zero with the input's sign, as x * 0 gives in IEEE arithmetic.
-      data_out      = keep_q[kq_rd] ? mult_out : {mult_out[DATA_WIDTH-1], {(DATA_WIDTH - 1) {1'b0}}};
+      // A dropped beat is the format's dropped word of the product: a zero with the input's sign in floats, as x * 0 gives in IEEE arithmetic.
+      data_out      = keep_q[kq_rd] ? mult_out : sienna_fmt_pkg::fmt_drop(mult_out, zero_point_i);
     end
   end
 
@@ -104,25 +104,25 @@ module dropout #(
       kq_wr <= '0;
       kq_rd <= '0;
     end else begin
-      if (!IS_INT && training_mode && in_valid) begin
+      if (SCALES && training_mode && in_valid) begin
         keep_q[kq_wr] <= (lfsr_next >= DROPOUT_THRESHOLD);  // the word this beat advances to
         kq_wr <= kq_wr + 1'b1;
       end
-      if (!IS_INT && training_mode && mult_done) kq_rd <= kq_rd + 1'b1;
+      if (SCALES && training_mode && mult_done) kq_rd <= kq_rd + 1'b1;
     end
   end
 
-  if (!sienna_fmt_pkg::supported(EXP_W, MAN_W)) begin : G_BAD_FORMAT
-    $fatal(1, "dropout: unsupported format EXP_W=%0d MAN_W=%0d", EXP_W, MAN_W);
-  end else if (IS_INT) begin : G_INT
+  if (DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH) begin : G_BAD_DATA_WIDTH  // fmt_mul and fmt_drop work at the build's width
+    $fatal(1, "dropout: DATA_WIDTH %0d, but the build's words are %0d bits", DATA_WIDTH, sienna_fmt_pkg::DATA_WIDTH);
+  end else if (!SCALES) begin : G_KEEP
     assign mult_out  = '0;
     assign mult_done = 1'b0;
-  end else if (sienna_fmt_pkg::is_fp32(EXP_W, MAN_W)) begin : G_FP32
-    fp32Multiplier MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .A(data_in), .B(CONST_SCALE),
-                        .result_o(mult_out), .done_o(mult_done), .overflow_o(), .underflow_o(), .invalid_o());
-  end else begin : G_FP
-    fpMultiplier #(.EXP_W(EXP_W), .MAN_W(MAN_W)) MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .A(data_in),
-        .B(CONST_SCALE), .result_o(mult_out), .done_o(mult_done), .overflow_o(), .underflow_o(), .invalid_o());
+  end else if (sienna_fmt_pkg::mul_latency(DATA_WIDTH, DATA_WIDTH) != sienna_fmt_pkg::DROPOUT_SCALE_LATENCY) begin : G_BAD_LATENCY
+    $fatal(1, "dropout: fmt_mul takes %0d cycles at %0d bits, but DROPOUT_SCALE_LATENCY is %0d", sienna_fmt_pkg::mul_latency(DATA_WIDTH, DATA_WIDTH),
+           DATA_WIDTH, sienna_fmt_pkg::DROPOUT_SCALE_LATENCY);
+  end else begin : G_SCALE  // x * CONST_SCALE in the format: fp32Multiplier, bf16Multiplier
+    fmt_mul #(.DATA_WIDTH(DATA_WIDTH), .EXT_DATA_WIDTH(DATA_WIDTH)) MUL (.clk_i(clk), .rstn_i(rst_n), .valid_i(mult_valid_in), .a_i(data_in),
+        .b_i(CONST_SCALE), .product_o(mult_out), .done_o(mult_done));
   end
 
 endmodule

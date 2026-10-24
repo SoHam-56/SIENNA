@@ -1,16 +1,19 @@
 `timescale 1ns / 1ps
 
-// dropout in bf16, training mode, on credit links with checkers bound and 0% then 30% random stalls: every output is x * 2 or a signed zero.
+// dropout in bf16 (FMT=bf16), training mode, on credit links with checkers bound and 0% then 30% random stalls: every output is x * 2 or a signed zero.
 module TB_dropout_fmt #(
     parameter int FAULT = 0  // 6: the input link's credit two bits wide against the output's one
 );
-  localparam int EXP_W = 8, MAN_W = 7, W = 16;
+  localparam int EXP_W = 8, MAN_W = 7, W = 16;  // the bench's own bf16 encoder
+  if (!(sienna_fmt_pkg::DATA_WIDTH == 16 && sienna_fmt_pkg::EXPONENT_WIDTH == 8)) begin : G_BAD_FORMAT  // the bench's vectors are bf16 words
+    $fatal(1, "TB_dropout_fmt: build with FMT=bf16 (+define+FMT_BF16), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
   localparam int SLOTS = 4;  // the TB's output slots: beats in flight through the multiplier never exceed them
   logic clk = 0, rst_n = 0, reseed = 0;
   always #5 clk = ~clk;
   credit_link_if #(.DATA_W(W), .CRW((FAULT == 6) ? 2 : 1)) in_l ();
   credit_link_if #(.DATA_W(W), .CRW(1)) out_l ();
-  dropout #(.EXP_W(EXP_W), .MAN_W(MAN_W), .LFSR_WIDTH(32)) dut (
+  dropout #(.LFSR_WIDTH(32)) dut (
       .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(1'b1), .reseed_i(reseed), .seed_i(32'h2ACE002A),
       .zero_point_i('0));
 

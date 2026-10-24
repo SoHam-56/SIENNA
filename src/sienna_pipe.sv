@@ -538,8 +538,6 @@ module sienna_pipe #(
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;
       dropout #(
-          .EXP_W            (sienna_fmt_pkg::EXPONENT_WIDTH),
-          .MAN_W            (sienna_fmt_pkg::MANTISSA_WIDTH),
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
           .LFSR_WIDTH       (LFSR_WIDTH)

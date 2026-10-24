@@ -102,7 +102,8 @@ module TB_sienna_top #(
 
   // ── Links: this TB is the host (L0) and the weight-cache writer (L2), each with a counter and a checker ──
   `include "sienna_set_side.svh"
-  sienna_add_pkg::add_words_t add_words_i;  // the set's ADD words (apply_add)
+  `include "tb_side_pack.svh"
+  tb_add_words_t add_words_i;  // the set's ADD words (apply_add)
   localparam int SIDE_W = $bits(set_side_t);
   credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
   // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
@@ -240,39 +241,18 @@ module TB_sienna_top #(
       .cfg_act_i           ('0),
       .cfg_train_i         (1'b0),
       .cfg_seed_i          ('0),
-      .cfg_req_zp_i        ('0),
-      .cfg_req_min_i       ('0),
-      .cfg_req_max_i       ('0),
-      .cfg_gp_mx_i         ('0),
-      .cfg_gp_shx_i        ('0),
-      .cfg_gp_mout_i       ('0),
-      .cfg_gp_shout_i      ('0),
-      .cfg_gp_zout_i       ('0),
-      .cfg_add_zp2_i       ('0),
-      .cfg_add_m1_i        ('0),
-      .cfg_add_m2_i        ('0),
-      .cfg_add_shift_i     ('0),
-      .cfg_add_zpo_i       ('0),
-      .cfg_add_amin_i      ('0),
-      .cfg_add_amax_i      ('0),
+      .cfg_lane_i          ('0),
+      .cfg_add_i           ('0),
       .cfg_pack_shift_i    ('0),
       .cfg_pack_map_i      ('0),
       .cfg_pack_act_i      ('0),
-      .cfg_pack_zp_i       ('0),
-      .cfg_pack_min_i      ('0),
-      .cfg_pack_max_i      ('0),
-      .cfg_pack_mx_i       ('0),
-      .cfg_pack_shx_i      ('0),
-      .cfg_pack_mout_i     ('0),
-      .cfg_pack_shout_i    ('0),
-      .cfg_pack_zout_i     ('0),
+      .cfg_pack_lane_i     ('0),
       .busy_o              (),
       .done_o              (),
       .a_rows              (idle_rows[0]),
       .w_rows              (idle_rows[1]),
       .w_bias_i            ('0),
-      .w_req_mult_i        ('0),
-      .w_req_shift_i       ('0),
+      .w_req_scale_i       ('0),
       .set_done_o          (),
       .host                       (host_lnk),
       .bias_i                     (bias_i),
@@ -419,6 +399,10 @@ module TB_sienna_top #(
   // The sideband of the set being put, from the per-set signals above; entry 0 of each table is the set's own.
   function automatic set_side_t side_now();
     set_side_t s;
+    logic [PACK_ENTRIES-1:0][TB_ENTRY_W-1:0] ents;
+    ents[0] = tb_entry(req_zp_i, req_min_i, req_max_i, gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i);
+    for (int e = 1; e < PACK_ENTRIES; e++)
+      ents[e] = tb_entry(pack_zp_i[e], pack_min_i[e], pack_max_i[e], pack_mx_i[e], pack_shx_i[e], pack_mout_i[e], pack_shout_i[e], pack_zout_i[e]);
     s               = '0;
     s.wc_last       = wc_last_i;
     s.weight_tile   = weight_tile_i;
@@ -430,19 +414,11 @@ module TB_sienna_top #(
     s.pack_shift    = pack_shift_i;
     s.pack_map      = pack_map_i;
     s.act           = {pack_act_i, activation_function_i};
-    s.zp            = {pack_zp_i, req_zp_i};
-    s.amin          = {pack_min_i, req_min_i};
-    s.amax          = {pack_max_i, req_max_i};
-    s.mx            = {pack_mx_i, gp_mx_i};
-    s.shx           = {pack_shx_i, gp_shx_i};
-    s.mout          = {pack_mout_i, gp_mout_i};
-    s.shout         = {pack_shout_i, gp_shout_i};
-    s.zout          = {pack_zout_i, gp_zout_i};
-    s.mult          = req_mult_i;
-    s.shift         = req_shift_i;
+    s.entry         = tb_side_entries(ents);
+    s.scale         = tb_side_scales(req_mult_i, req_shift_i);
     s.res_hold      = res_hold_i;
     s.res_add       = res_add_i;
-    s.add           = add_words_i;
+    s.add           = tb_side_add(add_words_i);
 `ifdef TB_FLOAT_ADD
     s.res_add       = 1'b1;  // fault build: every set claims to be an add set, so a build without the residual ADD fires a_no_residual_add
 `endif

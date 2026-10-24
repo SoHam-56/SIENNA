@@ -11,7 +11,7 @@ module add_lanes #(
     input  logic [NUM_LANES-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] q1_i,  // hold_mem's beat: the conv's requantized codes
     input  logic [NUM_LANES-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] q2_i,  // the add set's beat: the residual's codes through the identity requantize
     input  logic [TAG_W-1:0]           tag_i,
-    input  sienna_add_pkg::add_words_t words_i,  // the set's ADD words, every lane
+    input  sienna_fmt_pkg::add_params_t words_i,  // the set's ADD words, every lane
     output logic                       valid_o,
     output logic [NUM_LANES-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] result_o,
     output logic [TAG_W-1:0]           tag_o,
@@ -30,9 +30,9 @@ module add_lanes #(
 
   for (genvar k = 0; k < NUM_LANES; k++) begin : LANE
     int8QuantizedAdder u (
-        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(valid_i), .q1_i(q1_i[k]), .q2_i(q2_i[k]), .zp1_i(words_i.zp1), .zp2_i(words_i.zp2),
-        .m1_i(words_i.m1), .m2_i(words_i.m2), .shift_i(words_i.shift), .zpo_i(words_i.zpo), .act_min_i(words_i.amin),
-        .act_max_i(words_i.amax), .result_o(result_o[k]), .done_o(done[k]));
+        .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(valid_i), .q1_i(q1_i[k]), .q2_i(q2_i[k]), .zp1_i(words_i.in1_zero_point),
+        .zp2_i(words_i.in2_zero_point), .m1_i(words_i.in1_mantissa), .m2_i(words_i.in2_mantissa), .shift_i(words_i.shift),
+        .zpo_i(words_i.out_zero_point), .act_min_i(words_i.act_min), .act_max_i(words_i.act_max), .result_o(result_o[k]), .done_o(done[k]));
   end
 
   always_ff @(posedge clk_i) begin  // no reset: read only beside valid_o (D-8)

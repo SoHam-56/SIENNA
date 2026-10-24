@@ -12,12 +12,9 @@ module requant_lanes #(
     input  logic                                                     clear_i,  // no set in the stage: the next beat is beat 0
     input  logic                                                     valid_i,  // one wide-read beat
     input  logic [NUM_LANES-1:0][sienna_fmt_pkg::RESULT_DATA_WIDTH-1:0] acc_i,  // the mesh's result words: int32 sums where it requantizes
-    input  logic [N-1:0][23:0]                                       mult_i,   // per output channel: the scale's 24-bit mantissa
-    input  logic [N-1:0][5:0]                                        shift_i,  // and its right shift
+    input  sienna_fmt_pkg::requant_scale_t [N-1:0]                   scale_i,  // per output channel: the scale's mantissa and right shift
     input  logic                                                     packed_i, // the stage's set is packed: lane k reads column k % N at every beat
-    input  logic [NUM_LANES-1:0][7:0]                                zp_i,     // output zero point, per lane
-    input  logic [NUM_LANES-1:0][7:0]                                min_i,    // clamp, signed, per lane: the int8 range, or the fused ReLU / ReLU6
-    input  logic [NUM_LANES-1:0][7:0]                                max_i,
+    input  sienna_fmt_pkg::lane_entry_t [NUM_LANES-1:0]              entry_i,  // per lane: its entry's output zero point and clamp (the int8 range, or the fused ReLU / ReLU6)
     output logic                                                     valid_o,  // the beat, REQUANT_LATENCY cycles later
     output logic [NUM_LANES-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0]     result_o
 );
@@ -41,16 +38,17 @@ module requant_lanes #(
           .rstn_i   (rstn_i),
           .valid_i  (valid_i),
           .acc_i    (acc_i[k]),
-          .mult_i   (mult_i[ch]),
-          .shift_i  (shift_i[ch]),
-          .zp_i     (zp_i[k]),
-          .act_min_i(min_i[k]),
-          .act_max_i(max_i[k]),
+          .mult_i   (scale_i[ch].mantissa),
+          .shift_i  (scale_i[ch].shift),
+          .zp_i     (entry_i[k].zero_point),
+          .act_min_i(entry_i[k].act_min),
+          .act_max_i(entry_i[k].act_max),
           .result_o (result_o[k]),
           .done_o   (done[k])
       );
     end
     assign valid_o = done[0];  // every lane takes the same beats
+    wire unused_lane_words = ^entry_i;  // the entries' lane words are GPNAE's
   end else begin : G_PASS
     if (sienna_fmt_pkg::RESULT_DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH) begin : G_BAD_WIDTH  // a pass-through cannot narrow
       $fatal(1, "requant_lanes: the mesh gives %0d-bit results, the lanes take %0d-bit words", sienna_fmt_pkg::RESULT_DATA_WIDTH,
@@ -58,7 +56,7 @@ module requant_lanes #(
     end
     assign valid_o  = valid_i;
     assign result_o = acc_i;
-    wire unused_requant_inputs = ^{clk_i, rstn_i, clear_i, mult_i, shift_i, packed_i, zp_i, min_i, max_i};  // only a requantizing build reads them
+    wire unused_requant_inputs = ^{clk_i, rstn_i, clear_i, scale_i, packed_i, entry_i};  // only a requantizing build reads them
   end
 
 endmodule

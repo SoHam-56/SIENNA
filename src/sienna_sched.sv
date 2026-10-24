@@ -8,7 +8,7 @@
 // A block is cached when it has more than one row tile and at most WC_TILES/2 weight tiles.
 // Activation stream (a_rows), per column block, per row tile: the depth tiles of A (N rows each), then the residual tile if cfg_residual_i.
 // Row credits, in stream order: a set's N A rows (and N B rows if uncached) while an L0 credit is held, a bias row's one, a cache tile's N.
-// int8: every block has a bias beat, its int32 bias and requantize words on w_bias_i, w_req_mult_i, w_req_shift_i with its put (its row ignored).
+// Requantizing builds (int8): every block has a bias beat, its int32 bias and requantize scales on w_bias_i and w_req_scale_i with its put (its row ignored).
 // int8 residual: the depth passes' last is a hold set and the residual pass an add set (sienna-int8-residual).
 // Results leave per output tile on the output links (L9), column blocks outer and row tiles inner; lane L's j-th word of a set is word j*NUM_LANES + L.
 module sienna_sched #(
@@ -32,35 +32,15 @@ module sienna_sched #(
     input logic [CONTROL_WIDTH-1:0] cfg_act_i,
     input logic                     cfg_train_i,
     input logic [LFSR_WIDTH-1:0]    cfg_seed_i,
-    // int8 only, taken with cfg_load_i: the layer's requantize and GPNAE parameters (D-2)
-    input logic [7:0]               cfg_req_zp_i,
-    input logic [7:0]               cfg_req_min_i,
-    input logic [7:0]               cfg_req_max_i,
-    input logic [15:0]              cfg_gp_mx_i,
-    input logic [4:0]               cfg_gp_shx_i,
-    input logic [23:0]              cfg_gp_mout_i,   // SELU output scale: 24-bit mantissa and right shift
-    input logic [5:0]               cfg_gp_shout_i,
-    input logic [7:0]               cfg_gp_zout_i,
-    // int8 residual only, taken with cfg_load_i: the ADD's words (sienna_add_pkg::add_words_t); zp1 is cfg_req_zp_i, the conv output's
-    input logic [7:0]               cfg_add_zp2_i,
-    input logic [31:0]              cfg_add_m1_i,
-    input logic [31:0]              cfg_add_m2_i,
-    input logic [5:0]               cfg_add_shift_i,
-    input logic [7:0]               cfg_add_zpo_i,
-    input logic [7:0]               cfg_add_amin_i,
-    input logic [7:0]               cfg_add_amax_i,
+    // Taken with cfg_load_i where the build has them (int8; 1-bit dummies in floats): the layer's requantize and lane words (D-2), and
+    // the residual ADD's words, whose in1_zero_point is ignored for cfg_lane_i's zero_point, the conv output's
+    input sienna_fmt_pkg::lane_entry_t cfg_lane_i,
+    input sienna_fmt_pkg::add_params_t cfg_add_i,
     // Packing, taken with cfg_load_i: every set of the layer is packed this way (sienna-packing)
     input logic [2:0]                          cfg_pack_shift_i,
     input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] cfg_pack_map_i,
     input logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] cfg_pack_act_i,
-    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_zp_i,
-    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_min_i,
-    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_max_i,
-    input logic [PACK_ENTRIES-1:1][15:0]       cfg_pack_mx_i,
-    input logic [PACK_ENTRIES-1:1][4:0]        cfg_pack_shx_i,
-    input logic [PACK_ENTRIES-1:1][23:0]       cfg_pack_mout_i,
-    input logic [PACK_ENTRIES-1:1][5:0]        cfg_pack_shout_i,
-    input logic [PACK_ENTRIES-1:1][7:0]        cfg_pack_zout_i,
+    input sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] cfg_pack_lane_i,  // entries 1..: requantize and lane words, as cfg_lane_i
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
@@ -69,8 +49,7 @@ module sienna_sched #(
     credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
     input  logic [N-1:0][sienna_fmt_pkg::ACC_DATA_WIDTH-1:0] w_bias_i,
-    input  logic [N-1:0][23:0]       w_req_mult_i,   // per channel: requantize scale's 24-bit mantissa and right shift
-    input  logic [N-1:0][5:0]        w_req_shift_i,
+    input  sienna_fmt_pkg::requant_scale_t [N-1:0] w_req_scale_i,  // per channel: the requantize scale
 
     output logic                     set_done_o,  // a set left the pipeline with its last word (partial sums leave with no results)
 
@@ -119,20 +98,11 @@ module sienna_sched #(
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
   logic [LFSR_WIDTH-1:0] seed_q;
-  logic [7:0] rq_zp_q, rq_min_q, rq_max_q, gp_zout_q;  // int8 layer-wide parameters
-  logic [5:0] gp_shout_q;
-  logic [15:0] gp_mx_q;
-  logic [4:0] gp_shx_q;
-  logic [23:0] gp_mout_q;
-  sienna_add_pkg::add_words_t add_q;  // int8 residual: the ADD's words, zp1 the requantize zero point
+  sienna_fmt_pkg::lane_entry_t lane_q;  // the layer's requantize and lane words
   logic [2:0] pk_shift_q;  // packing configuration, as the cfg_pack_* ports
   logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pk_map_q;
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
-  logic [PACK_ENTRIES-1:1][7:0] pk_zp_q, pk_min_q, pk_max_q, pk_zout_q;
-  logic [PACK_ENTRIES-1:1][5:0] pk_shout_q;
-  logic [PACK_ENTRIES-1:1][15:0] pk_mx_q;
-  logic [PACK_ENTRIES-1:1][4:0] pk_shx_q;
-  logic [PACK_ENTRIES-1:1][23:0] pk_mout_q;
+  sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] pk_lane_q;
   logic [31:0] total_sets;
   logic active;
 
@@ -146,8 +116,7 @@ module sienna_sched #(
   // ── The pipeline this layer runs on (sienna_pipe, beside this in sienna_top) ──
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
   logic [N-1:0][ACC_DATA_WIDTH-1:0]       p_bias;
-  logic [N-1:0][23:0]            p_mult;   // int8: the requantize words of the set being started
-  logic [N-1:0][5:0]             p_shift;
+  sienna_fmt_pkg::requant_scale_t [N-1:0] p_scale;  // the requantize scales of the set being started
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
   logic [WCTW-1:0]               p_tile;
   logic [WCAW-1:0]               p_wc_addr;
@@ -157,47 +126,54 @@ module sienna_sched #(
 
   // The pipeline's host link (L0): this layer holds up to two staging credits and puts each set with its last row.
   `include "sienna_set_side.svh"
-  set_side_t p_side;
+  set_side_t p_side, p_side_base;  // the sideband; the base before a residual's add set takes its identity requantize
   logic [1:0] l0_cnt;
   credit_counter #(.MAX(2), .CRW(1)) l0_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host.put), .credit_i(host.credit),
                                             .has_credit_o(), .count_o(l0_cnt));
   assign host.put = p_start;
   assign host.data = p_side;
   always_comb begin
-    p_side               = '0;
-    p_side.wc_last       = p_wc_last;
-    p_side.weight_tile   = p_tile;
-    p_side.weight_cached = p_cached;
-    p_side.accumulate    = p_acc;
-    p_side.bias_valid    = p_bias_v;
-    p_side.train         = train_q;
-    p_side.seed          = p_seed;
-    p_side.pack_shift    = pk_shift_q;
-    p_side.pack_map      = pk_map_q;
-    p_side.act           = {pk_act_q, act_q};
-    p_side.zp            = {pk_zp_q, rq_zp_q};
-    p_side.amin          = {pk_min_q, rq_min_q};
-    p_side.amax          = {pk_max_q, rq_max_q};
-    p_side.mx            = {pk_mx_q, gp_mx_q};
-    p_side.shx           = {pk_shx_q, gp_shx_q};
-    p_side.mout          = {pk_mout_q, gp_mout_q};
-    p_side.shout         = {pk_shout_q, gp_shout_q};
-    p_side.zout          = {pk_zout_q, gp_zout_q};
-    p_side.mult          = p_mult;
-    p_side.shift         = p_shift;
-    p_side.res_hold      = int_res && (is_p == dt - 1);  // the conv's words and clamp, linear: its beats wait in hold_mem
-    p_side.res_add       = int_res && is_res_pass;  // identity requantize, the ADD's words, the layer's activation
-    if (p_side.res_hold) p_side.act[0] = CONTROL_WIDTH'(3'b101);
-    if (p_side.res_add) begin
-      for (int c = 0; c < N; c++) begin  // scale 2^23 2^-23 = 1: the residual's codes unchanged
-        p_side.mult[c]  = 24'h80_0000;
-        p_side.shift[c] = 6'd23;
+    p_side_base          = '0;
+    p_side_base.wc_last       = p_wc_last;
+    p_side_base.weight_tile   = p_tile;
+    p_side_base.weight_cached = p_cached;
+    p_side_base.accumulate    = p_acc;
+    p_side_base.bias_valid    = p_bias_v;
+    p_side_base.train         = train_q;
+    p_side_base.seed          = p_seed;
+    p_side_base.pack_shift    = pk_shift_q;
+    p_side_base.pack_map      = pk_map_q;
+    p_side_base.act           = {pk_act_q, act_q};
+    p_side_base.entry         = {pk_lane_q, lane_q};
+    p_side_base.scale         = p_scale;
+    p_side_base.res_hold      = int_res && (is_p == dt - 1);  // the conv's words and clamp, linear: its beats wait in hold_mem
+    p_side_base.res_add       = int_res && is_res_pass;  // identity requantize, the ADD's words, the layer's activation
+    if (p_side_base.res_hold) p_side_base.act[0] = CONTROL_WIDTH'(3'b101);
+  end
+  if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_ADD_SIDE
+    sienna_fmt_pkg::add_params_t add_q;  // residual: the ADD's words, in1_zero_point the requantize zero point
+    always_comb begin
+      p_side = p_side_base;
+      if (p_side.res_add) begin
+        for (int c = 0; c < N; c++) begin  // scale 2^23 2^-23 = 1: the residual's codes unchanged
+          p_side.scale[c].mantissa = 24'h80_0000;
+          p_side.scale[c].shift    = 6'd23;
+        end
+        p_side.entry[0].zero_point = '0;
+        p_side.entry[0].act_min    = 8'h80;
+        p_side.entry[0].act_max    = 8'h7F;
+        p_side.add                 = add_q;
       end
-      p_side.zp[0]   = '0;
-      p_side.amin[0] = 8'h80;
-      p_side.amax[0] = 8'h7F;
-      p_side.add     = add_q;
     end
+    always_ff @(posedge clk_i or negedge rstn_i)  // the ADD's words with the configuration; in1_zero_point is the conv output's
+      if (!rstn_i) add_q <= '0;
+      else if (cfg_load_i && !active) begin
+        add_q                <= cfg_add_i;
+        add_q.in1_zero_point <= cfg_lane_i.zero_point;
+      end
+  end else begin : G_NO_ADD_SIDE
+    assign p_side = p_side_base;  // no residual: no add set is ever put
+    wire unused_add_words = ^cfg_add_i;  // only a build with the residual ADD reads them
   end
 
   // The cache regions (L2): the loader puts once per cached block's fill, on the region of its half, when it holds that region's credit.
@@ -225,8 +201,7 @@ module sienna_sched #(
   if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::ACC_DATA_WIDTH) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
     $fatal(1, "sienna_top: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::ACC_DATA_WIDTH);
   end
-  logic [N-1:0][23:0] mult_buf[2];  // int8: the requantize words of the block each half holds
-  logic [N-1:0][5:0] shift_buf[2];
+  sienna_fmt_pkg::requant_scale_t [N-1:0] scale_buf[2];  // the requantize scales of the block each half holds
   logic [DIM_W-1:0] wl_blk;  // block the loader works on
   logic wl_bias_done;  // its bias row is in
   logic [DIM_W-1:0] wl_tile;  // tiles of it complete
@@ -310,8 +285,7 @@ module sienna_sched #(
     p_acc      = int_res ? (is_p < dt - 1) : (is_p != np - 1);  // int8 residual: the hold set closes the conv's sum, the add set is its own
     p_bias_v   = bias_q && (is_p == 0);
     p_bias     = bias_buf[is_blk[0]];
-    p_mult     = mult_buf[is_blk[0]];
-    p_shift    = shift_buf[is_blk[0]];
+    p_scale    = scale_buf[is_blk[0]];
     p_cached   = is_cached_pass;
     p_wc_last  = is_cached_pass && (is_r == rt - 1) && (is_p == dt - 1);
     p_tile     = WCTW'(int'(is_blk[0]) * HALF + int'(is_p));
@@ -331,26 +305,11 @@ module sienna_sched #(
       train_q <= 1'b0;
       act_q <= '0;
       seed_q <= '0;
-      rq_zp_q <= '0;
-      rq_min_q <= '0;
-      rq_max_q <= '0;
-      gp_mx_q <= '0;
-      gp_shx_q <= '0;
-      gp_mout_q <= '0;
-      gp_shout_q <= '0;
-      gp_zout_q <= '0;
-      add_q <= '0;
+      lane_q <= '0;
       pk_shift_q <= '0;
       pk_map_q <= '0;
       pk_act_q <= '0;
-      pk_zp_q <= '0;
-      pk_min_q <= '0;
-      pk_max_q <= '0;
-      pk_mx_q <= '0;
-      pk_shx_q <= '0;
-      pk_mout_q <= '0;
-      pk_shout_q <= '0;
-      pk_zout_q <= '0;
+      pk_lane_q <= '0;
       total_sets <= '0;
       wl_blk <= '0;
       wl_bias_done <= 1'b0;
@@ -388,27 +347,11 @@ module sienna_sched #(
         train_q <= cfg_train_i;
         act_q <= cfg_act_i;
         seed_q <= cfg_seed_i;
-        rq_zp_q <= cfg_req_zp_i;
-        rq_min_q <= cfg_req_min_i;
-        rq_max_q <= cfg_req_max_i;
-        gp_mx_q <= cfg_gp_mx_i;
-        gp_shx_q <= cfg_gp_shx_i;
-        gp_mout_q <= cfg_gp_mout_i;
-        gp_shout_q <= cfg_gp_shout_i;
-        gp_zout_q <= cfg_gp_zout_i;
-        add_q <= '{zp1: cfg_req_zp_i, zp2: cfg_add_zp2_i, m1: cfg_add_m1_i, m2: cfg_add_m2_i, shift: cfg_add_shift_i, zpo: cfg_add_zpo_i,
-                   amin: cfg_add_amin_i, amax: cfg_add_amax_i};
+        lane_q <= cfg_lane_i;
         pk_shift_q <= cfg_pack_shift_i;
         pk_map_q <= cfg_pack_map_i;
         pk_act_q <= cfg_pack_act_i;
-        pk_zp_q <= cfg_pack_zp_i;
-        pk_min_q <= cfg_pack_min_i;
-        pk_max_q <= cfg_pack_max_i;
-        pk_mx_q <= cfg_pack_mx_i;
-        pk_shx_q <= cfg_pack_shx_i;
-        pk_mout_q <= cfg_pack_mout_i;
-        pk_shout_q <= cfg_pack_shout_i;
-        pk_zout_q <= cfg_pack_zout_i;
+        pk_lane_q <= cfg_pack_lane_i;
         total_sets <= 32'(r) * 32'(c) * 32'(d + DIM_W'(cfg_residual_i));
         wl_blk <= '0;
         wl_bias_done <= 1'b0;
@@ -501,8 +444,7 @@ module sienna_sched #(
   // D-8: the requantize words carry no reset, so rstn_i is no hold enable on them; readers wait for bias_in, set by the same beat.
   always_ff @(posedge clk_i)
     if (wl_take_bias) begin
-      mult_buf[wl_blk[0]]  <= w_req_mult_i;
-      shift_buf[wl_blk[0]] <= w_req_shift_i;
+      scale_buf[wl_blk[0]] <= w_req_scale_i;
     end
 
   assign busy_o = active;

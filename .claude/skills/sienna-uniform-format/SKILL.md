@@ -3,6 +3,8 @@ name: sienna-uniform-format
 description: Use when changing SIENNA's number format - building it in bf16 (or later int8) end to end, adding the format parameter or format package, writing narrow float units (fpMultiplier, fpAdder) in ArithmeticLibrary, making GPNAE, Maxpool_2D or dropout format-generic, or writing a bit-exact golden model for a narrow format. Also use when someone asks why a bf16 run disagrees with fp32, or how precision is chosen per build.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+
 # SIENNA: one number format per build
 
 **Status: uniform bf16 implemented and verified 2026-09-28; int8 (sub-project 2a) implemented and verified 2026-09-30

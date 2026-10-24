@@ -3,6 +3,8 @@ name: sienna-int8-residual
 description: Use when designing, building or verifying SIENNA's int8 residual ADD (the generic affine int8QuantizedAdder gated on the true function - add_lanes, the hold/add set pair through the identity pass, hold_mem, the ADD words add_words_t) or the int8 GPNAE sigmoid breakpoint ladder for |x| >= 2.5; the pre-synthesis RTL part of int8 sub-project 2b.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+
 # int8 pre-synthesis RTL: residual ADD and the sigmoid ladder (spec; decisions approved by Soham 2026-10-10)
 
 Read from SIENNA main fce13e8 (clean clone `/proj/scratch/spramanik/n8_fix`), GPNAE afd786b, ArithmeticLibrary 1d04a26,

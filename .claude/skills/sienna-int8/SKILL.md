@@ -3,6 +3,8 @@ name: sienna-int8
 description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the generic affine requantize stage (int8Requantizer), fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 results are gated and how they compare with the TFLite interpreter, why GPNAE is fixed point in int8, or what 2a covers against 2b.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+
 # SIENNA: the int8 build (sub-project 2a)
 
 **Since 2026-10-17 (Soham; sienna-int8-residual Task 2.6b): the requantize is the generic `int8Requantizer` (24-bit mantissa, 6-bit right shift, round half up, 4 stages), gated on the true function; the TFLite-exact `tfliteRequant`, the G0 rounding pin and `REQ_ROUNDING` are gone, and the TFLite models are test vehicles whose interpreter agreement is reported. The text below records 2a as built.**

@@ -3,6 +3,8 @@ name: sienna-packing
 description: Use when designing, building or verifying SIENNA's multi-job packing - several small jobs (images, layers or whole small models smaller than the mesh) sharing one N x N set through block-diagonal weights, the per-set block size, the PE's out-of-block skip, per-block activation and int8 output parameters, the packed lane order, the packer and unpacker in model_runner. Also use when someone asks how a large synthesized mesh (say N = 64) runs 2x2 / 8x8 / 16x16 workloads without idling, or why packed float results equal unpacked ones bit for bit.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+
 # SIENNA: multi-job packing
 
 **Status: implemented and verified 2026-10-04 on the packing branch (gated tree SIENNA 8d7a4b2, SystolicMesh b1a2c31; the commit after it changes only this skill) at N = 8-32; N = 64 after check-in.**

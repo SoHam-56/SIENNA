@@ -3,6 +3,8 @@ name: sienna-bf16-fp32-accum
 description: Use when designing, building or verifying SIENNA's bf16 builds with fp32 accumulation - bf16 operands and products widened exactly into fp32 sums in the PEs and reducers, the fp32 -> bf16 narrowing of each result before the activation lanes, the widened bias, the bit-exact models for bf16, and the accuracy and area effect against bf16 accumulation.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+
 # bf16 builds accumulate in fp32 (spec approved by Soham 2026-10-08, with the three recommended decisions)
 
 ## Why

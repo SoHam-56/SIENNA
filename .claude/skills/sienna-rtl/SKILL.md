@@ -122,7 +122,7 @@ make perf-analysis FMT=bf16                     # regression.py --action perf; m
 make tflite FMT=int8 PYTHON=<venv>/bin/python   # model_runner.py --action tflite; refuses any FMT but int8
 make pack FMT=int8 N=32 PYTHON=<venv>/bin/python  # packed layers vs each job alone on the layer contract (regression.py --action pack)
 make multi FMT=bf16                             # TB_sienna_multi on sienna_top at COPIES = 2 (regression.py --action multi)
-make check-fmt check-hier                       # no RTL outside the package names a format; each define's hierarchy holds only its units
+make check-fmt check-hier                       # no RTL outside the package names a format; each define's hierarchy holds only its units (but B's fpNarrow(8,23) in fp32 GPNAE lanes, until Batch B)
 make sm-verilator FMT=int8                      # SystolicMesh's model checks (aril-fpu, aril-narrow, model-tests), then its mesh-regression at N, TILE, COLLAPSE_K; SM_CHECKS=0 skips the checks
 make gpnae-verilator FMT=int8                   # GPNAE's regression on gpnae_poly, the lane sienna_top uses; GPNAE_MODEL=hw for bit-exact (floats)
 make regression MODEL_DIR=<dir> PYTHON=<venv>/bin/python  # SIENNA's tests (pipeline, model, pack, gemm, tflite) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, one point per target (make -jN, N for the memory), then one table; SMALL=1: N = 8, 16; FMT=<f>: one format (sienna-tooling)

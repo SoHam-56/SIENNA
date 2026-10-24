@@ -8,7 +8,7 @@ TILE ?= 4
 # Number format of every build, regression, test and model run: FMT=fp32 (default), bf16 or int8, through ArithmeticLibrary's fmt.mk below.
 LANES      ?= 32
 COLLAPSE_K ?= 1
-# GEN_PKG=0 builds the test_config_pkg.sv already on disk (scripts that write their own); the format guard still runs.
+# GEN_PKG=0 builds the test_config_pkg.sv already on disk (scripts that write their own); pkg-geometry still checks its N, TILE_SIZE, NUM_LANES and COLLAPSE_K.
 GEN_PKG ?= 1
 # Interpreter for the Python flows; tflite and model need the tflite package, e.g. PYTHON=<venv>/bin/python.
 PYTHON ?= python3
@@ -306,7 +306,7 @@ help:
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
 	@echo "  make check-fmt         - no RTL outside the allowlist names a precision, and a planted EXP_W fails (C4)"
-	@echo "  make check-hier        - each define's hierarchy, at SET_PORT 0 and 1, holds only that precision's units"
+	@echo "  make check-hier        - each define's hierarchy, at SET_PORT 0 and 1, holds only that precision's units (but fpNarrow(8,23) in fp32 lanes)"
 	@echo "  make debug             - Build with GDB back-trace"
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
@@ -539,7 +539,7 @@ check-fmt:
 	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
 	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
 
-# check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna_top) and 0 (TB_model_run), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py).
+# check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna_top) and 0 (TB_model_run), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py), except B's fpNarrow(8,23) identity in the fp32 GPNAE lanes, until Batch B.
 check-hier: $(PKG_DEP)
 	@$(PYTHON) $(PRJ_DIR)/check_hier.py --verilator $(VERILATOR) --out $(PRJ_DIR)/Verilator_hier \
 	  --inc $(SRC_DIR) $(TB_DIR) $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR) --files $(DESIGN_FILES) $(PKG_FILE)

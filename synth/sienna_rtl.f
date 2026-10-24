@@ -1,3 +1,4 @@
+// No define in this list builds fp32: give every tool that reads it +define+FMT_BF16 or +define+FMT_INT8 for those formats (fmt.mk's FMT_DEF).
 SystolicMesh/ArithmeticLibrary/Common/src/sienna_fmt_pkg.sv
 SystolicMesh/ArithmeticLibrary/Common/src/credit_link_if.sv
 SystolicMesh/ArithmeticLibrary/Common/src/credit_counter.sv

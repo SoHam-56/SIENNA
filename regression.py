@@ -67,7 +67,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -4255,9 +4255,9 @@ def test_regression_points():
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
     assert small[1:3] == full[1:3] == ["add-lanes", "rq-lanes"] and not set(UNIT_POINTS) & set(small[3:])  # int8's unit benches: once
-    assert small[3] == full[3] == DEFAULT_POINT and [p for p in small if p.endswith(MULTI_KIND)] == [f"{f}/N8_T2/{MULTI_KIND}" for f in FORMATS]
-    extra = 1 + 3  # the default point and pipeline-multi per format
-    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 + extra == 203 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 445, (len(small), len(full))
+    assert small[3:6] == full[3:6] == [DEFAULT_POINT, *FAULT_POINTS] and [p for p in small if p.endswith(MULTI_KIND)] == [f"{f}/N8_T2/{MULTI_KIND}" for f in FORMATS]
+    extra = 1 + 2 + 3  # the default point, the two idle faults and pipeline-multi per format
+    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 + extra == 205 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 447, (len(small), len(full))
     layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
         for n, t in sweep(full):  # back-to-back and the layer contract's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
@@ -4269,7 +4269,14 @@ def test_regression_points():
         == [(1, False), (0, False), (1, True), (0, True)]
     assert [SPEC.parse(p)[x] for p in ("fp32/N64_T64/pipeline-b2b",) for x in ("ck", "b2b", "lanes")] == [1, True, 128]
     assert SPEC.points(True, ["int8"]) == ["selftest", "add-lanes", "rq-lanes"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
-    assert SPEC.points(True, ["fp32", "bf16"]) == ["selftest", DEFAULT_POINT] + [p for p in small if p[:4] in ("fp32", "bf16")]
+    assert SPEC.points(True, ["fp32", "bf16"]) == ["selftest", DEFAULT_POINT, *FAULT_POINTS] + [p for p in small if p[:4] in ("fp32", "bf16")]
+    assert SPEC.argv("idle-fault-sp1", argparse.Namespace())[:3] == ["make", "idle-fault", "SET_PORT=1"]
+    r = make_n("idle-fault", "SET_PORT=1", "PYTHON=py")
+    assert r.returncode == 0 and r.stdout.split()[-5:] == "py regression.py --action idle-fault --set-port 1".split()[-5:], r.stdout + r.stderr
+    assert make_n("idle-fault", "PYTHON=py").returncode == 0 and "SET_PORT=0 or SET_PORT=1" in make_n("idle-fault", "PYTHON=py").stdout
+    assert SPEC.verdict("idle-fault-sp0", "%Error: x.sv:5: Assertion failed in TOP.dut: a_idle_contract\nIDLE FAULT: CAUGHT (SET_PORT 0)\n", 0) == "PASS"
+    assert SPEC.verdict("idle-fault-sp1", "IDLE FAULT: CAUGHT (SET_PORT 1)\n", 1).startswith("FAIL"), "the action exits 0 only when it caught the fault"
+    assert SPEC.verdict("idle-fault-sp0", "IDLE FAULT: SURVIVED (SET_PORT 0)\n", 1).startswith("FAIL")
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
@@ -5716,6 +5723,7 @@ LAYER_CK0 = KINDS[-4:-1]  # the layer contract's kinds on the collapse-k 0 mesh,
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected
+FAULT_POINTS = ("idle-fault-sp0", "idle-fault-sp1")  # a put on the unused contract must fire a_idle_contract: TB_model_run FAULT 4, TB_sienna_top FAULT 8 (fp32)
 MULTI_KIND = "pipeline-multi"  # TB_sienna_multi on sienna_top at COPIES = 2 (SET_PORT = 1), per format at N8_T2
 DEFAULT_POINT = "default/N8_T2/pipeline"  # fp32's N8_T2 pipeline built with no precision define (FMT_DEF=): words and cycles must equal fp32's
 DEFAULT_TWIN = "fp32/N8_T2/pipeline"
@@ -5757,7 +5765,7 @@ class SiennaSpec(regress.Spec):
     def points(self, small, formats):
         if not formats:
             return []
-        return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + ([DEFAULT_POINT] if "fp32" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
+        return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + ([DEFAULT_POINT, *FAULT_POINTS] if "fp32" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
                                for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)] \
             + [f"{f}/N8_T2/{MULTI_KIND}" for f in formats]
 
@@ -5770,7 +5778,7 @@ class SiennaSpec(regress.Spec):
                 and (not k.endswith("-b2b") or n in B2B_SIZES))
 
     def parse(self, name):
-        if name == "selftest" or name in UNIT_POINTS:
+        if name == "selftest" or name in UNIT_POINTS or name in FAULT_POINTS:
             return {"n": 0, "kind": name}
         if name == DEFAULT_POINT:
             return {"fmt": "fp32", "n": 8, "tile": 2, "lanes": reg_lanes(8), "kind": "pipeline", "ck": 1, "b2b": False, "no_define": True}
@@ -5800,6 +5808,8 @@ class SiennaSpec(regress.Spec):
             return [py, "regression.py", "--action", "selftest"]
         if p["kind"] in UNIT_POINTS:
             return ["make", p["kind"], f"PYTHON={py}"]
+        if p["kind"] in FAULT_POINTS:
+            return ["make", "idle-fault", f"SET_PORT={p['kind'][-1]}", f"PYTHON={py}"]
         if p["kind"] == MULTI_KIND:
             return ["make", "multi", f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}", "COPIES=2"]
         k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"].removesuffix("-ck0")
@@ -5830,6 +5840,8 @@ class SiennaSpec(regress.Spec):
             return twin_verdict(text, tt)
         k = self.parse(name)["kind"]
         k = k if k in PIPELINE_KINDS else k.removesuffix("-ck0")  # a LAYER_CK0 point is judged as its base kind
+        if k in FAULT_POINTS:  # its log shows the assertion it provokes: judged on the action's own line, not on the firing
+            return regress.marker_verdict(regress.ANSI.sub("", text), rc, (r"^IDLE FAULT: CAUGHT",), (r"^IDLE FAULT: (SURVIVED|OTHER)",), firing=False)
         v = regress.common_verdict(text, rc)
         if v:
             return v
@@ -5901,6 +5913,29 @@ if "--results" in sys.argv[:-1]:  # point and summary runs: where the default po
     SPEC.results_dir = os.path.abspath(sys.argv[sys.argv.index("--results") + 1])
 
 
+def idle_fault_main(argv) -> None:
+    """A put on the unused contract (TB_model_run FAULT 4 at SET_PORT 0 through make gemm, TB_sienna_top FAULT 8 at SET_PORT 1): IDLE FAULT: CAUGHT
+    when the run fails with sienna_top's a_idle_contract message, SURVIVED when it does not fire, OTHER when the run fails some other way."""
+    ap = argparse.ArgumentParser(prog="regression.py --action idle-fault")
+    ap.add_argument("--set-port", type=int, choices=(0, 1), required=True)
+    a = ap.parse_args(argv)
+    env = dict(os.environ, EXTRA_FLAGS=f"-GFAULT={4 if a.set_port == 0 else 8}")
+    if a.set_port == 0:
+        cmd = ["make", "gemm", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "QUICK=1", f"PYTHON={sys.executable}"]
+    else:
+        t = next(x for x in PIPELINE_TESTS if x["name"] == PKG_DEFAULT_TEST)
+        generate_vectors({"n": 8, "tile_size": 2, "lanes": 32, **t, "fmt_name": "fp32"})  # the package and vectors TB_sienna_top reads
+        cmd = ["make", "verilator", "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
+    r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
+    text = r.stdout + r.stderr
+    fired = "a_idle_contract" in text and re.search(r"Assertion failed|%Error", text) is not None
+    planted = f"[FAULT {4 if a.set_port == 0 else 8}]" in text
+    print("\n".join(x for x in text.splitlines() if "a_idle_contract" in x or "FAULT" in x)[:2000])
+    v = "CAUGHT" if fired and planted else ("SURVIVED" if planted else "OTHER")
+    print(f"IDLE FAULT: {v} (SET_PORT {a.set_port}: the planted put {'ran' if planted else 'never ran'}, a_idle_contract {'fired' if fired else 'did not fire'}, exit {r.returncode})")
+    sys.exit(0 if v == "CAUGHT" else 1)
+
+
 def multi_main(argv) -> None:
     """TB_sienna_multi on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets, every set against its golden, then MULTI: PASS or FAIL."""
     ap = argparse.ArgumentParser(prog="regression.py --action multi")
@@ -5928,7 +5963,7 @@ def multi_main(argv) -> None:
     sys.exit(1 if bad else 0)
 
 
-MAINS = {"multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
+MAINS = {"idle-fault": idle_fault_main, "multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
          "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          "summary": summary_main, **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point")}}  # each parses its own options (regression.py --action A --help)
 

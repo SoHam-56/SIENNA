@@ -173,9 +173,9 @@ module sienna_pipe #(
   logic act_bypass;  // every lane's code is ReLU or linear; declared here because the lane-control block above its old place reads it
   logic [CRW-1:0] gp_sets;  // sets past the activation stage and not yet complete; pooling takes them in id order
   // int8: the requantize and GPNAE parameters of the set the activation stage holds (g_*); p_zp: dropout's drop value for the pooled set.
-  logic [N-1:0][23:0] g_mult;
-  logic [N-1:0][5:0]  g_shift;
-  logic [NUM_LANES-1:0][7:0]  g_zp, g_min, g_max, g_zout, p_zp;  // per lane: its column block's entry
+  sienna_fmt_pkg::requant_scale_t [N-1:0] g_scale;  // per output channel: the requantize scale
+  sienna_fmt_pkg::lane_entry_t [NUM_LANES-1:0] g_lane;  // per lane: its column block's entry
+  logic [NUM_LANES-1:0][7:0]  g_zp, g_zout, p_zp;  // per lane: its entry's zero points; p_zp the pooled set's drop value
   logic [NUM_LANES-1:0][15:0] g_mx;
   logic [NUM_LANES-1:0][4:0]  g_shx;
   logic [NUM_LANES-1:0][23:0] g_mout;
@@ -196,9 +196,8 @@ module sienna_pipe #(
   // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
   // =========================================================================
   `include "sienna_set_side.svh"
-  sienna_add_pkg::add_words_t g_add_w;  // the activation stage's set's ADD words
+  sienna_fmt_pkg::add_params_t g_add_w;  // the activation stage's set's ADD words
   logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
-  assign g_add_zpo = g_add_w.zpo;
   localparam int SIDE_W = $bits(set_side_t);
   localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
   localparam int L3_W   = NUM_LANES * RESULT_DATA_WIDTH + 3;  // a result beat: {packed, last, first, one word per lane}
@@ -835,71 +834,56 @@ module sienna_pipe #(
 
   // Requantizing builds (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
   if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ_SETS
-    logic [N-1:0][23:0] s_mult [NUM_IDS];
-    logic [N-1:0][5:0]  s_shift[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][7:0]  s_zp[NUM_IDS], s_min[NUM_IDS], s_max[NUM_IDS], s_zout[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][15:0] s_mx[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][4:0]  s_shx[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][23:0] s_mout[NUM_IDS];
-    logic [PACK_ENTRIES-1:0][5:0]  s_shout[NUM_IDS];
-    sienna_add_pkg::add_words_t s_add[NUM_IDS];  // int8 residual: an add set's ADD words
+    sienna_fmt_pkg::requant_scale_t [N-1:0] s_scale[NUM_IDS];  // per set id: each output channel's requantize scale
+    sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:0] s_entry[NUM_IDS];  // and each pack entry's requantize and lane words
+    sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:0] ge_entry;  // the activation stage's copy of its set's entries
     logic [7:0]   pe_add_zpo;  // the pooled set's ADD output zero point, for the drop value
     logic         pe_add;  // the pooled set is an add set
-    logic [PACK_ENTRIES-1:0][7:0]  ge_zp, ge_min, ge_max, ge_zout;  // the activation stage's copy of its set's entries
-    logic [PACK_ENTRIES-1:0][15:0] ge_mx;
-    logic [PACK_ENTRIES-1:0][4:0]  ge_shx;
-    logic [PACK_ENTRIES-1:0][23:0] ge_mout;
-    logic [PACK_ENTRIES-1:0][5:0]  ge_shout;
     logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] pe_act;  // the pooling stage's copy of its set's codes, zp and zout, for the drop value
     logic [PACK_ENTRIES-1:0][7:0]  pe_zp, pe_zout;
     always_ff @(posedge clk_i) begin  // no reset: an id's entry is written by its own accept before any stage reads it
       if (host_accept) begin
-        s_mult[host_next_id]  <= side.mult;
-        s_shift[host_next_id] <= side.shift;
-        s_zp[host_next_id]    <= side.zp;
-        s_min[host_next_id]   <= side.amin;
-        s_max[host_next_id]   <= side.amax;
-        s_mx[host_next_id]    <= side.mx;
-        s_shx[host_next_id]   <= side.shx;
-        s_mout[host_next_id]  <= side.mout;
-        s_shout[host_next_id] <= side.shout;
-        s_zout[host_next_id]  <= side.zout;
-        s_add[host_next_id]   <= side.add;
+        s_scale[host_next_id] <= side.scale;
+        s_entry[host_next_id] <= side.entry;
       end
       if (g_accept) begin
-        g_mult   <= s_mult[g_next_id];
-        g_shift  <= s_shift[g_next_id];
-        ge_zp    <= s_zp[g_next_id];
-        ge_min   <= s_min[g_next_id];
-        ge_max   <= s_max[g_next_id];
-        ge_mx    <= s_mx[g_next_id];
-        ge_shx   <= s_shx[g_next_id];
-        ge_mout  <= s_mout[g_next_id];
-        ge_shout <= s_shout[g_next_id];
-        ge_zout  <= s_zout[g_next_id];
+        g_scale  <= s_scale[g_next_id];
+        ge_entry <= s_entry[g_next_id];
       end
-      if (g_accept) g_add_w <= s_add[g_next_id];  // the activation stage's copy, like ge_mout
-      if (p_accept || p_null) begin  // the edge p_set_id loads on
-        pe_zp   <= s_zp[p_next_id];
-        pe_zout <= s_zout[p_next_id];
-        pe_add_zpo <= s_add[p_next_id].zpo;
-      end
+      if (p_accept || p_null)  // the edge p_set_id loads on
+        for (int e = 0; e < PACK_ENTRIES; e++) begin
+          pe_zp[e]   <= s_entry[p_next_id][e].zero_point;
+          pe_zout[e] <= s_entry[p_next_id][e].selu_out_zero_point;
+        end
     end
     always_ff @(posedge clk_i or negedge rstn_i)  // reset, as set_ents is, so p_zp reads tanh's 0 before the first pooled set
       if (!rstn_i) pe_act <= '0;
       else if (p_accept || p_null) pe_act <= set_ents[p_next_id];
-    always_ff @(posedge clk_i or negedge rstn_i)  // reset, as pe_act is
-      if (!rstn_i) pe_add <= 1'b0;
-      else if (p_accept || p_null) pe_add <= set_add[p_next_id];
+    if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_ADD_SETS
+      sienna_fmt_pkg::add_params_t s_add[NUM_IDS];  // residual: an add set's ADD words
+      always_ff @(posedge clk_i) begin  // no reset, as s_entry
+        if (host_accept) s_add[host_next_id] <= side.add;
+        if (g_accept) g_add_w <= s_add[g_next_id];  // the activation stage's copy, like ge_entry
+        if (p_accept || p_null) pe_add_zpo <= s_add[p_next_id].out_zero_point;
+      end
+      always_ff @(posedge clk_i or negedge rstn_i)  // reset, as pe_act is
+        if (!rstn_i) pe_add <= 1'b0;
+        else if (p_accept || p_null) pe_add <= set_add[p_next_id];
+      assign g_add_zpo = g_add_w.out_zero_point;
+    end else begin : G_NO_ADD_SETS
+      assign g_add_w    = '0;
+      assign g_add_zpo  = '0;
+      assign pe_add_zpo = '0;
+      assign pe_add     = 1'b0;
+    end
     for (genvar k = 0; k < NUM_LANES; k++) begin : G_LANE_PAR
-      assign g_zp[k]    = ge_zp[lane_ent[k]];
-      assign g_min[k]   = ge_min[lane_ent[k]];
-      assign g_max[k]   = ge_max[lane_ent[k]];
-      assign g_mx[k]    = ge_mx[lane_ent[k]];
-      assign g_shx[k]   = ge_shx[lane_ent[k]];
-      assign g_mout[k]  = ge_mout[lane_ent[k]];
-      assign g_shout[k] = ge_shout[lane_ent[k]];
-      assign g_zout[k]  = ge_zout[lane_ent[k]];
+      assign g_lane[k]  = ge_entry[lane_ent[k]];
+      assign g_zp[k]    = g_lane[k].zero_point;
+      assign g_mx[k]    = g_lane[k].in_rescale_mantissa;
+      assign g_shx[k]   = g_lane[k].in_rescale_shift;
+      assign g_mout[k]  = g_lane[k].selu_out_mantissa;
+      assign g_shout[k] = g_lane[k].selu_out_shift;
+      assign g_zout[k]  = g_lane[k].selu_out_zero_point;
       // D-5: a dropped value is the output zero point of the pooled column's activation (tanh, and every code the lane runs as tanh: 0).
       always_comb
         case (pe_act[p_lane_ent[k]])
@@ -910,18 +894,18 @@ module sienna_pipe #(
         endcase
     end
   end else begin : G_NO_REQ_SETS
-    assign g_mult  = '0;
-    assign g_shift = '0;
-    assign g_zp    = '0;
-    assign g_min   = '0;
-    assign g_max   = '0;
-    assign g_mx    = '0;
-    assign g_shx   = '0;
-    assign g_mout  = '0;
-    assign g_shout = '0;
-    assign g_zout  = '0;
-    assign p_zp    = '0;
-    assign g_add_w = '0;
+    assign g_scale   = '0;
+    assign g_lane    = '0;
+    assign g_zp      = '0;
+    assign g_mx      = '0;
+    assign g_shx     = '0;
+    assign g_mout    = '0;
+    assign g_shout   = '0;
+    assign g_zout    = '0;
+    assign p_zp      = '0;
+    assign g_add_w   = '0;
+    assign g_add_zpo = '0;
+    wire unused_add_words = ^g_add_w;  // only add_lanes reads it, in a build with the residual ADD
   end
 
   // =========================================================================
@@ -943,16 +927,13 @@ module sienna_pipe #(
         .clear_i (g_state == G_IDLE),
         .valid_i (wide_rd_valid),
         .acc_i   (wide_rd_data),
-        .mult_i  (g_mult),
-        .shift_i (g_shift),
+        .scale_i (g_scale),
         .packed_i(g_pack),
-        .zp_i    (g_zp),
-        .min_i   (g_min),
-        .max_i   (g_max),
+        .entry_i (g_lane),
         .valid_o (rq_v),
         .result_o(rq_d)
     );
-    // Each beat's destination rides beside int8Requantizer, which takes its own mult, shift, zp, min and max at stage 1.
+    // Each beat's destination rides beside int8Requantizer, which takes its own scale, zero point and clamp at stage 1.
     localparam int RQL = sienna_fmt_pkg::REQUANT_LATENCY;
     if (RQL < 2) begin : G_BAD_RQL  // the tag line below shifts RQL-1 stages behind a registered first one
       $fatal(1, "sienna_top: REQUANT_LATENCY %0d; the requantize tag line needs at least 2", RQL);
@@ -1024,7 +1005,7 @@ module sienna_pipe #(
         else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
                     tg_idx[RQL-1], add_idx);
       logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
-      sienna_add_pkg::add_words_t g_add_w_q;  // the ADD words before the last edge
+      sienna_fmt_pkg::add_params_t g_add_w_q;  // the ADD words before the last edge
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
         else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
@@ -1099,12 +1080,9 @@ module sienna_pipe #(
         .clear_i (g_state == G_IDLE),
         .valid_i (wide_rd_valid),
         .acc_i   (wide_rd_data),
-        .mult_i  (g_mult),
-        .shift_i (g_shift),
+        .scale_i (g_scale),
         .packed_i(g_pack),
-        .zp_i    (g_zp),
-        .min_i   (g_min),
-        .max_i   (g_max),
+        .entry_i (g_lane),
         .valid_o (fill_v),
         .result_o(fill_d)
     );

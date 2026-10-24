@@ -1,8 +1,8 @@
 `timescale 1ns / 100ps
 
-// requant_lanes on rq_lanes.mem: per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); req_lat() latency; outputs to rq_lanes_out.mem for the true-function gate.
+// requant_lanes on rq_lanes.mem: per-lane zp/min/max; sets 1, 2, 5 packed (lane k reads channel k % N); REQUANT_LATENCY latency; outputs to rq_lanes_out.mem for the true-function gate.
 module TB_requant_lanes;
-  localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::req_lat();
+  localparam int N = 16, NUM_LANES = 32, PER_LANE = N * N / NUM_LANES, REQ_LAT = sienna_fmt_pkg::REQUANT_LATENCY;
   logic clk_i = 0, rstn_i = 0, clear_i = 1, valid_i = 0, valid_o;
   logic [NUM_LANES-1:0][31:0] acc_i = '0;
   logic [N-1:0][23:0] mult_i = '0;
@@ -12,7 +12,20 @@ module TB_requant_lanes;
   logic [NUM_LANES-1:0][7:0] result_o;
   always #5 clk_i = ~clk_i;
 
-  requant_lanes #(.NUM_LANES(NUM_LANES), .N(N)) dut (.*);
+  if (!(sienna_fmt_pkg::HAS_REQUANT_EPILOGUE)) begin : G_BAD_FORMAT  // the bench's vectors are int8 words
+    $fatal(1, "TB_requant_lanes: build with FMT=int8 (+define+FMT_INT8), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
+  // The raw words in the package's bundles: a channel's scale, a lane's entry (its lane words zero).
+  sienna_fmt_pkg::requant_scale_t [N-1:0] scale_i;
+  sienna_fmt_pkg::lane_entry_t [NUM_LANES-1:0] entry_i;
+  for (genvar c = 0; c < N; c++) begin : G_SCALE
+    assign scale_i[c] = '{mantissa: mult_i[c], shift: shift_i[c]};
+  end
+  for (genvar k = 0; k < NUM_LANES; k++) begin : G_ENTRY
+    assign entry_i[k] = '{zero_point: zp_i[k], act_min: min_i[k], act_max: max_i[k], default: '0};
+  end
+  requant_lanes #(.NUM_LANES(NUM_LANES), .N(N)) dut (.clk_i(clk_i), .rstn_i(rstn_i), .clear_i(clear_i), .valid_i(valid_i), .acc_i(acc_i),
+      .scale_i(scale_i), .packed_i(packed_i), .entry_i(entry_i), .valid_o(valid_o), .result_o(result_o));
 
   logic [31:0] v[$];
   logic [NUM_LANES-1:0][7:0] want_q[$];  // filled before reset is released, then only popped by the checker

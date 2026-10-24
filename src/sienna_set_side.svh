@@ -10,17 +10,9 @@ typedef struct packed {
   logic [2:0]                                 pack_shift;     // a packed set of N >> pack_shift columns per job; 0 unpacked
   logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0]   pack_map;       // entry of each column block
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] act;            // activation per entry; entry 0 is the set's own, 1.. a packed set's table
-  logic [PACK_ENTRIES-1:0][7:0]               zp;             // int8 per entry: requantize zero point and clamp
-  logic [PACK_ENTRIES-1:0][7:0]               amin;
-  logic [PACK_ENTRIES-1:0][7:0]               amax;
-  logic [PACK_ENTRIES-1:0][15:0]              mx;             // int8 per entry: GPNAE input rescale and output requantize
-  logic [PACK_ENTRIES-1:0][4:0]               shx;
-  logic [PACK_ENTRIES-1:0][23:0]              mout;
-  logic [PACK_ENTRIES-1:0][5:0]               shout;
-  logic [PACK_ENTRIES-1:0][7:0]               zout;
-  logic [N-1:0][23:0]                         mult;           // int8 per output channel: requantize scale as a 24-bit mantissa and right shift
-  logic [N-1:0][5:0]                          shift;
-  logic                                       res_hold;       // int8 residual: the last depth pass; its beats go to hold_mem, no bank, no output
-  logic                                       res_add;        // int8 residual: the identity pass; its beats meet hold_mem in add_lanes
-  sienna_add_pkg::add_words_t                 add;            // int8 residual: the ADD's words
+  sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:0] entry;     // per entry: requantize zero point and clamp, lane rescale and SELU words (1-bit dummies in floats)
+  sienna_fmt_pkg::requant_scale_t [N-1:0]      scale;          // per output channel: the requantize scale (1-bit dummies in floats)
+  logic                                       res_hold;       // residual: the last depth pass; its beats go to hold_mem, no bank, no output
+  logic                                       res_add;        // residual: the identity pass; its beats meet hold_mem in add_lanes
+  sienna_fmt_pkg::add_params_t                add;            // residual: the ADD's words (a 1-bit dummy in floats)
 } set_side_t;

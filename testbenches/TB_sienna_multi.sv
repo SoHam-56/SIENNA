@@ -32,6 +32,7 @@ module TB_sienna_multi #(
   localparam int OUT_CAP = 64;  // sienna_top's OUT_MAX
   localparam int SW = $clog2(COPIES + 1);
   `include "sienna_set_side.svh"
+  `include "tb_side_pack.svh"
   // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
   credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
   for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
@@ -140,39 +141,18 @@ module TB_sienna_multi #(
       .cfg_act_i           ('0),
       .cfg_train_i         (1'b0),
       .cfg_seed_i          ('0),
-      .cfg_req_zp_i        ('0),
-      .cfg_req_min_i       ('0),
-      .cfg_req_max_i       ('0),
-      .cfg_gp_mx_i         ('0),
-      .cfg_gp_shx_i        ('0),
-      .cfg_gp_mout_i       ('0),
-      .cfg_gp_shout_i      ('0),
-      .cfg_gp_zout_i       ('0),
-      .cfg_add_zp2_i       ('0),
-      .cfg_add_m1_i        ('0),
-      .cfg_add_m2_i        ('0),
-      .cfg_add_shift_i     ('0),
-      .cfg_add_zpo_i       ('0),
-      .cfg_add_amin_i      ('0),
-      .cfg_add_amax_i      ('0),
+      .cfg_lane_i          ('0),
+      .cfg_add_i           ('0),
       .cfg_pack_shift_i    ('0),
       .cfg_pack_map_i      ('0),
       .cfg_pack_act_i      ('0),
-      .cfg_pack_zp_i       ('0),
-      .cfg_pack_min_i      ('0),
-      .cfg_pack_max_i      ('0),
-      .cfg_pack_mx_i       ('0),
-      .cfg_pack_shx_i      ('0),
-      .cfg_pack_mout_i     ('0),
-      .cfg_pack_shout_i    ('0),
-      .cfg_pack_zout_i     ('0),
+      .cfg_pack_lane_i     ('0),
       .busy_o              (),
       .done_o              (),
       .a_rows              (idle_rows[0]),
       .w_rows              (idle_rows[1]),
       .w_bias_i            ('0),
-      .w_req_mult_i        ('0),
-      .w_req_shift_i       ('0),
+      .w_req_scale_i       ('0),
       .set_done_o          (),
       .host                (host),
       .bias_i              (bias_i),
@@ -348,16 +328,9 @@ module TB_sienna_multi #(
     side.train         = TRAINING_MODE;
     side.seed          = set_seed(k);
     side.act[0]        = ACTIVATION_CODE;
-    side.zp[0]         = req_zp_i;
-    side.amin[0]       = req_min_i;
-    side.amax[0]       = req_max_i;
-    side.mx[0]         = gp_mx_i;
-    side.shx[0]        = gp_shx_i;
-    side.mout[0]       = gp_mout_i;
-    side.shout[0]      = gp_shout_i;
-    side.zout[0]       = gp_zout_i;
-    side.mult          = req_mult_i;
-    side.shift         = req_shift_i;
+    side.entry         = tb_side_entries({{(PACK_ENTRIES - 1) * TB_ENTRY_W{1'b0}},
+                                          tb_entry(req_zp_i, req_min_i, req_max_i, gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i)});
+    side.scale         = tb_side_scales(req_mult_i, req_shift_i);
     if (fault == 3 && k == 0) begin
       $display("  [FAULT 3] set 0 put to copy %0d, whose turn it is not", (c + 1) % COPIES);
       c = (c + 1) % COPIES;

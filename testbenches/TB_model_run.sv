@@ -26,6 +26,7 @@ module TB_model_run #(
   localparam int EXP_W = sienna_fmt_pkg::EXPONENT_WIDTH, MAN_W = sienna_fmt_pkg::MANTISSA_WIDTH, IS_INT = (sienna_fmt_pkg::EXPONENT_WIDTH == 0);
   localparam int PACK_ENTRIES = 8, WC_TILES = 128;
   `include "sienna_set_side.svh"
+  `include "tb_side_pack.svh"
 
   localparam int STALL_CYCLES = 50_000;  // this long with nothing moving is a hang
   localparam int RCW = $clog2(N + 1);  // a set's N row credits in one cycle
@@ -126,6 +127,20 @@ module TB_model_run #(
       @(negedge clk_i) idle_put = 1'b0;
     end
   end
+  // The int8 words in the package's bundles (zeros in floats); cfg_add_i's in1_zero_point is ignored for the requantize's.
+  logic [N-1:0][TB_SCALE_W-1:0] w_req_raw;
+  logic [PACK_ENTRIES-1:1][TB_ENTRY_W-1:0] pack_raw;
+  for (genvar c = 0; c < N; c++) begin : G_SCALE
+    assign w_req_raw[c] = {w_req_mult_i[c], w_req_shift_i[c]};
+  end
+  for (genvar e = 1; e < PACK_ENTRIES; e++) begin : G_PACK_ENTRY
+    assign pack_raw[e] = tb_entry(cfg_pack_zp_i[e], cfg_pack_min_i[e], cfg_pack_max_i[e], cfg_pack_mx_i[e], cfg_pack_shx_i[e], cfg_pack_mout_i[e],
+                                  cfg_pack_shout_i[e], cfg_pack_zout_i[e]);
+  end
+  tb_add_words_t cfg_add_raw;
+  assign cfg_add_raw = '{zp1: cfg_req_zp_i, zp2: cfg_add_zp2_i, m1: cfg_add_m1_i, m2: cfg_add_m2_i, shift: cfg_add_shift_i, zpo: cfg_add_zpo_i,
+                         amin: cfg_add_amin_i, amax: cfg_add_amax_i};
+
   sienna_top #(
       .SET_PORT      (0),  // the layer contract: configuration and rows on L10
       .NUM_LANES     (NUM_LANES),
@@ -150,39 +165,19 @@ module TB_model_run #(
       .cfg_act_i       (cfg_act_i),
       .cfg_train_i     (cfg_train_i),
       .cfg_seed_i      (cfg_seed_i),
-      .cfg_req_zp_i    (cfg_req_zp_i),
-      .cfg_req_min_i   (cfg_req_min_i),
-      .cfg_req_max_i   (cfg_req_max_i),
-      .cfg_gp_mx_i     (cfg_gp_mx_i),
-      .cfg_gp_shx_i    (cfg_gp_shx_i),
-      .cfg_gp_mout_i   (cfg_gp_mout_i),
-      .cfg_gp_shout_i  (cfg_gp_shout_i),
-      .cfg_gp_zout_i   (cfg_gp_zout_i),
-      .cfg_add_zp2_i   (cfg_add_zp2_i),
-      .cfg_add_m1_i    (cfg_add_m1_i),
-      .cfg_add_m2_i    (cfg_add_m2_i),
-      .cfg_add_shift_i (cfg_add_shift_i),
-      .cfg_add_zpo_i   (cfg_add_zpo_i),
-      .cfg_add_amin_i  (cfg_add_amin_i),
-      .cfg_add_amax_i  (cfg_add_amax_i),
+      .cfg_lane_i      (tb_lane_entry(tb_entry(cfg_req_zp_i, cfg_req_min_i, cfg_req_max_i, cfg_gp_mx_i, cfg_gp_shx_i, cfg_gp_mout_i,
+                                               cfg_gp_shout_i, cfg_gp_zout_i))),
+      .cfg_add_i       (tb_side_add(cfg_add_raw)),
       .cfg_pack_shift_i(cfg_pack_shift_i),
       .cfg_pack_map_i  (cfg_pack_map_i),
       .cfg_pack_act_i  (cfg_pack_act_i),
-      .cfg_pack_zp_i   (cfg_pack_zp_i),
-      .cfg_pack_min_i  (cfg_pack_min_i),
-      .cfg_pack_max_i  (cfg_pack_max_i),
-      .cfg_pack_mx_i   (cfg_pack_mx_i),
-      .cfg_pack_shx_i  (cfg_pack_shx_i),
-      .cfg_pack_mout_i (cfg_pack_mout_i),
-      .cfg_pack_shout_i(cfg_pack_shout_i),
-      .cfg_pack_zout_i (cfg_pack_zout_i),
+      .cfg_pack_lane_i (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE ? ((PACK_ENTRIES - 1) * ENTRY_BITS)'(pack_raw) : '0),
       .busy_o          (busy_o),
       .done_o          (done_o),
       .a_rows          (a_lnk),
       .w_rows          (w_lnk),
       .w_bias_i        (w_bias_i),
-      .w_req_mult_i    (w_req_mult_i),
-      .w_req_shift_i   (w_req_shift_i),
+      .w_req_scale_i   (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE ? (N * SCALE_BITS)'(w_req_raw) : '0),
       .set_done_o      (set_done_o),
       // The set contract, unused at SET_PORT = 0: tied off
       .host                (idle_host),

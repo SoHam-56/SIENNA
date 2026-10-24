@@ -1,12 +1,15 @@
 `timescale 1ns / 100ps
 
-// add_lanes on add_lanes.mem: per set its ADD words, per beat each lane's q1 and q2; the tag rides qadd_lat() cycles; busy_o is high exactly while a beat is inside; outputs to add_lanes_out.mem for the true-function gate.
+// add_lanes on add_lanes.mem: per set its ADD words, per beat each lane's q1 and q2; the tag rides QUANT_ADD_LATENCY cycles; busy_o is high exactly while a beat is inside; outputs to add_lanes_out.mem for the true-function gate.
 module TB_add_lanes;
-  localparam int NUM_LANES = 32, SETS = 6, PER = 8, TAG_W = 16, LAT = sienna_fmt_pkg::qadd_lat();
+  localparam int NUM_LANES = 32, SETS = 6, PER = 8, TAG_W = 16, LAT = sienna_fmt_pkg::QUANT_ADD_LATENCY;
   logic clk_i = 0, rstn_i = 0, valid_i = 0, valid_o, busy_o;
   logic [NUM_LANES-1:0][7:0] q1_i = '0, q2_i = '0, result_o;
   logic [TAG_W-1:0] tag_i = '0, tag_o;
-  sienna_add_pkg::add_words_t words_i = '0;
+  sienna_fmt_pkg::add_params_t words_i = '0;
+  if (!(sienna_fmt_pkg::HAS_RESIDUAL_ADD)) begin : G_BAD_FORMAT  // the bench's vectors are int8 words
+    $fatal(1, "TB_add_lanes: build with FMT=int8 (+define+FMT_INT8), not %s", sienna_fmt_pkg::FORMAT_NAME);
+  end
   always #5 clk_i = ~clk_i;
 
   add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(TAG_W)) dut (.*);
@@ -73,7 +76,8 @@ module TB_add_lanes;
         if ($fscanf(fd, "%h", tg) != 1) $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d beat %0d has no tag", s, b);
         @(posedge clk_i);
         #1;
-        words_i = '{zp1: c[0][7:0], zp2: c[1][7:0], m1: c[2], m2: c[3], shift: c[4][5:0], zpo: c[5][7:0], amin: c[6][7:0], amax: c[7][7:0]};
+        words_i = '{in1_zero_point: c[0][7:0], in2_zero_point: c[1][7:0], in1_mantissa: c[2], in2_mantissa: c[3], shift: c[4][5:0],
+                   out_zero_point: c[5][7:0], act_min: c[6][7:0], act_max: c[7][7:0]};
         for (int k = 0; k < NUM_LANES; k++) begin
           if ($fscanf(fd, "%h", e) != 1) $fatal(1, "TB_add_lanes: add_lanes.mem: set %0d beat %0d lane %0d is missing", s, b, k);
           {q1_i[k], q2_i[k], w[k]} = e;

@@ -52,42 +52,21 @@ module sienna_top #(
     input logic [CONTROL_WIDTH-1:0] cfg_act_i,
     input logic                     cfg_train_i,
     input logic [LFSR_WIDTH-1:0]    cfg_seed_i,
-    // int8 only, taken with cfg_load_i: the layer's requantize and GPNAE parameters (D-2)
-    input logic [7:0]               cfg_req_zp_i,
-    input logic [7:0]               cfg_req_min_i,
-    input logic [7:0]               cfg_req_max_i,
-    input logic [15:0]              cfg_gp_mx_i,
-    input logic [4:0]               cfg_gp_shx_i,
-    input logic [23:0]              cfg_gp_mout_i,   // SELU output scale: 24-bit mantissa and right shift
-    input logic [5:0]               cfg_gp_shout_i,
-    input logic [7:0]               cfg_gp_zout_i,
-    // int8 residual only, taken with cfg_load_i: the ADD's words (sienna_add_pkg::add_words_t); zp1 is cfg_req_zp_i, the conv output's
-    input logic [7:0]               cfg_add_zp2_i,
-    input logic [31:0]              cfg_add_m1_i,
-    input logic [31:0]              cfg_add_m2_i,
-    input logic [5:0]               cfg_add_shift_i,
-    input logic [7:0]               cfg_add_zpo_i,
-    input logic [7:0]               cfg_add_amin_i,
-    input logic [7:0]               cfg_add_amax_i,
+    // Where the build has them (int8; 1-bit dummies in floats): the layer's requantize and lane words (D-2), and the residual ADD's
+    // words, whose in1_zero_point is ignored for cfg_lane_i's zero_point, the conv output's
+    input sienna_fmt_pkg::lane_entry_t cfg_lane_i,
+    input sienna_fmt_pkg::add_params_t cfg_add_i,
     // Packing, taken with cfg_load_i: every set of the layer is packed this way (sienna-packing)
     input logic [2:0]                                 cfg_pack_shift_i,
     input logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0]   cfg_pack_map_i,
     input logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] cfg_pack_act_i,
-    input logic [PACK_ENTRIES-1:1][7:0]               cfg_pack_zp_i,
-    input logic [PACK_ENTRIES-1:1][7:0]               cfg_pack_min_i,
-    input logic [PACK_ENTRIES-1:1][7:0]               cfg_pack_max_i,
-    input logic [PACK_ENTRIES-1:1][15:0]              cfg_pack_mx_i,
-    input logic [PACK_ENTRIES-1:1][4:0]               cfg_pack_shx_i,
-    input logic [PACK_ENTRIES-1:1][23:0]              cfg_pack_mout_i,
-    input logic [PACK_ENTRIES-1:1][5:0]               cfg_pack_shout_i,
-    input logic [PACK_ENTRIES-1:1][7:0]               cfg_pack_zout_i,
+    input sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] cfg_pack_lane_i,  // entries 1..: requantize and lane words, as cfg_lane_i
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
     credit_link_if.consumer         a_rows,  // L10: one row of N words per put (sienna_sched's contract)
     credit_link_if.consumer         w_rows,  // L10: the weight stream, one row of N words per put
     input logic [N-1:0][sienna_fmt_pkg::ACC_DATA_WIDTH-1:0] w_bias_i,  // int8 only: with each block's bias row on the weight stream
-    input logic [N-1:0][23:0]       w_req_mult_i,   // per channel: requantize scale's 24-bit mantissa and right shift
-    input logic [N-1:0][5:0]        w_req_shift_i,
+    input sienna_fmt_pkg::requant_scale_t [N-1:0] w_req_scale_i,  // int8 only: per channel, the requantize scale, with each block's bias row
     output logic                    set_done_o,  // a set left the pipeline with its last word (partial sums leave with no results)
 
     // ── The set contract (SET_PORT = 1), per copy where noted ──
@@ -169,39 +148,18 @@ module sienna_top #(
         .cfg_act_i           (cfg_act_i),
         .cfg_train_i         (cfg_train_i),
         .cfg_seed_i          (cfg_seed_i),
-        .cfg_req_zp_i        (cfg_req_zp_i),
-        .cfg_req_min_i       (cfg_req_min_i),
-        .cfg_req_max_i       (cfg_req_max_i),
-        .cfg_gp_mx_i         (cfg_gp_mx_i),
-        .cfg_gp_shx_i        (cfg_gp_shx_i),
-        .cfg_gp_mout_i       (cfg_gp_mout_i),
-        .cfg_gp_shout_i      (cfg_gp_shout_i),
-        .cfg_gp_zout_i       (cfg_gp_zout_i),
-        .cfg_add_zp2_i       (cfg_add_zp2_i),
-        .cfg_add_m1_i        (cfg_add_m1_i),
-        .cfg_add_m2_i        (cfg_add_m2_i),
-        .cfg_add_shift_i     (cfg_add_shift_i),
-        .cfg_add_zpo_i       (cfg_add_zpo_i),
-        .cfg_add_amin_i      (cfg_add_amin_i),
-        .cfg_add_amax_i      (cfg_add_amax_i),
+        .cfg_lane_i          (cfg_lane_i),
+        .cfg_add_i           (cfg_add_i),
         .cfg_pack_shift_i    (cfg_pack_shift_i),
         .cfg_pack_map_i      (cfg_pack_map_i),
         .cfg_pack_act_i      (cfg_pack_act_i),
-        .cfg_pack_zp_i       (cfg_pack_zp_i),
-        .cfg_pack_min_i      (cfg_pack_min_i),
-        .cfg_pack_max_i      (cfg_pack_max_i),
-        .cfg_pack_mx_i       (cfg_pack_mx_i),
-        .cfg_pack_shx_i      (cfg_pack_shx_i),
-        .cfg_pack_mout_i     (cfg_pack_mout_i),
-        .cfg_pack_shout_i    (cfg_pack_shout_i),
-        .cfg_pack_zout_i     (cfg_pack_zout_i),
+        .cfg_pack_lane_i     (cfg_pack_lane_i),
         .busy_o              (busy_o),
         .done_o              (done_o),
         .a_rows              (a_rows),
         .w_rows              (w_rows),
         .w_bias_i            (w_bias_i),
-        .w_req_mult_i        (w_req_mult_i),
-        .w_req_shift_i       (w_req_shift_i),
+        .w_req_scale_i       (w_req_scale_i),
         .set_done_o          (set_done_o),
         .host                (l0),
         .wc_region           (wc),
@@ -505,12 +463,9 @@ module sienna_top #(
     assign done_o        = 1'b0;
     assign set_done_o    = 1'b0;
     assign idle_put = cfg_load_i || a_rows.put || w_rows.put;
-    wire unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_train_i, cfg_seed_i, cfg_req_zp_i,
-                                 cfg_req_min_i, cfg_req_max_i, cfg_gp_mx_i, cfg_gp_shx_i, cfg_gp_mout_i, cfg_gp_shout_i, cfg_gp_zout_i,
-                                 cfg_add_zp2_i, cfg_add_m1_i, cfg_add_m2_i, cfg_add_shift_i, cfg_add_zpo_i, cfg_add_amin_i, cfg_add_amax_i,
-                                 cfg_pack_shift_i, cfg_pack_map_i, cfg_pack_act_i, cfg_pack_zp_i, cfg_pack_min_i, cfg_pack_max_i, cfg_pack_mx_i,
-                                 cfg_pack_shx_i, cfg_pack_mout_i, cfg_pack_shout_i, cfg_pack_zout_i, a_rows.data, w_rows.data, w_bias_i,
-                                 w_req_mult_i, w_req_shift_i};  // only the layer contract reads them
+    wire unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_train_i, cfg_seed_i, cfg_lane_i,
+                                 cfg_add_i, cfg_pack_shift_i, cfg_pack_map_i, cfg_pack_act_i, cfg_pack_lane_i, a_rows.data, w_rows.data,
+                                 w_bias_i, w_req_scale_i};  // only the layer contract reads them
   end
 
 `ifndef SYNTHESIS

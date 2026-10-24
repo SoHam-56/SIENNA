@@ -43,6 +43,7 @@ module TB_sienna_model;
   // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
   localparam int PACK_ENTRIES = 8;
   `include "sienna_set_side.svh"
+  `include "tb_side_pack.svh"
   credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
   // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
   credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
@@ -64,16 +65,9 @@ module TB_sienna_model;
     side.train         = training_mode_i;
     side.seed          = dropout_seed_i;
     side.act[0]        = activation_function_i;
-    side.zp[0]         = req_zp_i;
-    side.amin[0]       = req_min_i;
-    side.amax[0]       = req_max_i;
-    side.mx[0]         = gp_mx_i;
-    side.shx[0]        = gp_shx_i;
-    side.mout[0]       = gp_mout_i;
-    side.shout[0]      = gp_shout_i;
-    side.zout[0]       = gp_zout_i;
-    side.mult          = req_mult_i;
-    side.shift         = req_shift_i;
+    side.entry         = tb_side_entries({{(PACK_ENTRIES - 1) * TB_ENTRY_W{1'b0}},
+                                          tb_entry(req_zp_i, req_min_i, req_max_i, gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i)});
+    side.scale         = tb_side_scales(req_mult_i, req_shift_i);
   end
   // The host drives its rows, sideband and put on the falling edge, so the counter, checker and DUT sample them alike; it starts a set only with a credit held.
   logic drain_chk = 1'b0;
@@ -159,39 +153,18 @@ module TB_sienna_model;
       .cfg_act_i           ('0),
       .cfg_train_i         (1'b0),
       .cfg_seed_i          ('0),
-      .cfg_req_zp_i        ('0),
-      .cfg_req_min_i       ('0),
-      .cfg_req_max_i       ('0),
-      .cfg_gp_mx_i         ('0),
-      .cfg_gp_shx_i        ('0),
-      .cfg_gp_mout_i       ('0),
-      .cfg_gp_shout_i      ('0),
-      .cfg_gp_zout_i       ('0),
-      .cfg_add_zp2_i       ('0),
-      .cfg_add_m1_i        ('0),
-      .cfg_add_m2_i        ('0),
-      .cfg_add_shift_i     ('0),
-      .cfg_add_zpo_i       ('0),
-      .cfg_add_amin_i      ('0),
-      .cfg_add_amax_i      ('0),
+      .cfg_lane_i          ('0),
+      .cfg_add_i           ('0),
       .cfg_pack_shift_i    ('0),
       .cfg_pack_map_i      ('0),
       .cfg_pack_act_i      ('0),
-      .cfg_pack_zp_i       ('0),
-      .cfg_pack_min_i      ('0),
-      .cfg_pack_max_i      ('0),
-      .cfg_pack_mx_i       ('0),
-      .cfg_pack_shx_i      ('0),
-      .cfg_pack_mout_i     ('0),
-      .cfg_pack_shout_i    ('0),
-      .cfg_pack_zout_i     ('0),
+      .cfg_pack_lane_i     ('0),
       .busy_o              (),
       .done_o              (),
       .a_rows              (idle_rows[0]),
       .w_rows              (idle_rows[1]),
       .w_bias_i            ('0),
-      .w_req_mult_i        ('0),
-      .w_req_shift_i       ('0),
+      .w_req_scale_i       ('0),
       .set_done_o          (),
       .host                       (host_lnk),  // unpacked sets: the sideband's pack fields and entries 1.. stay zero
       .bias_i                     (bias_i),

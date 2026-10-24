@@ -107,6 +107,18 @@ module sienna_top #(
     $fatal(1, "sienna_top: the layer contract needs HOST_WORDS, IN_ROWS and IN_COLS = N (%0d), not %0d, %0d, %0d", N, HOST_WORDS, IN_ROWS, IN_COLS);
   end
 
+  // I3: every plain-vector boundary port is as wide as the define's package says; WIDTH warnings are off in the Makefile, so a port written at another width would truncate silently.
+  localparam int ENTRY_BITS = $bits(sienna_fmt_pkg::lane_entry_t);
+  if ($bits(bias_i) != N * ACC_DATA_WIDTH || $bits(w_bias_i) != N * ACC_DATA_WIDTH ||
+      $bits(north_write_data_i) != HOST_WORDS * DATA_WIDTH || $bits(west_write_data_i) != HOST_WORDS * DATA_WIDTH ||
+      $bits(w_req_scale_i) != N * $bits(sienna_fmt_pkg::requant_scale_t) || $bits(cfg_lane_i) != ENTRY_BITS ||
+      $bits(cfg_pack_lane_i) != (PACK_ENTRIES - 1) * ENTRY_BITS || $bits(cfg_add_i) != $bits(sienna_fmt_pkg::add_params_t)) begin : G_BAD_PORT_WIDTH
+    $fatal(1, "sienna_top: a port's width is not the %s define's: bias_i %0d w_bias_i %0d (want %0d), north/west_write_data_i %0d/%0d (want %0d), w_req_scale_i %0d (want %0d), cfg_lane_i %0d cfg_pack_lane_i %0d (want %0d, %0d), cfg_add_i %0d (want %0d)",
+           sienna_fmt_pkg::FORMAT_NAME, $bits(bias_i), $bits(w_bias_i), N * ACC_DATA_WIDTH, $bits(north_write_data_i), $bits(west_write_data_i),
+           HOST_WORDS * DATA_WIDTH, $bits(w_req_scale_i), N * $bits(sienna_fmt_pkg::requant_scale_t), $bits(cfg_lane_i), $bits(cfg_pack_lane_i),
+           ENTRY_BITS, (PACK_ENTRIES - 1) * ENTRY_BITS, $bits(cfg_add_i), $bits(sienna_fmt_pkg::add_params_t));
+  end
+
 `ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the host and output links are checked at time 0
   if (SET_PORT == 1) begin : G_HOST_W
     initial

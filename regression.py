@@ -4167,6 +4167,17 @@ def test_parse_time_rejections():
 
 
 @selftest
+def test_build_key_per_format():
+    with tempfile.TemporaryDirectory() as d:  # make build-key with an empty dependency file: the key's flag line carries the build's define
+        open(os.path.join(d, "VTB_sienna_top__ver.d"), "w").close()
+        key = lambda *a: subprocess.run(["make", "-s", "build-key", f"VERILATOR_DIR={d}", *a], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
+        keys = {f: key(f"FMT={f}") for f in reg.FORMATS}
+        keys["none"] = key("FMT=fp32", "FMT_DEF=")
+        assert all(keys.values()) and len(set(keys.values())) == 4, {k: v[-80:] for k, v in keys.items()}
+        assert all(f"+define+FMT_{f.upper()}" in keys[f] for f in reg.FORMATS) and "+define+FMT_" not in keys["none"]
+
+
+@selftest
 def test_multi_point():
     pts = reg.SPEC.points(True, ["bf16"])
     assert "bf16/N8_T2/pipeline-multi" in pts and not any(p.endswith("pipeline-multi") and "N8_T2" not in p for p in pts), pts

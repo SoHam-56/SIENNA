@@ -306,6 +306,7 @@ help:
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
 	@echo "  make check-fmt         - no RTL outside the allowlist names a precision, and a planted EXP_W fails (C4)"
+	@echo "  make check-hier        - each define's hierarchy, at SET_PORT 0 and 1, holds only that precision's units"
 	@echo "  make debug             - Build with GDB back-trace"
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
@@ -537,6 +538,11 @@ check-fmt:
 	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
 	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
 
+# check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna_top) and 0 (TB_model_run), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py).
+check-hier: $(PKG_DEP)
+	@$(PYTHON) $(PRJ_DIR)/check_hier.py --verilator $(VERILATOR) --out $(PRJ_DIR)/Verilator_hier \
+	  --inc $(SRC_DIR) $(TB_DIR) $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR) --files $(DESIGN_FILES) $(PKG_FILE)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # File listing / checking
 # ─────────────────────────────────────────────────────────────────────────────
@@ -702,4 +708,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi check-fmt add-lanes rq-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

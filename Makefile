@@ -305,6 +305,7 @@ help:
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
+	@echo "  make check-fmt         - no RTL outside the allowlist names a precision, and a planted EXP_W fails (C4)"
 	@echo "  make debug             - Build with GDB back-trace"
 	@echo "  make perf              - Build with performance profiling"
 	@echo ""
@@ -525,6 +526,17 @@ debug: verilator
 perf: VERILATOR_FLAGS += --stats --profile-cfuncs
 perf: verilator
 
+# check-fmt: no RTL outside the allowlist names a precision (ArithmeticLibrary's check_fmt.sh); GPNAE and SystolicMesh run their own; C4: a planted EXP_W must fail it.
+# src/gpnae_lane.sv gives B's gpnae_poly its EXP_W and MAN_W; Batch B's single gpnae removes it and this entry.
+FMT_ALLOW = ^(GPNAE|SystolicMesh)/|^src/gpnae_lane\.sv$$
+check-fmt:
+	@bash $(SM_LIB_DIR)/Common/check_fmt.sh $(PRJ_DIR) '$(FMT_ALLOW)' && echo "check-fmt OK: the tree passes" || { echo "check-fmt FAIL: the tree"; exit 1; }
+	@t=$$(mktemp -d); mkdir -p $$t/src; cp $(SRC_DIR)/sienna_pipe.sv $$t/src/; \
+	sed -i 's/^endmodule/  localparam int EXP_W = 8;\nendmodule/' $$t/src/sienna_pipe.sv; \
+	if bash $(SM_LIB_DIR)/Common/check_fmt.sh $$t '$(FMT_ALLOW)' > $$t/c4.log; then echo "check-fmt FAIL: C4 planted EXP_W passed"; exit 1; \
+	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
+	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
+
 # ─────────────────────────────────────────────────────────────────────────────
 # File listing / checking
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,4 +702,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi add-lanes rq-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi check-fmt add-lanes rq-lanes regression regression-summary sim build-key

@@ -5,8 +5,7 @@ SHELL := /bin/bash
 # =========================================================================
 N    ?= 16
 TILE ?= 4
-# Number format of every build, regression, test and model run: fp32, bf16 or int8.
-FMT  ?= fp32
+# Number format of every build, regression, test and model run: FMT=fp32 (default), bf16 or int8, through ArithmeticLibrary's fmt.mk below.
 LANES      ?= 32
 COLLAPSE_K ?= 1
 # GEN_PKG=0 builds the test_config_pkg.sv already on disk (scripts that write their own); the format guard still runs.
@@ -22,12 +21,6 @@ SMALL ?= 0
 QUICK ?= 0
 # Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna_top parameter; 0 is wires.
 LINK_STAGES ?= 0
-
-FORMATS = fp32 bf16 int8
-# Exactly one word, and one of FORMATS: anything left after filter-out, or a word count but 1, stops make.
-ifneq ($(filter-out $(FORMATS),$(FMT))$(words $(FMT)),1)
-$(error Invalid FMT=$(FMT): must be one of fp32, bf16, int8)
-endif
 
 # make regression: only SMALL= and FMT= on make's command line narrow it, not exported ones.
 REG_SMALL = $(if $(filter command line,$(origin SMALL)),$(SMALL),0)
@@ -46,11 +39,6 @@ $(error COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tf
 endif
 endif
 
-# EXP_W MAN_W IS_INT ACC_W OUT_W of each FMT, as model_runner.py's _config_items writes them into test_config_pkg.sv.
-FMT_FIELDS_fp32 = 8 23 0 32 32
-FMT_FIELDS_bf16 = 8 7 0 32 16
-FMT_FIELDS_int8 = 0 7 1 32 32
-
 # Project Structure
 PRJ_DIR     = $(shell pwd)
 SRC_DIR     = $(PRJ_DIR)/src
@@ -60,6 +48,10 @@ SM_LIB_DIR  = $(PRJ_DIR)/SystolicMesh/ArithmeticLibrary
 GPNAE_DIR   = $(PRJ_DIR)/GPNAE/src
 MAXPOOL_DIR = $(PRJ_DIR)/Maxpool
 DROPOUT_DIR = $(PRJ_DIR)/Dropout
+
+# FMT ?= fp32; any value but fp32, bf16 or int8 stops make; FMT_DEF is the build's +define+FMT_<FMT>, which sienna_fmt_pkg reads.
+# A command-line FMT_DEF= builds with no define, which must elaborate fp32 (make regression's default point).
+include $(SM_LIB_DIR)/Common/fmt.mk
 
 # Toolchain
 VERILATOR = verilator
@@ -243,8 +235,7 @@ VERILATOR_FLAGS = \
 	--Wno-TIMESCALEMOD \
 	--Wno-UNSIGNED
 
-# The build's precision define, which sienna_fmt_pkg's map and the mesh's math modules read.
-FMT_DEF = +define+FMT_$(shell echo $(FMT) | tr a-z A-Z)
+# The build's precision define, which sienna_fmt_pkg's map and the math modules read.
 VERILATOR_FLAGS += $(FMT_DEF)
 
 # Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK; SIM_ARGS go to the simulator (e.g. +verilator+rand+reset+2)
@@ -292,8 +283,9 @@ help:
 	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top, sienna_layer's model, gemm and tflite runs, and sm-verilator"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
-	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv); still guarded"
-	@echo "  verilator, lint, debug, perf and vcs run make pkg first, then check its format and N/TILE/LANES"
+	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv)"
+	@echo "  verilator, lint, debug, perf and vcs run make pkg first; the format is the define's (+define+FMT_<FMT>), never the package's"
+	@echo "  FMT_DEF=                - Build with no precision define, which must elaborate fp32"
 	@echo "  NOTE: so a default make verilator rewrites the tracked testbenches/test_config_pkg.sv; don't commit it"
 	@echo ""
 	@echo "Simulation Targets:"
@@ -399,35 +391,19 @@ pkg:
 		--collapse-k $(COLLAPSE_K) \
 		--test $(PKG_TEST)
 
-# Fails the build unless the package's EXP_W, MAN_W, IS_INT (when present), ACC_W, OUT_W, N, TILE_SIZE and NUM_LANES are FMT's, N, TILE and LANES.
-pkg-check: $(if $(filter 0,$(GEN_PKG)),,pkg)
-	@[ -r $(PKG_FILE) ] || { echo "ERROR: $(PKG_FILE) is missing or unreadable: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; exit 1; }
-	@set -- $(FMT_FIELDS_$(FMT)); \
-	field() { awk -v k="$$1" '$$1 == "localparam" && $$3 == k { sub(/;.*/, "", $$5); print $$5 }' $(PKG_FILE) 2>/dev/null; }; \
-	e=$$(field EXP_W); m=$$(field MAN_W); i=$$(field IS_INT); n=$$(field N); t=$$(field TILE_SIZE); l=$$(field NUM_LANES); \
-	if [ "$$e" != "$$1" ] || [ "$$m" != "$$2" ] || { [ -n "$$i" ] && [ "$$i" != "$$3" ]; }; then \
-		echo "ERROR: $(PKG_FILE) has EXP_W=$${e:-missing} MAN_W=$${m:-missing} IS_INT=$${i:-absent}, but FMT=$(FMT) needs EXP_W=$$1 MAN_W=$$2 IS_INT=$$3."; \
-		echo "       The package is stale or for another format: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
+# What a build compiles: the package make pkg writes for FMT, N, TILE and TEST, or with GEN_PKG=0 the one on disk; the format is the define's.
+# Fails the build unless the package's N, TILE_SIZE, NUM_LANES and COLLAPSE_K are N, TILE, LANES and COLLAPSE_K (a stale package of another size).
+pkg-geometry: $(if $(filter 0,$(GEN_PKG)),,pkg)
+	@[ -r $(PKG_FILE) ] || { echo "ERROR: $(PKG_FILE) is missing or unreadable: run make pkg, or build without GEN_PKG=0."; exit 1; }
+	@field() { awk -v k="$$1" '$$1 == "localparam" && $$3 == k { sub(/;.*/, "", $$5); print $$5 }' $(PKG_FILE) 2>/dev/null; }; \
+	n=$$(field N); t=$$(field TILE_SIZE); l=$$(field NUM_LANES); c=$$(field COLLAPSE_K); \
+	if [ "$$n" != "$(N)" ] || [ "$$t" != "$(TILE)" ] || [ "$$l" != "$(LANES)" ] || [ "$$c" != "$(COLLAPSE_K)" ]; then \
+		echo "ERROR: $(PKG_FILE) has N=$${n:-missing} TILE_SIZE=$${t:-missing} NUM_LANES=$${l:-missing} COLLAPSE_K=$${c:-missing}, but the build asks for N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K)."; \
+		echo "       The package was written for another geometry: run make pkg with these, or pass the package's."; \
 		exit 1; \
 	fi; \
-	a=$$(field ACC_W); o=$$(field OUT_W); \
-	if [ "$$a" != "$$4" ] || [ "$$o" != "$$5" ]; then \
-		echo "ERROR: $(PKG_FILE) has ACC_W=$${a:-missing} OUT_W=$${o:-missing}, but FMT=$(FMT) sums in $$4 bits and gives $$5-bit results (ACC_W=$$4 OUT_W=$$5)."; \
-		echo "       The package predates fp32 sums for bf16 or is stale: run make pkg FMT=$(FMT), or build without GEN_PKG=0."; \
-		exit 1; \
-	fi; \
-	if [ "$$n" != "$(N)" ] || [ "$$t" != "$(TILE)" ] || [ "$$l" != "$(LANES)" ]; then \
-		echo "ERROR: $(PKG_FILE) has N=$${n:-missing} TILE_SIZE=$${t:-missing} NUM_LANES=$${l:-missing}, but the build asks for N=$(N) TILE=$(TILE) LANES=$(LANES)."; \
-		echo "       The package was written for another geometry: run make pkg with these N, TILE, LANES, or pass the package's."; \
-		exit 1; \
-	fi; \
-	c=$$(field COLLAPSE_K); \
-	if [ "$$c" != "$(COLLAPSE_K)" ]; then \
-		echo "ERROR: $(PKG_FILE) has COLLAPSE_K=$${c:-missing}, but the build asks for COLLAPSE_K=$(COLLAPSE_K)."; \
-		echo "       The package is for the other mesh mode or predates it: run make pkg with this COLLAPSE_K, or pass the package's."; \
-		exit 1; \
-	fi; \
-	echo "-- test_config_pkg.sv matches FMT=$(FMT) N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K): EXP_W=$$e MAN_W=$$m IS_INT=$${i:-absent} ACC_W=$$a OUT_W=$$o"
+	echo "-- test_config_pkg.sv matches N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K); the format is the define's ($(or $(FMT_DEF),no define))"
+PKG_DEP = pkg-geometry
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
@@ -440,7 +416,7 @@ BUILD_KEY = { for f in $$(sed -e 's/^[^:]*://' -e 's/\\$$//' $(VERILATOR_DIR)/V$
 	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
 	echo '$(TOP_MODULE) $(VERILATOR_FLAGS)'; }
 
-verilator: pkg-check
+verilator: $(PKG_DEP)
 	@echo "=== Verilator simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	@rm -f $(VERILATOR_DIR)/build_key.txt
@@ -462,7 +438,7 @@ ifneq ($(TRACE),0)
 endif
 
 # The last build, run on the stimulus now in testbenches/ without building; it refuses a build of other inputs, package items (but TB_KNOBS) or flags.
-sim: pkg-check
+sim: $(PKG_DEP)
 	@[ -x $(VERILATOR_DIR)/$(TOP_MODULE)_sim ] && [ -r $(VERILATOR_DIR)/build_key.txt ] || { echo "ERROR: no finished build in $(VERILATOR_DIR): make verilator first"; exit 1; }
 	@$(BUILD_KEY) | cmp -s - $(VERILATOR_DIR)/build_key.txt || { echo "ERROR: $(VERILATOR_DIR) holds a build of other sources, package items or flags: make verilator"; exit 1; }
 	$(call copy_mem_files,$(VERILATOR_DIR))
@@ -495,7 +471,7 @@ gpnae-verilator:
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS
 # ─────────────────────────────────────────────────────────────────────────────
-vcs: pkg-check
+vcs: $(PKG_DEP)
 	@echo "=== VCS simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
 ifeq ($(TRACE),fst)
 	@echo "-- WARNING: VCS's \$$dumpvars only produces VCD; this run will write"
@@ -532,7 +508,7 @@ wave:
 # ─────────────────────────────────────────────────────────────────────────────
 # Lint / debug / perf
 # ─────────────────────────────────────────────────────────────────────────────
-lint: pkg-check
+lint: $(PKG_DEP)
 	@echo "=== Linting $(TOP_MODULE)  FMT=$(FMT) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --lint-only \
@@ -646,7 +622,7 @@ ADDL_DIR = $(VERILATOR_DIR)/add_lanes
 add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
-	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
+	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv \
 	  $(TB_DIR)/TB_add_lanes.sv -o sim
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
@@ -658,7 +634,7 @@ RQL_DIR = $(VERILATOR_DIR)/rq_lanes
 rq-lanes:
 	mkdir -p $(RQL_DIR)
 	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
-	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
+	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv -o sim
 	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }
@@ -708,4 +684,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-check model gemm perf-analysis tflite residual pack add-lanes rq-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack add-lanes rq-lanes regression regression-summary sim build-key

@@ -316,6 +316,7 @@ help:
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
+	@echo "  make multi FMT=bf16 [COPIES=2]    - TB_sienna_multi on sienna_top at COPIES copies (regression.py --action multi)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
 	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
 	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
@@ -613,6 +614,11 @@ residual:
 	@[ "$(FMT)" = int8 ] || { echo "ERROR: make residual runs the int8 residual layers only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
 	$(PYTHON) regression.py --action residual --n $(N) --tile $(TILE) --lanes $(LANES) --tflite --mid-reset
 
+# TB_sienna_multi on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets in FMT at N, TILE and LANES (regression.py --action multi).
+COPIES ?= 2
+multi:
+	$(PYTHON) regression.py --action multi --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES) --copies $(COPIES)$(if $(TEST), --test $(TEST))
+
 # Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
@@ -684,4 +690,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack add-lanes rq-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi add-lanes rq-lanes regression regression-summary sim build-key

@@ -66,7 +66,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -4167,6 +4167,24 @@ def test_parse_time_rejections():
 
 
 @selftest
+def test_multi_point():
+    pts = reg.SPEC.points(True, ["bf16"])
+    assert "bf16/N8_T2/pipeline-multi" in pts and not any(p.endswith("pipeline-multi") and "N8_T2" not in p for p in pts), pts
+    argv = reg.SPEC.argv("int8/N8_T2/pipeline-multi", argparse.Namespace())
+    assert argv[:3] == ["make", "multi", "FMT=int8"] and "COPIES=2" in argv, argv
+    try:
+        reg.SPEC.parse("fp32/N16_T4/pipeline-multi")
+        raise AssertionError("pipeline-multi offered at N16")
+    except ValueError:
+        pass
+    r = make_n("multi", "FMT=bf16", "PYTHON=py")
+    assert r.returncode == 0 and r.stdout.split()[:7] == "py regression.py --action multi --format bf16 --n".split(), r.stdout
+    ok = "MULTI COPIES=2 N=8 lanes=32\nRESULT: PASSED\nMULTI: PASS (COPIES=2 fp32 N=8 T=2 48 sets of x, make exit 0; l)\n"
+    assert reg.SPEC.verdict("fp32/N8_T2/pipeline-multi", ok, 0) == "PASS"
+    assert reg.SPEC.verdict("fp32/N8_T2/pipeline-multi", ok.replace("MULTI: PASS", "MULTI: FAIL"), 1).startswith("FAIL")
+
+
+@selftest
 def test_default_point():
     pts = reg.SPEC.points(True, ["fp32"])
     assert reg.DEFAULT_POINT in pts and reg.DEFAULT_POINT not in reg.SPEC.points(True, ["bf16", "int8"]), pts[:6]
@@ -4198,19 +4216,21 @@ def test_regression_points():
     assert sweep(full) == sweep(small) + [(32, t) for t in (2, 4, 8, 16, 32)] + [(64, t) for t in (2, 4, 8, 16, 32, 64)], sweep(full)
     assert small[0] == full[0] == "selftest" and "selftest" not in small[1:]  # format-independent: once
     assert small[1:3] == full[1:3] == ["add-lanes", "rq-lanes"] and not set(UNIT_POINTS) & set(small[3:])  # int8's unit benches: once
-    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 == 199 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 == 441, (len(small), len(full))
+    assert small[3] == full[3] == DEFAULT_POINT and [p for p in small if p.endswith(MULTI_KIND)] == [f"{f}/N8_T2/{MULTI_KIND}" for f in FORMATS]
+    extra = 1 + 3  # the default point and pipeline-multi per format
+    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 + extra == 203 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 445, (len(small), len(full))
     layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
         for n, t in sweep(full):  # back-to-back and sienna_layer's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
             want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f] + (["residual"] if f == "int8" else [])
-            assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/")] == want, (f, n, t)
+            assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/") and not p.endswith(MULTI_KIND)] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1
     assert SPEC.parse("fp32/N32_T8/gemm-ck0")["ck"] == 0
     assert [(SPEC.parse(f"int8/N8_T2/{k}")["ck"], SPEC.parse(f"int8/N8_T2/{k}")["b2b"]) for k in ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b")] \
         == [(1, False), (0, False), (1, True), (0, True)]
     assert [SPEC.parse(p)[x] for p in ("fp32/N64_T64/pipeline-b2b",) for x in ("ck", "b2b", "lanes")] == [1, True, 128]
     assert SPEC.points(True, ["int8"]) == ["selftest", "add-lanes", "rq-lanes"] + [p for p in small if p.startswith("int8/")] and SPEC.points(False, []) == []
-    assert SPEC.points(True, ["fp32", "bf16"]) == ["selftest"] + [p for p in small if p[:4] in ("fp32", "bf16")]
+    assert SPEC.points(True, ["fp32", "bf16"]) == ["selftest", DEFAULT_POINT] + [p for p in small if p[:4] in ("fp32", "bf16")]
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
     for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
@@ -5653,6 +5673,7 @@ LAYER_CK0 = KINDS[-4:-1]  # the layer contract's kinds on the collapse-k 0 mesh,
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected
+MULTI_KIND = "pipeline-multi"  # TB_sienna_multi on sienna_top at COPIES = 2 (SET_PORT = 1), per format at N8_T2
 DEFAULT_POINT = "default/N8_T2/pipeline"  # fp32's N8_T2 pipeline built with no precision define (FMT_DEF=): words and cycles must equal fp32's
 DEFAULT_TWIN = "fp32/N8_T2/pipeline"
 COMPARED = re.compile(r"cycles|^\s*(Total|Exact|Tol pass|Failed|Passed)\s*:|TRUTH:|stall|RESULT:")  # the lines whose words and cycles a twin must repeat
@@ -5694,7 +5715,8 @@ class SiennaSpec(regress.Spec):
         if not formats:
             return []
         return ["selftest"] + (list(UNIT_POINTS) if "int8" in formats else []) + ([DEFAULT_POINT] if "fp32" in formats else []) + [f"{f}/N{n}_T{t}/{k}" for f in formats for n in (regress.SIZES_SMALL if small else regress.SIZES)
-                               for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)]
+                               for t in pow2_tile_sizes(n) for k in KINDS if self._offered(f, n, k)] \
+            + [f"{f}/N8_T2/{MULTI_KIND}" for f in formats]
 
     @staticmethod
     def _offered(f, n, k):
@@ -5710,6 +5732,10 @@ class SiennaSpec(regress.Spec):
         if name == DEFAULT_POINT:
             return {"fmt": "fp32", "n": 8, "tile": 2, "lanes": reg_lanes(8), "kind": "pipeline", "ck": 1, "b2b": False, "no_define": True}
         m = re.fullmatch(r"(\w+)/N(\d+)_T(\d+)/([a-z0-9-]+)", name)
+        if m and m.group(1) in FORMATS and m.group(4) == MULTI_KIND:
+            if (m.group(2), m.group(3)) != ("8", "2"):
+                raise ValueError(f"{name}: {MULTI_KIND} runs at N8_T2 only")
+            return {"fmt": m.group(1), "n": 8, "tile": 2, "lanes": reg_lanes(8), "kind": MULTI_KIND, "ck": 1, "b2b": False}
         if not m or m.group(1) not in FORMATS or m.group(4) not in KINDS:
             raise ValueError(f"{name}: points are selftest, {', '.join(UNIT_POINTS)} and <fmt>/N<n>_T<t>/<kind>, kind one of {', '.join(KINDS)}")
         f, n, t, k = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -5731,6 +5757,8 @@ class SiennaSpec(regress.Spec):
             return [py, "regression.py", "--action", "selftest"]
         if p["kind"] in UNIT_POINTS:
             return ["make", p["kind"], f"PYTHON={py}"]
+        if p["kind"] == MULTI_KIND:
+            return ["make", "multi", f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}", "COPIES=2"]
         k = "pipeline" if p["kind"] in PIPELINE_KINDS else p["kind"].removesuffix("-ck0")
         mk = ["make", k, f"FMT={p['fmt']}", f"PYTHON={py}", f"N={p['n']}", f"TILE={p['tile']}", f"LANES={p['lanes']}"]
         return mk + {"model": [f"MODEL_DIR={getattr(opts, 'model_dir', '')}", f"MODEL_COUNT={MODEL_COUNT}"], "gemm": ["QUICK=1"]}.get(k, []) \
@@ -5759,6 +5787,8 @@ class SiennaSpec(regress.Spec):
         if k == "add-lanes":  # the bench's beats, latency, tags and busy_o, then its outputs on the true function
             return regress.marker_verdict(text, rc, (r"^add_lanes: \d+ beats, 0 errors, 0 latency errors, 0 tag errors, 0 busy errors \(\d+ busy cycles\);",
                                                      r"^RESULT: PASSED", r"^ADD LANES: PASS"), (r"RESULT: FAILED", r"^ADD LANES: FAIL"))
+        if k == MULTI_KIND:
+            return regress.marker_verdict(text, rc, (r"^MULTI: PASS \(COPIES=2",), (r"^MULTI: FAIL",))
         if k == "rq-lanes":
             return regress.marker_verdict(text, rc, (r"^TB_requant_lanes: \d+ beats, 0 errors, 0 latency errors;", r"^RESULT: PASSED", r"^REQUANT LANES: PASS"),
                                           (r"RESULT: FAILED", r"^REQUANT LANES: FAIL"))
@@ -5819,7 +5849,34 @@ if "--results" in sys.argv[:-1]:  # point and summary runs: where the default po
     SPEC.results_dir = os.path.abspath(sys.argv[sys.argv.index("--results") + 1])
 
 
-MAINS = {"pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
+def multi_main(argv) -> None:
+    """TB_sienna_multi on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets, every set against its golden, then MULTI: PASS or FAIL."""
+    ap = argparse.ArgumentParser(prog="regression.py --action multi")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS))
+    ap.add_argument("--n", type=int, default=8)
+    ap.add_argument("--tile", type=int, default=2)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--copies", type=int, default=2)
+    ap.add_argument("--sets", type=int, default=48)
+    ap.add_argument("--test", default="matmul_relu_nopool")
+    a = ap.parse_args(argv)
+    t = next(x for x in PIPELINE_TESTS if x["name"] == a.test)
+    generate_vectors({"n": a.n, "tile_size": a.tile, "lanes": a.lanes, **t, "num_sets": a.sets, "fmt_name": a.fmt_name})
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    lp = os.path.join(RESULTS_DIR, f"multi_{a.fmt_name}_N{a.n}_T{a.tile}.log")
+    cmd = ["make", "verilator", "TOP_MODULE=TB_sienna_multi", "TESTBENCH=TB_sienna_multi.sv", "TRACE=0", f"FMT={a.fmt_name}", f"N={a.n}",
+           f"TILE={a.tile}", f"LANES={a.lanes}", "GEN_PKG=0", f"EXTRA_FLAGS=-GCOPIES={a.copies} -GCOLLAPSE_K=1"]
+    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    text = r.stdout + r.stderr
+    open(lp, "w").write(text)
+    print("\n".join(x for x in text.splitlines() if x.startswith(("MULTI", "RESULT", "  [FAIL]", "%Error", "[FATAL]")) or "Assertion failed" in x))
+    bad = r.returncode != 0 or "Assertion failed" in text or "%Error" in text or not re.search(r"^RESULT: PASSED", text, re.M) \
+        or not re.search(rf"^MULTI COPIES={a.copies} ", text, re.M)
+    print(f"MULTI: {'FAIL' if bad else 'PASS'} (COPIES={a.copies} {a.fmt_name} N={a.n} T={a.tile} {a.sets} sets of {a.test}, make exit {r.returncode}; {lp})")
+    sys.exit(1 if bad else 0)
+
+
+MAINS = {"multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
          "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          "summary": summary_main, **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point")}}  # each parses its own options (regression.py --action A --help)
 

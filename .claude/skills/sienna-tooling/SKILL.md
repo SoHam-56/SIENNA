@@ -3,6 +3,9 @@ name: sienna-tooling
 description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, make regression's points and table) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
 ---
 
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> Since then: `make regression` adds `default/N8_T2/pipeline` (no define; it must equal fp32's) and `<fmt>/N8_T2/pipeline-multi` (`make multi`, `--action multi`); regression.py and model_runner.py read the package through ArithmeticLibrary's `fmt_pkg.py`, and `test_build_key_per_format` checks that `make build-key` differs per define.
+
 # SIENNA tooling: two scripts
 
 **Status: implemented and verified 2026-10-05 on branch `tooling` (SIENNA only; not pushed), gated tree 7b711bd
@@ -79,7 +82,7 @@ never the other way round.
 - `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite --report F` (was gpnae_int8_tflite.py): the int8 tanh and sigmoid lane at TFLite's converter scales, gated on the true function (truth.py, exit 1 and `ACCURACY: FAIL` on a miss); its agreement with TFLite's integer TANH and LOGISTIC is printed beside the gate, not gated
 - `--action rq-vectors OUT [--check F --truth J]` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py), and with `--check` its outputs gated on the true function (`make rq-lanes`)
 - `--action add-vectors OUT [--check F --truth J]` — TB_add_lanes vectors and, with `--check`, its outputs gated on the true function (`make add-lanes`)
-- `--action residual [--n --tile --lanes --cases ... --tflite --mid-reset --collapse-k 0|1 --seed --work]` — the int8 residual layer cases on `sienna_layer` / TB_model_run (resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add), each stage gated on the true function (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane); `--tflite` adds converter-made residual blocks through the importer and a hand-built ONNX-style block, `--mid-reset` a reset inside the hold window; ends `RESIDUAL: PASS|FAIL` (`make residual FMT=int8`)
+- `--action residual [--n --tile --lanes --cases ... --tflite --mid-reset --collapse-k 0|1 --seed --work]` — the int8 residual layer cases on the layer contract (`sienna_top` `SET_PORT = 0`) / TB_model_run (resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add), each stage gated on the true function (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane); `--tflite` adds converter-made residual blocks through the importer and a hand-built ONNX-style block, `--mid-reset` a reset inside the hold window; ends `RESIDUAL: PASS|FAIL` (`make residual FMT=int8`)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
 - `--action points [--small] [--formats f,...]`, `--action point --name P`, `--action summary` — make regression (below); they replaced `--action all`, the single-point gate, on 2026-10-10
 
@@ -161,7 +164,7 @@ TB-only knobs (`TB_KNOBS` in model_runner.py and the Makefile: ACTIVATION_CODE, 
 ACCUM_PASSES, MIXED_LEN, MIXED_ACTS, PACKED, TRAINING_MODE, DROPOUT_SEED), and runs the other tests of the group on
 that build with `make sim`. Measured: a build is 70 s at N = 16 against 1-2 s of simulation, and about 8.6 min at
 N = 64 fp32.
-- Every generator writes `test_config_pkg.sv` with every item (TB_sienna_multi still reads the knobs from it) and, beside
+- Every generator writes `test_config_pkg.sv` with every item but the format (TB_sienna_multi still reads the knobs from it; the format and its widths are the define's) and, beside
   it, `test_knobs.mem` (`write_test_config`: lowercase name and value per line). TB_sienna_top reads the knobs from that
   file at time 0 (`read_knobs`: a missing, unknown or repeated setting is `$fatal`), and no file the build compiles or
   can include names one but the package's own declarations (`knob_references` over `build_sources`), so no knob value

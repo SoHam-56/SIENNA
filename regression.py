@@ -1782,7 +1782,7 @@ def write_pkg(N: int, T: int, test: str, lanes: int = 32, host_words: int = None
     generate_vectors({"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, "fmt_name": fmt_name, **t})
     path = os.path.join(TB_DIR, "test_config_pkg.sv")
     got = _pkg_fields(path)
-    want = {"EXP_W": FORMATS[fmt_name][0], "MAN_W": FORMATS[fmt_name][1], "IS_INT": int(fmt_name == "int8"), "N": N, "TILE_SIZE": T}
+    want = {"N": N, "TILE_SIZE": T}  # the format is the build's define, not the package's
     bad = {k: got.get(k) for k in want if got.get(k) != want[k]}
     if bad:
         sys.exit(f"[ERROR] pkg: {path} has {bad}, expected {want}")

@@ -15,6 +15,7 @@ import argparse
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import io
 import itertools
 import json
@@ -1563,6 +1564,19 @@ PIPELINE_TESTS = [
 ]
 
 
+OUT_WORD = re.compile(r"Dropout -> Output \(Lane (\d+)\)\s*: dec=\S+\s+hex=([0-9a-fA-F]+)")  # every L9 word TB_sienna_top prints, lane and word
+
+
+def build_define(key_file: str) -> str:
+    """The +define+FMT_<F> on a build's flag line (build_key.txt's last line), or none; unreadable if the build wrote no key."""
+    try:
+        last = open(key_file).read().rstrip("\n").splitlines()[-1]
+    except (OSError, IndexError):
+        return "unreadable"
+    d = [w for w in last.split() if w.startswith("+define+FMT_")]
+    return " ".join(d) if d else "none"
+
+
 def build_key(pkg_text: str) -> str:
     """What a TB_sienna_top build depends on in a package: every line but the run-time knobs' (make's guard adds the inputs and flags)."""
     knob = re.compile(r"^\s*localparam\s+\w+\s+(?:" + "|".join(mr.TB_KNOBS) + r")\s*=")
@@ -1834,7 +1848,11 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         if os.path.exists(TRUTH_DUMP):
             os.remove(TRUTH_DUMP)  # a stale dump would be gated as this test's
         raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes, build=key != built)
+        if key != built:  # the build's precision define, from the flag line make wrote into build_key.txt
+            print(f"      BUILD DEFINE: {build_define(os.path.join(ROOT, 'Verilator', 'build_key.txt'))}")
         built = key if "-- Done" in raw_log or "-- Running simulation" in raw_log else None  # a failed build leaves no binary to reuse
+        w = OUT_WORD.findall(raw_log)
+        print(f"      WORDS {t['name']}: {len(w)} outputs, sha1 {hashlib.sha1(' '.join(f'{a}:{b}' for a, b in w).encode()).hexdigest()}")
 
         # 3. Parse Log
         r = {
@@ -4203,12 +4221,22 @@ def test_default_point():
     assert argv[:3] == ["make", "pipeline", "FMT=fp32"] and argv[-1] == "FMT_DEF=" and "FMT_DEF=" not in reg.SPEC.argv(reg.DEFAULT_TWIN, argparse.Namespace())
     r = make_n("lint", "GEN_PKG=0", "FMT_DEF=")
     assert r.returncode == 0 and "+define+FMT_" not in r.stdout and "+define+FMT_FP32" in make_n("lint", "GEN_PKG=0").stdout, r.stdout[-300:]
-    log = "  Passed : 4 / 4\n  Sanity Clean\npipeline_complete_o asserted @ 100  (311 cycles)\n  Exact     : 512\n"
-    assert reg.compared_lines("# command: x\n" + log) == reg.compared_lines(log) and len(reg.compared_lines(log)) == 3
+    log = "  Passed : 4 / 4\n  Sanity Clean\npipeline_complete_o asserted @ 100  (311 cycles)\n  Exact     : 512\n      WORDS t: 2 outputs, sha1 ab\n"
+    assert reg.compared_lines("# command: x\n" + log) == reg.compared_lines(log) and len(reg.compared_lines(log)) == 4
+    assert reg.twin_verdict(log.replace("sha1 ab", "sha1 ac"), log).startswith("FAIL (differs"), "a word hash must be compared"
+    assert reg.OUT_WORD.findall("[DEBUG 5] Dropout -> Output (Lane 3)   : dec=1.0000  hex=3f800000") == [("3", "3f800000")]
+    with tempfile.TemporaryDirectory() as d:
+        k = os.path.join(d, "build_key.txt")
+        open(k, "w").write("abc  f.sv\nTB_sienna_top --timing +define+FMT_BF16 -Wno-X\n")
+        assert reg.build_define(k) == "+define+FMT_BF16"
+        open(k, "w").write("abc  f.sv\nTB_sienna_top --timing -Wno-X\n")
+        assert reg.build_define(k) == "none" and reg.build_define(os.path.join(d, "missing")) == "unreadable"
     assert reg.twin_verdict(log, "# other host\n" + log) == "PASS"
     assert reg.twin_verdict(log.replace("311", "312"), log).startswith("FAIL (differs from fp32/N8_T2/pipeline at result line 2")
     assert reg.twin_verdict(log, log.replace("512", "511")).startswith("FAIL (differs")
     assert reg.SPEC.verdict(reg.DEFAULT_POINT, "nothing\n", 0).startswith("FAIL"), "a failing pipeline verdict decides first"
+    mk = open(os.path.join(ROOT, "Makefile")).read()
+    assert f"regression/{reg.DEFAULT_POINT}: | regression/{reg.DEFAULT_TWIN}" in mk, "the default point runs after its twin"
 
 
 @selftest
@@ -4546,7 +4574,11 @@ def test_regression_target():
                       (("SMALL=1", "FMT=int8"), SPEC.points(True, ["int8"]))):
         lines = recipe("regression", "MODEL_DIR=/m", *args)
         names = [x.split("--name ")[1].split()[0] for x in lines if "--action point " in x]
-        assert names == pts, (args, sorted(set(names) ^ set(pts))[:5])
+        if DEFAULT_POINT in pts:  # make runs the default point's twin first
+            assert names.index(DEFAULT_TWIN) < names.index(DEFAULT_POINT), names[:8]
+            pts = [p for p in pts if p != DEFAULT_TWIN]
+            pts.insert(pts.index(DEFAULT_POINT), DEFAULT_TWIN)
+        assert names == pts, (args, sorted(set(names) ^ set(pts))[:5], names[:8])
         assert all("--results " in x and "--model-dir=/m" in x and "--run " in x and x.rstrip().endswith("--keep-going") for x in lines if "--action point " in x), lines[:2]
         assert "--action summary" in lines[-1] and "--run " in lines[-1] and ("--small" in lines[-1]) == ("SMALL=1" in args), lines[-1]
         assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
@@ -4579,7 +4611,7 @@ def test_regression_target():
     env = dict(MAKE_ENV, FMT="bf16", SMALL="1")  # exported, FMT and SMALL do not narrow it: only make's command line does
     r = subprocess.run(["make", "-s", "-n", "regression", py], cwd=ROOT, env=env, capture_output=True, text=True)
     names = [x.split("--name ")[1].split()[0] for x in r.stdout.splitlines() if "--action point " in x]
-    assert r.returncode == 0 and names == SPEC.points(False, list(FORMATS)), (r.stderr[-200:], len(names))
+    assert r.returncode == 0 and sorted(names) == sorted(SPEC.points(False, list(FORMATS))), (r.stderr[-200:], len(names))
 
 
 @selftest
@@ -5687,7 +5719,7 @@ UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make 
 MULTI_KIND = "pipeline-multi"  # TB_sienna_multi on sienna_top at COPIES = 2 (SET_PORT = 1), per format at N8_T2
 DEFAULT_POINT = "default/N8_T2/pipeline"  # fp32's N8_T2 pipeline built with no precision define (FMT_DEF=): words and cycles must equal fp32's
 DEFAULT_TWIN = "fp32/N8_T2/pipeline"
-COMPARED = re.compile(r"cycles|^\s*(Total|Exact|Tol pass|Failed|Passed)\s*:|TRUTH:|stall|RESULT:")  # the lines whose words and cycles a twin must repeat
+COMPARED = re.compile(r"cycles|^\s*(Total|Exact|Tol pass|Failed|Passed)\s*:|TRUTH:|stall|RESULT:|^\s*WORDS ")  # the lines whose words (hashes) and cycles a twin must repeat
 
 
 def twin_verdict(text: str, twin_text: str) -> str:
@@ -5781,12 +5813,21 @@ class SiennaSpec(regress.Spec):
             v = self.verdict(DEFAULT_TWIN, text, rc)
             if v != "PASS":
                 return v
-            if re.search(r"verilator --binary.*\+define\+FMT_", regress.ANSI.sub("", text)):
-                return "FAIL (the build named a precision define)"
+            plain = regress.ANSI.sub("", text)
+            defs = re.findall(r"^\s*BUILD DEFINE: (.*)$", plain, re.M)
+            if not defs or set(defs) != {"none"}:
+                return f"FAIL (its builds' defines are {sorted(set(defs)) or 'not printed'}, not none)"
             twin = os.path.join(self.results_dir or self.results, DEFAULT_TWIN + ".log")
             if not os.path.exists(twin):
                 return f"FAIL (no {DEFAULT_TWIN} result to compare with in {os.path.dirname(os.path.dirname(os.path.dirname(twin)))})"
-            return twin_verdict(text, open(twin, errors="replace").read())
+            tt = regress.ANSI.sub("", open(twin, errors="replace").read())
+            tdefs = re.findall(r"^\s*BUILD DEFINE: (.*)$", tt, re.M)
+            if not tdefs or set(tdefs) != {"+define+FMT_FP32"}:
+                return f"FAIL ({DEFAULT_TWIN}'s builds' defines are {sorted(set(tdefs)) or 'not printed'}, not +define+FMT_FP32)"
+            run = lambda x: (re.findall(r"^# point \S+\s+run (\S+)", x, re.M) or ["-"])[0]
+            if run(plain) != "-" and run(tt) != run(plain):
+                return f"FAIL ({DEFAULT_TWIN}'s result is of run {run(tt)}, not {run(plain)})"
+            return twin_verdict(text, tt)
         k = self.parse(name)["kind"]
         k = k if k in PIPELINE_KINDS else k.removesuffix("-ck0")  # a LAYER_CK0 point is judged as its base kind
         v = regress.common_verdict(text, rc)

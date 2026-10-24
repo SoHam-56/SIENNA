@@ -833,6 +833,9 @@ module sienna_pipe #(
   end
 
   // Requantizing builds (D-2): parameters per set id; the stages copy their set's words and entries at accept, so a lane picks among N or 8, not NUM_IDS times that.
+  if (sienna_fmt_pkg::HAS_RESIDUAL_ADD && !sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_BAD_FLAGS  // the hold and add path lives in the requantize pipeline
+    $fatal(1, "sienna_top: HAS_RESIDUAL_ADD needs HAS_REQUANT_EPILOGUE, whose tag line carries the hold and add beats");
+  end
   if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ_SETS
     sienna_fmt_pkg::requant_scale_t [N-1:0] s_scale[NUM_IDS];  // per set id: each output channel's requantize scale
     sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:0] s_entry[NUM_IDS];  // and each pack entry's requantize and lane words

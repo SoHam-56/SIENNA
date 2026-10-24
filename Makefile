@@ -683,6 +683,9 @@ endif
 regression/%:
 	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(abspath $(MODEL_DIR))$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
 
+# The default point compares with its twin's finished result, so its twin runs first.
+regression/default/N8_T2/pipeline: | regression/fp32/N8_T2/pipeline
+
 regression: $(addprefix regression/,$(REG_POINTS))
 	@$(REG_SUMMARY) --run $(REG_RUN)
 

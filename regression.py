@@ -42,6 +42,7 @@ from model_runner import (  # noqa: E402
     apply_activation, bits_float, drop_zp, exact_layer, fmt_bits, fold_bias, get_polynomial_terms, imatmul, op_hex, op_round,
     quant_act, quant_weights, requant_params, requantize, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
+import fmt_pkg  # noqa: E402  the one parser of sienna_fmt_pkg's define map, on the same path
 
 
 def _load_truth():
@@ -1690,11 +1691,11 @@ RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point: ruling tex
                                          "(the hold set's grant waited on rq_room, so add_lanes' busy_o was low); and a lane set's g_done needs its own beats "
                                          "through requantize after the hold's last (a_rq_one_set)")},
 }
-RTL_TOP = os.path.join(ROOT, "src", "sienna_top.sv")
+RTL_TOP = os.path.join(ROOT, "src", "sienna_pipe.sv")  # the pipeline, where the stage assertions live
 
 
 def _ruling_ok(point: str, ruling, rtl: str) -> bool:
-    """A point's ruling is its text; a "*" ruling (every point) is (guard, text), and sienna_top.sv must declare that exact guard."""
+    """A point's ruling is its text; a "*" ruling (every point) is (guard, text), and sienna_pipe.sv must declare that exact guard."""
     if point != "*":
         return isinstance(ruling, str) and bool(ruling.strip())
     if not (isinstance(ruling, tuple) and len(ruling) == 2 and all(isinstance(x, str) for x in ruling)):
@@ -2054,7 +2055,7 @@ def run_models(a, sim, log):
 
 
 def pack_main(argv=None):
-    """Packed layers on sienna_layer: each job's block equals the job alone on the RTL and its golden, bit for bit; cycles packed vs alone."""
+    """Packed layers on sienna_top's layer contract: each job's block equals the job alone on the RTL and its golden, bit for bit; cycles packed vs alone."""
     ap = argparse.ArgumentParser(description=pack_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="pack")
     ap.add_argument("--n", type=int, default=16)
@@ -2182,7 +2183,7 @@ def gemm_main(argv=None):
     ap.add_argument("--emulate", action="store_true", help="numpy stand-in for the RTL")
     ap.add_argument("--quick", action="store_true", help="a few small shapes only")
     ap.add_argument("--engine", choices=("layer", "sets"), default="layer",
-                    help="layer: sienna_layer schedules everything; sets: the host drives sienna_top set by set")
+                    help="layer: sienna_top's layer contract (sienna_sched) schedules everything; sets: the host drives sienna_top set by set")
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(mr.FORMATS),
                     help="format of A and B on the layer engine; int8 sums in int32 and requantizes")
     ap.add_argument("--host-gaps", action="store_true", help="host idles a cycle after each load and waits for the credit")
@@ -2271,7 +2272,7 @@ def gemm_main(argv=None):
 
 
 def layer_bias_special(a, sim, rep) -> bool:
-    """One bf16 layer whose bias row holds +0, -0 and subnormals (_special_bias): bit-exact, and sienna_layer's a_bias_widened, the only check that sees them, must not fire."""
+    """One bf16 layer whose bias row holds +0, -0 and subnormals (_special_bias): bit-exact, and sienna_sched's a_bias_widened, the only check that sees them, must not fire."""
     rng = np.random.RandomState(4711)
     A = mr.op_round(rng.uniform(-1, 1, (32, 40)), a.fmt_name)
     B = mr.op_round(rng.uniform(-1, 1, (40, 24)), a.fmt_name)
@@ -2289,7 +2290,7 @@ def layer_bias_special(a, sim, rep) -> bool:
     return good
 
 
-# ── residual: int8 ADD layers on sienna_layer (sienna-int8-residual) ─────────
+# ── residual: int8 ADD layers on sienna_top's layer contract (sienna-int8-residual) ─────────
 
 RES_CASES = {  # name: N -> (rows M, depth K, columns C, conv clamp, ADD's fused activation, the lane after the ADD)
     "resnet_relu": lambda N: (64, 144, 16, "none", "relu", "relu"),  # ResNet-8's shape: 8x8 rows, 3x3x16 depth, 16 channels
@@ -2550,7 +2551,7 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
 
 
 def residual_main(argv=None) -> None:
-    """int8 residual layers on sienna_layer (TB_model_run), each stage gated on the true function (the conv's requantize, the identity
+    """int8 residual layers on sienna_top's layer contract (TB_model_run), each stage gated on the true function (the conv's requantize, the identity
     requantize, hold_mem, the ADD, the fill, the lane); int8_residual_exact is a diagnostic. --tflite adds the converter-made residual blocks
     through the TFLite importer and a hand-built ONNX-style block, --mid-reset resets of the tiles case with hold_mem holding beats."""
     ap = argparse.ArgumentParser(description=residual_main.__doc__)
@@ -2714,25 +2715,14 @@ def analyse_res(ev, k_sets, flags, load, start, launch, written, reduce, g_up, g
 
 
 DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
-FMT_KNOBS = {"fp32": (8, 23), "bf16": (8, 7), "int8": (0, 7)}  # (EXP_W, MAN_W) of each build
-FMT_PKG = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "src", "sienna_fmt_pkg.sv")
+FMT_KNOBS = tuple(fmt_pkg.FORMATS)  # the builds' formats, one define each
 
 
 def rtl_lat() -> tuple:
-    """sienna_fmt_pkg's unit latencies, parsed from the RTL: ({fmt: (mul_lat, add_lat)}, fx_lat, req_lat, qadd_lat)."""
-    raw = open(FMT_PKG).read()
-
-    def body(fn: str, form: str) -> tuple:
-        m = re.search(rf"function automatic int {fn}\([^)]*\);(.*?)endfunction", raw, re.S)
-        b = re.fullmatch(form, re.sub(r"//[^\n]*", "", m.group(1)).strip()) if m else None
-        if not b:
-            raise RuntimeError(f"regression.py --action perf: {FMT_PKG}: {fn}() is not in the form the model reads; update rtl_lat()")
-        return tuple(int(x) for x in b.groups())
-
-    mi, mw, mhi, mlo = body("mul_lat", r"if \(is_int\(exp_w\)\) return (\d+);\s*return \(man_w \+ 1 > (\d+)\) \? (\d+) : (\d+);")
-    ai, af = body("add_lat", r"return is_int\(exp_w\) \? (\d+) : (\d+);")
-    unit = {f: ((mi if e == 0 else mhi if m + 1 > mw else mlo), (ai if e == 0 else af)) for f, (e, m) in FMT_KNOBS.items()}
-    return unit, body("fx_lat", r"return (\d+);")[0], body("req_lat", r"return (\d+);")[0], body("qadd_lat", r"return (\d+);")[0]
+    """sienna_fmt_pkg's unit latencies under each define, through fmt_pkg.py: ({fmt: (MUL_LATENCY, ADD_LATENCY)}, fxMac's, REQUANT_LATENCY, QUANT_ADD_LATENCY)."""
+    unit = {f: (fmt_pkg.get(f, "MUL_LATENCY"), fmt_pkg.get(f, "ADD_LATENCY")) for f in FMT_KNOBS}
+    fx = fmt_pkg.get("int8", "HORNER_STEP_LATENCY") - 1  # the int8 Horner step is one register, then fxMac
+    return unit, fx, fmt_pkg.get("int8", "REQUANT_LATENCY"), fmt_pkg.get("int8", "QUANT_ADD_LATENCY")
 
 
 UNIT_LAT = FX_LAT = REQ_LAT = QADD_LAT = None  # mul_lat and add_lat per format, fxMac, int8Requantizer, add_lanes' ADD; perf_init() parses them
@@ -2797,13 +2787,13 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
 
 
 def lane_params() -> tuple:
-    """gpnae_poly's K and TAIL_CONTEXTS defaults and its bf16 TAIL_NEWTON, parsed from the RTL; fails if sienna_top overrides K or TAIL_CONTEXTS."""
+    """gpnae_poly's K and TAIL_CONTEXTS defaults and its bf16 TAIL_NEWTON, parsed from the RTL; fails if gpnae_lane overrides K or TAIL_CONTEXTS."""
     poly = open(os.path.join(ROOT, "GPNAE", "src", "gpnae_poly.sv")).read()
-    inst = re.search(r"gpnae_poly #\((.*?)\) gpnae_inst", open(os.path.join(ROOT, "src", "sienna_top.sv")).read(), re.S)
+    inst = re.search(r"gpnae_poly #\((.*?)\) lane", open(os.path.join(ROOT, "src", "gpnae_lane.sv")).read(), re.S)
     k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
     nw = re.search(r"localparam int TAIL_NEWTON = FP32 \? 0 : (\d+);", poly)  # Task 1.14a: bf16 sigmoid x < 0's Newton steps
     if not (k and t and nw and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
-        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS / TAIL_NEWTON not found, or sienna_top overrides them")
+        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS / TAIL_NEWTON not found, or gpnae_lane overrides them")
     return int(k.group(1)), int(t.group(1)), int(nw.group(1))
 
 
@@ -3043,7 +3033,7 @@ def perf_main(argv=None) -> None:
     ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
     ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
     ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FMT_KNOBS), help="number format of the build")
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FMT_KNOBS), help="number format of the build (its define)")
     args = ap.parse_args(argv)
     perf_init()
     global MUL_LAT, ADD_LAT, FMT
@@ -3621,54 +3611,37 @@ def fixture_pkg(d: str, fmt: str, n: int = 16, tile: int = 4, lanes: int = 32, d
 
 
 def pkg_guard(pkg: str, *args) -> tuple:
-    """(exit, output) of the shell make -n prints for pkg-check GEN_PKG=0 on pkg."""
-    r = make_n("pkg-check", "GEN_PKG=0", f"PKG_FILE={pkg}", *args)
+    """(exit, output) of the shell make -n prints for pkg-geometry GEN_PKG=0 on pkg."""
+    r = make_n("pkg-geometry", "GEN_PKG=0", f"PKG_FILE={pkg}", *args)
     assert r.returncode == 0, r.stderr
     g = subprocess.run(["bash", "-c", r.stdout], capture_output=True, text=True)
     return g.returncode, g.stdout + g.stderr
 
 
 @selftest
-def test_guard_passes_matching_package():
-    with tempfile.TemporaryDirectory() as d:
-        for f in reg.FORMATS:
-            rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={f}")
-            assert rc == 0 and f"matches FMT={f} N=16 TILE=4 LANES=32" in out, out
-
-
-@selftest
-def test_guard_rejects_other_format():
-    with tempfile.TemporaryDirectory() as d:
+def test_guard_passes_any_format():
+    with tempfile.TemporaryDirectory() as d:  # the package carries no format: one geometry's package serves every define
         for f in reg.FORMATS:
             for want in reg.FORMATS:
-                if want != f:
-                    rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={want}")
-                    assert rc != 0 and f"but FMT={want} needs" in out, (f, want, out)
+                rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={want}")
+                assert rc == 0 and "matches N=16 TILE=4 LANES=32 COLLAPSE_K=1" in out and f"+define+FMT_{want.upper()}" in out, (f, want, out)
 
 
 @selftest
-def test_guard_rejects_pre_format_package():
-    with tempfile.TemporaryDirectory() as d:
-        rc, out = pkg_guard(fixture_pkg(d, "fp32", drop=("EXP_W", "MAN_W", "IS_INT")), "FMT=fp32")
-        assert rc != 0 and "EXP_W=missing" in out, out
-
-
-@selftest
-def test_guard_rejects_bf16_sum_package():
-    with tempfile.TemporaryDirectory() as d:  # a bf16 package from before fp32 sums: ACC_W 16 and no OUT_W
-        rc, out = pkg_guard(fixture_pkg(d, "bf16", drop=("OUT_W",), edit={"ACC_W": 16}), "FMT=bf16")
-        assert rc != 0 and "ACC_W=16 OUT_W=missing, but FMT=bf16 sums in 32 bits and gives 16-bit results" in out, out
-        for f, o in (("fp32", 32), ("bf16", 16), ("int8", 32)):
-            rc, out = pkg_guard(fixture_pkg(d, f), f"FMT={f}")
-            assert rc == 0 and f"ACC_W=32 OUT_W={o}" in out, (f, out)
+def test_package_has_no_format():
+    for f in reg.FORMATS:  # the define gives the format and its widths: test_config_pkg must not, or a bench could read a stale one
+        names = {k for k, _, _ in reg._config_items({}, f, "relu", 1, 15, 1, [], False, 1)}
+        assert not names & {"EXP_W", "MAN_W", "IS_INT", "ACC_W", "OUT_W", "DATA_WIDTH"}, (f, names)
+    mk = open(os.path.join(ROOT, "Makefile")).read()
+    assert "FMT_FIELDS" not in mk and "pkg-check" not in mk and "include $(SM_LIB_DIR)/Common/fmt.mk" in mk
 
 
 @selftest
 def test_guard_checks_geometry():
     with tempfile.TemporaryDirectory() as d:
         big = fixture_pkg(d, "bf16", 32, 8)
-        rc, out = pkg_guard(big, "FMT=bf16")  # a stale same-format package of another size
-        assert rc != 0 and "N=32 TILE_SIZE=8 NUM_LANES=32, but the build asks for N=16 TILE=4 LANES=32" in out, out
+        rc, out = pkg_guard(big, "FMT=bf16")  # a stale package of another size
+        assert rc != 0 and "N=32 TILE_SIZE=8 NUM_LANES=32 COLLAPSE_K=1, but the build asks for N=16 TILE=4 LANES=32 COLLAPSE_K=1" in out, out
         rc, out = pkg_guard(big, "FMT=bf16", "N=32", "TILE=8")
         assert rc == 0 and "N=32 TILE=8 LANES=32" in out, out
         rc, out = pkg_guard(fixture_pkg(d, "int8"), "FMT=int8", "LANES=64")
@@ -4004,7 +3977,7 @@ def test_residual_cross_sweep():
     assert _residual_cross_sweep_bad({"p1": (1, 0)}, {b: {"*": ("a_x", "ruled")}}, rtl + "  a_x_y: assert property (1'b1);\n")  # a prefix is no match
     assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ("a_x_never", " ")}}, rtl)  # a ruling needs its written reason
     assert _residual_cross_sweep_bad({"p1": (0, 0)}, {b: {"*": ("a_x_never", "ruled")}}, rtl) and RESIDUAL_CROSS_UNREACHABLE.get(g) is None  # the L3 grant cross has none
-    assert _ruling_ok("*", RESIDUAL_CROSS_UNREACHABLE[b]["*"], open(RTL_TOP).read())  # the committed ruling's assertion is in sienna_top
+    assert _ruling_ok("*", RESIDUAL_CROSS_UNREACHABLE[b]["*"], open(RTL_TOP).read())  # the committed ruling's assertion is in sienna_pipe
     gone = "".join(x for x in open(RTL_TOP).read().splitlines(True) if not re.match(r"^\s*a_hold_done_no_bank\s*:", x))
     assert not _ruling_ok("*", RESIDUAL_CROSS_UNREACHABLE[b]["*"], gone)  # the guard deleted from the RTL: the ruling fails
     assert RESIDUAL_CROSS.findall(_residual_cross_line([4, 0], 8) + "\n") == [("4", "0")]
@@ -4156,7 +4129,7 @@ def test_guard_checks_collapse_k():
     with tempfile.TemporaryDirectory() as d:
         ck0 = fixture_pkg(d, "bf16", edit={"COLLAPSE_K": 0})
         rc, out = pkg_guard(ck0, "FMT=bf16")
-        assert rc != 0 and "COLLAPSE_K=0, but the build asks for COLLAPSE_K=1" in out, out
+        assert rc != 0 and "COLLAPSE_K=0, but the build asks for N=16 TILE=4 LANES=32 COLLAPSE_K=1" in out, out
         rc, out = pkg_guard(ck0, "FMT=bf16", "COLLAPSE_K=0")
         assert rc == 0, out
         rc, out = pkg_guard(fixture_pkg(d, "bf16", drop=("COLLAPSE_K",)), "FMT=bf16")
@@ -4173,7 +4146,7 @@ def test_guard_missing_file():
 @selftest
 def test_parse_time_rejections():
     r = make_n("pipeline", "FMT=fp16")
-    assert r.returncode != 0 and "Invalid FMT=fp16: must be one of fp32, bf16, int8" in r.stderr, r.stderr
+    assert r.returncode != 0 and "FMT=fp16: not one of fp32 bf16 int8" in r.stderr, r.stderr
     for t in ("regression", "pack", "perf-analysis"):
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
@@ -4198,7 +4171,7 @@ def test_pack_target():
     r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
     assert r.returncode == 0 and r.stdout.split() == "py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
     r = make_n("pack", "FMT=fp16")
-    assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+    assert r.returncode != 0 and "FMT=fp16: not one of" in r.stderr, r.stderr
 
 
 @selftest
@@ -4493,7 +4466,7 @@ def test_sim_reuses_only_its_own_build():
     mk = open(os.path.join(ROOT, "Makefile")).read()
     cp = mk[mk.index("define copy_mem_files"):mk.index("endef", mk.index("define copy_mem_files"))]
     assert "cp $$d/$$p $(1)/" in cp and "cp -u" not in cp, cp  # every test's stimulus copied, whatever the timestamps: cp -u skipped a file of the same second
-    rec = mk[mk.index("\nverilator: pkg-check"):mk.index("\n\n", mk.index("\nverilator: pkg-check") + 2)]  # make verilator: the key goes only after a whole build
+    rec = mk[mk.index("\nverilator: $(PKG_DEP)"):mk.index("\n\n", mk.index("\nverilator: $(PKG_DEP)") + 2)]  # make verilator: the key goes only after a whole build
     assert rec.index("rm -f $(VERILATOR_DIR)/build_key.txt") < rec.index("$(VERILATOR) --binary") < rec.index("-f V$(TOP_MODULE).mk") < rec.index("> $(VERILATOR_DIR)/build_key.txt"), rec
     with tempfile.TemporaryDirectory() as d:  # the key itself: knob values leave it unchanged; any other item, an input file or a flag changes it
         pkg, vdir = fixture_pkg(d, "fp32"), os.path.join(d, "V")
@@ -4543,7 +4516,7 @@ def test_regression_target():
     s = recipe("regression-summary", "SMALL=1")
     assert len(s) == 1 and "--action summary" in s[0] and "--small" in s[0] and "--run" not in s[0], s
     r = make_n("regression", "FMT=fp16")
-    assert r.returncode != 0 and "Invalid FMT=fp16" in r.stderr, r.stderr
+    assert r.returncode != 0 and "FMT=fp16: not one of" in r.stderr, r.stderr
     r = make_n("regression", "SMALL=2")
     assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
     assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
@@ -4574,7 +4547,7 @@ def test_gpnae_target_model():
 def test_layer_mode_check():
     line = "[LAYER] sets=4 outputs=64 cycles=99 a_rows=2/2 w_rows=2/2 epilogues=0/0 out_stall=0 in_stall=0"
     tb = open(os.path.join(ROOT, "testbenches", "TB_model_run.sv")).read()  # the mode printed is the elaborated mesh's, not the package's
-    assert "in_stall=%0d collapse_k=%0d" in tb and "dut.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "TB_model_run's [LAYER] line lost the mesh's COLLAPSE_K"
+    assert "in_stall=%0d collapse_k=%0d" in tb and "dut.G_LAYER.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "TB_model_run's [LAYER] line lost the mesh's COLLAPSE_K"
     old = mr.COLLAPSE_K
     try:
         for ck in (0, 1):
@@ -4681,13 +4654,9 @@ def test_dropout_mask_check():
         assert "pair windows" in str(e), e
 
 @selftest
-def test_fmt_fields_match_formats():
-    mk = open(os.path.join(ROOT, "Makefile")).read()
-    fields = {f: tuple(int(x) for x in v.split()) for f, v in re.findall(r"^FMT_FIELDS_(\w+) = ([\d ]+)$", mk, re.M)}
-    assert re.search(r"^FORMATS = (.*)$", mk, re.M).group(1).split() == list(reg.FORMATS)
-    pkg_of = lambda f: {k: v for k, v, _ in reg._config_items({}, f, "relu", 1, 15, 1, [], False, 1)}  # what the package writes
-    assert fields == {f: tuple(pkg_of(f)[k] for k in ("EXP_W", "MAN_W", "IS_INT", "ACC_W", "OUT_W")) for f in reg.FORMATS}, fields
-    assert fields == {f: (*reg.FORMATS[f], int(f == "int8"), 32, 32 if f == "int8" else 1 + sum(reg.FORMATS[f])) for f in reg.FORMATS}, fields
+def test_formats_match_fmt_mk():
+    mk = open(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "fmt.mk")).read()
+    assert re.search(r"^FORMATS\s*=\s*(.*)$", mk, re.M).group(1).split() == list(reg.FORMATS) == list(fmt_pkg.FORMATS)
 
 
 # ── tool: _parse_log (was test_regression_parse.py) ──
@@ -5121,8 +5090,8 @@ def perf_fmt(f):
 
 @perf_selftest
 def test_rtl_lat():
-    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's mul_lat, add_lat, as parsed
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 4)  # fx_lat, req_lat, qadd_lat, gpnae_poly's K, TAIL_CONTEXTS
+    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 4)  # fxMac, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae_poly's K, TAIL_CONTEXTS
 
 
 @perf_selftest
@@ -5664,7 +5633,7 @@ KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model"
          "residual")  # per N, tile size and format; model in fp32 and bf16, tflite and residual in int8
 PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
-LAYER_CK0 = KINDS[-4:-1]  # sienna_layer's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
+LAYER_CK0 = KINDS[-4:-1]  # the layer contract's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected

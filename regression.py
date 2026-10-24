@@ -4149,8 +4149,8 @@ def test_parse_time_rejections():
     assert r.returncode != 0 and "FMT=fp16: not one of fp32 bf16 int8" in r.stderr, r.stderr
     for t in ("regression", "pack", "perf-analysis"):
         r = make_n(t, "COLLAPSE_K=0")
-        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
-    for t in ("gemm", "model", "tflite"):  # sienna_layer's runs build the mesh mode they are given
+        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top and the layer contract's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
+    for t in ("gemm", "model", "tflite"):  # the layer contract's runs build the mesh mode they are given
         r = make_n(t, "COLLAPSE_K=0", "MODEL_DIR=/m", "FMT=int8" if t == "tflite" else "FMT=fp32", "PYTHON=py")
         assert r.returncode == 0 and "--collapse-k 0" in r.stdout, (t, r.stdout + r.stderr)
     for ck, want in (("0", False), ("1", True)):  # make tflite adds the packed layers at N >= 16 on the collapse-k 1 mesh only
@@ -4232,7 +4232,7 @@ def test_regression_points():
     assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 + extra == 203 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 445, (len(small), len(full))
     layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
     for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
-        for n, t in sweep(full):  # back-to-back and sienna_layer's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
+        for n, t in sweep(full):  # back-to-back and the layer contract's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
             want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f] + (["residual"] if f == "int8" else [])
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/") and not p.endswith(MULTI_KIND)] == want, (f, n, t)
     assert SPEC.parse("bf16/N16_T2/pipeline-ck0")["ck"] == 0 and SPEC.parse("bf16/N16_T2/pipeline")["ck"] == 1

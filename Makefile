@@ -29,13 +29,13 @@ ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
-# COLLAPSE_K is 0 or 1; TB_sienna_top and sienna_layer's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
+# COLLAPSE_K is 0 or 1; TB_sienna_top and the layer contract's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
 ifneq ($(filter pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
-$(error COLLAPSE_K=0 reaches TB_sienna_top and sienna_layer's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
+$(error COLLAPSE_K=0 reaches TB_sienna_top and the layer contract's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
 endif
 endif
 
@@ -280,7 +280,7 @@ help:
 	@echo "Precision (one variable for every build and run):"
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top, sienna_layer's model, gemm and tflite runs, and sm-verilator"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top, the layer contract's model, gemm and tflite runs, and sm-verilator"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv)"
@@ -313,7 +313,7 @@ help:
 	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
 	@echo "  make pipeline FMT=int8            - Full pipeline regression (TEST=<substring> narrows it)"
 	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
-	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_layer (regression.py --action gemm)"
+	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_top's layer contract (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
@@ -456,7 +456,7 @@ build-key:
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-module targets
 # ─────────────────────────────────────────────────────────────────────────────
-# The mesh TB takes its format only from SystolicMesh's regression, which patches EXP_W/MAN_W/COLLAPSE_K into it.
+# The mesh TB takes its format from SystolicMesh's FMT (its define) and its sizes and mesh mode as -G overrides.
 # SM_CHECKS=0: without the model checks (aril-fpu, aril-narrow, model-tests); SystolicMesh's own make regression covers every N, tile size and format.
 SM_CHECKS ?= 1
 sm-verilator:
@@ -600,7 +600,7 @@ model:
 		--collapse-k $(COLLAPSE_K) \
 		--count $(MODEL_COUNT)
 
-# GEMM shape sweep on sienna_layer, built at N, TILE and LANES.
+# GEMM shape sweep on sienna_top's layer contract, built at N, TILE and LANES.
 gemm:
 	$(PYTHON) regression.py --action gemm \
 		--n $(N) \
@@ -637,7 +637,7 @@ COPIES ?= 2
 multi:
 	$(PYTHON) regression.py --action multi --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES) --copies $(COPIES)$(if $(TEST), --test $(TEST))
 
-# Packed layers against each job alone on sienna_layer (regression.py --action pack), in FMT at N, TILE and LANES.
+# Packed layers against each job alone on sienna_top's layer contract (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 

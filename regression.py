@@ -4463,6 +4463,18 @@ def test_regression_points():
 
 
 @selftest
+def test_large_code():
+    # A collapse-k 0 TB_sienna at N = 64 passes 2 GB of code: those points, and only those, build with the large code model
+    big = ("fp32/N64_T2/model-ck0", "bf16/N64_T64/gemm-ck0", "int8/N64_T8/tflite-ck0")
+    assert [SPEC.env(n, {}).get("LARGE_CODE") for n in big] == ["1"] * len(big), [SPEC.env(n, {}) for n in big]
+    for n in ("fp32/N64_T2/model", "int8/N64_T2/gemm", "fp32/N32_T2/gemm-ck0", "bf16/N16_T2/pipeline-ck0", "int8/N64_T2/pipeline-b2b"):
+        assert "LARGE_CODE" not in SPEC.env(n, {}) and not any("LARGE_CODE" in a for a in SPEC.argv(n, type("O", (), {"model_dir": "/m"})())), n
+    run = lambda env: subprocess.run(["make", "-s", "-n", "verilator", "GEN_PKG=0"], cwd=ROOT, env=env, capture_output=True, text=True).stdout
+    on, off = run(dict(MAKE_ENV, LARGE_CODE="1")), run(MAKE_ENV)  # the point's environment reaches the build, as model_runner's make inherits it
+    assert all(f in on for f in ("-CFLAGS -mcmodel=large", "-CFLAGS -fno-pie", "-LDFLAGS -no-pie")) and "mcmodel" not in off, (on[-400:], off[-400:])
+
+
+@selftest
 def test_point_commands():
     py, opts = sys.executable, type("O", (), {"model_dir": "/m"})()
     at = lambda f, n, t, l: [f"FMT={f}", f"PYTHON={py}", f"N={n}", f"TILE={t}", f"LANES={l}"]
@@ -6095,6 +6107,8 @@ class SiennaSpec(regress.Spec):
     def env(self, name, env):
         if self.parse(name)["kind"].removesuffix("-ck0") in ("pack", "gemm"):  # -O0 builds these ~30% faster at N = 8 and 16 (rs1_spd_sienna); pipeline, tflite and model simulations are long enough to lose more (pipeline N = 16 +40-125%)
             env = dict(env, OPT_FAST="-O0")
+        if self.parse(name).get("ck") == 0 and self.parse(name)["n"] >= 64:  # past 2 GB of code: the large code model (the Makefile's LARGE_CODE), which model_runner's make inherits
+            env = dict(env, LARGE_CODE="1")
         return env
 
     def argv(self, name, opts):

@@ -1301,7 +1301,7 @@ def layer_stage_gates(job, Y, stages, N) -> list:
     """[(stage, truth.Result)] of an int8 layer from TB_model_run's stage dump: the conv's requantize on each exact int32 sum and its column's real
     scale; for a residual layer (job['add']) the identity requantize of the residual codes, hold_mem's transfer and the ADD on its real ratios, with
     the true clamps of job['clamps'] when given; the lane from the activation stage's input X to the output Y (ReLU and linear at truth.TARGET, the
-    others at truth.BOUND)."""
+    others at job['tol'], default their tier's tolerance, gpnae_model.TIER_TOL)."""
     eye = lambda W: W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype))
     res = [X for X, W in job["terms"] if eye(W)] if job.get("add") is not None else []  # the residual term only in a layer with an ADD
     if job.get("add") is not None and len(res) != 1:
@@ -1347,7 +1347,7 @@ def layer_stage_gates(job, Y, stages, N) -> list:
         m = np.broadcast_to(acts[None, :] == a, X.shape)
         qa = np.array([quants[c] for c in range(C)], np.float64)[None, :, :].repeat(M, 0)[m]
         quant = tuple(qa[:, i] for i in range(4))
-        bound = truth.TARGET if a in ("relu", "linear") else truth.BOUND
+        bound = truth.TARGET if a in ("relu", "linear") else job.get("tol", gpnae_model.TIER_TOL[int(job.get("tier", 0))])
         r = truth.gate("int8", "linear" if a == "relu" else a, X[m], Y[m], quant=quant, bound=bound)
         out.append((f"activation {a}", r._replace(func=a)))
     return out

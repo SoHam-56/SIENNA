@@ -226,6 +226,27 @@ def activate_int8(R, act: str, rq: dict, tier: int = 0, mem=None) -> np.ndarray:
     return np.asarray(int8_lane(mem).run(R, code, par, tier), np.int64)
 
 
+# ── the lanes' coefficient memory: the host's loader and its tier choice ──
+
+def coef_writes(mem) -> list:
+    """The load-path writes (address, data) that put a coefficient memory image (gpnae_model.Mem) into every lane."""
+    return mem.writes()
+
+
+def write_coef(path: str, mem) -> int:
+    """A load file for TB_model_run's and TB_sienna_model's +coef=: "aaa dddddddd" (hex address, data) per write; returns the count."""
+    w = coef_writes(mem)
+    with open(path, "w") as fh:
+        fh.write("".join(f"{a:03x} {d & 0xFFFFFFFF:08x}\n" for a, d in w))
+    return len(w)
+
+
+def pick_tier(tol: float) -> int:
+    """The cheapest tier whose tolerance is within tol: a layer that tolerates 10% runs tier 2, 5% tier 1, anything tighter tier 0."""
+    ok = [t for t, v in enumerate(gpnae_model.TIER_TOL) if v <= tol + 1e-12]
+    return max(ok) if ok else 0
+
+
 def drop_zp(act: str, rq: dict) -> int:
     """D-5: dropout's drop value, the output zero point of the set's activation (SELU gp_zout, sigmoid -128, ReLU / linear zp, else 0)."""
     return {1: rq["zout"], 2: -128, 4: rq["zp"], 5: rq["zp"]}.get(activation_to_code(act), 0)
@@ -1093,7 +1114,7 @@ def read_outputs(path, fmt="fp32"):
 
 def write_sets(path, groups, act):
     """TB_sienna_model's set file: the set count, then per set "partial code bias" and its A, B (and bias) words as fp32 hex; returns the count."""
-    code = ACT_CODE[act]
+    code = ACT_CODES[act]  # every activation: the set engine runs the lanes too
     lines = []
     n = 0
     for _, passes, bias in groups:
@@ -1374,8 +1395,24 @@ class RtlLayer:
         df = os.path.join(self.work, f"{tag}.stages")
         write_layer(lf, cfg, a, w, self.fmt_name, rq, pk, layer_epilogue(job, N) if int8 else None, job.get("bias_words"), add=job.get("add"))
         dump = [f"+dump={df}"] if int8 else []
-        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *dump, *plusargs, *os.environ.get("SIM_ARGS", "").split()],
+        lanes = [f"+tier={int(job.get('tier', 0))}"]  # the layer's lane tier (pick_tier), and a coefficient image loaded after reset
+        cf = os.path.join(self.work, f"{tag}.coef")
+        if job.get("coef") is not None:
+            write_coef(cf, job["coef"])
+            lanes.append(f"+coef={cf}")
+        bf, ff = os.path.join(self.work, f"{tag}.between"), os.path.join(self.work, f"{tag}.first")
+        if job.get("between") is not None:  # the layer runs at the first image, then again after this image's load with no reset
+            write_coef(bf, job["between"])
+            lanes += [f"+between={bf}", f"+out_first={ff}"]
+        if job.get("coef_busy"):  # writes while the layer streams, which the interlock must refuse
+            lanes.append("+coef_busy")
+        r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *dump, *lanes, *plusargs, *os.environ.get("SIM_ARGS", "").split()],
                            cwd=os.path.dirname(self.bin), capture_output=True, text=True)
+        if job.get("coef") is not None:
+            os.remove(cf)
+        self.first_Y = None
+        b = re.search(r"\[LAYER\] coef busy: (\d+) writes while the layer streamed, (\d+) refused", r.stdout)
+        self.busy_refused = (int(b.group(1)), int(b.group(2))) if b else None
         self.last_log, self.last_stages = r.stdout, None
         h = re.search(r"\[RES\] first hold_done (\d+) cycles into the layer", r.stdout)
         self.first_hold = int(h.group(1)) if h else None
@@ -1391,24 +1428,34 @@ class RtlLayer:
             raise RuntimeError(f"{tag}: layer simulation failed")
         check_layer_mode(r.stdout, tag)
         outs = read_outputs(of, self.fmt_name)
+        if job.get("between") is not None:
+            self.first_Y = self._tiles(read_outputs(ff, self.fmt_name), rt, ct, int8, tag)[:M, :C]
+            os.remove(bf)
+            os.remove(ff)
         if int8:
             self.last_stages = read_stage_dump(df, N, rt, ct, -(-cfg["kb"] // N) + cfg["residual"])
             os.remove(df)
         os.remove(lf)
         os.remove(of)
-        if len(outs) != rt * ct:
-            raise RuntimeError(f"{tag}: {len(outs)} output tiles, expected {rt * ct}")
-        Y = np.zeros((rt * N, ct * N), np.int64 if int8 else np.float32)
-        k = 0
-        for c in range(ct):  # the spec's output order: column blocks outer, row tiles inner
-            for r_ in range(rt):
-                Y[r_ * N : (r_ + 1) * N, c * N : (c + 1) * N] = outs[k].reshape(N, N)
-                k += 1
+        Y = self._tiles(outs, rt, ct, int8, tag)
         n, cyc = int(m.group(1)), int(m.group(3))
         self.sets += n
         self.cycles += cyc
         self.words += (len(a) + len(w)) * N
         return Y[:M, :C], n, cyc
+
+    def _tiles(self, outs, rt, ct, int8, tag):
+        """The output tiles in the spec's order (column blocks outer, row tiles inner) as one matrix."""
+        N = self.N
+        if len(outs) != rt * ct:
+            raise RuntimeError(f"{tag}: {len(outs)} output tiles, expected {rt * ct}")
+        Y = np.zeros((rt * N, ct * N), np.int64 if int8 else np.float32)
+        k = 0
+        for c in range(ct):
+            for r_ in range(rt):
+                Y[r_ * N : (r_ + 1) * N, c * N : (c + 1) * N] = outs[k].reshape(N, N)
+                k += 1
+        return Y
 
     def exact(self, job):
         """Bit-exact words run_job must return for a float job, from the streams format_layer sends: per tile its depth passes, the residual's identity pass, the bias."""
@@ -1433,7 +1480,8 @@ class RtlLayer:
                 passes, ai = [(ab[ai + t * N:ai + (t + 1) * N], Wt[t]) for t in range(dt)], ai + dt * N
                 if cfg["residual"]:
                     passes, ai = passes + [(ab[ai:ai + N], eye)], ai + N
-                Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(passes, b, job["act"], N, fmt, self.T)
+                Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(passes, b, job["act"], N, fmt, self.T, tier=int(job.get("tier", 0)),
+                                                                     mem=job.get("coef"))
         if ai != len(ab) or wi != len(wb):
             raise RuntimeError(f"exact: decoded {ai}/{len(ab)} A rows and {wi}/{len(wb)} W rows of format_layer's streams")
         return Y[:M, :C]
@@ -1461,11 +1509,16 @@ class RtlSets:
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
             raise RuntimeError("TB_sienna_model build failed")
 
-    def run(self, groups, act, tag):
+    def run(self, groups, act, tag, tier=0, coef=None):
+        """groups' sets through TB_sienna_model at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given."""
         sets_f = os.path.join(self.work, f"{tag}.sets")
         out_f = os.path.join(self.work, f"{tag}.out")
         n = write_sets(sets_f, groups, act)
-        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + (["+host_gaps"] if self.host_gaps else []),
+        lanes = [f"+tier={int(tier)}"]
+        if coef is not None:
+            write_coef(os.path.join(self.work, f"{tag}.coef"), coef)
+            lanes.append(f"+coef={os.path.join(self.work, f'{tag}.coef')}")
+        r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + lanes + (["+host_gaps"] if self.host_gaps else []),
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
@@ -1487,7 +1540,7 @@ class RtlSets:
         """One job as N x N sets in tile order -> (outputs, sets, cycles); a tile's result is its last set's, partial sets return none."""
         N = self.N
         groups, (P, C, rt, ct) = tile_job(job, N)
-        outs, n, cyc = self.run(groups, job["act"], tag)
+        outs, n, cyc = self.run(groups, job["act"], tag, int(job.get("tier", 0)), job.get("coef"))
         Y = np.zeros((rt * N, ct * N), np.float32)
         k = 0
         for (r, c), passes, _ in groups:
@@ -1506,7 +1559,8 @@ class RtlSets:
         Y = np.zeros((rt * N, ct * N), np.int64)
         for (r, c), passes, bias in groups:
             pb = [(word_bits(A, "fp32"), word_bits(B, "fp32")) for A, B in passes]  # write_sets sends the float32 words as they are
-            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(pb, None if bias is None else word_bits(bias, "fp32"), job["act"], N, "fp32", self.T)
+            Y[r * N:(r + 1) * N, c * N:(c + 1) * N] = exact_sum(pb, None if bias is None else word_bits(bias, "fp32"), job["act"], N, "fp32", self.T,
+                                                                 tier=int(job.get("tier", 0)), mem=job.get("coef"))
         return Y[:P, :C]
 
 
@@ -1518,7 +1572,7 @@ class Emulator(RtlSets):
     def build(self):
         pass
 
-    def run(self, groups, act, tag):
+    def run(self, groups, act, tag, tier=0, coef=None):  # ReLU and linear only: the lanes' tier and memory do not apply
         outs, n = [], 0
         for _, passes, bias in groups:
             acc = None

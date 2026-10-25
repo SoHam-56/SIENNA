@@ -2131,10 +2131,12 @@ def run_int8(a, sim, shapes) -> None:
                  f"peak {peak} MAC/cycle", head):
         print(line, flush=True)
         rep.write(line + "\n")
-    cases = [(name, m, k, n, "linear") for name, m, k, n in shapes]
-    cases += [(f"layer_{act}_bias", 64, 48, 40, act) for act in ("tanh", "sigmoid", "selu")]
+    cases = [(name, m, k, n, "linear", {}) for name, m, k, n in shapes]
+    cases += [(f"layer_{act}_bias", 64, 48, 40, act, {}) for act in ("tanh", "sigmoid", "selu")]
+    # the lanes' tier field and load path (lane_cases): tier 1, the loaded swapped image after reset and between two runs, writes while busy
+    cases += [(t, 32, 48, 24, "tanh", dict(e, tol=tol)) for t, e, tol in lane_cases("int8", True)]
     rows, bad, over, all_mism = [], 0, 0, 0
-    for name, m, k, n, act in cases:
+    for name, m, k, n, act, extra in cases:
         rng = np.random.RandomState(m * 7 + k * 13 + n)
         A, B = rng.uniform(-1, 1, (m, k)), rng.uniform(-1, 1, (k, n))
         bias = None if act == "linear" else rng.uniform(-0.5, 0.5, n)
@@ -2143,10 +2145,36 @@ def run_int8(a, sim, shapes) -> None:
         hw_bias = mr.fold_bias(bias, s_a, s_w, z_a, B_q)
         req = mr.requant_params(mr.wrap32(mr.imatmul(A_q, B_q) + hw_bias[None, :]), s_a, s_w, act)
         job = {"terms": [(A_q.astype(np.float32), B_q.astype(np.float32))], "bias": hw_bias, "act": act,
-               "shape": (m, n), "req": req}
+               "shape": (m, n), "req": req, **extra}
         t0 = time.time()
         y, sets, cyc = sim.run_job(job, name)
-        mism = int(np.sum(y != mr.int8_layer_exact(A_q, B_q, hw_bias, req, act)))
+        img = extra.get("coef", extra.get("between"))
+        model = mr.int8_layer_exact(A_q, B_q, hw_bias, req, act, extra.get("tier", 0), img)
+        mism = int(np.sum(y != model))
+        if extra:  # the case must exercise the field: its model's words are not the reset image's tier 0 (the refused case's are)
+            dflt = mr.int8_layer_exact(A_q, B_q, hw_bias, req, act)
+            differ = int(np.sum(model != dflt))
+            note = ""
+            if "between" in extra:
+                fm = int(np.sum(sim.first_Y != dflt))
+                note = f"; its first run {fm} outputs off the reset image's"
+                if fm:
+                    print(f"FAIL {name}: the run before the load differs from the reset image in {fm} outputs", flush=True)
+                    bad += 1
+            if extra.get("coef_busy"):
+                t, rf = sim.busy_refused or (0, 0)
+                note = f"; {rf} of {t} writes while busy refused"
+                if not (t == 4 and rf == 4):
+                    print(f"FAIL {name}: {rf} of {t} writes while busy refused", flush=True)
+                    bad += 1
+            print(f"    {name}: {differ} outputs of the model differ from tier 0 of the reset image{note}", flush=True)
+            rep.write(f"    {name}: {differ} outputs of the model differ from tier 0 of the reset image{note}\n")
+            if (differ == 0) != bool(extra.get("coef_busy")):
+                print(f"FAIL {name}: the case does not exercise the tier or the loaded image", flush=True)
+                bad += 1
+            if mism:  # a lane that ignored its tier or image would pass the true function at a stricter tier: these gate bit for bit too
+                print(f"FAIL {name}: {mism} outputs differ from the bit-exact model of tier {extra.get('tier', 0)}{' of the loaded image' if img is not None else ''}", flush=True)
+                bad += 1
         ref = A @ B + (0.0 if bias is None else bias[None, :])
         if act != "linear":
             ref = mr.apply_activation(ref.astype(np.float32), act).astype(np.float64)
@@ -2175,7 +2203,7 @@ def run_int8(a, sim, shapes) -> None:
         over += sum(r.over for _, r in gates)
         fails = [(st, r) for st, r in gates if not r.ok]
         for st, r in gates:  # each stage's worst
-            sl = f"    {st}: {truth.line(r, bound=_act_bound(r.func)) if st.startswith('activation') else truth.stage_line(r)}"
+            sl = f"    {st}: {truth.line(r, bound=extra.get('tol', _act_bound(r.func))) if st.startswith('activation') else truth.stage_line(r)}"
             print(sl, flush=True)
             rep.write(sl + "\n")
         for st, r in fails:
@@ -2286,6 +2314,87 @@ def gemm_main(argv=None):
                     sys.exit(1)
         if a.fmt_name == "bf16" and not layer_bias_special(a, sim, rep):
             sys.exit(1)
+        if not lane_features(a, sim, rep):
+            sys.exit(1)
+        if a.fmt_name == "fp32" and a.engine == "layer" and not a.emulate and a.tile == 2 and mr.COLLAPSE_K == 1:  # the set contract's tier and load path, once per N
+            sets = mr.RtlSets(a.n, a.lanes, a.work, False, a.tile)
+            sets.build()
+            if not lane_features(a, sets, rep, "sets "):
+                sys.exit(1)
+
+
+LANE_CASES = {"lanes_tier1": 1, "lanes_loaded": 0, "lanes_between": 0, "lanes_refused": 0}  # the gemm points' tier and load runs and their tiers
+SET_LANE_CASES = ("lanes_tier1", "lanes_loaded")  # those the set contract runs (no between or busy load there)
+
+
+def lane_case_line(tag: str, tier: int) -> str:
+    """The gemm verdict's pattern for one float tier or load run: bit-exact at its tier and within its tolerance of the true function; whether
+    it moved off the reset image's tier 0 (or, refused, did not) is the run's own FAIL line."""
+    return rf"^{tag} +\d+ +\d+ +\d+ +\d+ +\d+  0 outputs differ from the bit-exact model of tier {tier}(?: of the loaded image)?; \d+ differ from tier 0 of the reset image; true function PASS "
+
+
+def swapped_image(fmt: str):
+    """The lanes' reset image with tiers 0 and 2 swapped (descriptors and tail sets): loaded, tier 0 runs the 10% design."""
+    m = gpnae_model.default_mem(fmt)
+    m.desc[0], m.desc[2] = m.desc[2], m.desc[0]
+    m.tail[0], m.tail[2] = m.tail[2], m.tail[0]
+    return m
+
+
+def lane_cases(fmt: str, layer: bool) -> list:
+    """The lanes' tier and load cases: (tag, the job's extra keys, the tolerance its words are gated at, its expected tier label). tier 1; tier 0
+    of the swapped image loaded after reset (it holds the 10% design); on the layer contract also that image loaded between two runs of the
+    layer with no reset, and writes while the layer streams, which the interlock must refuse."""
+    tol = gpnae_model.TIER_TOL
+    out = [("lanes_tier1", {"tier": 1}, tol[1]), ("lanes_loaded", {"tier": 0, "coef": swapped_image(fmt)}, tol[2])]
+    if layer:
+        out += [("lanes_between", {"tier": 0, "between": swapped_image(fmt)}, tol[2]), ("lanes_refused", {"tier": 0, "coef_busy": True}, tol[0])]
+    return out
+
+
+def lane_features(a, sim, rep, contract: str = "") -> bool:
+    """The lanes' tier field and coefficient load path on sim's contract (the layer's; "sets " the set contract's), on a tanh layer (lane_cases):
+    each run bit-exact against the model of its tier and image and within its tier's tolerance of the true function; the tier and load runs
+    must differ from the reset image's tier 0, the between run's first pass must equal it, and every write while busy must be refused."""
+    rng = np.random.RandomState(6)
+    A = mr.op_round(rng.uniform(-1, 1, (32, 48)), a.fmt_name)
+    B = mr.op_round(rng.uniform(-0.6, 0.6, (48, 24)), a.fmt_name)
+    b = mr.op_round(rng.uniform(-0.5, 0.5, 24), a.fmt_name)
+    good = True
+    base = {"terms": [(A, B)], "bias": b, "act": "tanh", "shape": (32, 24)}
+    dflt = np.asarray(sim.exact(dict(base, tier=0)))
+    pre = np.asarray(sim.exact(dict(base, act="linear")))  # the lanes' inputs: the layer's words before the activation
+    for tag, extra, tol in lane_cases(a.fmt_name, isinstance(sim, mr.RtlLayer)):
+        job = dict(base, **extra)
+        y, sets, cyc = sim.run_job(job, tag)
+        img = {"tier": job["tier"]}
+        if "coef" in job or "between" in job:
+            img["coef"] = job.get("coef", job.get("between"))
+        want = np.asarray(sim.exact(dict(base, **img)))
+        words = mr.word_bits(y, a.fmt_name)
+        mism = int(np.sum(words != want))
+        differ = int(np.sum(want != dflt))
+        r = truth.gate(a.fmt_name, "tanh", pre.ravel(), np.asarray(words).ravel(), bound=tol)
+        ok = mism == 0 and r.ok and (differ > 0 if tag != "lanes_refused" else differ == 0)
+        note = ""
+        if tag == "lanes_between":  # the first run, before the load, is the reset image's
+            fm = int(np.sum(mr.word_bits(sim.first_Y, a.fmt_name) != dflt))
+            ok &= fm == 0
+            note = f"; its first run {fm} outputs off the reset image's"
+        if tag == "lanes_refused":
+            t, rf = sim.busy_refused or (0, 0)
+            ok &= t == 4 and rf == 4
+            note = f"; {rf} of {t} writes while busy refused"
+        img_txt = " of the loaded image" if "coef" in img else ""
+        line = (f"{contract + tag:<22} {32:>5} {48:>5} {24:>5} {sets:>7} {cyc:>10}  {mism} outputs differ from the bit-exact model of tier {job['tier']}"
+                f"{img_txt}; {differ} differ from tier 0 of the reset image; true function {'PASS' if r.ok else 'FAIL'} worst "
+                f"{truth.worst_text(r.worst)} at {100 * tol:g}%{note}")
+        print(line, flush=True)
+        rep.write(line + "\n")
+        if not ok:
+            print(f"FAIL {contract + tag}: {line.split('  ', 1)[1]}", flush=True)
+        good &= ok
+    return good
 
 
 def layer_bias_special(a, sim, rep) -> bool:
@@ -4361,6 +4470,12 @@ def test_point_verdicts():
     clean = (f"  TRUTH: {n32} tests gated, 0 with misses\n  BACK_TO_BACK: 0 of {n32} tests ran the back-to-back pass\n"
              f"\x1b[1m  Passed      : \x1b[92m{n32}\x1b[0m / {n32}\n  Verdict : \x1b[92m✅ Sanity Clean\x1b[0m\n")
     plain = regress.ANSI.sub("", clean)
+    tf = "; true function PASS worst 0.9% at 5%\n"
+    lanes_ok = ("lanes_tier1               32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 1; 7 differ from tier 0 of the reset image" + tf +
+                "lanes_loaded              32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0 of the loaded image; 7 differ from tier 0 of the reset image" + tf)
+    lanes_all = lanes_ok + ("lanes_between             32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0 of the loaded image; 7 differ from tier 0 of the reset image" + tf +
+                            "lanes_refused             32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0; 0 differ from tier 0 of the reset image" + tf)
+    lanes8 = "".join(f"    {t}: 31 outputs of the model differ from tier 0 of the reset image\n" for t in LANE_CASES)
     v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
     assert n32 > 20 and v("int8/N8_T2/pipeline", clean) == f"FAIL ({n32} tests ran, int8 has {len([t for t in PIPELINE_TESTS if 'int8' in t.get('formats', tuple(FORMATS))])})"
     for p, text, rc, want in (
@@ -4386,12 +4501,27 @@ def test_point_verdicts():
             ("int8/N16_T4/tflite-ck0", "MODEL GATE: FAIL int8\n", 0, "FAIL (log: MODEL GATE: FAIL int8)"),
             ("int8/N8_T2/residual", "RESIDUAL: PASS\n", 0, "PASS"), ("int8/N8_T2/residual", "RESIDUAL: FAIL tiles\n", 0, "FAIL (log: RESIDUAL: FAIL tiles)"),
             ("bf16/N8_T2/pack", "PACK REGRESSION PASS: 0 mismatching outputs\n", 0, "PASS"), ("bf16/N8_T2/pack", "done\n", 0, "FAIL (no 'PACK REGRESSION PASS: 0 mismatching outputs')"),
-            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\nGEMM int8: 9 cases, 0 failing (every case per stage on the true function)\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n" + lanes8 + "GEMM int8: 9 cases, 0 failing (every case per stage on the true function)\n", 0, "PASS"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n" + lanes8.replace("    lanes_tier1", "    lanes_t1") + "GEMM int8: 9 cases, 0 failing (every case per stage on the true function)\n", 0,
+             "FAIL (no '    lanes_tier1: \\d+ outputs of the model differ from tier 0 of the reset image')"),
+            ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n" + lanes8 + "FAIL lanes_refused: 3 of 4 writes while busy refused\nGEMM int8: 9 cases, 1 failing\n", 0,
+             "FAIL (log: FAIL lanes_refused: 3 of 4 writes while busy refused)"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
-            ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu")), 0, "PASS"),
+            ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
+             + lanes_all + lanes_ok.replace("lanes_", "sets lanes_"), 0, "PASS"),
+            ("fp32/N8_T4/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
+             + lanes_all, 0, "PASS"),  # the set contract's runs only at T = 2
+            ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
+             + lanes_all, 0, "FAIL (no '" + lane_case_line("sets lanes_tier1", 1).strip("^$") + "')"),
+            ("bf16/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"  layer_{x}: 0 outputs differ from the bit-exact model\n" for x in ("tanh", "sigmoid", "selu"))
+             + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n" + lanes_all.replace("true function PASS", "true function FAIL", 1), 0,
+             "FAIL (no '" + lane_case_line("lanes_tier1", 1).strip("^$") + "')"),  # a tier run off the true function fails
+            ("bf16/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"  layer_{x}: 0 outputs differ from the bit-exact model\n" for x in ("tanh", "sigmoid", "selu"))
+             + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n" + lanes_all + "FAIL lanes_tier1: 0 differ from tier 0\n", 0,
+             "FAIL (log: FAIL lanes_tier1: 0 differ from tier 0)"),  # a tier run whose outputs equal tier 0's does not exercise it
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\nlayer_tanh_bias  64 max err 9.3e-04 of the output range\n", 0, "FAIL (no 'layer_sigmoid_bias .* max err ')"),
             ("bf16/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"  layer_{x}: 0 outputs differ from the bit-exact model\n" for x in ("tanh", "sigmoid", "selu"))
-             + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n", 0, "PASS"),
+             + "layer_bias_special  32 40 24 12 308  0 outputs differ from the bit-exact model\n" + lanes_all, 0, "PASS"),
             ("bf16/N8_T2/gemm", "grid_1x8x8 1\n  layer_tanh: 0 outputs differ from the bit-exact model\n", 0, "FAIL (no '  layer_sigmoid: 0 outputs differ from the bit-exact model')"),
             ("int8/N8_T2/gemm", "GEMM int8: 0 cases\n", 0, "FAIL (no 'grid_\\d+x\\d+x\\d+ ')"), ("fp32/N8_T2/gemm", "grid_1x8x8 1\nFAIL grid_1x8x8: error\n", 0, "FAIL (log: FAIL grid_1x8x8: error)"),
             ("selftest", "ALL 9 PASSED\n", 0, "PASS"), ("selftest", "1 of 9 FAILED\n", 0, "FAIL (no 'ALL \\d+ PASSED')"),
@@ -5890,10 +6020,15 @@ class SiennaSpec(regress.Spec):
             return regress.marker_verdict(text, rc, (r"^RESIDUAL: PASS",), (r"^RESIDUAL: FAIL",))
         if k == "pack":
             return regress.marker_verdict(text, rc, (r"^PACK REGRESSION PASS: 0 mismatching outputs$",))
-        acts = ("tanh", "sigmoid", "selu")  # gemm: its rows, every activation's own check, and no FAIL line
+        acts = ("tanh", "sigmoid", "selu")  # gemm: its rows, every activation's own check, the lanes' tier and load runs, and no FAIL line
+        p = self.parse(name)
         need = {"fp32": [rf"^layer_{x}_bias .* max err " for x in acts],
                 "bf16": [rf"^  layer_{x}: 0 outputs differ from the bit-exact model$" for x in acts] + [r"^layer_bias_special .* 0 outputs differ from the bit-exact model$"],
-                "int8": [r"^GEMM int8: \d+ cases, 0 failing "]}[self.parse(name)["fmt"]]
+                "int8": [r"^GEMM int8: \d+ cases, 0 failing "] + [rf"^    {t}: \d+ outputs of the model differ from tier 0 of the reset image" for t in LANE_CASES]}[p["fmt"]]
+        if p["fmt"] != "int8":  # the layer contract's, and at fp32 T = 2 the set contract's (TB_sienna_model)
+            need += [lane_case_line(t, n) for t, n in LANE_CASES.items()]
+            if p["fmt"] == "fp32" and p["tile"] == 2 and p["ck"] == 1:
+                need += [lane_case_line("sets " + t, LANE_CASES[t]) for t in SET_LANE_CASES]
         return regress.marker_verdict(text, rc, [r"^grid_\d+x\d+x\d+ "] + need, (r"^FAIL ",))
 
     def not_run(self, name, opts):

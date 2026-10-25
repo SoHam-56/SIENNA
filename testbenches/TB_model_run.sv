@@ -39,6 +39,7 @@ module TB_model_run #(
   logic cfg_load_i = 0, cfg_residual_i = 0, cfg_bias_i = 0, cfg_train_i = 0;
   logic [15:0] cfg_m_i = '0, cfg_kb_i = '0, cfg_n_i = '0;
   logic [CONTROL_WIDTH-1:0] cfg_act_i = '0;
+  logic [1:0] cfg_tier_i = '0;
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
   logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
@@ -163,6 +164,7 @@ module TB_model_run #(
       .cfg_residual_i  (cfg_residual_i),
       .cfg_bias_i      (cfg_bias_i),
       .cfg_act_i       (cfg_act_i),
+      .cfg_tier_i      (cfg_tier_i),
       .cfg_train_i     (cfg_train_i),
       .cfg_seed_i      (cfg_seed_i),
       .cfg_lane_i      (tb_lane_entry(tb_entry(cfg_req_zp_i, cfg_req_min_i, cfg_req_max_i, cfg_gp_mx_i, cfg_gp_shx_i, cfg_gp_mout_i,

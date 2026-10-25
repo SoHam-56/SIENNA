@@ -50,6 +50,7 @@ module sienna_top #(
     input logic                     cfg_residual_i,  // add an M x N residual input, streamed with A
     input logic                     cfg_bias_i,      // add a bias row, streamed with the weights
     input logic [CONTROL_WIDTH-1:0] cfg_act_i,
+    input logic [1:0]               cfg_tier_i,  // the lanes' accuracy tier for the layer: 0 within 1%, 1 within 5%, 2 within 10%
     input logic                     cfg_train_i,
     input logic [LFSR_WIDTH-1:0]    cfg_seed_i,
     // Where the build has them (int8; 1-bit dummies in floats): the layer's requantize and lane words (D-2), and the residual ADD's
@@ -158,6 +159,7 @@ module sienna_top #(
         .cfg_residual_i      (cfg_residual_i),
         .cfg_bias_i          (cfg_bias_i),
         .cfg_act_i           (cfg_act_i),
+        .cfg_tier_i          (cfg_tier_i),
         .cfg_train_i         (cfg_train_i),
         .cfg_seed_i          (cfg_seed_i),
         .cfg_lane_i          (cfg_lane_i),
@@ -475,7 +477,7 @@ module sienna_top #(
     assign done_o        = 1'b0;
     assign set_done_o    = 1'b0;
     assign idle_put = cfg_load_i || a_rows.put || w_rows.put;
-    wire unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_train_i, cfg_seed_i, cfg_lane_i,
+    wire unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_tier_i, cfg_train_i, cfg_seed_i, cfg_lane_i,
                                  cfg_add_i, cfg_pack_shift_i, cfg_pack_map_i, cfg_pack_act_i, cfg_pack_lane_i, a_rows.data, w_rows.data,
                                  w_bias_i, w_req_scale_i};  // only the layer contract reads them
   end

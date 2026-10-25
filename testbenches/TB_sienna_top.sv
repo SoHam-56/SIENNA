@@ -250,6 +250,7 @@ module TB_sienna_top #(
       .cfg_residual_i      (1'b0),
       .cfg_bias_i          (1'b0),
       .cfg_act_i           ('0),
+      .cfg_tier_i          ('0),
       .cfg_train_i         (1'b0),
       .cfg_seed_i          ('0),
       .cfg_lane_i          ('0),

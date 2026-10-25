@@ -114,57 +114,26 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 
 ## GPNAE — the activation engine
 
-`GPNAE/src/`, also a submodule. Evaluates SELU, sigmoid or tanh on one FP32 value at a time. "TYTAN" is the polynomial core.
+`GPNAE/src/`, a submodule; each of the pipeline's lanes is one `gpnae` (since Batch B Stage 2, 2026-10-24; `src/gpnae_lane.sv` is gone). Design D of `/proj/work/spramanik/sienna_report/gpnae_fit_study.log` (bf16: D', option (i)): short polynomial pieces with saturation past them, no lookup tables. The published Taylor lane is tagged `gpnae_taylor_final` (2f2db42).
 
-### Control word
-
-| `control_word_i` | Activation | `NUM_TERMS` | Path |
-|---|---|---|---|
-| `2'b00` | idle / pass-through | 1 | **not implemented** — see known-issues |
-| `2'b01` | SELU | 14 | sign check, then SeLu block |
-| `2'b10` | sigmoid | 15 | MAC → sigtan, `select_sub = 2'b00` |
-| `2'b11` | tanh | 30 | input doubled, MAC → sigtan, `select_sub = 2'b01` |
-
-These encodings match `activation_to_code()` and `get_polynomial_terms()` in `model_runner.py` (regression.py imports them).
-
-The pipeline instantiates `gpnae_poly`, not `gpnae.sv`. Its control word is 3 bits and adds two modes that bypass the polynomial:
+### Control word, tier and load path
 
 | `control_word_i` | Activation |
 |---|---|
-| `3'b001` / `3'b010` / `3'b011` | SELU / sigmoid / tanh, as above |
-| `3'b100` | ReLU, exact |
-| `3'b101` | linear, exact |
+| `3'b001` | SELU |
+| `3'b010` | sigmoid |
+| `3'b100` / `3'b101` | ReLU / linear, exact (bypass) |
+| any other | tanh |
 
-`gpnae_poly` takes no term count: each activation's polynomial degree comes from its coefficient table. `sienna_top` stores the code per set (`set_act`), so consecutive sets can use different activations.
+`tier_i` (0, 1, 2) picks the accuracy tier, the sets fitted to 1%, 5% and 10%; `sienna_pipe` takes it per set from the set side (`set_side_t.tier`, the set contract) or from `cfg_tier_i` (the layer contract), with the activation. `coef_wr_i`, `coef_addr_i` (9 bits) and `coef_data_i` (32 bits) write the coefficient memory; `sienna_top` fans one load port out to every lane behind an interlock: `coef_ready_o` is high only while no set is in any pipeline, every lane's `idle_o` is high and no layer runs, and a write while it is low is refused (`a_load_ready` and each lane's `a_load_idle` fire if one lands anyway). The host loads between layers. The memory's reset contents are the fitted image (`GPNAE/gpnae_coef_default.json`), so a host that never loads gets the fitted lane.
 
 ### Structure
 
-`gpnae.sv` holds an `InputFIFO`, a `mac` (the Taylor/Maclaurin evaluator), a `SeLu` block, a `sigtan` block, and `gpnae_control_unit`.
-
-The control unit runs `IDLE → WAIT_LAST → OP → {SELU_CHECK→SELU_POS|SELU_NEG, SIGMOID, TANH} → OP`. It stays in `OP` as the per-element dispatch point, looping until the FIFO drains. `done_o` is delayed through a 3-bit shift register so downstream logic sees a settled result.
-
-It also gates clocks combinationally: `selu_clk_o = clk_i & selu_enable`, and similarly for `mac_clk_o` and `sigtan_clk_o`. `SeLu.sv` does the same to its `fp32_down` instance. This is power-motivated but is not synthesis-clean — see known-issues.
-
-### Polynomial evaluation (TYTAN)
-
-`datapath.v` is Horner's method in hardware: one multiplier and one adder wired so that each pass computes `coeff + x·previous`. `controller.sv` sequences it: `IDLE → RESET_DATAPATH → LOAD_SIGNAL → LOAD_COEFF → MULTIPLY → WAIT_MUL → ADD → WAIT_ADD → CHECK_TERMS → STORE_RESULT`, looping back to `LOAD_COEFF` until `term_count` reaches `terms_i - 1`.
-
-Coefficients come from `CoeffROM` → `rom_block`, addressed **descending** (`coeff_addr_o = terms_i - 1 - term_count`), which is what Horner requires.
-
-`controller.sv` tracks a credit counter clocked on `mac_credit_clk_i`, incremented on `fifo_wr_i` and decremented on entering `LOAD_SIGNAL`, so it knows how many elements are waiting without polling the FIFO. Note that `start_i` (driven by the top level's `last_i` pulse) acts as a **stop** condition in `IDLE`, not a go signal.
-
-### Transcendental composition
-
-Sigmoid and tanh share one identity. The MAC evaluates `e^x` (with the input pre-doubled for tanh, via a manual exponent increment in `gpnae.sv`). Then `fp32_up_down.sv` computes `e^x + 1` and `e^x − 1` in parallel — it is `fp32_down.sv` duplicated with two constant paths. Finally `fp32Divider` produces:
-
-- sigmoid: `e^x / (e^x + 1)` — `select_sub = 2'b00` selects `mac_result` as numerator
-- tanh: `(e^2x − 1) / (e^2x + 1)` — `select_sub = 2'b01` selects `sub_result`
-
-SELU takes a different route: positive inputs are multiplied by λ (`32'h3F867D5F`) directly; negative inputs go through `fp32_down` (which computes `e^x − 1`) and are then multiplied by λα (`32'h3FD62D7D`).
-
-### InputFIFO
-
-`InputFIFO.v` is not a pointer FIFO. It keeps a `2^ADDR_LINES` status bitmap and uses two priority encoders (`PE5B`) to find the first free slot for writing and the first occupied slot for reading, backed by a `dual_port_ram`. Simultaneous read and write is **not** supported — the `always` block is `if (wr_en_i) ... else if (rd_en_i) ...`, so a read coinciding with a write is dropped.
+- `gpnae_act_in`: per element, the piece from abs(x) against the descriptor's bounds (count of bounds passed; past the last, the function's limit), the coefficient base, degree and fraction; floats square tanh's operand and, for negative sigmoid past the reflect range, split x log2 e into 2^-n and f; int8 rescales the code (int16Multiplier) and centres it on the fit.
+- `barrel_mac`: K = 16 slots take one Horner step each in turn (`gpnae_horner`: fmt_mul then fmt_add, or fixedPointMultiplyAdd in int8), so the step unit starts one step a cycle; each slot runs its own base and degree, and a slot past its degree pads with 0.
+- `gpnae_post`: lambda x (SELU x >= 0), x P (SELU x < 0, tanh), P or 1 - P (sigmoid), 2^-n P then E(1 - E) (fp32 negative sigmoid), the rails, and int8's SELU requantize.
+- `gpnae_tail` (bf16 only, `HAS_FLOAT_TAIL`): negative sigmoid below -1.5 in fp32, 2^-n P(f) and Newton steps for 1/(1 + E), rounded to bf16; eight contexts.
+- Results leave in input order once K output credits are held (`lane_link`).
 
 ---
 

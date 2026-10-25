@@ -608,6 +608,8 @@ now passes `--assert`; both lanes pass with every assertion live.
 
 ## 17. gpnae_poly's fitted polynomials diverge past |x| of about 4 — FIXED
 
+Superseded 2026-10-24 (Batch B Stage 2): `gpnae_poly` and this Taylor tail are gone. The new lane saturates each function past the input where its limit is within tolerance and runs negative sigmoid by range reduction (fp32 on the barrel MAC, bf16 on an fp32 tail below -1.5); every input is gated on the true function at each tier. The text below is the record of B.
+
 **Confirmed (reproduced)** 2026-09-23 by the seed sweep: `matmul_random_tanh` at
 `SIENNA_SEED=1` returned tanh = 19.32 where the answer was 0.99983. The lane the pipeline uses
 is `gpnae_poly`, not the published `gpnae`. Its coefficient fits hold only near zero, measured

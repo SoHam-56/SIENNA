@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPN
 import mesh_model  # noqa: E402
 import gpnae_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))  # model_runner and check_hier
 import model_runner as mr  # noqa: E402  the numerics and the device build package, one owner each
 from model_runner import (  # noqa: E402
     FORMATS, ROOT, SETS_IN_FLIGHT, TB_DIR, _config_items, activate_int8, activation_to_code,
@@ -1711,7 +1712,7 @@ RESIDUAL_CROSS_UNREACHABLE = {  # cross (RESIDUAL_CROSSES) -> {point: ruling tex
                                          "(the hold set's grant waited on rq_room, so add_lanes' busy_o was low); and a lane set's g_done needs its own beats "
                                          "through requantize after the hold's last (a_rq_one_set)")},
 }
-RTL_TOP = os.path.join(ROOT, "src", "sienna_pipe.sv")  # the pipeline, where the stage assertions live
+RTL_TOP = os.path.join(ROOT, "src", "pipeline", "sienna_pipe.sv")  # the pipeline, where the stage assertions live
 
 
 def _ruling_ok(point: str, ruling, rtl: str) -> bool:
@@ -2943,7 +2944,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
 def lane_params() -> tuple:
     """gpnae's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_pipe overrides them."""
     src = open(os.path.join(ROOT, "GPNAE", "src", "gpnae.sv")).read()
-    inst = re.search(r"\bgpnae #\((.*?)\) gpnae", open(os.path.join(ROOT, "src", "sienna_pipe.sv")).read(), re.S)
+    inst = re.search(r"\bgpnae #\((.*?)\) gpnae", open(os.path.join(ROOT, "src", "pipeline", "sienna_pipe.sv")).read(), re.S)
     k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", src) for n in ("K", "TAIL_CONTEXTS"))
     if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
         raise RuntimeError("regression.py --action perf: gpnae's K / TAIL_CONTEXTS not found, or sienna_pipe overrides them")
@@ -3907,7 +3908,7 @@ def test_truth_synthetic_dump():
 
 def _tb_b2b_files() -> tuple:
     """The expected and bound files TB_sienna_top's back-to-back pass reads."""
-    src = open(os.path.join(ROOT, "testbenches", "TB_sienna_top.sv")).read()
+    src = open(os.path.join(ROOT, "testbenches", "top", "TB_sienna_top.sv")).read()
     blk = src[src.index("[STAGE] BACK TO BACK"):]
     blk = blk[:blk.index("collect_outputs")]
     get = lambda q: re.search(r'read_mem_file\("([^"]+)",\s*' + q + r"\)", blk).group(1)
@@ -4115,7 +4116,7 @@ def test_residual_stimulus():
 
 def _tb_hold_add_line(*v) -> str:
     """TB_sienna_top's [HOLD/ADD] $display with the values v put in its %0d fields, from the TB's own source."""
-    src = open(os.path.join(ROOT, "testbenches", "TB_sienna_top.sv")).read()
+    src = open(os.path.join(ROOT, "testbenches", "top", "TB_sienna_top.sv")).read()
     fmt = re.search(r'\$display\("(\[HOLD/ADD\][^"]*)"', src).group(1)
     assert fmt.count("%0d") == len(v), (fmt, v)
     return fmt.replace("%0d", "{}").format(*v) + "\n"
@@ -4692,7 +4693,7 @@ def test_model_points_skip_without_models():
 @selftest
 def test_tb_knobs_are_run_time():
     # TB_sienna_top reads the TB-only settings from test_knobs.mem, so no knob value can reach its elaboration or the DUT's
-    src = open(os.path.join(TB_DIR, "TB_sienna_top.sv")).read()
+    src = open(os.path.join(TB_DIR, "top", "TB_sienna_top.sv")).read()
     found = knob_references(build_sources())  # every file TB_sienna_top's build compiles or can include, the package's own declarations aside
     assert not found and len(build_sources()) > 30, found
     with tempfile.TemporaryDirectory() as d:  # the scan finds a knob anywhere but a package declaration
@@ -4826,7 +4827,7 @@ def test_gpnae_target_tier():
 @selftest
 def test_layer_mode_check():
     line = "[LAYER] sets=4 outputs=64 cycles=99 a_rows=2/2 w_rows=2/2 epilogues=0/0 out_stall=0 in_stall=0"
-    tb = open(os.path.join(ROOT, "testbenches", "TB_model_run.sv")).read()  # the mode printed is the elaborated mesh's, not the package's
+    tb = open(os.path.join(ROOT, "testbenches", "top", "TB_model_run.sv")).read()  # the mode printed is the elaborated mesh's, not the package's
     assert "in_stall=%0d collapse_k=%0d" in tb and "dut.G_LAYER.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "TB_model_run's [LAYER] line lost the mesh's COLLAPSE_K"
     old = mr.COLLAPSE_K
     try:
@@ -5914,7 +5915,7 @@ def test_vcs_commands():
     r = subprocess.run(["make", "-s", "-p", "-n", "help", "SIM=vcs"], cwd=ROOT, env=env, capture_output=True, text=True)
     assert re.search(r"(?m)^SIENNA_SIM := vcs$", r.stdout), "make exports SIENNA_SIM"
     r = subprocess.run([sys.executable, "-c", "import model_runner as m; print(m.SIM, m.SIM_TARGET, os.path.basename(m.SIM_DIR))".replace("os.path", "__import__('os').path")],
-                       cwd=ROOT, env=dict(env, SIENNA_SIM="vcs"), capture_output=True, text=True)
+                       cwd=os.path.join(ROOT, "scripts"), env=dict(env, SIENNA_SIM="vcs"), capture_output=True, text=True)
     assert r.stdout.split() == ["vcs", "vcs", "VCS"], (r.stdout, r.stderr[-300:])
     r = run("regression", "SIM=vcs", "SMALL=1", "FMT=int8", f"PYTHON={sys.executable}")
     pts = [x for x in r.stdout.splitlines() if "--action point " in x]

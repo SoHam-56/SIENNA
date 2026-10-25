@@ -602,7 +602,7 @@ just changed, so `$stable` is false by construction. The assertion looks wrong r
 the RTL; the intended property is probably that the result holds while `done_o` is high.
 **Fixed 2026-09-23** on Soham's instruction. The property is now
 `!$stable(final_result_o) |-> done_o` (the result changes only on a done cycle), and all three
-TB properties in `TB_gpnae.sv` and `TB_gpnae_poly.sv` carry `disable iff (!rstn_i)`: the TB
+TB properties in `TB_gpnae.sv` carry `disable iff (!rstn_i)`: the TB
 resets before every batch, and reset clears the result without a done pulse. GPNAE's Makefile
 now passes `--assert`; both lanes pass with every assertion live.
 

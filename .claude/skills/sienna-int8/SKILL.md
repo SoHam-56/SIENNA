@@ -131,7 +131,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 - Task 11: `gpnae_poly_int8`'s G_RUN leaves on barrel_mac's `done_o` for a one-element group (the float lane's G_RUN,
   copied, hung); the published float lanes' same latent hang is fixed the same way since (Soham 2026-09-30):
   `gpnae_poly` in GPNAE 892eb7c, the Taylor lane `gpnae` in e6014b9, each with SINGLE lines in its TB.
-- Task 12: `TB_gpnae_poly` drives writes 1 ns after each clock edge in int8 mode (the zero-delay drive tripped the FIFO's
+- Task 12: GPNAE's lane bench drove writes 1 ns after each clock edge in int8 mode (the zero-delay drive tripped the FIFO's
   full assertion at 32 writes per batch); float modes unchanged.
 - Task 16: PINMISSING is fatal in this flow, so `sienna_top`'s ten new inputs were tied off (`'0`) in its four
   instantiations until Task 19 connected them.

@@ -7,6 +7,7 @@ import test_config_pkg::*;
 // Streams one network layer's sets from +sets=<file> through sienna_top back to back and writes every set's outputs to +out=<file>.
 // int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
 // +out_slots=S (1..64) L9 slots per lane and +out_stall_pct=P random output stalls (-DTB_OUT_STALL_PCT sets the default); +fault_put puts with no credit once.
+// +tier=T: every set's lane tier; +coef=<file>: "aaa dddddddd" (hex address, data) lines written through the lanes' load path after reset.
 module TB_sienna_model;
   // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
@@ -39,12 +40,11 @@ module TB_sienna_model;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
-  logic coef_wr = 1'b0;  // the lanes' load path, idle
+  logic [1:0] tier = '0;  // +tier: the sets' lane tier
+  logic coef_wr = 1'b0;  // +coef: the lanes' load path
   logic [8:0] coef_addr = '0;
   logic [31:0] coef_data = '0;
-  /* verilator lint_off UNUSEDSIGNAL */
-  logic coef_ready;  // sienna_top's load interlock
-  /* verilator lint_on UNUSEDSIGNAL */
+  logic coef_ready;  // sienna_top's load interlock: each write waits for it
 
   // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
   localparam int PACK_ENTRIES = 8;
@@ -71,6 +71,7 @@ module TB_sienna_model;
     side.train         = training_mode_i;
     side.seed          = dropout_seed_i;
     side.act[0]        = activation_function_i;
+    side.tier          = tier;
     side.entry         = tb_side_entries({{(PACK_ENTRIES - 1) * TB_ENTRY_W{1'b0}},
                                           tb_entry(req_zp_i, req_min_i, req_max_i, gp_mx_i, gp_shx_i, gp_mout_i, gp_shout_i, gp_zout_i)});
     side.scale         = tb_side_scales(req_mult_i, req_shift_i);
@@ -186,7 +187,7 @@ module TB_sienna_model;
       .west_write_reset_i         (west_write_reset_i),
       .drained_i                  (1'b0),
       .copy_sel_o                 (),
-      .coef_wr_i                  (coef_wr),  // the lanes keep their reset coefficient memory
+      .coef_wr_i                  (coef_wr),  // +coef=<file>: the lanes' coefficient memory, loaded after reset
       .coef_addr_i                (coef_addr),
       .coef_data_i                (coef_data),
       .coef_ready_o               (coef_ready),
@@ -299,6 +300,33 @@ module TB_sienna_model;
     join
   endtask
 
+  // +coef=<file>: the lanes' coefficient memory, one (address, data) write per cycle on the falling edge, before any set.
+  task automatic coef_load();
+    string cf;
+    integer fc, n;
+    logic [11:0] a;
+    logic [31:0] d;
+    if (!$value$plusargs("coef=%s", cf)) return;
+    fc = $fopen(cf, "r");
+    if (fc == 0) begin
+      $display("[FATAL] cannot open %s", cf);
+      $finish;
+    end
+    n = 0;
+    while ($fscanf(fc, "%h %h", a, d) == 2) begin
+      coef_wr = 1'b0;
+      while (!coef_ready) @(negedge clk_i);
+      coef_wr   = 1'b1;
+      coef_addr = a[8:0];
+      coef_data = d;
+      @(negedge clk_i);
+      n++;
+    end
+    coef_wr = 1'b0;
+    $fclose(fc);
+    $display("[MODEL] coef: %0d load-path writes from %s", n, cf);
+  endtask
+
   initial begin
     string sets_f, out_f;
     integer fin, fout, rc;
@@ -356,11 +384,16 @@ module TB_sienna_model;
       $finish;
     end
 
+    begin
+      int t;
+      if ($value$plusargs("tier=%d", t)) tier = 2'(t);
+    end
     repeat (10) @(posedge clk_i);
     rstn_i = 1;
     north_write_reset_i = 0;
     west_write_reset_i = 0;
     @(negedge clk_i);
+    coef_load();
     if (fault_put) begin  // before the staging credits are advertised
       $display("  [FAULT put] a host put with %0d credits held", host_cnt);
       start_pipeline_i = 1;

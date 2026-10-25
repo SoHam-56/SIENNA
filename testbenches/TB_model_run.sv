@@ -16,6 +16,10 @@ import test_config_pkg::*;
 // +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
 // int8 +hold_wait: the reset waits, from C, for a cycle at which hold_mem holds unread hold beats; +hold_check: a reset outside that window fails.
 // -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
+// +tier=T: the layer's lane tier (cfg_tier_i); +coef=<file>: "aaa dddddddd" (hex address, data) lines written through the lanes' load path
+// after every reset, before the configure, each once coef_ready_o is high.
+// +between=<file> (with +out_first=<file>): the layer runs to completion, its results go to out_first, then <file> is loaded with no reset
+// and the layer runs again into +out. +coef_busy: four corrupting writes while the layer streams; the interlock must refuse every one.
 module TB_model_run #(
     parameter int FAULT       = 0,
     parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
@@ -43,9 +47,8 @@ module TB_model_run #(
   logic coef_wr_i = 1'b0;
   logic [8:0] coef_addr_i = '0;
   logic [31:0] coef_data_i = '0;
-  /* verilator lint_off UNUSEDSIGNAL */
   logic coef_ready_o;  // sienna_top's load interlock
-  /* verilator lint_on UNUSEDSIGNAL */
+  bit restream = 0;  // +between: the second run streams and collects from the start again, with no reset
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
   logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
@@ -246,7 +249,7 @@ module TB_model_run #(
   logic [SDW-1:0] sd_hid = '0, sd_gnid = '0, sd_gsid = '0;
   logic [NUM_LANES-1:0][7:0] sd_hd = '0, sd_fd = '0, sd_q1 = '0, sd_q2 = '0;
   always_ff @(posedge clk_i) begin
-    sd_rst <= !rstn_i;
+    sd_rst <= !rstn_i || restream;  // +between's second run numbers its sets from 0 again
     {sd_hacc, sd_gacc, sd_rd, sd_ghold, sd_gpack, sd_hwr, sd_fv, sd_fadd, sd_ain} <=
         {dut.G_LAYER.pipe.host_accept, dut.G_LAYER.pipe.g_accept, dut.G_LAYER.pipe.wide_rd_valid, dut.G_LAYER.pipe.g_hold, dut.G_LAYER.pipe.g_pack, dut.G_LAYER.pipe.hold_wr_s,
          dut.G_LAYER.pipe.fill_v, dut.G_LAYER.pipe.fill_add, dut.G_LAYER.pipe.add_in_s};
@@ -326,7 +329,7 @@ module TB_model_run #(
   int bounds[$];
   longint t_done = 0;
   always_ff @(posedge clk_i) begin
-    if (!rstn_i) begin  // a mid-stream reset drops the cut pass's results
+    if (!rstn_i || restream) begin  // a mid-stream reset drops the cut pass's results; +between's first run was written out
       for (int l = 0; l < NUM_LANES; l++) lane_q[l].delete();
       res_q.delete();
       bounds.delete();
@@ -353,7 +356,7 @@ module TB_model_run #(
   // int8: the epilogue beside the next bias row; the layer says which W row it took as a block's bias.
   int ei = 0;
   always_ff @(posedge clk_i)
-    if (!rstn_i) ei <= 0;
+    if (!rstn_i || restream) ei <= 0;
     else if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && dut.G_LAYER.sched.wl_take_bias) ei <= ei + 1;
 
   // Output of any kind while the mid-stream reset's home check watches is stray.
@@ -404,7 +407,7 @@ module TB_model_run #(
   always @(negedge clk_i) begin
     a_lnk.put = 1'b0;
     w_lnk.put = 1'b0;
-    if (!rstn_i) begin  // the clean pass after a mid-stream reset streams from the first row
+    if (!rstn_i || restream) begin  // the clean pass after a mid-stream reset (or +between's second run) streams from the first row
       ai = 0;
       wi = 0;
     end
@@ -438,6 +441,38 @@ module TB_model_run #(
     end
   end
 
+  // +coef=<file>: one load-path write per cycle once coef_ready_o, each driven 1 ns after an edge as every other input here.
+  task automatic coef_load();
+    string cf;
+    if (!$value$plusargs("coef=%s", cf)) return;
+    coef_load_file(cf);
+  endtask
+  task automatic coef_load_file(input string cf);
+    integer fc, nw;
+    logic [11:0] a;
+    logic [31:0] d;
+    fc = $fopen(cf, "r");
+    if (fc == 0) $fatal(1, "TB_model_run: cannot open %s", cf);
+    nw = 0;
+    while ($fscanf(fc, "%h %h", a, d) == 2) begin
+      #1;
+      while (!coef_ready_o) begin
+        coef_wr_i = 1'b0;
+        @(posedge clk_i);
+        #1;
+      end
+      coef_wr_i   = 1'b1;
+      coef_addr_i = a[8:0];
+      coef_data_i = d;
+      @(posedge clk_i);
+      nw++;
+    end
+    #1 coef_wr_i = 1'b0;
+    $fclose(fc);
+    $display("[LAYER] coef: %0d load-path writes from %s", nw, cf);
+    @(posedge clk_i);
+  endtask
+
   initial begin
     string layer_f, out_f, kind;
     integer fin, fout, rc;
@@ -449,13 +484,20 @@ module TB_model_run #(
     logic [DATA_WIDTH-1:0] v;
     logic [31:0] w32;
     bit finished;
-    int failed = 0, osp, mid_reset = 0, msp;
+    int failed = 0, osp, mid_reset = 0, msp, tier = 0;
+    string between_f, first_f;
+    int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0;
     int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
 
     void'($value$plusargs("out_slots=%d", out_slots));
     void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
     void'($value$plusargs("in_stall_pct=%d", in_stall_pct));
     void'($value$plusargs("mid_reset=%d", mid_reset));
+    void'($value$plusargs("tier=%d", tier));
+    between = $value$plusargs("between=%s", between_f);
+    if (between && (!$value$plusargs("out_first=%s", first_f) || mid_reset > 0)) $fatal(1, "TB_model_run: +between needs +out_first and no +mid_reset");
+    busy_load = $test$plusargs("coef_busy");
+    if (tier < 0 || tier > 2) $fatal(1, "TB_model_run: +tier=%0d: 0, 1 or 2", tier);
     hold_wait = $test$plusargs("hold_wait");
     hold_check = $test$plusargs("hold_check");
     if (out_slots < 1 || out_slots > OUT_CAP || out_stall_pct < 0 || out_stall_pct > 90 || in_stall_pct < 0 || in_stall_pct > 90) begin
@@ -547,9 +589,11 @@ module TB_model_run #(
     por_n = 1;
     repeat (3) @(posedge clk_i);
 
-    for (int pass = (mid_reset > 0) ? 0 : 1; pass < 2; pass++) begin
+    for (int pass = (mid_reset > 0 || between) ? 0 : 1; pass < 2; pass++) begin
+      if (!(between && pass == 1)) coef_load();  // the lanes' coefficient memory, reset to its default with the rest (+between: loaded above)
       // Configure: the only control the software gives.
       #1;
+      cfg_tier_i = 2'(tier);
       cfg_m_i = 16'(m);
       cfg_kb_i = 16'(kb);
       cfg_n_i = 16'(n);
@@ -598,7 +642,14 @@ module TB_model_run #(
         last_ai = ai;
         last_wi = wi;
         last_sets = bounds.size();
-        if (pass == 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.G_LAYER.pipe.hm_any)) break;  // mid-stream, A credits held (+hold_wait: hold_mem waiting)
+        if (pass == 1 && busy_load && busy_tries < 4 && cycle - t0 >= 40) begin  // +coef_busy: words 0, 1 and two descriptor fields
+          coef_wr_i   = 1'b1;
+          coef_addr_i = (busy_tries < 2) ? 9'(busy_tries) : 9'(128 + busy_tries);
+          coef_data_i = 32'h4120_0000;
+          if (!coef_ready_o) busy_refused++;
+          busy_tries++;
+        end else if (busy_load) coef_wr_i = 1'b0;
+        if (pass == 0 && mid_reset > 0 && cycle - t0 >= mid_reset && a_cnt != 0 && (hold_wait == 0 || dut.G_LAYER.pipe.hm_any)) break;  // mid-stream, A credits held (+hold_wait: hold_mem waiting)
         if (idle > STALL_CYCLES) begin
           $display("[FATAL] nothing moved for %0d cycles: %0d/%0d activation rows, %0d/%0d weight rows, %0d sets done", idle, ai, na, wi,
                    nw, bounds.size());
@@ -606,6 +657,24 @@ module TB_model_run #(
         end
       end
       streaming = 0;
+      if (pass == 0 && between) begin  // the first run is done: write it out, load the next image with no reset, run again
+        repeat (OUT_CAP + 4) @(posedge clk_i);
+        fout = $fopen(first_f, "w");
+        for (int k = 0; k < bounds.size(); k++) begin
+          automatic int lo = (k == 0) ? 0 : bounds[k-1];
+          if (bounds[k] == lo) continue;
+          $fwrite(fout, "S %0d %0d\n", k, bounds[k] - lo);
+          for (int i = lo; i < bounds[k]; i++) $fwrite(fout, "%h\n", res_q[i]);
+        end
+        $fclose(fout);
+        $display("  [Between] first run: %0d sets, %0d outputs; loading %s with no reset", bounds.size(), res_q.size(), between_f);
+        coef_load_file(between_f);
+        #1 restream = 1;
+        @(posedge clk_i);
+        #1 restream = 0;
+        repeat (3) @(posedge clk_i);
+        continue;
+      end
       if (pass == 0) begin
         if (finished) begin
           $display("[FATAL] the layer finished before +mid_reset=%0d cycles: no mid-stream reset", mid_reset);
@@ -670,6 +739,13 @@ module TB_model_run #(
     @(negedge clk_i);
     drain_chk = 1'b0;
 
+    if (busy_load) begin
+      $display("[LAYER] coef busy: %0d writes while the layer streamed, %0d refused", busy_tries, busy_refused);
+      if (busy_tries != 4 || busy_refused != busy_tries) begin
+        failed++;
+        $display("[FAIL] +coef_busy: %0d of %0d writes taken while the layer streamed", busy_tries - busy_refused, busy_tries);
+      end
+    end
     fout = $fopen(out_f, "w");
     for (int k = 0; k < bounds.size(); k++) begin
       automatic int lo = (k == 0) ? 0 : bounds[k-1];

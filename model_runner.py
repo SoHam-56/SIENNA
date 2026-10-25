@@ -73,7 +73,7 @@ def op_hex(data, fmt: str) -> list:
     return [f"{int(b):04x}" for b in bits]
 
 
-# Polynomial terms per activation; no SIENNA RTL reads them (gpnae_poly's degree is in its table), kept for the untracked run_real_model.py.
+# The published Taylor lane's terms per activation; no RTL reads them (the lanes' degrees are coefficient-memory data), kept for the untracked run_real_model.py.
 ACTIVATION_TERMS = {"selu": 14, "sigmoid": 15, "tanh": 30, "relu": 0, "linear": 0}
 
 
@@ -203,19 +203,48 @@ def requant_params(acc, s_a: float, s_w, act: str, rng=None, zq=None) -> dict:
     return rq
 
 
-def int8_lane():
-    f = gpnae_model.FORMATS["int8"]
-    return gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+_INT8_LANES = {}
 
 
-def activate_int8(R, act: str, rq: dict) -> np.ndarray:
-    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters."""
+def int8_lane(mem=None):
+    """gpnae_model's int8 lane on the coefficient memory mem (default: the lanes' reset image)."""
+    if mem is not None:
+        return gpnae_model.Lane(gpnae_model.FORMATS["int8"], mem)
+    if "int8" not in _INT8_LANES:
+        _INT8_LANES["int8"] = gpnae_model.Lane(gpnae_model.FORMATS["int8"])
+    return _INT8_LANES["int8"]
+
+
+def activate_int8(R, act: str, rq: dict, tier: int = 0, mem=None) -> np.ndarray:
+    """The int8 lane stage: ReLU and linear pass the requantized value, the others run the fixed-point lane with the set's parameters,
+    at a tier of a coefficient memory (default the reset image)."""
     code = activation_to_code(act)
     R = np.asarray(R, np.int64)
     if code in (4, 5):
         return R.copy()
     par = gpnae_model.Int8Params(mx=rq["mx"], shx=rq["shx"], zin=rq["zp"], mout=rq["mout"], shout=rq["shout"], zout=rq["zout"])
-    return np.asarray(int8_lane().run(R, code, par), np.int64)
+    return np.asarray(int8_lane(mem).run(R, code, par, tier), np.int64)
+
+
+# ── the lanes' coefficient memory: the host's loader and its tier choice ──
+
+def coef_writes(mem) -> list:
+    """The load-path writes (address, data) that put a coefficient memory image (gpnae_model.Mem) into every lane."""
+    return mem.writes()
+
+
+def write_coef(path: str, mem) -> int:
+    """A load file for TB_model_run's and TB_sienna_model's +coef=: "aaa dddddddd" (hex address, data) per write; returns the count."""
+    w = coef_writes(mem)
+    with open(path, "w") as fh:
+        fh.write("".join(f"{a:03x} {d & 0xFFFFFFFF:08x}\n" for a, d in w))
+    return len(w)
+
+
+def pick_tier(tol: float) -> int:
+    """The cheapest tier whose tolerance is within tol: a layer that tolerates 10% runs tier 2, 5% tier 1, anything tighter tier 0."""
+    ok = [t for t, v in enumerate(gpnae_model.TIER_TOL) if v <= tol + 1e-12]
+    return max(ok) if ok else 0
 
 
 def drop_zp(act: str, rq: dict) -> int:
@@ -259,18 +288,18 @@ def add_lane_params(add: dict, s_out: float, y) -> dict:
                 s_out=s_out, s_selu=s_selu)
 
 
-def int8_residual_exact(A_q, B_q, hw_bias, rq: dict, R_q, add: dict, ra: dict, act: str) -> np.ndarray:
+def int8_residual_exact(A_q, B_q, hw_bias, rq: dict, R_q, add: dict, ra: dict, act: str, tier: int = 0, mem=None) -> np.ndarray:
     """the layer contract's int8 residual output for one product, bit-exact: the conv's requantize (q1), the ADD with the residual codes R_q, the lane."""
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
-    return activate_int8(qadd_codes(requantize(acc, rq), R_q, add), act, ra)
+    return activate_int8(qadd_codes(requantize(acc, rq), R_q, add), act, ra, tier, mem)
 
 
-def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str) -> np.ndarray:
+def int8_layer_exact(A_q, B_q, hw_bias, rq: dict, act: str, tier: int = 0, mem=None) -> np.ndarray:
     """the layer contract's int8 output for one product: int32 sums, per-column requantize, the lane; the layer engine neither pools nor drops out."""
     assert all(np.asarray(m).dtype == np.int64 and np.asarray(m).min() >= -128 and np.asarray(m).max() <= 127
                for m in (A_q, B_q)), "int8_layer_exact: operands must be int64 arrays of int8 values"  # as _golden_int8
     acc = wrap32(imatmul(A_q, B_q) + np.asarray(hw_bias, np.int64)[None, :])
-    return activate_int8(requantize(acc, rq), act, rq)
+    return activate_int8(requantize(acc, rq), act, rq, tier, mem)
 
 
 def word_bits(x, fmt: str) -> np.ndarray:
@@ -281,13 +310,18 @@ def word_bits(x, fmt: str) -> np.ndarray:
 _LANES = {}
 
 
-def exact_sum(passes, bias, act: str, N: int, fmt: str, T: int, collapse_k=None) -> np.ndarray:
-    """Bit-exact N x N result of one sum in a float format: mesh_model over its passes (A, B words) in order, the bias words in the reducer, then the GPNAE lane."""
+def exact_sum(passes, bias, act: str, N: int, fmt: str, T: int, collapse_k=None, tier: int = 0, mem=None) -> np.ndarray:
+    """Bit-exact N x N result of one sum in a float format: mesh_model over its passes (A, B words) in order, the bias words in the reducer, then the
+    GPNAE lane at tier of the coefficient memory mem (default the reset image)."""
     f = fpu.FORMATS[fmt]
-    if fmt not in _LANES:
-        _LANES[fmt] = gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+    if mem is not None:
+        lane = gpnae_model.Lane(f, mem)
+    else:
+        if fmt not in _LANES:
+            _LANES[fmt] = gpnae_model.Lane(f)
+        lane = _LANES[fmt]
     C = mesh_model.matmul(f, passes, N, T, COLLAPSE_K if collapse_k is None else collapse_k, bias)
-    return _LANES[fmt].run(C, activation_to_code(act))
+    return lane.run(C, activation_to_code(act), tier)
 
 
 def exact_layer(A, B, bias, act, N, fmt, T=4):
@@ -1012,7 +1046,7 @@ def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
 
 # ── 4. Device protocol: host to hardware; a silicon driver replaces 5-6 ──────
 
-ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae_poly
+ACT_CODE = {"relu": 4, "linear": 5}  # the bypass modes of gpnae
 ACT_CODES = {"linear": 5, "relu": 4, "selu": 1, "sigmoid": 2, "tanh": 3}
 
 

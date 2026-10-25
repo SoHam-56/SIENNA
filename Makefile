@@ -67,7 +67,6 @@ TOP_FILES = \
 	sienna_top.sv \
 	sienna_sched.sv \
 	sienna_pipe.sv \
-	gpnae_lane.sv \
 	requant_lanes.sv \
 	add_lanes.sv \
 	fwft.sv
@@ -83,15 +82,10 @@ SM_LIB_FILES = \
 	Multipliers/Radix4Booth/src/R4Booth.sv \
 	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
 	Multipliers/FP32/src/fp32Multiplier.sv \
-	Multipliers/FP/src/fpMultiplier.sv \
-	Multipliers/FPWiden/src/fpMulWiden.sv \
 	Multipliers/Int/src/intMultiplier.sv \
 	Adders/FP32/src/LZC.sv \
 	Adders/FP32/src/fp32Adder.sv \
-	Adders/FP/src/fpAdder.sv \
 	Adders/Int/src/intAdder.sv \
-	Converters/FPNarrow/src/fpNarrow.sv \
-	Multipliers/Fx/src/fxMac.sv \
 	Requantizer/src/int8Requantizer.sv \
 	QuantizedAdder/src/int8QuantizedAdder.sv \
 	Fmt/src/fmt_mul.sv \
@@ -101,20 +95,24 @@ SM_LIB_FILES = \
 	Multipliers/Int8/src/int8Multiplier.sv \
 	Adders/BF16/src/bf16Adder.sv \
 	Adders/Int32/src/int32Adder.sv \
-	Converters/FP32ToBF16/src/fp32ToBf16.sv
+	Converters/FP32ToBF16/src/fp32ToBf16.sv \
+	Multipliers/Int16/src/int16Multiplier.sv \
+	Multipliers/Int24/src/int24Multiplier.sv
 
-# gpnae_poly's lane only: the published gpnae.sv and its InputFIFO / SeLu / sigtan build in GPNAE's own Makefile.
+# The gpnae lane (GPNAE's own files; the units it picks are ArithmeticLibrary's, above).
 GPNAE_FILES = \
-	TYTAN/Memory/CoeffROM.v \
-	TYTAN/Memory/ROM.v \
-	TYTAN/LZC.v \
-	TYTAN/barrel_mac.sv \
-	fp32_down.sv \
-	gpnae_tail.sv \
-	gpnae_poly_int8.sv \
+	gpnae_pkg.sv \
 	lane_fifo.sv \
 	lane_link.sv \
-	gpnae_poly.sv
+	fixedPointMultiplyAdd.sv \
+	gpnae_horner.sv \
+	TYTAN/barrel_mac.sv \
+	gpnae_exp_split.sv \
+	gpnae_coef_mem.sv \
+	gpnae_act_in.sv \
+	gpnae_post.sv \
+	gpnae_tail.sv \
+	gpnae.sv
 
 MAXPOOL_FILES = \
 	Maxpool_2D.sv
@@ -182,7 +180,6 @@ MEM_DIRS := \
 	$(TB_DIR) \
 	$(SM_DIR) \
 	$(GPNAE_DIR) \
-	$(GPNAE_DIR)/TYTAN/Memory \
 	$(MAXPOOL_DIR) \
 	$(DROPOUT_DIR)
 
@@ -529,8 +526,7 @@ perf: VERILATOR_FLAGS += --stats --profile-cfuncs
 perf: verilator
 
 # check-fmt: no RTL outside the allowlist names a precision (ArithmeticLibrary's check_fmt.sh); GPNAE and SystolicMesh run their own; C4: a planted EXP_W must fail it.
-# src/gpnae_lane.sv gives B's gpnae_poly its EXP_W and MAN_W; Batch B's single gpnae removes it and this entry.
-FMT_ALLOW = ^(GPNAE|SystolicMesh)/|^src/gpnae_lane\.sv$$
+FMT_ALLOW = ^(GPNAE|SystolicMesh)/
 check-fmt:
 	@bash $(SM_LIB_DIR)/Common/check_fmt.sh $(PRJ_DIR) '$(FMT_ALLOW)' && echo "check-fmt OK: the tree passes" || { echo "check-fmt FAIL: the tree"; exit 1; }
 	@t=$$(mktemp -d); mkdir -p $$t/src; cp $(SRC_DIR)/sienna_pipe.sv $$t/src/; \

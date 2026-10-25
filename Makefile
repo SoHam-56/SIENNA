@@ -12,8 +12,8 @@ COLLAPSE_K ?= 1
 GEN_PKG ?= 1
 # Interpreter for the Python flows; tflite and model need the tflite package, e.g. PYTHON=<venv>/bin/python.
 PYTHON ?= python3
-# model_runner.py has no default model directory, so make model needs one.
-MODEL_DIR ?=
+# The MLPerf Tiny models make model and the model points run: models/ (NOTICE: sources, licenses, the inputs not committed); MODEL_DIR=<d> picks another.
+MODEL_DIR ?= $(PRJ_DIR)/models
 # Inferences per model in make model; make regression runs 3.
 MODEL_COUNT ?= 1
 # make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
@@ -301,7 +301,7 @@ help:
 	@echo ""
 	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
 	@echo "  make pipeline FMT=int8            - Full pipeline regression (TEST=<substring> narrows it)"
-	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
+	@echo "  make model FMT=bf16 [MODEL_DIR=<d>] - MLPerf Tiny models on the RTL (model_runner.py; no int8; default models/)"
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_top's layer contract (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
@@ -311,7 +311,7 @@ help:
 	@echo "  make idle-fault SET_PORT=0|1      - a put on the unused contract must fire a_idle_contract (regression.py --action idle-fault)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
 	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
-	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
+	@echo "  make regression [MODEL_DIR=<d>]   - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
 	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
 	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
 	@echo "  make regression-summary           - The table of the results in REG_DIR (default testbenches/results/regression)"
@@ -588,7 +588,7 @@ pipeline:
 # Format-aware runs (each script writes its own package and builds with GEN_PKG=0)
 # ─────────────────────────────────────────────────────────────────────────────
 model:
-	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models>; model_runner.py has no default"; exit 1; }
+	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
 	$(PYTHON) model_runner.py \
 		--model-dir $(MODEL_DIR) \
 		--n $(N) \

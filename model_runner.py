@@ -1854,6 +1854,21 @@ MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
 ACTIONS = ("model", "tflite")
 
 
+MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to supply one that is missing (models/NOTICE says why they are not committed)
+    "resnet8": (("data/cifar-10-batches-py/test_batch", "perf_samples_idxs.npy"), "run models/fetch_cifar10.sh"),
+    "ad01": (("normal_id_01_00000000_hist_librosa.bin",), "copy it into the model directory"),
+    "kws": (("marvin_617de221_0.wav",), "copy it into the model directory"),
+    "vww": ((), ""),
+}
+
+
+def missing_inputs(name, mdir):
+    """The files model name needs under mdir that are not there (its .tflite first), and how to supply them."""
+    files, how = MODEL_INPUTS[name]
+    miss = [f for f in (MODELS[name],) + files if not os.path.isfile(os.path.join(mdir, f))]
+    return miss, ("make regression MODEL_DIR=<directory with it>" if MODELS[name] in miss else how)
+
+
 def model_main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
@@ -1914,7 +1929,16 @@ def model_main(argv=None):
     tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": [],
              "runs": {}, "rep_seen": set(), "rep_failed": set()}
     results = {}
-    models = a.models.split(",")
+    models, skipped = a.models.split(","), []
+    for name in list(models):  # a model whose input files are absent is skipped by name, not failed
+        miss, how = missing_inputs(name, a.model_dir)
+        if miss:
+            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({how})")
+            models.remove(name)
+            skipped.append(name)
+    if not models:
+        log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
+        return
     for name in models:
         model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
         if name == "resnet8" and a.ref_accuracy:
@@ -1986,7 +2010,8 @@ def model_main(argv=None):
     log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(tally['runs'])} of {len(models)} models ran, "
         f"{tally['inferences']} inferences; hardware: {tally['bad_layers']} of {tally['layers']} layers fail ({how}); "
         f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; other failures: {len(extra)}; "
-        f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}")
+        f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}"
+        + (f"; skipped (inputs absent): {', '.join(skipped)}" if skipped else ""))
     if not ok:
         sys.exit(1)
 

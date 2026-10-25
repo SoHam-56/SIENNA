@@ -4638,15 +4638,23 @@ def test_add_lanes_real_clamp():
 
 
 @selftest
-def test_model_points_need_model_dir():
+def test_model_points_skip_without_models():
+    """A model point with no model directory (unset, missing or holding no model) is SKIPPED, not failed; make's default is the repo's models/;
+    inside a run a model whose input files are absent is skipped by name, and a run that ran no model fails."""
     with tempfile.TemporaryDirectory() as d:
         o = lambda md: type("O", (), {"model_dir": md})()
-        assert SPEC.not_run("fp32/N8_T2/pipeline", o("")) is None and SPEC.not_run("fp32/N8_T2/model", o(d)).startswith(f"MODEL_DIR={d} is missing pretrainedResnet.tflite")
-        assert "MODEL_DIR unset" in SPEC.not_run("bf16/N8_T2/model", o("")) and "does not exist" in SPEC.not_run("bf16/N8_T2/model", o(d + "/x"))
-        assert all("make regression MODEL_DIR=<directory with pretrainedResnet.tflite, ad01_fp32.tflite" in SPEC.not_run("fp32/N8_T2/model", o(x)) for x in ("", d))
-        for m in mr.MODELS.values():
-            open(os.path.join(d, m), "w").write("")
-        assert SPEC.not_run("fp32/N8_T2/model", o(d)) is None
+        assert SPEC.skipped("fp32/N8_T2/pipeline", o("")) is None and SPEC.skipped("selftest", o("")) is None and SPEC.skipped("add-lanes", o("")) is None
+        assert SPEC.skipped("fp32/N8_T2/model", o("")) == "no MODEL_DIR" and SPEC.skipped("bf16/N8_T2/model-ck0", o(d + "/x")).startswith("no MODEL_DIR")
+        assert SPEC.skipped("fp32/N8_T2/model", o(d)) == f"no MODEL_DIR ({d} holds no model)"
+        open(os.path.join(d, "vww_96_float.tflite"), "w").write("")
+        assert SPEC.skipped("fp32/N8_T2/model", o(d)) is None
+        assert mr.missing_inputs("vww", d) == ([], "") and mr.missing_inputs("kws", d)[0] == ["kws_ref_model_float32.tflite", "marvin_617de221_0.wav"]
+    shipped = os.path.join(ROOT, "models")
+    assert all(os.path.isfile(os.path.join(shipped, m)) for m in mr.MODELS.values()) and SPEC.skipped("fp32/N8_T2/model", o(shipped)) is None
+    assert mr.missing_inputs("resnet8", shipped)[1] == "run models/fetch_cifar10.sh" or not mr.missing_inputs("resnet8", shipped)[0]
+    r = subprocess.run(["make", "-s", "-n", "model", "PYTHON=py"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
+    assert f"--model-dir {shipped} " in r.stdout and "/proj/" not in r.stdout.replace(ROOT, "<root>"), r.stdout[-300:]
+    assert SPEC.verdict("fp32/N8_T2/model", "MODEL GATE: SKIPPED (no model has its files in /m)\n", 0) == "FAIL (MODEL GATE: SKIPPED: no model ran)"
 
 
 @selftest
@@ -6125,6 +6133,8 @@ class SiennaSpec(regress.Spec):
         if k == "tflite" and self.parse(name)["n"] >= 16 and self.parse(name)["ck"] == 1:  # the packed TFLite layers run there too (collapse-k 1 only)
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS", r"^TFLITE_PACK: \d+ of \d+ models in \d+ packed layers at N = \d+, 0 failing$"),
                                           (r"^MODEL GATE: FAIL", r"^TFLITE_PACK: .*, [1-9]\d* failing$"))
+        if k == "model" and re.search(r"^MODEL GATE: SKIPPED", text, re.M):  # a directory with models but none with its inputs
+            return "FAIL (MODEL GATE: SKIPPED: no model ran)"
         if k in ("model", "tflite"):
             return regress.marker_verdict(text, rc, (r"^MODEL GATE: PASS",), (r"^MODEL GATE: FAIL",))
         if k == "residual":
@@ -6142,17 +6152,14 @@ class SiennaSpec(regress.Spec):
                 need += [lane_case_line("sets " + t, LANE_CASES[t]) for t in SET_LANE_CASES]
         return regress.marker_verdict(text, rc, [r"^grid_\d+x\d+x\d+ "] + need, (r"^FAIL ",))
 
-    def not_run(self, name, opts):
-        if self.parse(name)["kind"].removesuffix("-ck0") != "model":
+    def skipped(self, name, opts):
+        """A model point with no model directory, or one holding none of the models, is skipped (make regression defaults MODEL_DIR to models/)."""
+        if name in ("selftest", DEFAULT_POINT) or name in UNIT_POINTS or name in FAULT_POINTS or self.parse(name)["kind"].removesuffix("-ck0") != "model":
             return None
-        d, need = getattr(opts, "model_dir", ""), list(mr.MODELS.values())
-        how = f"make regression MODEL_DIR=<directory with {', '.join(need)}>"
-        if not d:
-            return f"MODEL_DIR unset: the model points need {how}"
-        if not os.path.isdir(d):
-            return f"MODEL_DIR={d} does not exist: {how}"
-        missing = [m for m in need if not os.path.isfile(os.path.join(d, m))]
-        return f"MODEL_DIR={d} is missing {', '.join(missing)}: {how}" if missing else None
+        d = getattr(opts, "model_dir", "")
+        if not d or not os.path.isdir(d) or not any(os.path.isfile(os.path.join(d, m)) for m in mr.MODELS.values()):
+            return "no MODEL_DIR" + (f" ({d} holds no model)" if d else "")
+        return None
 
 
 SPEC = SiennaSpec(ROOT, os.path.join(ROOT, "testbenches", "results", "regression"))

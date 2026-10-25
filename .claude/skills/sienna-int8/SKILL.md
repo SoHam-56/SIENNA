@@ -85,7 +85,7 @@ int8 models. **2b** (own spec, after 2a passes) runs the four MLPerf Tiny int8 m
 - **G0, oracle:** TensorFlow installed (quota checked first); requantize and int8 conv / FC Python reference, bit-exact
   against the TFLite interpreter (reference kernels) on thousands of random cases; the rounding variant recorded;
   single-layer int8 TFLite models (3x3 conv, fully connected) with known quantization generated for G4.
-- **G1, ArithmeticLibrary:** each new unit gets the float units' DV (DPI reference TB, Vivado vectors, Makefile).
+- **G1, ArithmeticLibrary:** each new unit gets the float units' DV (DPI reference TB, Makefile).
   int8 x int8 multiplier exhaustive (65,536 pairs); int32 adder corners incl. wrap plus random; 16-bit fixed-point
   multiply / add exhaustive where feasible; requantize unit corners (INT_MIN, largest multiplier, every shift) plus
   10^6 random against the G0 reference. fp32 / bf16 units unchanged.

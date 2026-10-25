@@ -442,7 +442,7 @@ of the project. `TB_gpnae.sv` itself is unchanged and still has the dead
 
 ## 9. Duplicate module definitions across the build — FIXED (one ArithmeticLibrary in the top build)
 
-**Was latent, and flagged by Vivado.** The root `Makefile` listed both `ArithmeticLibrary` checkouts (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `LZC`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` were each compiled twice, and Verilator was silenced with `--Wno-MODDUP`. The `cntlz8` copy in `GPNAE/src/TYTAN/LZC.v` had already been removed.
+**Was latent, and flagged by FPGA synthesis.** The root `Makefile` listed both `ArithmeticLibrary` checkouts (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `LZC`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` were each compiled twice, and Verilator was silenced with `--Wno-MODDUP`. The `cntlz8` copy in `GPNAE/src/TYTAN/LZC.v` had already been removed.
 
 **Fixed.** The root `Makefile` now compiles only `SystolicMesh/ArithmeticLibrary` and only the GPNAE files the `gpnae_poly` lanes use (the published `gpnae.sv` with `InputFIFO`, `SeLu` and `sigtan` builds in GPNAE's own `Makefile`), and `--Wno-MODDUP` is gone; `synth/sienna_rtl.f` lists the same set. The two checkouts remain because each submodule must build standalone; keep them on the same commit by fast-forwarding `GPNAE/ArithmeticLibrary` from `SystolicMesh/ArithmeticLibrary` and bumping both pointers together.
 
@@ -473,7 +473,7 @@ for (int k = 0; k < NUM_PP; k++) begin
 end
 ```
 
-Non-blocking assignments in a loop mean only the last iteration takes effect, and `sum_final` is never read. The real output comes from the `adder_tree_comb` `always_comb` block below it. Vivado confirms:
+Non-blocking assignments in a loop mean only the last iteration takes effect, and `sum_final` is never read. The real output comes from the `adder_tree_comb` `always_comb` block below it. FPGA synthesis confirms:
 
 ```
 WARNING: [Synth 8-6014] Unused sequential element sum_final_reg was removed.
@@ -494,7 +494,7 @@ The golden model matches this — `apply_dropout(..., training=False)` also retu
 
 ## 13. Synthesis: memories inferred as registers
 
-**Confirmed (reproduced).** From `VIVADO/SIENNA.runs/synth_1/`, targeting `xc7a200tfbg484-3`:
+**Confirmed (reproduced).** From an FPGA synthesis run targeting `xc7a200tfbg484-3`:
 
 | Resource | Used | Available | Util |
 |---|---|---|---|
@@ -514,7 +514,7 @@ WARNING: [Synth 8-4767] Trying to implement RAM 'gpnae_out_mem_reg' in registers
 
 `fwft`'s asynchronous reset over the whole memory array and `gpnae_out_mem`'s access pattern both block BRAM inference. Converting those to BRAM-friendly forms — synchronous-reset or no-reset memory, single write port, registered read — is the highest-leverage area reduction available.
 
-0 DSPs is expected rather than a defect: the FP32 units are custom logic built from `R4Booth` and Karatsuba stages, not `A*B` expressions that Vivado would map onto DSP48 slices.
+0 DSPs is expected rather than a defect: the FP32 units are custom logic built from `R4Booth` and Karatsuba stages, not `A*B` expressions that synthesis would map onto DSP slices.
 
 There is also a cluster of `[Synth 8-7137] ... has both Set and reset with same priority ... may cause simulation mismatches` warnings on `fwft`'s `mem_reg` and on `sienna_top`'s `fifo2_wr_data_reg`, which are worth resolving on their own.
 
@@ -697,8 +697,8 @@ call. The mesh sim now runs under `stdbuf -oL`, so a crash log shows how far it 
 | Low exact-match percentages | not a bug — truncating FP units |
 | `exp=0.000000 act=0.000000` in log lines | 7 — the conversion really is broken, not the formatting |
 | SELU negatives wrong above \|x\| ≈ 2.5 | 5d (fixed) |
-| Vivado `cntlz8` critical warning | 9 — GPNAE-only builds are clean now |
-| Vivado "unused sequential element" warnings | 11 |
+| Synthesis `cntlz8` critical warning | 9 — GPNAE-only builds are clean now |
+| Synthesis "unused sequential element" warnings | 11 |
 | 98% LUT utilization | 13 |
 
 A note on test strength, from an episode worth not repeating. While a

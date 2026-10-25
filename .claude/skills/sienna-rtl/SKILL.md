@@ -7,7 +7,7 @@ description: Working knowledge of the SIENNA SystemVerilog accelerator repo — 
 
 > **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 
-A Float32 neural-network accelerator pipeline in SystemVerilog, simulated with Verilator (primary) and VCS, synthesized with Vivado. One matrix flows end to end: matmul, then an activation function, then 2-D max pooling, then dropout.
+A Float32 neural-network accelerator pipeline in SystemVerilog, simulated with Verilator (primary) and VCS. One matrix flows end to end: matmul, then an activation function, then 2-D max pooling, then dropout.
 
 Read `references/architecture.md` before changing dataflow or FSMs, `references/verification.md` before touching a testbench or the regression scripts, and **`references/known-issues.md` before debugging anything** — several live defects are catalogued there with evidence, and re-deriving them costs hours. `references/file-map.md` says what every file is and, importantly, which ones are dead.
 For anything involving a second matrix or a stream of sets, read the `sienna-back-to-back`
@@ -226,7 +226,7 @@ Adding a design file means adding it to the appropriate `*_FILES` list in the ro
 
 Cycle counts and utilization figures quoted around this project have two very different provenances, and they get conflated easily:
 
-- **Measured**: SystolicMesh cycle counts (399/849/1797/3885 for N=16 at T=2/4/8/16), the 18,769-cycle end-to-end tanh latency, and the Vivado synthesis numbers (98.26% LUT, 18.05% FF, 4 BRAM tiles, 0 DSPs on `xc7a200tfbg484-3`). These come from real runs and are reproducible.
+- **Measured**: SystolicMesh cycle counts (399/849/1797/3885 for N=16 at T=2/4/8/16), the 18,769-cycle end-to-end tanh latency, and the FPGA synthesis numbers (98.26% LUT, 18.05% FF, 4 BRAM tiles, 0 DSPs on `xc7a200tfbg484-3`). These come from real runs and are reproducible.
 - **Modeled**: every GOPS and GB/s figure in `performance_analysis_report.log`, and all INT8 projections. They assume a 950 MHz FP32 clock and a 1.5 GHz INT8 clock that no timing run has demonstrated, plus an assumed 16× area ratio. The report labels these as back-calculations; keep that label when quoting them.
 
 `performance_analysis_report.log` is untracked and its RTL breakdown was written by inspection, so treat its per-stage cycle attribution as an argument rather than an instrumented measurement.

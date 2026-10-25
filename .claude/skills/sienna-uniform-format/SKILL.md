@@ -94,7 +94,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
 - **Each new unit gets the fp32 units' DV infrastructure** (Soham's requirement): a Verilator
   testbench against Berkeley SoftFloat through DPI (fp16 natively; bf16 via f32 then narrowed),
   corner cases plus random pairs, flag checks with the same flush-to-zero handling and ulp rule as
-  TB_fp32Multiplier/TB_fp32Adder; a Vivado testbench with `gen_vectors.cpp` + `vectors.mem`; a
+  TB_fp32Multiplier/TB_fp32Adder; a
   Makefile. Plus: at (8, 23) each generic unit must match the fp32 unit bit for bit on all vectors.
   Done: 205,776 vectors identical at (8, 23); bf16 exhaustive over all 2^32 operand pairs, 0 errors
   per unit. The bf16 reference computes in f32 with round-to-odd, then narrows by nearest-even; its

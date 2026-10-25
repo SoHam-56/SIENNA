@@ -148,13 +148,8 @@ Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`
 |---|---|---|
 | `Adders/FP32/testbenches/TB_fp32Adder.sv` | live | DPI-C against SoftFloat, ±3 ULP, 2000 random vectors |
 | `Multipliers/FP32/testbenches/TB_fp32Multiplier.sv` | live | DPI-C against SoftFloat, ±2 ULP |
-| `Adders/FP32/testbenches/TB_fp32AdderVIVADO.sv` | live | Same plan, reads `vectors.mem` instead of DPI-C |
-| `Multipliers/FP32/testbenches/TB_fp32MultiplierVIVADO.sv` | live | Same |
 | `Multipliers/Karatsuba/testbenches/TB_karatsuba.sv` | live | Signed and unsigned against native `*` |
-| `*/testbenches/generate_vectors.sh` | live | Builds SoftFloat, compiles `gen_vectors.cpp`, emits `vectors.mem` |
-| `Adders/FP32/testbenches/berkeley-softfloat-3/` | third party | The IEEE-754 reference model, not design source; the one copy, used by Adders/FP32, Multipliers/FP32, Adders/FP, Multipliers/FP and Common's `generate_vectors.sh` |
-
-`ArithmeticLibrary/README.md` is not about the library — it documents the Vivado DPI linker workaround (symlinking Vivado's bundled `ld` to the system one).
+| `Adders/FP32/testbenches/berkeley-softfloat-3/` | third party | The IEEE-754 reference model, not design source; the one copy, used by Adders/FP32 and Multipliers/FP32 |
 
 ---
 
@@ -163,8 +158,7 @@ Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`
 | Path | What it is |
 |---|---|
 | `Verilator/` | Verilator object directory, compiled binary, copied `.mem` files |
-| `VCS/`, `VIVADO/` | VCS and Vivado working directories |
-| `VIVADO/SIENNA.runs/synth_1/runme.log` | Synthesis log. Source of the utilization and critical-warning evidence in issue 13 |
+| `VCS/` | VCS working directory |
 | `SystolicMesh/testbenches/results/readiness/` | 36 IP regression logs plus `readiness_report.md` |
 | `__pycache__/` | Python bytecode |
 

@@ -46,8 +46,8 @@ TB_DIR      = $(PRJ_DIR)/testbenches
 SM_DIR      = $(PRJ_DIR)/SystolicMesh/src
 SM_LIB_DIR  = $(PRJ_DIR)/SystolicMesh/ArithmeticLibrary
 GPNAE_DIR   = $(PRJ_DIR)/GPNAE/src
-MAXPOOL_DIR = $(PRJ_DIR)/Maxpool
-DROPOUT_DIR = $(PRJ_DIR)/Dropout
+MAXPOOL_DIR = $(SRC_DIR)/pool
+DROPOUT_DIR = $(SRC_DIR)/dropout
 
 # FMT ?= fp32; any value but fp32, bf16 or int8 stops make; FMT_DEF is the build's +define+FMT_<FMT>, which sienna_fmt_pkg reads.
 # A command-line FMT_DEF= builds with no define, which must elaborate fp32 (make regression's default point).
@@ -68,12 +68,12 @@ ACTIVATION ?= tanh
 PKG_TEST = $(or $(TEST),matmul_relu_nopool)
 
 TOP_FILES = \
-	sienna_top.sv \
-	sienna_sched.sv \
-	sienna_pipe.sv \
-	requant_lanes.sv \
-	add_lanes.sv \
-	fwft.sv
+	top/sienna_top.sv \
+	pipeline/sienna_sched.sv \
+	pipeline/sienna_pipe.sv \
+	lanes/requant_lanes.sv \
+	lanes/add_lanes.sv \
+	fifo/fwft.sv
 
 SM_FILES = \
 	top/SystolicMesh.sv \
@@ -217,8 +217,8 @@ VERILATOR_FLAGS = \
 	-Wno-UNOPTTHREADS \
 	-MAKEFLAGS OPT_FAST=$(OPT_FAST) \
 	--sv \
-	-I$(SRC_DIR) \
-	-I$(TB_DIR) \
+	-I$(SRC_DIR)/top \
+	-I$(TB_DIR)/top \
 	-I$(SM_DIR) \
 	-I$(SM_LIB_DIR) \
 	-I$(GPNAE_DIR) \
@@ -252,12 +252,12 @@ VERILATOR_FLAGS += --trace --trace-structs --trace-max-array 2048 --trace-max-wi
 endif
 
 # VCS: the same include paths and define, EXTRA_FLAGS' -G as -pvalue+ and -D as +define+, LINK_STAGES; sim.mk keeps it plain (TRACE=vcd adds waveforms).
-VCS_FLAGS = +incdir+$(SRC_DIR) +incdir+$(TB_DIR) +incdir+$(SM_DIR) +incdir+$(SM_LIB_DIR) +incdir+$(GPNAE_DIR) +incdir+$(MAXPOOL_DIR) +incdir+$(DROPOUT_DIR) \
+VCS_FLAGS = +incdir+$(SRC_DIR)/top +incdir+$(TB_DIR)/top +incdir+$(SM_DIR) +incdir+$(SM_LIB_DIR) +incdir+$(GPNAE_DIR) +incdir+$(MAXPOOL_DIR) +incdir+$(DROPOUT_DIR) \
 	$(FMT_DEF) $(call vcs_g,$(TOP_MODULE),$(filter -G%,$(EXTRA_FLAGS))) $(patsubst -D%,+define+%,$(filter -D%,$(EXTRA_FLAGS))) \
 	$(filter +define+%,$(EXTRA_FLAGS)) $(if $(filter-out 0,$(LINK_STAGES)),-pvalue+$(TOP_MODULE).LINK_STAGES=$(LINK_STAGES))
 # A VCS build is <VCS_DIR>/<TOP_MODULE>_sim, run in VCS_DIR as Verilator's in VERILATOR_DIR; its key hashes every source and include file, as BUILD_KEY's dependency list does.
 VCS_BIN = $(VCS_DIR)/$(TOP_MODULE)_sim
-VCS_BUILD_KEY = { for f in $(sort $(DESIGN_FILES) $(TB_DIR)/$(TESTBENCH) $(wildcard $(TB_DIR)/*.svh $(SRC_DIR)/*.svh)); do md5sum "$$f"; done; \
+VCS_BUILD_KEY = { for f in $(sort $(DESIGN_FILES) $(TB_DIR)/top/$(TESTBENCH) $(wildcard $(TB_DIR)/top/*.svh $(SRC_DIR)/top/*.svh)); do md5sum "$$f"; done; \
 	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
 	echo '$(TOP_MODULE) $(VCS_OPTS) $(VCS_FLAGS)'; }
 
@@ -417,7 +417,7 @@ verilator: $(PKG_DEP)
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
-		$(TB_DIR)/$(TESTBENCH) \
+		$(TB_DIR)/top/$(TESTBENCH) \
 		-o $(TOP_MODULE)_sim
 	@echo "-- Compiling Verilator C++ model"
 	$(MAKE) -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
@@ -483,7 +483,7 @@ endif
 	$(VCS) $(VCS_OPTS) -top $(TOP_MODULE) -Mdir=$(VCS_DIR)/csrc_$(TOP_MODULE) -o $(VCS_BIN) $(VCS_FLAGS) \
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
-		$(TB_DIR)/$(TESTBENCH)
+		$(TB_DIR)/top/$(TESTBENCH)
 	@$(VCS_BUILD_KEY) > $(VCS_BIN).build_key.txt
 	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running simulation"
@@ -517,7 +517,7 @@ lint: $(PKG_DEP)
 		$(VERILATOR_FLAGS) \
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
-		$(TB_DIR)/$(TESTBENCH)
+		$(TB_DIR)/top/$(TESTBENCH)
 	@echo "-- Lint complete"
 
 debug: VERILATOR_FLAGS += --debug --gdbbt
@@ -530,16 +530,16 @@ perf: verilator
 FMT_ALLOW = ^(GPNAE|SystolicMesh)/
 check-fmt:
 	@bash $(SM_LIB_DIR)/Common/check_fmt.sh $(PRJ_DIR) '$(FMT_ALLOW)' && echo "check-fmt OK: the tree passes" || { echo "check-fmt FAIL: the tree"; exit 1; }
-	@t=$$(mktemp -d); mkdir -p $$t/src; cp $(SRC_DIR)/sienna_pipe.sv $$t/src/; \
-	sed -i 's/^endmodule/  localparam int EXP_W = 8;\nendmodule/' $$t/src/sienna_pipe.sv; \
+	@t=$$(mktemp -d); mkdir -p $$t/src/pipeline; cp $(SRC_DIR)/pipeline/sienna_pipe.sv $$t/src/pipeline/; \
+	sed -i 's/^endmodule/  localparam int EXP_W = 8;\nendmodule/' $$t/src/pipeline/sienna_pipe.sv; \
 	if bash $(SM_LIB_DIR)/Common/check_fmt.sh $$t '$(FMT_ALLOW)' > $$t/c4.log; then echo "check-fmt FAIL: C4 planted EXP_W passed"; exit 1; \
 	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
 	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
 
 # check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna_top) and 0 (TB_model_run), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py), the lanes' set exactly.
 check-hier: $(PKG_DEP)
-	@$(PYTHON) $(PRJ_DIR)/check_hier.py --verilator $(VERILATOR) --out $(PRJ_DIR)/Verilator_hier \
-	  --inc $(SRC_DIR) $(TB_DIR) $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR) --files $(DESIGN_FILES) $(PKG_FILE)
+	@$(PYTHON) $(PRJ_DIR)/scripts/check_hier.py --verilator $(VERILATOR) --out $(PRJ_DIR)/Verilator_hier \
+	  --inc $(SRC_DIR)/top $(TB_DIR)/top $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR) --files $(DESIGN_FILES) $(PKG_FILE)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # File listing / checking
@@ -589,7 +589,7 @@ pipeline:
 # ─────────────────────────────────────────────────────────────────────────────
 model:
 	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
-	$(PYTHON) model_runner.py \
+	$(PYTHON) scripts/model_runner.py \
 		--model-dir $(MODEL_DIR) \
 		--n $(N) \
 		--tile-size $(TILE) \
@@ -617,13 +617,13 @@ perf-analysis:
 
 tflite:
 	@[ "$(FMT)" = int8 ] || { echo "ERROR: make tflite runs the int8 TFLite models only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
-	$(PYTHON) model_runner.py --action tflite \
+	$(PYTHON) scripts/model_runner.py --action tflite \
 		--n $(N) \
 		--tile-size $(TILE) \
 		--lanes $(LANES) \
 		--collapse-k $(COLLAPSE_K)
 	@# the packed TFLite layers too, where a block of 8 fits N / 2 (N >= 16); the collapse-k 0 mesh refuses packed sets
-	$(if $(shell [ $(N) -ge 16 ] && [ $(COLLAPSE_K) = 1 ] && echo y),$(PYTHON) model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
+	$(if $(shell [ $(N) -ge 16 ] && [ $(COLLAPSE_K) = 1 ] && echo y),$(PYTHON) scripts/model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
 
 # int8 residual layers and the residual-block TFLite models on TB_model_run (regression.py --action residual); int8 only
 residual:
@@ -650,11 +650,11 @@ add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv $(TB_DIR)/TB_add_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv $(TB_DIR)/units/TB_add_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
-	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv \
-	  $(TB_DIR)/TB_add_lanes.sv -o sim
+	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv \
+	  $(TB_DIR)/units/TB_add_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim $(SIM_RUN) | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
@@ -666,10 +666,10 @@ rq-lanes:
 	mkdir -p $(RQL_DIR)
 	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
-	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv -o sim
+	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim $(SIM_RUN) | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }

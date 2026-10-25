@@ -1330,9 +1330,13 @@ module TB_sienna #(
     // hold (Review Focus 3): from the first words of set hold_set, every L9 credit is withheld for HOLD_CYC cycles; the outputs must equal the first plain pass's.
     // hold_set leaves SETS_IN_FLIGHT+4 sets to put after it where k_num_sets allows (else set 0), so the buffers fill and the host is blocked.
     // The host must end up blocked when it has more sets left than the entry admits: by staging credits once the banks are full, or by the entry first (fewer credits, or partial sums that hold no result bank).
-    // HOLD_CYC: at least 500, and long enough for the host to put SETS_IN_FLIGHT + 2 sets of N*N/HOST_WORDS row cycles and a put each (N = 64: 1156).
+    // HOLD_CYC: at least 500, and SETS_IN_FLIGHT + 2 sets at the slower of the host's put and the mesh's set interval max(T+2, K, T^2) (N = 64: 1156 at T = 8, 17408 at T = 32).
     localparam int HOST_SET_CYC = (N * N + HOST_WORDS - 1) / HOST_WORDS + 4;
-    localparam int HOLD_CYC = ((SETS_IN_FLIGHT + 2) * HOST_SET_CYC > 500) ? (SETS_IN_FLIGHT + 2) * HOST_SET_CYC : 500;
+    localparam int MESH_K = (COLLAPSE_K != 0) ? N : TILE_SIZE;  // the depth each array multiplies
+    localparam int MESH_SET_CYC = (TILE_SIZE * TILE_SIZE > MESH_K) ? ((TILE_SIZE * TILE_SIZE > TILE_SIZE + 2) ? TILE_SIZE * TILE_SIZE : TILE_SIZE + 2)
+                                                                   : ((MESH_K > TILE_SIZE + 2) ? MESH_K : TILE_SIZE + 2);
+    localparam int SET_CYC = (MESH_SET_CYC > HOST_SET_CYC) ? MESH_SET_CYC : HOST_SET_CYC;
+    localparam int HOLD_CYC = ((SETS_IN_FLIGHT + 2) * SET_CYC > 500) ? (SETS_IN_FLIGHT + 2) * SET_CYC : 500;
     logic [DATA_WIDTH-1:0] ref_results[$];  // the first plain pass's words and set boundaries
     int ref_bounds[$];
     task automatic stream_all_sets(input int id_base, input bit overrun, input bit close_fill, input bit hold = 0);

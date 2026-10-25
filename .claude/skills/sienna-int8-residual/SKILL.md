@@ -3,7 +3,7 @@ name: sienna-int8-residual
 description: Use when designing, building or verifying SIENNA's int8 residual ADD (the generic affine int8QuantizedAdder gated on the true function - add_lanes, the hold/add set pair through the identity pass, hold_mem, the ADD words add_words_t) or the int8 GPNAE sigmoid breakpoint ladder for |x| >= 2.5; the pre-synthesis RTL part of int8 sub-project 2b.
 ---
 
-> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/pipeline/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 
 # int8 pre-synthesis RTL: residual ADD and the sigmoid ladder (spec; decisions approved by Soham 2026-10-10)
 
@@ -26,10 +26,10 @@ Departures from the spec, each with its reason (plan `implementation-plan.md`, d
 - **P-4** the polynomial fit still scores tables on the 2a lane, so `poly_coeffs_int8.mem` is byte-identical.
 - **P-5** two rescales per threshold in the ladder edge sets.
 - **P-6** (Ruling F26, spec row D5) the device-protocol half of the host interface: the layer file's `A` line, `write_layer` from `job["add"]`, `RtlLayer.run_job`; model lowering of the ADD stays 2b.
-- **P-7** set-level tests in `TB_sienna_top` (nine `int8_residual_*` tests; `_one_pair` added in Task 2.9), layer cases in `sienna_layer` / `TB_model_run` (`regression.py --action residual`: resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add).
+- **P-7** set-level tests in `TB_sienna (pipeline)` (nine `int8_residual_*` tests; `_one_pair` added in Task 2.9), layer cases in `sienna_layer` / `TB_sienna (layer)` (`regression.py --action residual`: resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add).
 - **P-8** exhaustive ADD pairs checked from a dump (history with G1).
 - **P-9** reversed by Task 2.10b: `--action perf` models the residual tests; validated per test against measured cycles (PERF MODEL: PASS, 805 test-points; control `m_perf_sig` fails).
-- **F3** every stage of a residual layer is gated from `TB_model_run`'s per-stage dumps (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane).
+- **F3** every stage of a residual layer is gated from `TB_sienna (layer)`'s per-stage dumps (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane).
 - **D6 (review row)** the set-level tests, the layer cases and the TFLite blocks run in both mesh modes (collapse-k 1 and 0) and at random power-up.
 - **Changed words against main 9fa414e** (G4, N = 8 and 16, every tile size; per test in the G4 report): fp32 only 3 words in each of 2 mixed tests with tanh at N = 16 (T_TINY, Task 1.16); bf16 words in 22 tests with a sigmoid, tanh or SELU set (134,112 words over 154 test-points) and their cycles in 118 test-points (Decision 5: the fp32 tail and refits); int8 cycles and results identical everywhere, words changed in 238 test-points: the 6 `req_random` tests 157,649 words (redrawn for the new units), 13 sigmoid and SELU tests 14,053 (the ladder, Task 1.16's SELU, rounding), 20 others 1,030, at most 39 in one test-point (round half up at ties). Every changed word passes the true-function gates.
 - **Crosses (spec Risk 3)** hold done with an L3 grant: reached at 6 of 7 points (0 at N16 T16); hold done with a bank done: unreachable by design (`a_hold_done_no_bank`, shown firing by a forced mutant); an add set's last beat with the next accept: excluded by design (`rq_room` reads `busy_o`; `a_add_last_no_accept`, shown firing by `m_roomonly`).
@@ -228,12 +228,12 @@ G_POST cycle, k moves into a 5-bit buffer written beside `x_buf`, still at no cy
     set) and `_two_layers` (two ADD layers with different constants). They run with `zp_random`, `req_random` and random
     ADD scales at N = 8, 16 and 32, in both mesh modes and at random power-up, and must be bit-exact.
   - A residual-block TFLite model (conv 3x3 with no activation, + ADD(x), ReLU), and its 1x1-shortcut variant as two
-    layers, run through `TB_model_run` and must equal the interpreter bit for bit. They use regression.py's TFLite path,
+    layers, run through `TB_sienna (layer)` and must equal the interpreter bit for bit. They use regression.py's TFLite path,
     not model_runner.
   - Every existing int8 test keeps identical cycles. Its words are identical except in sigmoid tests with some
     |x| >= 2.5; that count is reported.
   - fp32 and bf16 stay identical in results, cycles and words.
-  - `TB_sienna_top` crosses hold / add pairs with partial sets, ReLU drains, lane sets and a full bank. Mutants that
+  - `TB_sienna (pipeline)` crosses hold / add pairs with partial sets, ReLU drains, lane sets and a full bank. Mutants that
     must fail: a hold read one beat off, zp_1 taken from the add set, the drop value taken from `pe_zp`, and `rq_room`
     left unwidened (`a_fill_one_source` fires).
 
@@ -258,7 +258,7 @@ Latency:
 1. The ADD semantics are not verified locally. No RTL is written until G0b passes.
 2. The int8 ResNet-8 model is not in the repo. Its structure comes from the float model, assuming conversion keeps it;
    G4's TFLite residual-block models check the converter's actual form.
-3. The hold set is a new kind of set in a credit-verified stage, the coincidence-invariant bug class. TB_sienna_top
+3. The hold set is a new kind of set in a credit-verified stage, the coincidence-invariant bug class. TB_sienna (pipeline)
    targets the same-cycle cases: a hold done with a lane set's `bank_done`, the L6 release with an `l3_grant`, and an add
    set's last beat with the next accept.
 4. `hold_mem`'s ordering rests on `a_rq_one_set`, which has 0 margin. If that invariant is relaxed later, `hold_mem` needs

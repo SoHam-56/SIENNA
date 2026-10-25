@@ -345,7 +345,7 @@ This may well interact with issue 3.
 
 ## 7. Every testbench's tolerance check measures the wrong thing — FIXED in the mesh and top TBs
 
-**Fixed 2026-09-22.** `TB_SystolicMesh.sv` and `TB_sienna_top.sv` now decode binary32 by hand
+**Fixed 2026-09-22.** `TB_SystolicMesh.sv` and `TB_sienna.sv (pipeline mode)` now decode binary32 by hand
 with `f32()`, as `TB_gpnae.sv`'s `fp_to_real()` already did, and run a checker self-test at
 time zero: 1.0 vs 1.0+3 ulp must pass, and 1.0 vs 2.0, 1.0 vs 0.98, 1.0 vs -1.0 and -0.5 vs
 -0.05 must fail, or the run stops with `[FAIL]`. With the old integer decode the self-test
@@ -370,7 +370,7 @@ actual_real   = $signed(actual);
 
 `expected` and `actual` are IEEE-754 bit patterns. Reinterpreting them as signed integers makes the resulting `abs_diff` and `rel_diff` meaningless as floating-point error measures.
 
-**`TB_sienna_top.sv` has the same defect by a different route.** It uses
+**`TB_sienna.sv (pipeline mode)` has the same defect by a different route.** It uses
 `$bitstoshortreal`, which looks correct — but Verilator maps it to the 64-bit
 `$bitstoreal`:
 
@@ -393,7 +393,7 @@ the reported "Tol%" figures do not mean what they say, and the check will not
 behave sensibly across a sign change or an exponent boundary.
 
 A portable replacement that works under Verilator is a manual decode; see
-`fp_to_real()` in `GPNAE/testbenches/TB_gpnae.sv`, or `f32()` in the mesh and top TBs:
+`fp_to_real()` in `GPNAE/testbenches/top/TB_gpnae.sv`, or `f32()` in the mesh and top TBs:
 
 ```systemverilog
 function automatic real f32(input logic [31:0] b);
@@ -442,9 +442,9 @@ of the project. `TB_gpnae.sv` itself is unchanged and still has the dead
 
 ## 9. Duplicate module definitions across the build — FIXED (one ArithmeticLibrary in the top build)
 
-**Was latent, and flagged by FPGA synthesis.** The root `Makefile` listed both `ArithmeticLibrary` checkouts (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `LZC`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` were each compiled twice, and Verilator was silenced with `--Wno-MODDUP`. The `cntlz8` copy in `GPNAE/src/TYTAN/LZC.v` had already been removed.
+**Was latent, and flagged by FPGA synthesis.** The root `Makefile` listed both `ArithmeticLibrary` checkouts (`SM_LIB_FILES` and `GPNAE_LIB_FILES`), so `fp32Adder`, `LZC`, `fp32Multiplier`, `R4Booth` and `karatsubaUnsigned` were each compiled twice, and Verilator was silenced with `--Wno-MODDUP`. The `cntlz8` copy in GPNAE's former `LZC.v` had already been removed.
 
-**Fixed.** The root `Makefile` now compiles only `SystolicMesh/ArithmeticLibrary` and only the GPNAE files the `gpnae_poly` lanes use (the published `gpnae.sv` with `InputFIFO`, `SeLu` and `sigtan` builds in GPNAE's own `Makefile`), and `--Wno-MODDUP` is gone; `synth/sienna_rtl.f` lists the same set. The two checkouts remain because each submodule must build standalone; keep them on the same commit by fast-forwarding `GPNAE/ArithmeticLibrary` from `SystolicMesh/ArithmeticLibrary` and bumping both pointers together.
+**Fixed.** The root `Makefile` now compiles only `SystolicMesh/ArithmeticLibrary` and only the GPNAE files the `gpnae_poly` lanes use (the published `gpnae.sv` with `InputFIFO`, `SeLu` and `sigtan` builds in GPNAE's own `Makefile`), and `--Wno-MODDUP` is gone; `src/sienna_rtl.f` lists the same set. The two checkouts remain because each submodule must build standalone; keep them on the same commit by fast-forwarding `GPNAE/ArithmeticLibrary` from `SystolicMesh/ArithmeticLibrary` and bumping both pointers together.
 
 ---
 
@@ -455,7 +455,7 @@ of the project. `TB_gpnae.sv` itself is unchanged and still has the dead
 | File | Instantiated | Status |
 |---|---|---|
 | `SystolicMesh/testbenches/TB_Mesh_2x2.sv`, `TB_Mesh_3x3.sv`, `TB_Mesh_5x5.sv`, `TB_Mesh_8x8.sv` | `Mesh` | no such module; deleted (SystolicMesh c260ef0) |
-| `ArithmeticLibrary/Divider/FP32/testbenches/TB_Divider_FP32.sv` | `divide_32` | no such module; deleted (ArithmeticLibrary dd14986) |
+| `TB_Divider_FP32.sv` (ArithmeticLibrary's divider bench) | `divide_32` | no such module; deleted (ArithmeticLibrary dd14986) |
 
 The four `TB_Mesh_*` files were one testbench regenerated per size for an older mesh interface with a `select_accumulator_i` input. `TB_Divider_FP32.sv` declared itself `module TB_Multi_FP32` and checked nothing. `fp32Divider.sv` and `divu.sv` stay: `sigtan` in the published `gpnae.sv` uses them.
 
@@ -507,9 +507,9 @@ Synthesis completes with 0 errors, but the design essentially fills the part wit
 
 ```
 WARNING: [Synth 8-4767] Trying to implement RAM 'mem_reg' in registers.
-  Block RAM or DRAM implementation is not possible  [src/fwft.sv:50]
+  Block RAM or DRAM implementation is not possible  [src/fifo/fwft.sv:50]
 WARNING: [Synth 8-4767] Trying to implement RAM 'gpnae_out_mem_reg' in registers.
-  [src/sienna_top.sv:343]
+  [src/top/sienna_top.sv:343]
 ```
 
 `fwft`'s asynchronous reset over the whole memory array and `gpnae_out_mem`'s access pattern both block BRAM inference. Converting those to BRAM-friendly forms — synchronous-reset or no-reset memory, single write port, registered read — is the highest-leverage area reduction available.
@@ -524,7 +524,7 @@ There is also a cluster of `[Synth 8-7137] ... has both Set and reset with same 
 
 **Fixed 2026-10-07** in SIENNA `credits` 8824c31: fwft is a credit-link consumer (it advertises 16, returns one credit per pop), overwrite-on-full is removed, and `a_fifo_room` fires on a put into a full FIFO (shown firing in cr5bx_ufault). The text below describes main before that.
 
-**Confirmed (inspection), by design.** `src/fwft.sv` ties `wr_ready_o` high and, on a write into a full FIFO, overwrites the oldest entry and advances `rd_ptr`. There is no overflow flag.
+**Confirmed (inspection), by design.** `src/fifo/fwft.sv` ties `wr_ready_o` high and, on a write into a full FIFO, overwrites the oldest entry and advances `rd_ptr`. There is no overflow flag.
 
 This is deliberate — the comment says so — but it means any upstream rate mismatch corrupts data with no indication. FIFO1 is 256 deep against 256 elements, so it cannot overflow at `N=16`; FIFO2 is 16 deep and is protected only by the dispatcher's `fifo2_count[target_lane] <= FIFO2_DEPTH - 4` check. Changing `NUM_LANES`, `POOL_H`/`POOL_W`, or the dispatcher's backpressure margin can silently break this.
 
@@ -542,7 +542,7 @@ Adding an overflow sticky bit would make the whole class of problems observable.
 pointers). This makes sets run back-to-back *serially* without a reset; it does not overlap
 them. Evidence: `TB_SystolicMesh` in `B2B_MODE` passes 5/5 distinct sets with one reset and
 no write-reset pulses, and fails sets 1 and 3 on the empty-after-load check with the pointer
-fix reverted. `TB_sienna_top -DBACK_TO_BACK` passes 81/81 on both passes, and fails pass 2
+fix reverted. `TB_sienna (pipeline) -DBACK_TO_BACK` passes 81/81 on both passes, and fails pass 2
 with 54 mismatches when the second west matrix is overwritten with 1.0, so the second pass
 really computes. Under Verilator the wrapped pointer writes still land in the right words;
 the false `queue_empty_o` was the only symptom, so element compares alone cannot see it.
@@ -589,7 +589,7 @@ fixes these.
 ## 16. GPNAE's `valid_done_signal` assertion cannot hold — FIXED (assertion, not RTL)
 
 **Confirmed (reproduced)** 2026-09-23. GPNAE's Makefile never passed `--assert`, so the
-assertions in `GPNAE/testbenches/TB_gpnae.sv` never ran. With `--assert` on, the regression
+assertions in `GPNAE/testbenches/top/TB_gpnae.sv` never ran. With `--assert` on, the regression
 stops at the first result:
 
 ```

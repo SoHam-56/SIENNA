@@ -3,7 +3,7 @@ name: sienna-back-to-back
 description: Use when making SIENNA process back-to-back or streamed matrix sets - pipelining stages, overlapping the systolic mesh with activation, re-arming control state after a matmul, or debugging a second set that hangs, returns stale results, or reports completion without computing.
 ---
 
-> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/pipeline/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 
 # SIENNA back-to-back sets
 
@@ -18,10 +18,10 @@ front. Phase 4 is the regression: every test streams 4 distinct sets.
 credit count is the `SETS_IN_FLIGHT` parameter (default 8, ids `$clog2(SETS_IN_FLIGHT+1)` bits),
 ReLU and linear sets bypass the lanes, and 1x1 pooling with no padding bypasses FIFO2 and
 Maxpool (`POOL_BYPASS`). Every regression test streams `SETS_IN_FLIGHT + 2` sets. Measured
-steady state for ReLU sets through TB_sienna_top: 19-21 cycles per set at N=16 (was 88) and 35 at N=32
+steady state for ReLU sets through TB_sienna (pipeline): 19-21 cycles per set at N=16 (was 88) and 35 at N=32
 (was 104), set by that testbench's host (N rows plus a start cycle and two handshake cycles). With
-TB_sienna_model's streaming host (start with the last row) a GEMM runs at 17.4 cycles per set at N=16
-and exactly 32.0 at N=32, the mesh's own limit of N cycles per set. `TB_sienna_model +trace` logs every
+TB_sienna (sets)'s streaming host (start with the last row) a GEMM runs at 17.4 cycles per set at N=16
+and exactly 32.0 at N=32, the mesh's own limit of N cycles per set. `TB_sienna (sets) +trace` logs every
 stage event and wait, which is how to find the next limit. Three
 credits had capped the rate at latency / 3, about 50 cycles per set, once the stages were fast.
 Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
@@ -29,7 +29,7 @@ Plans: `implementation-plan.md`, `phase2-plan.md`, `phase3-plan.md`.
 ## Top-level interface after phase 3 (history: before the credit links)
 
 **Superseded on 2026-10-07 by the credit links; see "Module boundaries as built" below for the current interface.**
-`pipeline_ready_o`, `start_pipeline_i` and every port "sampled with the start" are gone: the host puts a set on the L0 link `host`, whose data is the set's sideband (`set_side_t` in `src/sienna_set_side.svh`, the same fields as the old ports).
+`pipeline_ready_o`, `start_pipeline_i` and every port "sampled with the start" are gone: the host puts a set on the L0 link `host`, whose data is the set's sideband (`set_side_t` in `src/top/sienna_set_side.svh`, the same fields as the old ports).
 `pipeline_complete_o` and `done_set_id_o` are kept; outputs leave on the L9 links `out[NUM_LANES]` instead of `final_result_o` / `result_valid_o`.
 The table below is the interface as it was from phase 3 until then.
 
@@ -103,7 +103,7 @@ pending sum skips all of this, so normal behaviour is unchanged. Tests: `matmul_
 
 `src/sienna_multi.sv` puts COPIES `sienna_top`s behind one host port; each accepted start goes to
 the next copy in turn and each copy keeps its own output port (no reorder buffer).
-`testbenches/TB_sienna_multi.sv` streams 48 distinct sets and checks every one. Measured with 16
+`testbenches/top/TB_sienna.sv` (copies mode) streams 48 distinct sets and checks every one. Measured with 16
 lanes per copy: tanh 307.5 cycles per set with one copy, 149.0 with two, 73.4 with four; SELU 264.0
 and 66.0. Every copy uses the collapse-k mesh (`COLLAPSE_K=1` is sienna_multi's default): at N=16
 with 32 lanes, four copies give 62.6 (tanh) and 55.2 (SELU) cycles per set with or without it, so
@@ -225,7 +225,7 @@ set, so results emerge in issue order by construction. No reorder buffer.
 
 ### Module boundaries as built (credit links, SIENNA branch `credits` at 3d66c57, 2026-10-07)
 
-Every module boundary is now one credit link (`credit_link_if`, from ArithmeticLibrary `Common/src`); no boundary uses ready/valid or valid-only handshakes any more.
+Every module boundary is now one credit link (`credit_link_if`, from ArithmeticLibrary `src/credit`); no boundary uses ready/valid or valid-only handshakes any more.
 What still travels without its own credit: the row, cache-write and bias buses and `sienna_layer`'s int8 epilogue words, which ride beside a put that holds the credit, and `requant_lanes`' fixed-latency valid pipe inside the activation stage, which cannot stall.
 The consumer owns the buffer and grants one credit per free slot (after reset its slot count, sent as ordinary credits); the producer puts only while it holds a credit.
 The full contract, the deviations from the design and the measured cost are in the `sienna-credits` skill, section "As built".
@@ -234,7 +234,7 @@ Entry admission is still `SETS_IN_FLIGHT` (15), but it now lives inside L0: the 
 
 | Link | Boundary | Protocol as built | Slots (consumer) | Back-pressure |
 |---|---|---|---|---|
-| L0 | host -> `sienna_top` | one put per set, `data` = the set's sideband (`set_side_t`, `src/sienna_set_side.svh`), rows on the write buses before the put | 2 staging banks, withheld while the entry is full | yes |
+| L0 | host -> `sienna_top` | one put per set, `data` = the set's sideband (`set_side_t`, `src/top/sienna_set_side.svh`), rows on the write buses before the put | 2 staging banks, withheld while the entry is full | yes |
 | L1 | `sienna_top` -> SystolicMesh | one put per set (the start), `data` = `{wc_last, tile, cached, pack_shift, bias_valid, accumulate}`; credit back on `bcast_release` | 2 staging banks | yes |
 | L2 | weight-cache writer -> SystolicMesh (x2 regions) | one put opens a fill; the region's credit returns when the fill's last set (marked `wc_last`) is broadcast | 1 per region | yes |
 | L3 | SystolicMesh -> activation stage | the mesh pushes a result as PER_LANE wide beats `{packed, last, first, one word per lane}`; the stage grants a set's PER_LANE beats at once from G_IDLE | PER_LANE beats (8 at N 16, 32 lanes) | yes |
@@ -247,7 +247,7 @@ Entry admission is still `SETS_IN_FLIGHT` (15), but it now lives inside L0: the 
 | L10 | host -> `sienna_layer` A and W row streams | one row per put; a set's N A rows (and N B rows if uncached) granted at once per L0 credit held | N rows per set, one set granted ahead | yes |
 
 `sienna_multi` exposes L0 (`host[COPIES]`) and L9 (`out[COPIES*NUM_LANES]`) per copy and fans L2 out to every copy (a region credit goes back once every copy has returned its own).
-`LINK_STAGES` (Makefile, TB_sienna_top parameter) puts a `credit_reg` on L0, L1, L3 and L9 only; the row buses, cache write bus and bias are delayed 2*LINK_STAGES with the put.
+`LINK_STAGES` (Makefile, TB_sienna (pipeline) parameter) puts a `credit_reg` on L0, L1, L3 and L9 only; the row buses, cache write bus and bias are delayed 2*LINK_STAGES with the put.
 
 The host is hardware (testbench in simulation; a DMA or `sienna_layer`'s credit streams in a system), never software: the driver (`model_runner.py`'s role) works at layer granularity.
 
@@ -270,7 +270,7 @@ Missing one reintroduces the stale-flag bug at the top level.
 |---|---|
 | 1 Mesh re-arm | `TB_SystolicMesh` K sets, no reset between, all pass — **done** |
 | 2 Mesh streaming | mesh accepts set i+1 during set i's broadcast — **done**: `TB_SystolicMesh` streams K sets, host and consumer both overlap the mesh |
-| 3 Top overlap | `TB_sienna_top` K sets + overlap assertion — **done** |
+| 3 Top overlap | `TB_sienna (pipeline)` K sets + overlap assertion — **done** |
 | 4 Full | `make regression` green, all 5 tests x K sets — **done** |
 
 Submodule changes land first, per repo convention.
@@ -349,7 +349,7 @@ credit-overrun pass (159-217 cycles), and the activation stage never stalled on 
 pooling was faster than activation and the output could not be stalled.
 
 Back-pressure since the credit links (2026-10-07): a downstream consumer stalls SIENNA through L9.
-- TB_sienna_top's consumer advertises `+out_slots` per lane (default 64) and withholds credit returns at `+out_stall_pct`.
+- TB_sienna (pipeline)'s consumer advertises `+out_slots` per lane (default 64) and withholds credit returns at `+out_stall_pct`.
 - After a second reset it advertises one L9 slot per lane and withholds every credit for 500 cycles mid-set: no word leaves in those cycles, and afterwards the words and set boundaries equal the plain pass and every link count is home (Task 5b, every test in all three formats).
 - In the credits-3 tests that hold reaches the host: the entry is full for 485 to 500 of the 500 cycles, so the stalled output backs sets up all the way to the entry.
 - With 2 slots and 50% stalls (`cr5bxg_o2s50_int8_T4`) the producer is starved of L9 credits in every pass and the words still equal main's.

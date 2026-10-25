@@ -1,9 +1,9 @@
 ---
 name: sienna-tooling
-description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, make regression's points and table) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_model_run, backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
+description: Use when running, changing or extending SIENNA's Python tooling - the two scripts regression.py (hardware sanity: regressions, unit benches, packed layers, GEMM sweep, perf, tool self-tests, make regression's points and table) and model_runner.py (the host software stack: TFLite loading, lowering, tiling, packing, the device protocol to TB_sienna (layer), backends, reference numerics). Also use when someone asks how a software developer should build on SIENNA, what the layer-file protocol is, or where a former script (pack_regression.py, gemm_sweep.py, perf_analysis.py, tflite_*.py, test_*.py) went.
 ---
 
-> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/pipeline/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 > Since then: `make regression` adds `default/N8_T2/pipeline` (no define; it must equal fp32's) and `<fmt>/N8_T2/pipeline-multi` (`make multi`, `--action multi`); regression.py and model_runner.py read the package through ArithmeticLibrary's `fmt_pkg.py`, and `test_build_key_per_format` checks that `make build-key` differs per define.
 
 # SIENNA tooling: two scripts
@@ -57,12 +57,12 @@ Organised top to bottom as the layers a driver/compiler has, each a labelled sec
 3. **Middle end**: tiling into N x N sets (`format_layer`, `layer_epilogue`), packing (`pack_jobs`, `unpack`,
    `pack_precheck`), with the rules stated where they live: block width, at most 8 settings, N | lanes, a set runs at
    its slowest activation.
-4. **Device protocol**: the one boundary between host and hardware — the layer file TB_model_run reads (`L`, `Q`,
+4. **Device protocol**: the one boundary between host and hardware — the layer file TB_sienna (layer) reads (`L`, `Q`,
    `P`, `E` lines, rows of N hex words, per-block epilogue; an int8 residual layer adds an `A` line with its ADD words,
-   written by `write_layer` from `job["add"]` and refused by TB_model_run when missing) and the result file it writes. Written as one documented
+   written by `write_layer` from `job["add"]` and refused by TB_sienna (layer) when missing) and the result file it writes. Written as one documented
    encoder / decoder pair, so a driver for real silicon replaces only what is below it.
-5. **Backends**: `RtlLayer` (TB_model_run: build once, run a layer per invocation; was LayerSim), `RtlSets`
-   (TB_sienna_model, the host-driven set engine; was Sim), `Emulator` (numpy stand-in; was EmuSim). Same interface:
+5. **Backends**: `RtlLayer` (TB_sienna (layer): build once, run a layer per invocation; was LayerSim), `RtlSets`
+   (TB_sienna (sets), the host-driven set engine; was Sim), `Emulator` (numpy stand-in; was EmuSim). Same interface:
    `build()`, `run_job(job, tag) -> (outputs, sets, cycles)`.
 6. **CLI**:
    - `model_runner.py --action model` (default) `--model-dir D [--models ...] [--format fp32|bf16|int8] [--n] [--tile] [--lanes] [--engine layer|sets|emulate] [--count] [--no-sim]` (today's CLI)
@@ -82,7 +82,7 @@ never the other way round.
 - `--action oracle --out D --report F` — gate G0 (was tflite_oracle.py); `--action pack-models D` (was tflite_pack_models.py); `--action gpnae-tflite --report F` (was gpnae_int8_tflite.py): the int8 tanh and sigmoid lane at TFLite's converter scales, gated on the true function (truth.py, exit 1 and `ACCURACY: FAIL` on a miss); its agreement with TFLite's integer TANH and LOGISTIC is printed beside the gate, not gated
 - `--action rq-vectors OUT [--check F --truth J]` — TB_requant_lanes vectors (was testbenches/gen_rq_lanes.py), and with `--check` its outputs gated on the true function (`make rq-lanes`)
 - `--action add-vectors OUT [--check F --truth J]` — TB_add_lanes vectors and, with `--check`, its outputs gated on the true function (`make add-lanes`)
-- `--action residual [--n --tile --lanes --cases ... --tflite --mid-reset --collapse-k 0|1 --seed --work]` — the int8 residual layer cases on the layer contract (`sienna_top` `SET_PORT = 0`) / TB_model_run (resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add), each stage gated on the true function (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane); `--tflite` adds converter-made residual blocks through the importer and a hand-built ONNX-style block, `--mid-reset` a reset inside the hold window; ends `RESIDUAL: PASS|FAIL` (`make residual FMT=int8`)
+- `--action residual [--n --tile --lanes --cases ... --tflite --mid-reset --collapse-k 0|1 --seed --work]` — the int8 residual layer cases on the layer contract (`sienna_top` `SET_PORT = 0`) / TB_sienna (layer) (resnet_relu, deep and shallow cached and uncached, tiles, relu6_conv_linear_add, tanh_after_add), each stage gated on the true function (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane); `--tflite` adds converter-made residual blocks through the importer and a hand-built ONNX-style block, `--mid-reset` a reset inside the hold window; ends `RESIDUAL: PASS|FAIL` (`make residual FMT=int8`)
 - `--action selftest` — every tool self-test now in test_*.py, pure Python, no simulator
 - `--action points [--small] [--formats f,...]`, `--action point --name P`, `--action summary` — make regression (below); they replaced `--action all`, the single-point gate, on 2026-10-10
 
@@ -105,7 +105,7 @@ at N = 64 needs 108 to 430+ GB and the large code model, LARGE_CODE=1); the one-
 (1%, 5%, 10%), the protocol, load-path, cycles and fault points) and ArithmeticLibrary (`make regression`: every
 unit bench and model check once, each lint on its count lines) have their own, on the same engine.
 
-- **Engine.** `SystolicMesh/ArithmeticLibrary/Common/regress.py` (loaded by path as `aril_regress`, since every repo has
+- **Engine.** `SystolicMesh/ArithmeticLibrary/scripts/regress.py` (loaded by path as `aril_regress`, since every repo has
   a `regression.py`): a repo's `Spec` gives the points and each point's command, environment, verdict and reason not to
   run; the engine runs a point in a private copy of the tree (`copy_tree`: git's tracked and untracked, not ignored,
   files of the repo and its submodules, so ignored stale stimulus and old builds never reach a run), with TRACE=0,
@@ -159,13 +159,13 @@ unit bench and model check once, each lint on its count lines) have their own, o
 
 ### One build per hardware group (2026-10-10)
 
-The pipeline regression builds TB_sienna_top once per group of tests whose packages agree on everything but the
+The pipeline regression builds TB_sienna (pipeline) once per group of tests whose packages agree on everything but the
 TB-only knobs (`TB_KNOBS` in model_runner.py and the Makefile: ACTIVATION_CODE, NUM_SETS, HAS_BIAS, WEIGHT_CACHE,
 ACCUM_PASSES, MIXED_LEN, MIXED_ACTS, PACKED, TRAINING_MODE, DROPOUT_SEED), and runs the other tests of the group on
 that build with `make sim`. Measured: a build is 70 s at N = 16 against 1-2 s of simulation, and about 8.6 min at
 N = 64 fp32.
-- Every generator writes `test_config_pkg.sv` with every item but the format (TB_sienna_multi still reads the knobs from it; the format and its widths are the define's) and, beside
-  it, `test_knobs.mem` (`write_test_config`: lowercase name and value per line). TB_sienna_top reads the knobs from that
+- Every generator writes `test_config_pkg.sv` with every item but the format (TB_sienna (copies) still reads the knobs from it; the format and its widths are the define's) and, beside
+  it, `test_knobs.mem` (`write_test_config`: lowercase name and value per line). TB_sienna (pipeline) reads the knobs from that
   file at time 0 (`read_knobs`: a missing, unknown or repeated setting is `$fatal`), and no file the build compiles or
   can include names one but the package's own declarations (`knob_references` over `build_sources`), so no knob value
   can reach the elaboration or the DUT. `copy_mem_files` copies every stimulus file (plain `cp`: `cp -u` could skip a
@@ -175,7 +175,7 @@ N = 64 fp32.
   reused. `make sim` runs the binary only when `BUILD_KEY` (every Verilator input but the package by checksum, the
   package without the knobs, and the Verilator flags) equals the one `make verilator` stored after a whole build, so a
   stale or mismatched binary stops the run instead of answering for another configuration.
-- Self-tests: `test_tb_knobs_are_run_time` (TB_sienna_top names no knob; read_knobs covers each; the Makefile's list is
+- Self-tests: `test_tb_knobs_are_run_time` (TB_sienna (pipeline) names no knob; read_knobs covers each; the Makefile's list is
   model_runner's; the knobs file), `test_build_groups` (knob-only differences share a build, any other package item
   does not; every test once, each group contiguous), `test_sim_reuses_only_its_own_build` (the key ignores knob values
   and changes with any other item, an input file or a flag).
@@ -206,7 +206,7 @@ driver needs.
 ## As built (2026-10-05)
 
 Commits on `tooling` (SIENNA; the submodules are untouched: SystolicMesh b1a2c31, GPNAE 0d407a7, AriL cb46ced):
-d49a829 (TB_sienna_layer -> TB_model_run), 3cc5675 (Task 1), 21fbc8f (Task 2), 3217ed7 and 3584a1f (Task 3), ff91381
+d49a829 (TB_sienna_layer -> TB_sienna (layer)), 3cc5675 (Task 1), 21fbc8f (Task 2), 3217ed7 and 3584a1f (Task 3), ff91381
 (Task 4), fb68726 (comments) and the skill commits. The only tracked Python outside the submodules is `model_runner.py`
 (1,349 lines) and `regression.py` (3,017 lines); the check is the global-constraints command in the implementation plan.
 The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.md`) has the full record.
@@ -231,7 +231,7 @@ The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.m
 | `model_runner.py --model-dir D ...` | unchanged (`--action model` is the default) | `make model` |
 | `import tflite_ref`; `regression.FORMATS`, `op_round`, `quant_act`, `int8_layer_exact`, `write_sv_package`, ... | `model_runner.X` (regression.py imports them by name, so `regression.X` still resolves) | |
 | `model_runner.LayerSim`, `Sim`, `EmuSim` | `RtlLayer`, `RtlSets`, `Emulator` (no aliases) | |
-| `TB_sienna_layer` | `TB_model_run` | |
+| `TB_sienna_layer` | `TB_sienna (layer)` | |
 
 Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N*.log`, `tflite_int8_N*_T*.log`,
 `pipeline_performance_report.log`), so the farm comparison scripts read them as before.
@@ -241,7 +241,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 1. **model_runner has eight sections, not six** (2a88978, after the plan's tasks): a contents block, then 1 Numerics,
    2 Frontend, 3 Middle end, 4 Device protocol, 5 Device build, 6 Backends, 7 Runtime (`execute`, `macs_of`), 8 CLI.
    The build package and the graph executor fit none of the six layers. The device protocol is `write_layer` (moved
-   out of `RtlLayer.run_job`) and `read_outputs` for TB_model_run, plus `write_sets` for TB_sienna_model.
+   out of `RtlLayer.run_job`) and `read_outputs` for TB_sienna (layer), plus `write_sets` for TB_sienna (sets).
    `RtlSets.run_job` replaces the free function `run_job_hw`, so all three backends are used as `build()`,
    `run_job(job, tag)`. Every other definition is AST-identical to before. The 9 layer files compared offline are
    byte-identical, and the `tlr_` farm runs (pack in three formats, TFLite single-layer and packed, gemm, model bf16,
@@ -249,7 +249,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 2. **`# ── Device build ──` in model_runner** (`write_sv_package`, `_config_items`, `SETS_IN_FLIGHT`, `COLLAPSE_K`, and a
    new `write_build_pkg(N, T, lanes, fmt)`) so every global has one owner; `--collapse-k` sets `model_runner.COLLAPSE_K`.
    `write_build_pkg` writes only `test_config_pkg.sv` (byte-identical, checked in scratch copies); the old build path
-   also wrote stimulus `.mem` files that neither TB_model_run nor TB_sienna_model reads.
+   also wrote stimulus `.mem` files that neither TB_sienna (layer) nor TB_sienna (sets) reads.
 3. **model_runner appends the submodule directories to `sys.path`** (not insert): GPNAE and SystolicMesh each have a
    `regression.py`, and with insert `import regression` after `import model_runner` loaded SystolicMesh's.
 4. **perf reads the RTL in `perf_init()`, not at import** (ruling, Task 3 review): verbatim, `import regression` parsed
@@ -299,7 +299,7 @@ summary by `sienna_jobs/tlf_gate_summary.py`, launcher `sienna_jobs/tlf_msgs/`).
 - All 106 `pkf_` configurations pass and are identical to their `pkf_` run: regression words and cycles at N = 8, 16
   (T = 2-16) and 32 and collapse-k 0, the mesh sweeps, the unit benches, `make pack` at every N / T and format and the
   8 `--act` sweeps, the TFLite single-layer and packed runs, gemm, the four lints, `make model`, `--engine sets` and
-  TB_sienna_multi. The only text difference is the int8 pack log's info line naming `model_runner.py --action tflite
+  TB_sienna (copies). The only text difference is the int8 pack log's info line naming `model_runner.py --action tflite
   --pack` instead of `tflite_pack_run.py` (21fbc8f).
 - `make check` passes in fp32 (6 of 6 steps) and int8 (7 of 7); its regression, pack and tflite match the pkf runs.
 - `make check FMT=bf16` failed at `gpnae-verilator` on 7b711bd: GPNAE's regression gates bf16 accuracy against the

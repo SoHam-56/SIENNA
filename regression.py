@@ -2165,9 +2165,12 @@ def run_int8(a, sim, shapes) -> None:
             note = ""
             if "between" in extra:
                 fm = int(np.sum(sim.first_Y != dflt))
-                note = f"; its first run {fm} outputs off the reset image's"
+                note = f"; its first run {fm} outputs off the reset image's; loaded {sim.between_gap} cycles after done_o"
                 if fm:
                     print(f"FAIL {name}: the run before the load differs from the reset image in {fm} outputs", flush=True)
+                    bad += 1
+                if sim.between_gap is None:
+                    print(f"FAIL {name}: the testbench did not report when the load began", flush=True)
                     bad += 1
             if extra.get("coef_busy"):
                 t, rf = sim.busy_refused or (0, 0)
@@ -2387,8 +2390,8 @@ def lane_features(a, sim, rep, contract: str = "") -> bool:
         note = ""
         if tag == "lanes_between":  # the first run, before the load, is the reset image's
             fm = int(np.sum(mr.word_bits(sim.first_Y, a.fmt_name) != dflt))
-            ok &= fm == 0
-            note = f"; its first run {fm} outputs off the reset image's"
+            ok &= fm == 0 and sim.between_gap is not None
+            note = f"; its first run {fm} outputs off the reset image's; loaded {sim.between_gap} cycles after done_o"
         if tag == "lanes_refused":
             t, rf = sim.busy_refused or (0, 0)
             ok &= t == 4 and rf == 4

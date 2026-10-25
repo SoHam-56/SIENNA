@@ -51,10 +51,10 @@ DROPOUT_DIR = $(SRC_DIR)/dropout
 
 # FMT ?= fp32; any value but fp32, bf16 or int8 stops make; FMT_DEF is the build's +define+FMT_<FMT>, which sienna_fmt_pkg reads.
 # A command-line FMT_DEF= builds with no define, which must elaborate fp32 (make regression's default point).
-include $(SM_LIB_DIR)/Common/fmt.mk
+include $(SM_LIB_DIR)/scripts/fmt.mk
 # SIM ?= verilator, or vcs (ArithmeticLibrary's sim.mk: plain VCS builds; TRACE=vcd, XPROP=1, RANDINIT=1); every Python flow reads it as SIENNA_SIM.
 VCS_LINT_BASELINE = $(PRJ_DIR)/vcs_lint_baseline.txt
-include $(SM_LIB_DIR)/Common/sim.mk
+include $(SM_LIB_DIR)/scripts/sim.mk
 export SIENNA_SIM := $(SIM)
 
 # Toolchain
@@ -83,40 +83,40 @@ SM_FILES = \
 	engine/AccumulationUnit.sv
 
 SM_LIB_FILES = \
-	Multipliers/Radix4Booth/src/R4Booth.sv \
-	Multipliers/Karatsuba/src/karatsubaUnsigned.sv \
-	Multipliers/FP32/src/fp32Multiplier.sv \
-	Multipliers/Int/src/intMultiplier.sv \
-	Adders/FP32/src/LZC.sv \
-	Adders/FP32/src/fp32Adder.sv \
-	Adders/Int/src/intAdder.sv \
-	Requantizer/src/int8Requantizer.sv \
-	QuantizedAdder/src/int8QuantizedAdder.sv \
-	Fmt/src/fmt_mul.sv \
-	Fmt/src/fmt_add.sv \
-	Multipliers/BF16/src/bf16Multiplier.sv \
-	Multipliers/BF16Wide/src/bf16WideMultiplier.sv \
-	Multipliers/Int8/src/int8Multiplier.sv \
-	Adders/BF16/src/bf16Adder.sv \
-	Adders/Int32/src/int32Adder.sv \
-	Converters/FP32ToBF16/src/fp32ToBf16.sv \
-	Multipliers/Int16/src/int16Multiplier.sv \
-	Multipliers/Int24/src/int24Multiplier.sv
+	src/multipliers/R4Booth.sv \
+	src/multipliers/karatsubaUnsigned.sv \
+	src/multipliers/fp32Multiplier.sv \
+	src/multipliers/intMultiplier.sv \
+	src/adders/LZC.sv \
+	src/adders/fp32Adder.sv \
+	src/adders/intAdder.sv \
+	src/quantized/int8Requantizer.sv \
+	src/quantized/int8QuantizedAdder.sv \
+	src/fmt/fmt_mul.sv \
+	src/fmt/fmt_add.sv \
+	src/multipliers/bf16Multiplier.sv \
+	src/multipliers/bf16WideMultiplier.sv \
+	src/multipliers/int8Multiplier.sv \
+	src/adders/bf16Adder.sv \
+	src/adders/int32Adder.sv \
+	src/converters/fp32ToBf16.sv \
+	src/multipliers/int16Multiplier.sv \
+	src/multipliers/int24Multiplier.sv
 
 # The gpnae lane (GPNAE's own files; the units it picks are ArithmeticLibrary's, above).
 GPNAE_FILES = \
-	gpnae_pkg.sv \
-	lane_fifo.sv \
-	lane_link.sv \
-	fixedPointMultiplyAdd.sv \
-	gpnae_horner.sv \
-	TYTAN/barrel_mac.sv \
-	gpnae_exp_split.sv \
-	gpnae_coef_mem.sv \
-	gpnae_act_in.sv \
-	gpnae_post.sv \
-	gpnae_tail.sv \
-	gpnae.sv
+	lane/gpnae_pkg.sv \
+	link/lane_fifo.sv \
+	link/lane_link.sv \
+	mac/fixedPointMultiplyAdd.sv \
+	lane/gpnae_horner.sv \
+	mac/barrel_mac.sv \
+	lane/gpnae_exp_split.sv \
+	memory/gpnae_coef_mem.sv \
+	lane/gpnae_act_in.sv \
+	lane/gpnae_post.sv \
+	lane/gpnae_tail.sv \
+	lane/gpnae.sv
 
 MAXPOOL_FILES = \
 	Maxpool_2D.sv
@@ -131,8 +131,8 @@ CREDIT_FILES = \
 	credit_link_checker.sv
 
 DESIGN_FILES = \
-	$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv \
-	$(addprefix $(SM_LIB_DIR)/Common/src/,$(CREDIT_FILES)) \
+	$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv \
+	$(addprefix $(SM_LIB_DIR)/src/credit/,$(CREDIT_FILES)) \
 	$(addprefix $(SRC_DIR)/,$(TOP_FILES)) \
 	$(addprefix $(SM_DIR)/,$(SM_FILES)) \
 	$(addprefix $(SM_LIB_DIR)/,$(SM_LIB_FILES)) \
@@ -529,10 +529,10 @@ perf: verilator
 # check-fmt: no RTL outside the allowlist names a precision (ArithmeticLibrary's check_fmt.sh); GPNAE and SystolicMesh run their own; C4: a planted EXP_W must fail it.
 FMT_ALLOW = ^(GPNAE|SystolicMesh)/
 check-fmt:
-	@bash $(SM_LIB_DIR)/Common/check_fmt.sh $(PRJ_DIR) '$(FMT_ALLOW)' && echo "check-fmt OK: the tree passes" || { echo "check-fmt FAIL: the tree"; exit 1; }
+	@bash $(SM_LIB_DIR)/scripts/check_fmt.sh $(PRJ_DIR) '$(FMT_ALLOW)' && echo "check-fmt OK: the tree passes" || { echo "check-fmt FAIL: the tree"; exit 1; }
 	@t=$$(mktemp -d); mkdir -p $$t/src/pipeline; cp $(SRC_DIR)/pipeline/sienna_pipe.sv $$t/src/pipeline/; \
 	sed -i 's/^endmodule/  localparam int EXP_W = 8;\nendmodule/' $$t/src/pipeline/sienna_pipe.sv; \
-	if bash $(SM_LIB_DIR)/Common/check_fmt.sh $$t '$(FMT_ALLOW)' > $$t/c4.log; then echo "check-fmt FAIL: C4 planted EXP_W passed"; exit 1; \
+	if bash $(SM_LIB_DIR)/scripts/check_fmt.sh $$t '$(FMT_ALLOW)' > $$t/c4.log; then echo "check-fmt FAIL: C4 planted EXP_W passed"; exit 1; \
 	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
 	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
 
@@ -650,10 +650,10 @@ add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv $(TB_DIR)/units/TB_add_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv $(TB_DIR)/units/TB_add_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
-	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv \
+	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv \
 	  $(TB_DIR)/units/TB_add_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim $(SIM_RUN) | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
@@ -666,10 +666,10 @@ rq-lanes:
 	mkdir -p $(RQL_DIR)
 	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
-	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv -o sim
+	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim $(SIM_RUN) | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }

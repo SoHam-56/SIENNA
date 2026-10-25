@@ -19,7 +19,8 @@ import test_config_pkg::*;
 // +tier=T: the layer's lane tier (cfg_tier_i); +coef=<file>: "aaa dddddddd" (hex address, data) lines written through the lanes' load path
 // after every reset, before the configure, each once coef_ready_o is high.
 // +between=<file> (with +out_first=<file>): the layer runs to completion, its results go to out_first, then <file> is loaded with no reset
-// and the layer runs again into +out. +coef_busy: four corrupting writes while the layer streams; the interlock must refuse every one.
+// and the layer runs again into +out. +coef_busy=<file>: its "aaa dddddddd" writes, one a cycle from 40 cycles into the stream; the interlock must
+// refuse every one.
 module TB_model_run #(
     parameter int FAULT       = 0,
     parameter int LINK_STAGES = 0  // sienna_top's register stages on L0, L1, L3 and L9
@@ -486,7 +487,10 @@ module TB_model_run #(
     bit finished;
     int failed = 0, osp, mid_reset = 0, msp, tier = 0;
     string between_f, first_f;
-    int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0;
+    int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0, busy_n = 0;
+    logic [8:0] busy_a[8];  // +coef_busy: the writes' addresses and data
+    logic [31:0] busy_d[8];
+    string busy_f;
     int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
 
     void'($value$plusargs("out_slots=%d", out_slots));
@@ -496,7 +500,21 @@ module TB_model_run #(
     void'($value$plusargs("tier=%d", tier));
     between = $value$plusargs("between=%s", between_f);
     if (between && (!$value$plusargs("out_first=%s", first_f) || mid_reset > 0)) $fatal(1, "TB_model_run: +between needs +out_first and no +mid_reset");
-    busy_load = $test$plusargs("coef_busy");
+    busy_load = $value$plusargs("coef_busy=%s", busy_f);
+    if (busy_load) begin
+      integer fb;
+      logic [11:0] a;
+      logic [31:0] d;
+      fb = $fopen(busy_f, "r");
+      if (fb == 0) $fatal(1, "TB_model_run: cannot open +coef_busy=%s", busy_f);
+      while (busy_n < 8 && $fscanf(fb, "%h %h", a, d) == 2) begin
+        busy_a[busy_n] = a[8:0];
+        busy_d[busy_n] = d;
+        busy_n++;
+      end
+      $fclose(fb);
+      if (busy_n == 0) $fatal(1, "TB_model_run: +coef_busy=%s holds no write", busy_f);
+    end
     if (tier < 0 || tier > 2) $fatal(1, "TB_model_run: +tier=%0d: 0, 1 or 2", tier);
     hold_wait = $test$plusargs("hold_wait");
     hold_check = $test$plusargs("hold_check");
@@ -642,10 +660,10 @@ module TB_model_run #(
         last_ai = ai;
         last_wi = wi;
         last_sets = bounds.size();
-        if (pass == 1 && busy_load && busy_tries < 4 && cycle - t0 >= 40) begin  // +coef_busy: words 0, 1 and two descriptor fields
+        if (pass == 1 && busy_load && busy_tries < busy_n && cycle - t0 >= 40) begin  // +coef_busy: the file's writes, one a cycle
           coef_wr_i   = 1'b1;
-          coef_addr_i = (busy_tries < 2) ? 9'(busy_tries) : 9'(128 + busy_tries);
-          coef_data_i = 32'h4120_0000;
+          coef_addr_i = busy_a[busy_tries];
+          coef_data_i = busy_d[busy_tries];
           if (!coef_ready_o) busy_refused++;
           busy_tries++;
         end else if (busy_load) coef_wr_i = 1'b0;
@@ -741,7 +759,7 @@ module TB_model_run #(
 
     if (busy_load) begin
       $display("[LAYER] coef busy: %0d writes while the layer streamed, %0d refused", busy_tries, busy_refused);
-      if (busy_tries != 4 || busy_refused != busy_tries) begin
+      if (busy_tries != busy_n || busy_refused != busy_tries) begin
         failed++;
         $display("[FAIL] +coef_busy: %0d of %0d writes taken while the layer streamed", busy_tries - busy_refused, busy_tries);
       end

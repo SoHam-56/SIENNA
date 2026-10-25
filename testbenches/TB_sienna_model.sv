@@ -8,6 +8,7 @@ import test_config_pkg::*;
 // int8: after each set's bias words, 8 + 2N requantize words as in requant_<k>.mem.
 // +out_slots=S (1..64) L9 slots per lane and +out_stall_pct=P random output stalls (-DTB_OUT_STALL_PCT sets the default); +fault_put puts with no credit once.
 // +tier=T: every set's lane tier; +coef=<file>: "aaa dddddddd" (hex address, data) lines written through the lanes' load path after reset.
+// +coef_busy=<file>: those writes, one a cycle from 40 cycles after the first set's start, while sets stream; the interlock must refuse every one.
 module TB_sienna_model;
   // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
   localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
@@ -327,6 +328,32 @@ module TB_sienna_model;
     $display("[MODEL] coef: %0d load-path writes from %s", n, cf);
   endtask
 
+  // +coef_busy=<file>: the writes, one a cycle on the falling edge, each counted refused when coef_ready is low as it is driven.
+  int busy_tries = 0, busy_refused = 0, busy_n = 0;
+  task automatic coef_busy_writes(input string bf);
+    integer fb;
+    logic [11:0] a;
+    logic [31:0] d;
+    fb = $fopen(bf, "r");
+    if (fb == 0) begin
+      $display("[FATAL] cannot open %s", bf);
+      $finish;
+    end
+    repeat (40) @(negedge clk_i);
+    while ($fscanf(fb, "%h %h", a, d) == 2) begin
+      busy_n++;
+      coef_wr   = 1'b1;
+      coef_addr = a[8:0];
+      coef_data = d;
+      #1;
+      if (!coef_ready) busy_refused++;
+      busy_tries++;
+      @(negedge clk_i);
+    end
+    coef_wr = 1'b0;
+    $fclose(fb);
+  endtask
+
   initial begin
     string sets_f, out_f;
     integer fin, fout, rc;
@@ -453,6 +480,10 @@ module TB_sienna_model;
         start_pipeline_i = 0;
         @(negedge clk_i);  // let the credit land before sampling ready again
       end else load_and_start();
+      if (k == 0) begin  // +coef_busy: writes while the first sets stream
+        string bf;
+        if ($value$plusargs("coef_busy=%s", bf)) fork coef_busy_writes(bf); join_none
+      end
     end
     $fclose(fin);
 
@@ -498,6 +529,10 @@ module TB_sienna_model;
       for (int i = lo; i < bounds[k]; i++) $fwrite(fout, "%h\n", res_q[i]);
     end
     $fclose(fout);
+    if (busy_n > 0) begin
+      $display("[MODEL] coef busy: %0d writes while sets streamed, %0d refused", busy_tries, busy_refused);
+      if (busy_refused != busy_tries) $display("[FAIL] +coef_busy: %0d of %0d writes taken while sets streamed", busy_tries - busy_refused, busy_tries);
+    end
     $display("[MODEL] sets=%0d outputs=%0d cycles=%0d mesh_busy=%0d act_busy=%0d order_errors=%0d out_stall=%0d", n_sets,
              res_q.size(), last_done - t0 + 1, busy_mesh, busy_act, bad_ids, osp);
     $finish;

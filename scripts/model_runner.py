@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # the SIENNA repository
 SIM = os.environ.get("SIENNA_SIM", "verilator")  # the simulator: make SIM=vcs exports SIENNA_SIM=vcs to every flow it starts
 SIM_DIR = os.path.join(ROOT, "VCS" if SIM == "vcs" else "Verilator")  # make vcs builds <top>_sim there, as make verilator does in Verilator/
 SIM_TARGET = "vcs" if SIM == "vcs" else "verilator"

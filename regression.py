@@ -32,8 +32,8 @@ import time
 
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh"))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPNAE"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "GPNAE", "scripts"))
 import mesh_model  # noqa: E402
 import gpnae_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
@@ -51,7 +51,7 @@ fourstate = mr.fourstate  # 4-state safe parsing: an x or z word, count or hash 
 def _load_truth():
     """SystolicMesh's ArithmeticLibrary copy of truth.py, by its path (GPNAE's copy may be first on sys.path); registered as truth."""
     import importlib.util
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "Common", "models", "truth.py")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SystolicMesh", "ArithmeticLibrary", "models", "truth.py")
     spec = importlib.util.spec_from_file_location("truth", path)
     m = importlib.util.module_from_spec(spec)
     sys.modules["truth"] = m  # any later import truth gets this one
@@ -62,7 +62,7 @@ def _load_truth():
 truth = _load_truth()  # AriL's true-function gates: every pipeline stage gates on them
 
 # Ensure we can import the mesh helpers
-sys.path.insert(0, os.path.join(ROOT, "SystolicMesh"))
+sys.path.insert(0, os.path.join(ROOT, "SystolicMesh", "scripts"))
 
 from conv_tests import _basic_pair, _general_pair, _kernel_size
 from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
@@ -1442,7 +1442,7 @@ def truth_report(res: dict) -> tuple:
 
 # Two tests here used "act": "idle", i.e. control word 0, which is not a mode the RTL implements -- they
 # could only ever time out. Removed rather than adding an RTL bypass, which would be a design change.
-# Their matrix types are still covered by mm_ones and mm_small_values in SystolicMesh/matmul_tests.py.
+# Their matrix types are still covered by mm_ones and mm_small_values in SystolicMesh/scripts/matmul_tests.py.
 PIPELINE_TESTS = [
     {
         "name": "matmul_ident_selu",
@@ -2943,7 +2943,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
 
 def lane_params() -> tuple:
     """gpnae's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_pipe overrides them."""
-    src = open(os.path.join(ROOT, "GPNAE", "src", "gpnae.sv")).read()
+    src = open(os.path.join(ROOT, "GPNAE", "src", "lane", "gpnae.sv")).read()
     inst = re.search(r"\bgpnae #\((.*?)\) gpnae", open(os.path.join(ROOT, "src", "pipeline", "sienna_pipe.sv")).read(), re.S)
     k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", src) for n in ("K", "TAIL_CONTEXTS"))
     if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
@@ -3814,7 +3814,7 @@ def test_package_has_no_format():
         names = {k for k, _, _ in reg._config_items({}, f, "relu", 1, 15, 1, [], False, 1)}
         assert not names & {"EXP_W", "MAN_W", "IS_INT", "ACC_W", "OUT_W", "DATA_WIDTH"}, (f, names)
     mk = open(os.path.join(ROOT, "Makefile")).read()
-    assert "FMT_FIELDS" not in mk and "pkg-check" not in mk and "include $(SM_LIB_DIR)/Common/fmt.mk" in mk
+    assert "FMT_FIELDS" not in mk and "pkg-check" not in mk and "include $(SM_LIB_DIR)/scripts/fmt.mk" in mk
 
 
 @selftest
@@ -4296,8 +4296,8 @@ def test_residual_truth_path():
 @selftest
 def test_truth_is_systolicmesh_copy():
     # the gates load SystolicMesh's ArithmeticLibrary copy by path, and GPNAE's copy must be the same bytes
-    sm = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models")
-    gp = os.path.join(ROOT, "GPNAE", "ArithmeticLibrary", "Common", "models")
+    sm = os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "models")
+    gp = os.path.join(ROOT, "GPNAE", "ArithmeticLibrary", "models")
     assert os.path.realpath(truth.__file__) == os.path.realpath(os.path.join(sm, "truth.py")), truth.__file__
     assert sys.modules["truth"] is truth
     for f in ("truth.py", "test_truth.py"):
@@ -4644,7 +4644,7 @@ def test_unit_points():
     assert SPEC.parse("rq-lanes") == {"n": 0, "kind": "rq-lanes"} and regress.point_env(SPEC, "add-lanes", "s", 8)["TRACE"] == "0"
     r = make_n("rq-lanes", f"PYTHON={py}")
     assert r.returncode == 0 and "--action rq-vectors" in r.stdout and "--top-module TB_requant_lanes" in r.stdout and "--check" in r.stdout, r.stdout[-300:]
-    assert "Requantizer/src/int8Requantizer.sv" in r.stdout and "tfliteRequant" not in r.stdout, r.stdout[-300:]
+    assert "src/quantized/int8Requantizer.sv" in r.stdout and "tfliteRequant" not in r.stdout, r.stdout[-300:]
 
 
 @selftest
@@ -4936,7 +4936,7 @@ def test_dropout_mask_check():
 
 @selftest
 def test_formats_match_fmt_mk():
-    mk = open(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "fmt.mk")).read()
+    mk = open(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "scripts", "fmt.mk")).read()
     assert re.search(r"^FORMATS\s*=\s*(.*)$", mk, re.M).group(1).split() == list(reg.FORMATS) == list(fmt_pkg.FORMATS)
 
 
@@ -5987,7 +5987,7 @@ def selftest_main(argv=None) -> None:
 def _engine():
     """ArithmeticLibrary's make regression engine, under its own name (SystolicMesh and GPNAE each have a regression.py too)."""
     import importlib.util
-    s = importlib.util.spec_from_file_location("aril_regress", os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "regress.py"))
+    s = importlib.util.spec_from_file_location("aril_regress", os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "scripts", "regress.py"))
     m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m)
     return m

@@ -30,12 +30,12 @@ SIM_DIR = os.path.join(ROOT, "VCS" if SIM == "vcs" else "Verilator")  # make vcs
 SIM_TARGET = "vcs" if SIM == "vcs" else "verilator"
 FIRED = re.compile(r'Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]|^(?:Error|Fatal): "|^Error-\[|: started at .* failed at', re.M)  # Verilator's and VCS's forms
 sys.path.insert(0, ROOT)
-sys.path.append(os.path.join(ROOT, "GPNAE"))  # appended: the submodules have their own regression.py, which must not shadow ours
-sys.path.append(os.path.join(ROOT, "SystolicMesh"))
+sys.path.append(os.path.join(ROOT, "GPNAE", "scripts"))  # appended: the submodules have their own regression.py, which must not shadow ours
+sys.path.append(os.path.join(ROOT, "SystolicMesh", "scripts"))
 import gpnae_model  # noqa: E402
 import mesh_model  # noqa: E402
 from mesh_model import fpu  # noqa: E402
-sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
+sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "models"))
 import ipu  # noqa: E402
 import truth  # noqa: E402
 import fourstate  # noqa: E402  4-state safe parsing: an x or z word or count fails its test by name

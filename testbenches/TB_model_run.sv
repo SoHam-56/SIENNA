@@ -362,7 +362,7 @@ module TB_model_run #(
   // Output of any kind while the mid-stream reset's home check watches is stray.
   bit mid_check = 0;
   int stray = 0;
-  always @(posedge clk_i) if (mid_check && rstn_i && (res_v != '0 || set_done_o || done_o)) stray++;
+  always @(posedge clk_i) if (mid_check && rstn_i && (res_v !== '0 || set_done_o || done_o)) stray++;
 
 `ifdef PERF
   // Cycles with sets left but no A row taken, by cause, printed at the end.
@@ -698,7 +698,7 @@ module TB_model_run #(
         repeat (OUT_CAP + 64 + 8 * LINK_STAGES) @(posedge clk_i);
         mid_check = 0;
         // Home: no row credit held (the layer grants per set), both staging and region credits back, every L9 slot re-advertised.
-        if (a_cnt != 0 || w_cnt != 0 || int'(dut.G_LAYER.sched.l0_cnt) != 2 || !dut.G_LAYER.sched.wc_has[0] || !dut.G_LAYER.sched.wc_has[1] || lane_home != '1 || stray != 0 ||
+        if (a_cnt !== 0 || w_cnt !== 0 || dut.G_LAYER.sched.l0_cnt !== 2 || !dut.G_LAYER.sched.wc_has[0] || !dut.G_LAYER.sched.wc_has[1] || lane_home !== '1 || stray !== 0 ||
             busy_o) begin
           $display("[FAIL] not home after the mid-stream reset: A %0d (0), W %0d (0), staging %0d (2), regions %0d %0d (1 1), lanes home %0d of %0d, %0d stray output cycles, busy %0d",
                    a_cnt, w_cnt, dut.G_LAYER.sched.l0_cnt, dut.G_LAYER.sched.wc_has[0], dut.G_LAYER.sched.wc_has[1], $countones(lane_home), NUM_LANES, stray, busy_o);
@@ -712,14 +712,14 @@ module TB_model_run #(
       end
     end
     // The layer granted exactly the rows the streams hold, and every L9 slot comes home once the stalls stop.
-    if (a_cnt != 0 || w_cnt != 0) begin
+    if (a_cnt !== 0 || w_cnt !== 0) begin
       failed++;
       $display("[FAIL] the layer is done with row credits still held: A %0d, W %0d", a_cnt, w_cnt);
     end
     osp = out_stall_pct;
     out_stall_pct = 0;
     repeat (OUT_CAP + 4) @(posedge clk_i);
-    if (lane_home != '1) begin
+    if (lane_home !== '1) begin
       failed++;
       $display("[FAIL] L9 slots not all credited back after the layer: lanes home %b", lane_home);
     end

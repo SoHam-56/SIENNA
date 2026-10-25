@@ -1875,6 +1875,8 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             shutil.copy(TRUTH_DUMP, os.path.join(RESULTS_DIR, f"{t['name']}_truth_dump.txt"))
             kn = _tb_knobs()
             with open(os.path.join(RESULTS_DIR, f"{t['name']}_acts.txt"), "w") as fh:
+                ph, pw, pad = t.get("pool_h", 2), t.get("pool_w", 2), t.get("padding", 1)  # the pool geometry, so a comparison can map P words to columns
+                fh.write(f"G {ph} {pw} {pad} {lanes} {(N + 2 * pad - pw) // pw + 1}\n")
                 for k in range(kn["num_sets"]):
                     sw = _set_words(k, kn, N, fmt_name)
                     fh.write(f"{k} " + " ".join(sw["ents"][int(sw["col_ent"][c])]["act"] for c in range(N)) + "\n")

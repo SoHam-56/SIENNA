@@ -165,6 +165,8 @@ make multi FMT=int8                    # two pipelines behind one host (COPIES=2
 make check-fmt check-hier              # no format named outside the package; each build holds only its format's units
 ```
 
+Activate the venv in the shell that runs make: some checks call `python3` directly, and without the venv that is the system's Python, which may lack NumPy.
+
 `FMT` (`fp32`, `bf16`, `int8`; it becomes the build's define), `N` (matrix size, default 16), `TILE` (array size, default 4) and `LANES` (activation lanes, default 32) apply to every target.
 
 How `make regression` works:
@@ -201,9 +203,9 @@ Everything here runs on any Linux machine; nothing depends on the authors' serve
 
 ```bash
 git clone --recursive https://github.com/SoHam-56/SIENNA.git && cd SIENNA
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt   # every make below runs in this shell
 models/fetch_cifar10.sh          # optional: CIFAR-10 for the resnet8 model (a 163 MB download)
-make -j2 regression SMALL=1 PYTHON=$PWD/.venv/bin/python
+make -j2 regression SMALL=1
 ```
 
 **Choosing N in `make -jN`:** the largest process of one point peaks at about 0.8 GB at N = 8 and 1.5 GB at N = 16 (above), and each point also runs its C++ compiles side by side, so leave room beyond N times the peak; one point at a time fits in 16 GB.

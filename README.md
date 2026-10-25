@@ -228,7 +228,7 @@ make -j2 regression SMALL=1
 make -j2 regression SIM=vcs SMALL=1
 ```
 
-**Read the table** (also written to `testbenches/results/regression/regression.log`). Each row is one check: its name, its verdict, its time and its log. The last line is the overall verdict, for example `SIENNA REGRESSION PASS: 199 of 199 gated points passed`.
+**Read the table** (also written to `testbenches/results/regression/regression.log`). Each row is one check: its name, its verdict, its time and its log. The last line is the overall verdict, for example `SIENNA REGRESSION PASS: 205 of 205 gated points passed`.
 
 | Verdict | Meaning |
 |---|---|

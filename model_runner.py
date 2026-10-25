@@ -1854,10 +1854,10 @@ MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
 ACTIONS = ("model", "tflite")
 
 
-MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to supply one that is missing (models/NOTICE says why they are not committed)
+MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to fetch one that is missing (models/NOTICE: sources and licenses)
     "resnet8": (("data/cifar-10-batches-py/test_batch", "perf_samples_idxs.npy"), "run models/fetch_cifar10.sh"),
-    "ad01": (("normal_id_01_00000000_hist_librosa.bin",), "copy it into the model directory"),
-    "kws": (("marvin_617de221_0.wav",), "copy it into the model directory"),
+    "ad01": (("normal_id_01_00000000_hist_librosa.bin",), "run models/fetch_inputs.sh"),
+    "kws": (("marvin_617de221_0.wav",), "run models/fetch_inputs.sh"),
     "vww": ((), ""),
 }
 

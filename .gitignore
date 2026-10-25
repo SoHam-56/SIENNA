@@ -17,3 +17,7 @@ __pycache__/
 
 # CIFAR-10, downloaded by models/fetch_cifar10.sh (not redistributable here)
 models/data/
+# the kws and ad01 inputs, downloaded by models/fetch_inputs.sh
+models/marvin_617de221_0.wav
+models/normal_id_01_00000000_hist_librosa.bin
+models/*.part

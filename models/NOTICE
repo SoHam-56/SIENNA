@@ -17,6 +17,7 @@ Not in this directory:
   Features from Tiny Images", 2009): the page states no redistribution license, so it is not committed. fetch_cifar10.sh
   downloads it from that page into data/ (git-ignored); without it the resnet8 model is skipped.
 
-  marvin_617de221_0.wav (the kws model's input clip) and normal_id_01_00000000_hist_librosa.bin (the ad01 model's input):
-  neither is in a public repository with a license that allows redistribution, so neither is committed; without them the
-  kws and ad01 models are skipped. Put them in this directory, or point MODEL_DIR at a directory that holds them.
+  marvin_617de221_0.wav (the kws model's input clip, benchmark/runner/sd_card/) and normal_id_01_00000000_hist_librosa.bin
+  (the ad01 model's input, benchmark/reference_submissions/anomaly_detection/datasets/dcase01/): byte-identical copies are in
+  MLCommons Tiny at the commit above (Apache 2.0). They are not committed here; fetch_inputs.sh downloads both into this directory
+  (git-ignored) and checks each sha256. Without them the kws and ad01 models are skipped.

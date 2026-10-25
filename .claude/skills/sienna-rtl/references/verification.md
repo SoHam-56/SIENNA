@@ -9,7 +9,7 @@ How the testbenches, the Python tooling and the logs fit together.
 | Full pipeline | `sienna_top` | NumPy, in `regression.py` | yes — but see the tolerance caveat below |
 | SystolicMesh IP | `SystolicMesh` | float64 NumPy matmul | yes, with the same caveat |
 | Arithmetic units | `fp32Adder`, `fp32Multiplier` | Berkeley SoftFloat via DPI-C | yes, ±2–3 ULP |
-| GPNAE activations | `gpnae` | `gpnae_tests.py` golden model | yes, 1% relative or 1e-6 absolute — `TB_gpnae.sv` |
+| GPNAE activations | `gpnae` | `gpnae_model.py` bit-exact model and the true function | yes, 1% relative or 1e-6 absolute — `TB_gpnae.sv` |
 
 `TB_gpnae.sv` is file-driven: `GPNAE/regression.py` generates stimulus and
 golden values into `testbenches/stimulus/`, and the testbench scores every
@@ -147,10 +147,8 @@ The method that actually worked on the SELU race, after three plausible-looking 
    confirming correct behaviour because it matched a plausible figure. Against 90 elements it
    was the bug. Always divide by the number of elements.
 
-`gpnae_tests.py` is the reference for step 3: its series model quantises at every point the
-RTL produces a value, and `number_formats.py` supplies the truncating rounding mode the FP
-units actually use, so a correct hardware result matches it bit for bit rather than
-approximately.
+`gpnae_model.py` is the reference for step 3: it quantises at every point the RTL produces a
+value, so a correct hardware result matches it bit for bit rather than approximately.
 
 ## `run_real_model.py`
 

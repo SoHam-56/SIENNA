@@ -297,8 +297,8 @@ help:
 	@echo ""
 	@echo "Individual Module Targets:"
 	@echo "  make sm-verilator      - Systolic Mesh only: its model checks, then its regression in FMT at N, TILE, COLLAPSE_K (SM_CHECKS=0 skips the checks)"
-	@echo "  make gpnae-verilator   - GPNAE only: its regression in FMT on gpnae_poly, the lane sienna_top uses"
-	@echo "  make gpnae-verilator GPNAE_MODEL=hw - the same, bit-exact against the lane model instead of accuracy (int8 ignores it)"
+	@echo "  make gpnae-verilator   - GPNAE only: the lane sienna_top uses, every input of its gate in FMT against the true function"
+	@echo "  make gpnae-verilator GPNAE_TIER=1 - the same at accuracy tier 1 (5%; 2 is 10%, 0 the default 1%)"
 	@echo ""
 	@echo "Analysis Targets:"
 	@echo "  make lint              - Run Verilator lint check"
@@ -462,12 +462,11 @@ sm-verilator:
 	$(MAKE) -C SystolicMesh mesh-regression MATRIX_SIZE=$(N) \
 		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)$(if $(filter 0,$(SM_CHECKS)), --no-checks)"
 
-# GPNAE's Makefile takes no format: its regression writes gpnae_test_config.svh for FMT, then runs make verilator.
-# GPNAE_MODEL: exact (accuracy against the functions) or hw (bit-exact against gpnae_poly's model); int8 ignores it and runs both.
-GPNAE_MODEL ?= exact
+# GPNAE's lane gate at one tier of its coefficient memory: the RTL's words against the true function at that tier's tolerance.
+GPNAE_TIER ?= 0
 gpnae-verilator:
-	@echo "=== GPNAE only: FMT=$(FMT), gpnae_poly lane, model $(GPNAE_MODEL) ==="
-	cd GPNAE && $(PYTHON) regression.py --lane poly --format $(FMT) --model $(GPNAE_MODEL)
+	@echo "=== GPNAE only: FMT=$(FMT), tier $(GPNAE_TIER) ==="
+	cd GPNAE && $(PYTHON) regression.py --format $(FMT) --run gate --tier $(GPNAE_TIER)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS

@@ -98,7 +98,7 @@ module sienna_pipe #(
   localparam int MP_WIN = POOL_H * POOL_W;  // a maxpool window's elements, granted at once on L8
   localparam int MP_CRW = $clog2(MP_WIN + 1);
   localparam int MP_AHEAD = 2;  // windows maxpool grants ahead, so FIFO2 streams one element a cycle
-  localparam int LANE_K = 16;  // gpnae_poly's K: a lane starts a group only with this many L5 credits
+  localparam int LANE_K = 16;  // gpnae's K: a lane starts a group only with this many L5 credits
 
   localparam int POOL_OUT_ROWS = (IN_ROWS + 2 * PADDING - POOL_H) / STRIDE_ROWS + 1;
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
@@ -180,6 +180,7 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0][4:0]  g_shx;
   logic [NUM_LANES-1:0][23:0] g_mout;
   logic [NUM_LANES-1:0][5:0]  g_shout;
+  sienna_fmt_pkg::lane_params_t [NUM_LANES-1:0] g_par;  // per lane: the bundle gpnae takes
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -428,6 +429,9 @@ module sienna_pipe #(
     end
   end
 
+  logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o: read by the coefficient load path, which this build has not
+  wire unused_lane_idle = ^lane_idle;
+
   generate
     genvar g;
     for (g = 0; g < NUM_LANES; g++) begin : backend_lanes
@@ -443,7 +447,7 @@ module sienna_pipe #(
       assign gpnae_result[g] = l5.data;
       assign l5.credit       = l5_cr[g];
 
-      gpnae_lane #(
+      gpnae #(
           .ADDR_LINES   (GPNAE_ADDR_LINES),
           .CONTROL_WIDTH(GPNAE_CTRL_WIDTH),
           .OUT_MAX      (L5_MAX),
@@ -454,12 +458,12 @@ module sienna_pipe #(
           .in            (l4),
           .out           (l5),
           .control_word_i(gpnae_ctrl[g]),
-          .gp_mx_i       (g_mx[g]),
-          .gp_shx_i      (g_shx[g]),
-          .gp_zin_i      (g_add ? g_add_zpo : g_zp[g]),  // int8: the lane's input zero point: the ADD's zp_o after an ADD, else its requantize entry's (P-3)
-          .gp_mout_i     (g_mout[g]),
-          .gp_shout_i    (g_shout[g]),
-          .gp_zout_i     (g_zout[g])
+          .tier_i        (2'd0),  // tier 0, within 1%
+          .par_i         (g_par[g]),
+          .coef_wr_i     (1'b0),  // the lanes keep their reset coefficient memory
+          .coef_addr_i   ('0),
+          .coef_data_i   ('0),
+          .idle_o        (lane_idle[g])
       );
 
       // L7 into FIFO2, or with a 1x1 pool straight into dropout on L9's credits; L8 FIFO2 -> maxpool -> dropout; L9 out.
@@ -887,6 +891,9 @@ module sienna_pipe #(
       assign g_mout[k]  = g_lane[k].selu_out_mantissa;
       assign g_shout[k] = g_lane[k].selu_out_shift;
       assign g_zout[k]  = g_lane[k].selu_out_zero_point;
+      // the lane's input zero point: the ADD's zp_o after an ADD, else its requantize entry's (P-3)
+      assign g_par[k]   = '{in_rescale_mantissa: g_mx[k], in_rescale_shift: g_shx[k], in_zero_point: g_add ? g_add_zpo : g_zp[k],
+                            selu_out_mantissa: g_mout[k], selu_out_shift: g_shout[k], selu_out_zero_point: g_zout[k]};
       // D-5: a dropped value is the output zero point of the pooled column's activation (tanh, and every code the lane runs as tanh: 0).
       always_comb
         case (pe_act[p_lane_ent[k]])
@@ -905,10 +912,12 @@ module sienna_pipe #(
     assign g_mout    = '0;
     assign g_shout   = '0;
     assign g_zout    = '0;
+    assign g_par     = '0;
     assign p_zp      = '0;
     assign g_add_w   = '0;
     assign g_add_zpo = '0;
     wire unused_add_words = ^g_add_w;  // only add_lanes reads it, in a build with the residual ADD
+    wire unused_lane_words = ^{g_add, g_add_zpo, g_zp, g_mx, g_shx, g_mout, g_shout, g_zout};  // a float lane takes no parameters
   end
 
   // =========================================================================

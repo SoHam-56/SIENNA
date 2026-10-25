@@ -102,7 +102,7 @@ Notes per link:
    and simulated with our Verilator 5.035 on the farm, plus `--lint-only -DSYNTHESIS -Wall`. Pass: compiles, every
    put matched by a credit, the checker fires on a deliberate violation.
 1. AriL: the four shared files and a unit bench (counter, checker firing on purpose, `credit_reg` 0..3 stages).
-2. GPNAE: L4/L5 in `gpnae_poly` and `gpnae_poly_int8`; `TB_gpnae_poly` drives links with the checker bound.
+2. GPNAE: L4/L5 in the lane; its bench drives links with the checker bound.
 3. SystolicMesh: L1, L2, L3; `TB_SystolicMesh` drives links (start-while-not-ready and overrun tests become
    no-credit tests).
 4. SIENNA: `sienna_top` (L0, L3-L9), `sienna_layer` (L10), `sienna_multi`, `Maxpool_2D`, `dropout`, `fwft`; every

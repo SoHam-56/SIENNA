@@ -45,7 +45,7 @@ Cycle counts do not change: `fpMulWiden` takes 3 cycles = today's `mul_lat(8,7)`
 
 ## Verification (bottom-up, N <= 32 until check-in)
 
-1. ArithmeticLibrary: `fpNarrow` TB against the Python model; `fpMulWiden` reset change re-run (its existing TB); `TB_sienna_fmt_pkg` expectations (`acc_w(8,7)` = 32, the new accumulator-format helpers).
+1. ArithmeticLibrary: `fpNarrow` TB against the Python model; `fpMulWiden` reset change re-run (its existing TB); the package's expectations (`acc_w(8,7)` = 32, the new accumulator-format helpers).
 2. SystolicMesh: mesh regression bf16 at N = 8, 16, 32, every tile, bit-exact against the new `mesh_model`; fp32 and int8 identical to before; `TB_PE_pack` bf16 case.
 3. SIENNA: `make regression FMT=bf16` (bf16 goldens regenerate from the new model; bit-exact), fp32 and int8 gates unchanged and outputs identical to `stage_credits_v6`; `make gemm FMT=bf16` (bit-exact against the model; error vs K reported); `make pack FMT=bf16`.
 4. Model gate (#43): bf16 layers bit-exact against the model, classifiers' top-1, ad01's anomaly score now inside its bound, so ad01 bf16 leaves the REPORTED list and is gated.

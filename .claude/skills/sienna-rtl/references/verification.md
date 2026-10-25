@@ -95,8 +95,6 @@ Conv is pure data layout: the hardware only ever does `A × B`. `conv_tests.py`'
 
 Tolerance is ±3 ULP for the adder, ±2 ULP for the multiplier, with explicit escape hatches for NaN equivalence and for flush-to-zero versus SoftFloat's denormal results. Random inputs are sanitized by `fix_random_input()`, which rewrites denormals to the smallest normal and Inf/NaN to the largest normal, so the random phase never exercises those — corner cases cover them separately.
 
-The `*VIVADO.sv` variants read pre-generated vectors from `vectors.mem` instead of calling DPI-C, because linking SoftFloat into xsim is fragile. `generate_vectors.sh` builds SoftFloat if needed, compiles `gen_vectors.cpp` against it and emits that file. `ArithmeticLibrary/README.md` documents the Vivado DPI linker workaround (symlinking Vivado's bundled `ld` to the system one).
-
 ## Current status
 
 **7 of 7 passing** on a clean build (Verilator 5.035, N=16, TILE=4):

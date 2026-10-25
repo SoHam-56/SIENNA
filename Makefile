@@ -12,8 +12,8 @@ COLLAPSE_K ?= 1
 GEN_PKG ?= 1
 # Interpreter for the Python flows; tflite and model need the tflite package, e.g. PYTHON=<venv>/bin/python.
 PYTHON ?= python3
-# model_runner.py has no default model directory, so make model needs one.
-MODEL_DIR ?=
+# The MLPerf Tiny models make model and the model points run: models/ (NOTICE: sources, licenses, the inputs not committed); MODEL_DIR=<d> picks another.
+MODEL_DIR ?= $(PRJ_DIR)/models
 # Inferences per model in make model; make regression runs 3.
 MODEL_COUNT ?= 1
 # make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
@@ -52,6 +52,10 @@ DROPOUT_DIR = $(PRJ_DIR)/Dropout
 # FMT ?= fp32; any value but fp32, bf16 or int8 stops make; FMT_DEF is the build's +define+FMT_<FMT>, which sienna_fmt_pkg reads.
 # A command-line FMT_DEF= builds with no define, which must elaborate fp32 (make regression's default point).
 include $(SM_LIB_DIR)/Common/fmt.mk
+# SIM ?= verilator, or vcs (ArithmeticLibrary's sim.mk: plain VCS builds; TRACE=vcd, XPROP=1, RANDINIT=1); every Python flow reads it as SIENNA_SIM.
+VCS_LINT_BASELINE = $(PRJ_DIR)/vcs_lint_baseline.txt
+include $(SM_LIB_DIR)/Common/sim.mk
+export SIENNA_SIM := $(SIM)
 
 # Toolchain
 VERILATOR = verilator
@@ -247,27 +251,15 @@ else ifeq ($(TRACE),vcd)
 VERILATOR_FLAGS += --trace --trace-structs --trace-max-array 2048 --trace-max-width 1024 -DENABLE_TRACE
 endif
 
-VCS_FLAGS = \
-	-full64 \
-	-sverilog \
-	-timescale=1ns/100ps \
-	-Mdir=$(VCS_DIR) \
-	+v2k \
-	+incdir+$(SRC_DIR) \
-	+incdir+$(TB_DIR) \
-	+incdir+$(SM_DIR) \
-	+incdir+$(SM_LIB_DIR) \
-	+incdir+$(GPNAE_DIR) \
-	+incdir+$(MAXPOOL_DIR) \
-	+incdir+$(DROPOUT_DIR) \
-	+define+VCS \
-	$(FMT_DEF)
-
-ifeq ($(TRACE),vcd)
-VCS_FLAGS += -debug_all +define+ENABLE_TRACE
-else ifeq ($(TRACE),fst)
-VCS_FLAGS += -debug_all +define+ENABLE_TRACE
-endif
+# VCS: the same include paths and define, EXTRA_FLAGS' -G as -pvalue+ and -D as +define+, LINK_STAGES; sim.mk keeps it plain (TRACE=vcd adds waveforms).
+VCS_FLAGS = +incdir+$(SRC_DIR) +incdir+$(TB_DIR) +incdir+$(SM_DIR) +incdir+$(SM_LIB_DIR) +incdir+$(GPNAE_DIR) +incdir+$(MAXPOOL_DIR) +incdir+$(DROPOUT_DIR) \
+	$(FMT_DEF) $(call vcs_g,$(TOP_MODULE),$(filter -G%,$(EXTRA_FLAGS))) $(patsubst -D%,+define+%,$(filter -D%,$(EXTRA_FLAGS))) \
+	$(filter +define+%,$(EXTRA_FLAGS)) $(if $(filter-out 0,$(LINK_STAGES)),-pvalue+$(TOP_MODULE).LINK_STAGES=$(LINK_STAGES))
+# A VCS build is <VCS_DIR>/<TOP_MODULE>_sim, run in VCS_DIR as Verilator's in VERILATOR_DIR; its key hashes every source and include file, as BUILD_KEY's dependency list does.
+VCS_BIN = $(VCS_DIR)/$(TOP_MODULE)_sim
+VCS_BUILD_KEY = { for f in $(sort $(DESIGN_FILES) $(TB_DIR)/$(TESTBENCH) $(wildcard $(TB_DIR)/*.svh $(SRC_DIR)/*.svh)); do md5sum "$$f"; done; \
+	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
+	echo '$(TOP_MODULE) $(VCS_OPTS) $(VCS_FLAGS)'; }
 
 default: help
 
@@ -291,7 +283,7 @@ help:
 	@echo "  make build-key           - Print the key make sim compares with the build's (inputs, package without the run-time knobs, flags)"
 	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
 	@echo "  make verilator TRACE=vcd - Simulate + write VCD waveform (larger)"
-	@echo "  make vcs                 - Simulate using Synopsys VCS (no waveform)"
+	@echo "  make vcs                 - Simulate using Synopsys VCS (no waveform); SIM=vcs runs every flow below on VCS (README: Running with VCS)"
 	@echo "  make vcs       TRACE=vcd - Simulate + write VCD waveform"
 	@echo "  make vcs       TRACE=fst - VCS has no native FST dump; still writes VCD"
 	@echo ""
@@ -309,7 +301,7 @@ help:
 	@echo ""
 	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
 	@echo "  make pipeline FMT=int8            - Full pipeline regression (TEST=<substring> narrows it)"
-	@echo "  make model FMT=bf16 MODEL_DIR=<d> - MLPerf Tiny models on the RTL (model_runner.py; no int8)"
+	@echo "  make model FMT=bf16 [MODEL_DIR=<d>] - MLPerf Tiny models on the RTL (model_runner.py; no int8; default models/)"
 	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_top's layer contract (regression.py --action gemm)"
 	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
@@ -319,7 +311,7 @@ help:
 	@echo "  make idle-fault SET_PORT=0|1      - a put on the unused contract must fire a_idle_contract (regression.py --action idle-fault)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
 	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
-	@echo "  make regression MODEL_DIR=<d>     - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
+	@echo "  make regression [MODEL_DIR=<d>]   - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
 	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
 	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
 	@echo "  make regression-summary           - The table of the results in REG_DIR (default testbenches/results/regression)"
@@ -440,16 +432,25 @@ endif
 
 # The last build, run on the stimulus now in testbenches/ without building; it refuses a build of other inputs, package items (but TB_KNOBS) or flags.
 sim: $(PKG_DEP)
+ifeq ($(SIM),vcs)
+	@[ -x $(VCS_BIN) ] && [ -r $(VCS_BIN).build_key.txt ] || { echo "ERROR: no finished build in $(VCS_DIR): make vcs first"; exit 1; }
+	@$(VCS_BUILD_KEY) | cmp -s - $(VCS_BIN).build_key.txt || { echo "ERROR: $(VCS_DIR) holds a build of other sources, package items or flags: make vcs"; exit 1; }
+	$(call copy_mem_files,$(VCS_DIR))
+	@echo "-- Running simulation (no build: $(VCS_DIR)'s inputs, package and flags are this run's)"
+	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim $(VCS_RUN) $(SIM_ARGS)
+	@echo "-- Done"
+else
 	@[ -x $(VERILATOR_DIR)/$(TOP_MODULE)_sim ] && [ -r $(VERILATOR_DIR)/build_key.txt ] || { echo "ERROR: no finished build in $(VERILATOR_DIR): make verilator first"; exit 1; }
 	@$(BUILD_KEY) | cmp -s - $(VERILATOR_DIR)/build_key.txt || { echo "ERROR: $(VERILATOR_DIR) holds a build of other sources, package items or flags: make verilator"; exit 1; }
 	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running simulation (no build: $(VERILATOR_DIR)'s inputs, package and flags are this run's)"
 	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
 	@echo "-- Done"
+endif
 
 # The key make sim compares with the build's (BUILD_KEY), printed.
 build-key:
-	@$(BUILD_KEY)
+	@$(if $(filter vcs,$(SIM)),$(VCS_BUILD_KEY),$(BUILD_KEY))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sub-module targets
@@ -459,34 +460,35 @@ build-key:
 SM_CHECKS ?= 1
 sm-verilator:
 	@echo "=== Systolic Mesh only: FMT=$(FMT) N=$(N) TILE=$(TILE) COLLAPSE_K=$(COLLAPSE_K) ==="
-	$(MAKE) -C SystolicMesh mesh-regression MATRIX_SIZE=$(N) \
+	$(MAKE) -C SystolicMesh mesh-regression MATRIX_SIZE=$(N) SIM=$(SIM) \
 		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)$(if $(filter 0,$(SM_CHECKS)), --no-checks)"
 
 # GPNAE's lane gate at one tier of its coefficient memory: the RTL's words against the true function at that tier's tolerance.
 GPNAE_TIER ?= 0
 gpnae-verilator:
 	@echo "=== GPNAE only: FMT=$(FMT), tier $(GPNAE_TIER) ==="
-	cd GPNAE && $(PYTHON) regression.py --format $(FMT) --run gate --tier $(GPNAE_TIER)
+	cd GPNAE && $(PYTHON) regression.py --format $(FMT) --run gate --tier $(GPNAE_TIER) --sim $(SIM)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS
 # ─────────────────────────────────────────────────────────────────────────────
 vcs: $(PKG_DEP)
-	@echo "=== VCS simulation: $(TOP_MODULE)  TRACE=$(TRACE) ==="
+	@echo "=== VCS simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 ifeq ($(TRACE),fst)
 	@echo "-- WARNING: VCS's \$$dumpvars only produces VCD; this run will write"
 	@echo "            TB_sienna_top.vcd, not FST (need \$$fsdbDumpvars/Verdi for FST)."
 endif
 	@mkdir -p $(VCS_DIR)
-	$(VCS) $(VCS_FLAGS) \
-		-o $(VCS_DIR)/$(TOP_MODULE)_sim \
+	@rm -f $(VCS_BIN).build_key.txt
+	$(VCS) $(VCS_OPTS) -top $(TOP_MODULE) -Mdir=$(VCS_DIR)/csrc_$(TOP_MODULE) -o $(VCS_BIN) $(VCS_FLAGS) \
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/$(TESTBENCH)
+	@$(VCS_BUILD_KEY) > $(VCS_BIN).build_key.txt
 	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running simulation"
-	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim
-	@echo "-- VCS simulation complete"
+	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim $(VCS_RUN) $(SIM_ARGS)
+	@echo "-- Done"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Waveform viewer
@@ -586,7 +588,7 @@ pipeline:
 # Format-aware runs (each script writes its own package and builds with GEN_PKG=0)
 # ─────────────────────────────────────────────────────────────────────────────
 model:
-	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models>; model_runner.py has no default"; exit 1; }
+	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
 	$(PYTHON) model_runner.py \
 		--model-dir $(MODEL_DIR) \
 		--n $(N) \
@@ -643,26 +645,34 @@ pack:
 	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
 
 # add_lanes on regression.py --action add-vectors: fails unless the log has RESULT: PASSED and no error or failed assertion (patterns bracketed against make's echo), then gates its outputs on the true function
-ADDL_DIR = $(VERILATOR_DIR)/add_lanes
+ADDL_DIR = $(if $(filter vcs,$(SIM)),$(VCS_DIR),$(VERILATOR_DIR))/add_lanes
 add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
+ifeq ($(SIM),vcs)
+	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv $(TB_DIR)/TB_add_lanes.sv,+define+FMT_INT8)
+else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/QuantizedAdder/src/int8QuantizedAdder.sv $(SRC_DIR)/add_lanes.sv \
 	  $(TB_DIR)/TB_add_lanes.sv -o sim
-	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
-	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
+endif
+	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim $(SIM_RUN) | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
+	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(ADDL_DIR)/sim.log || { echo "TB_add_lanes: failed ($(ADDL_DIR)/sim.log)"; exit 1; }
 	$(PYTHON) regression.py --action add-vectors --check $(TB_DIR)/add_lanes_out.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 
 # requant_lanes on regression.py --action rq-vectors: fails unless the log has RESULT: PASSED and no error or failed assertion (patterns bracketed against make's echo), then gates its outputs on the true function
-RQL_DIR = $(VERILATOR_DIR)/rq_lanes
+RQL_DIR = $(if $(filter vcs,$(SIM)),$(VCS_DIR),$(VERILATOR_DIR))/rq_lanes
 rq-lanes:
 	mkdir -p $(RQL_DIR)
 	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
+ifeq ($(SIM),vcs)
+	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv,+define+FMT_INT8)
+else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
 	  $(SM_LIB_DIR)/Common/src/sienna_fmt_pkg.sv $(SM_LIB_DIR)/Requantizer/src/int8Requantizer.sv $(SRC_DIR)/requant_lanes.sv $(TB_DIR)/TB_requant_lanes.sv -o sim
-	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
-	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }
+endif
+	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim $(SIM_RUN) | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
+	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }
 	$(PYTHON) regression.py --action rq-vectors --check $(TB_DIR)/rq_lanes_out.mem --truth $(RQL_DIR)/rq_lanes_truth.json
 
 # make regression: SIENNA's points, each its own target (make -jN runs N side by side), then the table; FMT=<f> narrows it to one format.
@@ -672,7 +682,7 @@ space := $(empty) $(empty)
 REG_FORMATS = $(subst $(space),$(comma),$(strip $(or $(REG_FMT),$(FORMATS))))
 REG_SELECT  = --formats $(REG_FORMATS)$(if $(filter 1,$(REG_SMALL)), --small)
 REG_DIR    ?= $(TB_DIR)/results/regression
-REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(abspath $(MODEL_DIR))
+REG_SUMMARY = $(PYTHON) regression.py --action summary --results $(REG_DIR) $(REG_SELECT) --model-dir=$(abspath $(MODEL_DIR)) --sim $(SIM)
 ifneq ($(filter regression,$(MAKECMDGOALS)),)
 ifeq ($(origin REG_RUN),undefined)
 REG_RUN := $(shell date +%Y%m%d-%H%M%S)-$(shell echo $$PPID)
@@ -682,7 +692,7 @@ endif
 
 # One point, e.g. make regression/bf16/N8_T2/pipeline: runs in a private copy of the tree, writes $(REG_DIR)/<point>.log and .json.
 regression/%:
-	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(abspath $(MODEL_DIR))$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
+	@$(PYTHON) regression.py --action point --name $* --results $(REG_DIR) --model-dir=$(abspath $(MODEL_DIR)) --sim $(SIM)$(if $(REG_RUN), --run $(REG_RUN))$(if $(filter regression,$(MAKECMDGOALS)), --keep-going)
 
 # The default point compares with its twin's finished result, so its twin runs first.
 regression/default/N8_T2/pipeline: | regression/fp32/N8_T2/pipeline

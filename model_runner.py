@@ -25,6 +25,10 @@ import time
 import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+SIM = os.environ.get("SIENNA_SIM", "verilator")  # the simulator: make SIM=vcs exports SIENNA_SIM=vcs to every flow it starts
+SIM_DIR = os.path.join(ROOT, "VCS" if SIM == "vcs" else "Verilator")  # make vcs builds <top>_sim there, as make verilator does in Verilator/
+SIM_TARGET = "vcs" if SIM == "vcs" else "verilator"
+FIRED = re.compile(r'Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]|^(?:Error|Fatal): "|^Error-\[|: started at .* failed at', re.M)  # Verilator's and VCS's forms
 sys.path.insert(0, ROOT)
 sys.path.append(os.path.join(ROOT, "GPNAE"))  # appended: the submodules have their own regression.py, which must not shadow ours
 sys.path.append(os.path.join(ROOT, "SystolicMesh"))
@@ -34,6 +38,7 @@ from mesh_model import fpu  # noqa: E402
 sys.path.append(os.path.join(ROOT, "SystolicMesh", "ArithmeticLibrary", "Common", "models"))
 import ipu  # noqa: E402
 import truth  # noqa: E402
+import fourstate  # noqa: E402  4-state safe parsing: an x or z word or count fails its test by name
 
 
 # ── 1. Numerics: the reference arithmetic the host must reproduce ────────────
@@ -1110,8 +1115,11 @@ def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_w
             f.write("".join(f"{int(v) & 0xFFFFFFFF:08x}\n" for v in epilogue.ravel()))
 
 
-def read_outputs(path, fmt="fp32"):
-    """The result file (an "S" line per output set, then its words) as float32 sets; words are in the build's format, a narrow one widened exactly; int8 as signed integer codes."""
+def read_outputs(path, fmt="fp32", test=None):
+    """The result file (an "S" line per output set, then its words) as float32 sets; words are in the build's format, a narrow one widened exactly; int8 as signed integer codes.
+    An x or z word raises fourstate.Unknown (a ValueError) naming the word and test."""
+    test, k = test or os.path.basename(path), 0
+    word = lambda line: fourstate.word(line, test, k)
     if fmt == "int8":  # two's-complement codes
         sets, cur = [], None
         for line in open(path):
@@ -1119,7 +1127,8 @@ def read_outputs(path, fmt="fp32"):
                 cur = []
                 sets.append(cur)
             else:
-                cur.append(int(line, 16))
+                cur.append(word(line))
+                k += 1
         return [((np.array(s, np.int64) + 128) % 256) - 128 for s in sets]
     sh = 23 - FORMATS[fmt][1]
     sets = []
@@ -1129,7 +1138,8 @@ def read_outputs(path, fmt="fp32"):
             cur = []
             sets.append(cur)
         else:
-            cur.append(int(line, 16) << sh)
+            cur.append(word(line) << sh)
+            k += 1
     return [np.array(s, dtype=np.uint32).view(np.float32) for s in sets]
 
 
@@ -1379,14 +1389,14 @@ class RtlLayer:
 
     def __init__(self, N, lanes, work, fmt_name="fp32", tile_size=4):
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
-        self.bin = os.path.join(ROOT, "Verilator", "TB_model_run_sim")
+        self.bin = os.path.join(SIM_DIR, "TB_model_run_sim")
         self.cycles = self.sets = self.words = 0
         self.first_hold = self.first_free = self.last_log = self.last_stages = None
         self.retries = 0  # Verilator internal-error rebuilds
 
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
-        cmd = ["make", "verilator", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0", f"FMT={self.fmt_name}", f"N={self.N}",
+        cmd = ["make", SIM_TARGET, "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0", f"FMT={self.fmt_name}", f"N={self.N}",
                f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
                "GEN_PKG=0"]  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
@@ -1434,6 +1444,12 @@ class RtlLayer:
         if job.get("coef") is not None:
             os.remove(cf)
         self.first_Y = None
+        if FIRED.search(r.stdout + r.stderr) is None:  # a count with an x or z fails the layer by name (a ValueError its callers report)
+            for pat, what in ((rf"\[LAYER\] sets=\S+ outputs=\S+ cycles=({fourstate.DEC})", "cycle count"), (rf"\[LAYER\] sets=({fourstate.DEC})", "set count")):
+                try:
+                    fourstate.field(pat, r.stdout, tag, what)
+                except fourstate.Unknown as e:
+                    raise RuntimeError(f"{tag}: {fourstate.fail_line(e)}")
         b = re.search(r"\[LAYER\] coef busy: (\d+) writes while the layer streamed, (\d+) refused", r.stdout)
         self.busy_refused = (int(b.group(1)), int(b.group(2))) if b else None
         g = re.search(r"\[Between\] loaded .* its first write (\d+) cycles after done_o", r.stdout)
@@ -1443,7 +1459,7 @@ class RtlLayer:
         self.first_hold = int(h.group(1)) if h else None
         f = re.search(r"\[RES\] first hold window closed (\d+) cycles into the layer", r.stdout)
         self.first_free = int(f.group(1)) if f else None
-        if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
+        if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
@@ -1452,7 +1468,7 @@ class RtlLayer:
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: layer simulation failed")
         check_layer_mode(r.stdout, tag)
-        outs = read_outputs(of, self.fmt_name)
+        outs = read_outputs(of, self.fmt_name, tag)
         if job.get("between") is not None:
             self.first_Y = self._tiles(read_outputs(ff, self.fmt_name), rt, ct, int8, tag)[:M, :C]
             os.remove(bf)
@@ -1518,7 +1534,7 @@ class RtlSets:
     def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
         self.N, self.lanes, self.work, self.T = N, lanes, work, tile_size
         self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
-        self.bin = os.path.join(ROOT, "Verilator", "TB_sienna_model_sim")
+        self.bin = os.path.join(SIM_DIR, "TB_sienna_model_sim")
         self.cycles = 0
         self.sets = 0
 
@@ -1526,7 +1542,7 @@ class RtlSets:
         if COLLAPSE_K == 0:
             raise ValueError("TB_sienna_model builds collapse-k 1")
         write_build_pkg(self.N, self.T, self.lanes, "fp32")
-        r = subprocess.run(["make", "verilator", "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
+        r = subprocess.run(["make", SIM_TARGET, "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
                             "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
                             "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
                            cwd=ROOT, capture_output=True, text=True)
@@ -1551,16 +1567,20 @@ class RtlSets:
         r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + lanes + (["+host_gaps"] if self.host_gaps else []),
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
-        if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
+        if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the model simulation")
+        try:  # a count with an x or z fails the model run by name
+            fourstate.field(rf"\[MODEL\] sets=\S+ outputs=\S+ cycles=({fourstate.DEC})", r.stdout, tag, "cycle count")
+        except fourstate.Unknown as e:
+            raise RuntimeError(f"{tag}: {fourstate.fail_line(e)}")
         b = re.search(r"\[MODEL\] coef busy: (\d+) writes while sets streamed, (\d+) refused", r.stdout)
         self.busy_refused = (int(b.group(1)), int(b.group(2))) if b else None
         m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
         if not m or int(m.group(6)) != 0:
             sys.stdout.write(r.stdout[-3000:])
             raise RuntimeError(f"{tag}: simulation failed")
-        outs = read_outputs(out_f)
+        outs = read_outputs(out_f, "fp32", tag)
         os.remove(sets_f)
         os.remove(out_f)
         cyc = int(m.group(3))
@@ -1866,6 +1886,21 @@ MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
 ACTIONS = ("model", "tflite")
 
 
+MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to fetch one that is missing (models/NOTICE: sources and licenses)
+    "resnet8": (("data/cifar-10-batches-py/test_batch", "perf_samples_idxs.npy"), "run models/fetch_cifar10.sh"),
+    "ad01": (("normal_id_01_00000000_hist_librosa.bin",), "run models/fetch_inputs.sh"),
+    "kws": (("marvin_617de221_0.wav",), "run models/fetch_inputs.sh"),
+    "vww": ((), ""),
+}
+
+
+def missing_inputs(name, mdir):
+    """The files model name needs under mdir that are not there (its .tflite first), and how to supply them."""
+    files, how = MODEL_INPUTS[name]
+    miss = [f for f in (MODELS[name],) + files if not os.path.isfile(os.path.join(mdir, f))]
+    return miss, ("make regression MODEL_DIR=<directory with it>" if MODELS[name] in miss else how)
+
+
 def model_main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
@@ -1926,7 +1961,16 @@ def model_main(argv=None):
     tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": [],
              "runs": {}, "rep_seen": set(), "rep_failed": set()}
     results = {}
-    models = a.models.split(",")
+    models, skipped = a.models.split(","), []
+    for name in list(models):  # a model whose input files are absent is skipped by name, not failed
+        miss, supply = missing_inputs(name, a.model_dir)
+        if miss:
+            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({supply})")
+            models.remove(name)
+            skipped.append(name)
+    if not models:
+        log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
+        return
     for name in models:
         model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
         if name == "resnet8" and a.ref_accuracy:
@@ -1998,7 +2042,8 @@ def model_main(argv=None):
     log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(tally['runs'])} of {len(models)} models ran, "
         f"{tally['inferences']} inferences; hardware: {tally['bad_layers']} of {tally['layers']} layers fail ({how}); "
         f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; other failures: {len(extra)}; "
-        f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}")
+        f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}"
+        + (f"; skipped (inputs absent): {', '.join(skipped)}" if skipped else ""))
     if not ok:
         sys.exit(1)
 

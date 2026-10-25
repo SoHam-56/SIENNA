@@ -39,6 +39,12 @@ module TB_sienna_model;
   logic [$clog2(WC_TILES*N*N)-1:0] wc_write_addr_i;
   logic [LFSR_WIDTH-1:0]    dropout_seed_i;
   logic [CONTROL_WIDTH-1:0] activation_function_i;
+  logic coef_wr = 1'b0;  // the lanes' load path, idle
+  logic [8:0] coef_addr = '0;
+  logic [31:0] coef_data = '0;
+  /* verilator lint_off UNUSEDSIGNAL */
+  logic coef_ready;  // sienna_top's load interlock
+  /* verilator lint_on UNUSEDSIGNAL */
 
   // The host link (L0): start_pipeline_i is the put, pipeline_ready_o says this host holds a staging credit; no cached sets, so no fills (L2).
   localparam int PACK_ENTRIES = 8;
@@ -180,6 +186,10 @@ module TB_sienna_model;
       .west_write_reset_i         (west_write_reset_i),
       .drained_i                  (1'b0),
       .copy_sel_o                 (),
+      .coef_wr_i                  (coef_wr),  // the lanes keep their reset coefficient memory
+      .coef_addr_i                (coef_addr),
+      .coef_data_i                (coef_data),
+      .coef_ready_o               (coef_ready),
       .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),

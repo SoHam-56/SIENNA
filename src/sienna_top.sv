@@ -91,7 +91,12 @@ module sienna_top #(
     output logic [COPIES-1:0]       maxpool_busy_o,
     output logic [COPIES-1:0]       dropout_busy_o,
 
-    // ── Both contracts: L9, copy c's lane l is out[c*NUM_LANES + l]; a word per put while the consumer's credit is held ──
+    // ── Both contracts: the lanes' coefficient memory load path, into every lane of every copy while they are idle (gpnae_pkg's map),
+    // and L9, copy c's lane l is out[c*NUM_LANES + l]; a word per put while the consumer's credit is held ──
+    input logic                     coef_wr_i,
+    input logic [8:0]               coef_addr_i,
+    input logic [31:0]              coef_data_i,
+    output logic                    coef_ready_o,  // every pipeline empty, every lane idle and no layer running: a write is taken, else refused
     credit_link_if.producer         out[COPIES*NUM_LANES]
 );
   localparam int DATA_WIDTH     = sienna_fmt_pkg::DATA_WIDTH;
@@ -134,6 +139,9 @@ module sienna_top #(
 
   // Whether the unused contract's inputs put or write this cycle; a_idle_contract checks it registered, since a host may drive at the edge.
   logic idle_put;
+  logic coef_ready, coef_take;  // the load interlock: a write reaches the lanes only while nothing is in flight
+  assign coef_take    = coef_wr_i && coef_ready;
+  assign coef_ready_o = coef_ready;
 
   if (SET_PORT == 0) begin : G_LAYER
     credit_link_if #(.DATA_W(SIDE_W), .CRW(1)) l0 ();  // sienna_sched's sets into the pipeline
@@ -142,6 +150,8 @@ module sienna_top #(
     logic wc_we, north_we, west_we, set_done;
     logic [WCAW-1:0] wc_addr;
     logic [N-1:0][DATA_WIDTH-1:0] north, west;
+    logic pipe_ready;
+    assign coef_ready = pipe_ready && !busy_o && !cfg_load_i;  // a layer in flight keeps the lanes' memory as it started
     sienna_sched #(
         .N            (N),
         .WC_TILES     (WC_TILES),
@@ -234,6 +244,10 @@ module sienna_top #(
         .west_write_enable_i (west_we),
         .west_write_data_i   (west),
         .west_write_reset_i  (1'b0),
+        .coef_wr_i           (coef_take),
+        .coef_addr_i         (coef_addr_i),
+        .coef_data_i         (coef_data_i),
+        .coef_ready_o        (pipe_ready),
         .out                 (out),
         .pipeline_complete_o (set_done),
         .done_set_id_o       (unused_id),
@@ -265,6 +279,8 @@ module sienna_top #(
     logic [SW-1:0] sel;  // the copy whose turn it is
     logic [COPIES-1:0] put;  // per copy: the host's put this cycle
     logic [COPIES-1:0] wc_cred[2];  // per region: this cycle's credit from each copy
+    logic [COPIES-1:0] copy_ready;  // per copy: its coef_ready_o
+    assign coef_ready = &copy_ready;
     for (genvar c = 0; c < COPIES; c++) begin : G_COPY
       logic mine;  // the turn is this copy's: the row buses reach it
       assign mine   = (COPIES == 1) || (sel == SW'(c));
@@ -326,6 +342,10 @@ module sienna_top #(
           .west_write_enable_i (west_write_enable_i && mine),
           .west_write_data_i   (west_write_data_i),
           .west_write_reset_i  (west_write_reset_i && mine),
+          .coef_wr_i           (coef_take),
+          .coef_addr_i         (coef_addr_i),
+          .coef_data_i         (coef_data_i),
+          .coef_ready_o        (copy_ready[c]),
           .out                 (outl),
           .pipeline_complete_o (pipeline_complete_o[c]),
           .done_set_id_o       (done_set_id_o[c]),
@@ -491,6 +511,13 @@ module sienna_top #(
   a_idle_contract: assert property (@(posedge clk_i) disable iff (!rstn_i) !idle_put_q)
     else $error("sienna_top: a_idle_contract: a put or write on the %s contract, which SET_PORT = %0d leaves unused", (SET_PORT == 0) ? "set" : "layer",
                 SET_PORT);
+  // A coefficient write reaches the lanes only while the interlock is ready. Both terms are registered.
+  logic take_q, ready_q;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {take_q, ready_q} <= 2'b01;
+    else {take_q, ready_q} <= {coef_take, coef_ready};
+  a_load_ready: assert property (@(posedge clk_i) disable iff (!rstn_i) take_q |-> ready_q)
+    else $error("sienna_top: a_load_ready: a coefficient write reached the lanes while a set or layer was in flight");
 `else
   wire unused_idle_put = idle_put;  // checks only
 `endif

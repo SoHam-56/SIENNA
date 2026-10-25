@@ -1931,9 +1931,9 @@ def model_main(argv=None):
     results = {}
     models, skipped = a.models.split(","), []
     for name in list(models):  # a model whose input files are absent is skipped by name, not failed
-        miss, how = missing_inputs(name, a.model_dir)
+        miss, supply = missing_inputs(name, a.model_dir)
         if miss:
-            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({how})")
+            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({supply})")
             models.remove(name)
             skipped.append(name)
     if not models:

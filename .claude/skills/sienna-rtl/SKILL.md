@@ -141,7 +141,7 @@ SIENNA's Python is two scripts: `regression.py` (hardware sanity, every check ab
 - The tracked `testbenches/test_config_pkg.sv` is the fp32 default (`make pkg FMT=fp32 N=16 TILE=4`). Every build overwrites it, so don't commit it from a run.
 - `PYTHON` (default `python3`) runs the scripts; `tflite`, `model` and make regression's tflite and model points need the `tflite` package (`PYTHON=<venv>/bin/python`).
 - **Packing ports.** On the set contract each start's sideband carries `pack_shift`, `pack_map`, the activation per entry and, in int8, each entry's `lane_entry_t` (requantize zero point and clamp, lane rescale and SELU words); tied to 0 they give today's results and cycles. On the layer contract the same come as configuration (`cfg_pack_shift_i`, `cfg_pack_map_i`, `cfg_pack_act_i`, `cfg_pack_lane_i`; the layer file's L, P and E lines). Packing needs `LANES` = N or a multiple: the default 32 cannot pack at N = 64 (use `LANES=64` or `128`). The `sienna-packing` skill has the rules and refusals.
-- `gpnae-verilator` rewrites GPNAE's tracked `testbenches/gpnae_test_config.svh` for FMT, as GPNAE's regression always does.
+- `gpnae-verilator` runs GPNAE's lane gate in FMT at `GPNAE_TIER` (default 0); it reads no coefficient file.
 
 ## State as of 2026-09-20 — read this first
 

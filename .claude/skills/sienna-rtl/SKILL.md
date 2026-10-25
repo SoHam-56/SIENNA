@@ -189,11 +189,9 @@ Be aware the tolerance check does not measure what it claims: every testbench in
 
 **An int8 residual layer is two sets, and the first fills no bank yet needs one.** `sienna_sched` turns each output tile of an int8 ADD layer into a *hold set* (the conv's last depth pass, requantized into `hold_mem`, no output) and an *add set* (the residual through the identity pass, requantized, then `add_lanes` with the `hold_mem` beat of the same index, then the normal bypass or lane path). Both live inside the activation stage: no new credit link. A hold set still takes an L3 grant, so it waits for a free activation bank (`l6_rsv` counts its reservation from the grant until `hold_done`) although it writes none; a hang with a hold set at the head of the stage is a bank shortage, not an ADD bug. `hold_mem` keeps no set tags: its order rests on `a_rq_one_set` (one set in the requantize at a time), and `a_hold_push_empty` / `a_add_pop_full` catch an overwrite or an early read. The set after an add set waits for `add_lanes` to drain (`rq_room`, `rq_drain` read `busy_o`). Floats refuse the residual sideband (`a_float_no_add`).
 
-**Coefficient memory is binary, everything else is hex.** `taylor_coeffs.mem` is loaded with `$readmemb` (`GPNAE/src/TYTAN/Memory/ROM.v`) and holds 32-character binary lines. Every matrix `.mem` is `$readmemh`. Writing a coefficient table in hex fails silently, producing zeros or X.
+**The lanes read no coefficient file.** `gpnae_coef_mem` resets to the literal tables `fit_poly_coeffs.py` writes into it from `GPNAE/gpnae_coef_default.json`, and the host changes them only through the load path. Every matrix `.mem` is `$readmemh`.
 
 **The GPNAE FIFO is not first-word-fall-through, and its read pointer has two owners.** `InputFIFO` presents the *previously popped* word, so a consumer must pop before it samples. The TYTAN controller does; the SELU FSM did not, which cost it the first element of every batch. Both the TYTAN controller and the SELU FSM can issue pops, arbitrated by decoding `current_state` in `fifo_rd_en_o`. Any change to element consumption in GPNAE has to account for both. See known-issues #3.
-
-**Six copies of `taylor_coeffs.mem` exist** across the working tree and build directories, currently all identical. The Makefile's `copy_mem_files` sweeps several directories into the simulation directory, so an inconsistent copy will be picked up by position rather than intent. Change `GPNAE/src/TYTAN/Memory/taylor_coeffs.mem` and let the copy rules propagate it.
 
 ## Milestone tags
 

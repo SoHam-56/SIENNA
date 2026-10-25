@@ -101,8 +101,8 @@ at N = 16, T = 4 (`--action all`); records dated before that (skills, reports) m
 Each repo owns its regression (Soham, 2026-10-10): SIENNA's runs SIENNA's tests only. SystolicMesh (`make regression
 [SMALL=1] [FMT=]`: model-tests, aril-fpu, aril-narrow once, the mesh at every N, tile size and format in collapse-k 1 and 0 (collapse-k 0
 at N = 64 needs 108 to 430+ GB and the large code model, LARGE_CODE=1); the one-N run is `make mesh-regression MATRIX_SIZE=<n>`, which SIENNA's `make sm-verilator` calls), GPNAE (`make regression
-[FMT=]`: its two model checks once, the published Taylor lane in fp32 as published, the poly lane bit-exact against gpnae_model in each format, and its accuracy against
-the functions: fp32 gated at 1%, bf16 reported, not gated) and ArithmeticLibrary (`make regression`: every
+[FMT=]`: selftest, check-model, check-fmt and check-hier once; per format lint, the barrel bench, the lane's words against the true function at each tier
+(1%, 5%, 10%), the protocol, load-path, cycles and fault points) and ArithmeticLibrary (`make regression`: every
 unit bench and model check once, each lint on its count lines) have their own, on the same engine.
 
 - **Engine.** `SystolicMesh/ArithmeticLibrary/Common/regress.py` (loaded by path as `aril_regress`, since every repo has
@@ -253,7 +253,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 3. **model_runner appends the submodule directories to `sys.path`** (not insert): GPNAE and SystolicMesh each have a
    `regression.py`, and with insert `import regression` after `import model_runner` loaded SystolicMesh's.
 4. **perf reads the RTL in `perf_init()`, not at import** (ruling, Task 3 review): verbatim, `import regression` parsed
-   sienna_fmt_pkg.sv, gpnae_poly.sv and sienna_top.sv, so an RTL change perf cannot read broke every action. perf's
+   sienna_fmt_pkg.sv, the lane RTL and sienna_top.sv, so an RTL change perf cannot read broke every action. perf's
    results are identical; its errors start "regression.py --action perf:".
 5. **Self-tests are an explicit registry** (`@selftest`, `@perf_selftest` runs `perf_init()` first), not collected by
    name: the oracle's helper `test_inputs` is a global `test_*` too. Clashing fixture names were renamed (ENV ->

@@ -1871,6 +1871,14 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
                 r.update(status="FAIL" if r["status"] == "PASS" else r["status"], failed=max(r["failed"], 1))
         results.append(r)
 
+        if os.environ.get("SIENNA_KEEP_TRUTH") and os.path.exists(TRUTH_DUMP):  # comparison runs: the dump and each set's per-column activations
+            shutil.copy(TRUTH_DUMP, os.path.join(RESULTS_DIR, f"{t['name']}_truth_dump.txt"))
+            kn = _tb_knobs()
+            with open(os.path.join(RESULTS_DIR, f"{t['name']}_acts.txt"), "w") as fh:
+                for k in range(kn["num_sets"]):
+                    sw = _set_words(k, kn, N, fmt_name)
+                    fh.write(f"{k} " + " ".join(sw["ents"][int(sw["col_ent"][c])]["act"] for c in range(N)) + "\n")
+
         # 4. Dump Formatted HW Matrix Trace
         dump_hardware_trace(t["name"], N, print_to_console=(r["status"] != "PASS"))
 

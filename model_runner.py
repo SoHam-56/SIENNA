@@ -1436,6 +1436,8 @@ class RtlLayer:
         self.first_Y = None
         b = re.search(r"\[LAYER\] coef busy: (\d+) writes while the layer streamed, (\d+) refused", r.stdout)
         self.busy_refused = (int(b.group(1)), int(b.group(2))) if b else None
+        g = re.search(r"\[Between\] loaded .* its first write (\d+) cycles after done_o", r.stdout)
+        self.between_gap = int(g.group(1)) if g else None  # +between: how soon after the layer's done_o the load began
         self.last_log, self.last_stages = r.stdout, None
         h = re.search(r"\[RES\] first hold_done (\d+) cycles into the layer", r.stdout)
         self.first_hold = int(h.group(1)) if h else None

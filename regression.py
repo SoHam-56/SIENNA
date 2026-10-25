@@ -44,6 +44,7 @@ from model_runner import (  # noqa: E402
     quant_act, quant_weights, requant_params, requantize, wrap32, write_sv_package)
 import ipu  # noqa: E402  AriL's integer model, on the path model_runner set
 import fmt_pkg  # noqa: E402  the one parser of sienna_fmt_pkg's define map, on the same path
+fourstate = mr.fourstate  # 4-state safe parsing: an x or z word, count or hash fails its test by name
 
 
 def _load_truth():
@@ -1167,12 +1168,13 @@ def _tb_knobs() -> dict:
         return {k: int(v) for k, v in (ln.split() for ln in fh if ln.strip())}
 
 
-def read_truth_dump(path: str, lanes: int) -> dict:
+def read_truth_dump(path: str, lanes: int, test: str = "-") -> dict:
     """{pass: {"M": {r: {e: (sum, word)}}, "X"/"A"/"R": {k: {e: word}}, "Q": {k: {e: (q1, q2, y)}}, "P": {k: {window: (word, keep)}},
     "D": {k: {i: word}}}}; R: a hold set's beats into hold_mem, Q: an add set's ADD inputs and output."""
-    d = {}
+    d, n = {}, 0
+    h = lambda x: fourstate.word(x, test, n, "dumped word")  # an x or z raises fourstate.Unknown, numbered by the dump's line
     with open(path) as fh:
-        for ln in fh:
+        for n, ln in enumerate(fh):
             t = ln.split()
             if not t:
                 continue
@@ -1181,13 +1183,13 @@ def read_truth_dump(path: str, lanes: int) -> dict:
                 continue
             g = d.setdefault(t[1], {"M": {}, "X": {}, "A": {}, "P": {}, "D": {}, "Q": {}, "R": {}})
             if t[0] == "M":
-                g["M"].setdefault(int(t[2]), {})[int(t[3])] = (int(t[4], 16), int(t[5], 16))
+                g["M"].setdefault(int(t[2]), {})[int(t[3])] = (h(t[4]), h(t[5]))
             elif t[0] == "Q":
-                g["Q"].setdefault(int(t[2]), {})[int(t[3])] = (int(t[4], 16), int(t[5], 16), int(t[6], 16))
+                g["Q"].setdefault(int(t[2]), {})[int(t[3])] = (h(t[4]), h(t[5]), h(t[6]))
             elif t[0] in ("X", "A", "D", "R"):
-                g[t[0]].setdefault(int(t[2]), {})[int(t[3])] = int(t[4], 16)
+                g[t[0]].setdefault(int(t[2]), {})[int(t[3])] = h(t[4])
             elif t[0] == "P":
-                g["P"].setdefault(int(t[2]), {})[int(t[4]) * lanes + int(t[3])] = (int(t[5], 16), int(t[6]))
+                g["P"].setdefault(int(t[2]), {})[int(t[4]) * lanes + int(t[3])] = (h(t[5]), fourstate.word(t[6], test, n, "dropout keep bit", 10))
             else:
                 raise ValueError(f"truth dump: unknown line {ln.strip()!r}")
     return d
@@ -1285,7 +1287,7 @@ def truth_test(N: int, fmt: str, lanes: int) -> dict:
     knobs, pkg = _tb_knobs(), _pkg_fields(os.path.join(TB_DIR, "test_config_pkg.sv"))
     if not os.path.exists(TRUTH_DUMP):
         raise RuntimeError(f"no truth dump at {TRUTH_DUMP}")
-    dump = read_truth_dump(TRUTH_DUMP, lanes)
+    dump = read_truth_dump(TRUTH_DUMP, lanes, f"N{N} {fmt}")
     hdr = dump.pop("_hdr", {})
     if "b2b" not in hdr:
         raise RuntimeError("truth dump: no 'H b2b' line")
@@ -1563,7 +1565,7 @@ PIPELINE_TESTS = [
 ]
 
 
-OUT_WORD = re.compile(r"Dropout -> Output \(Lane (\d+)\)\s*: dec=\S+\s+hex=([0-9a-fA-F]+)")  # every L9 word TB_sienna_top prints, lane and word
+OUT_WORD = re.compile(r"Dropout -> Output \(Lane (\d+)\)\s*: dec=\S+\s+hex=([0-9a-fA-FxXzZ]+)")  # every L9 word TB_sienna_top prints, lane and word (x, z: 4-state)
 
 
 def build_define(key_file: str) -> str:
@@ -1621,8 +1623,8 @@ def build_order(tests: list, N: int, T: int, lanes: int, fmt: str) -> list:
 def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 4, lanes: int = 32, build: bool = True) -> tuple:
     t0 = time.time()
     process = subprocess.Popen(
-        ["make", "verilator" if build else "sim", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}", f"COLLAPSE_K={mr.COLLAPSE_K}",
-         "GEN_PKG=0"],  # GEN_PKG=0: build the package this test just wrote, in its format and geometry
+        ["make", mr.SIM_TARGET if build else "sim", f"FMT={fmt_name}", f"N={N}", f"TILE={T}", f"LANES={lanes}", f"COLLAPSE_K={mr.COLLAPSE_K}",
+         "GEN_PKG=0", f"SIM={mr.SIM}"],  # GEN_PKG=0: build the package this test just wrote, in its format and geometry
         cwd=ROOT,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1641,8 +1643,8 @@ def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 
     return "".join(raw_log), time.time() - t0
 
 
-def _parse_log(raw: str) -> dict:
-    fired = re.search(r"^.*(?:Assertion failed|%Error).*$", raw, re.M)
+def _parse_log(raw: str, test: str = "-") -> dict:
+    fired = re.search(r'^.*(?:Assertion failed|%Error).*$|^(?:Error|Fatal): ".*$|^Error-\[.*$|^.*: started at .* failed at.*$', raw, re.M)  # Verilator's and VCS's forms
     if fired:  # a firing assertion leaves the exit code and the TB's counts untouched, so the log is the only witness
         return {"status": "ASSERT", "total": 0, "exact": 0, "tol": 0, "failed": 1, "cyc": 0, "fired": fired.group(0).strip()}
     if "FATAL" in raw or "[FATAL] Timeout" in raw:
@@ -1654,20 +1656,25 @@ def _parse_log(raw: str) -> dict:
             "failed": 1,
             "cyc": 0,
         }
-    ex = lambda p: int(m.group(1)) if (m := re.search(p, raw)) else 0
-    tot, exact, tol, fail = (
-        ex(r"Total\s+:\s+(\d+)"),
-        ex(r"Exact\s+:\s+(\d+)"),
-        ex(r"Tol pass\s+:\s+(\d+)"),
-        ex(r"Failed\s+:\s+(\d+)"),
-    )
+    D = fourstate.DEC
+    try:  # a 4-state simulator's x in a count fails the test by name
+        ex = lambda p, what="count": fourstate.field(p, raw, test, what) or 0
+        tot, exact, tol, fail = (
+            ex(rf"Total\s+:\s+({D})"),
+            ex(rf"Exact\s+:\s+({D})"),
+            ex(rf"Tol pass\s+:\s+({D})"),
+            ex(rf"Failed\s+:\s+({D})"),
+        )
+        cyc = ex(rf"asserted @ \d+\s+\(({D}) cycles\)", "cycle count")
+    except fourstate.Unknown as e:
+        return {"status": "FAIL", "total": 0, "exact": 0, "tol": 0, "failed": 1, "cyc": 0, "fired": fourstate.fail_line(e)}
     return {
         "status": "PASS" if fail == 0 and tot > 0 else "FAIL",
         "total": tot,
         "exact": exact,
         "tol": tol,
         "failed": fail,
-        "cyc": ex(r"asserted @ \d+\s+\((\d+) cycles\)"),
+        "cyc": cyc,
         "b2b": bool(re.search(r"^ BACK_TO_BACK: (?:PASSED|FAILED)", raw, re.M)),  # a -DBACK_TO_BACK build ran its back-to-back pass
     }
 
@@ -1848,10 +1855,13 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             os.remove(TRUTH_DUMP)  # a stale dump would be gated as this test's
         raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes, build=key != built)
         if key != built:  # the build's precision define, from the flag line make wrote into build_key.txt
-            print(f"      BUILD DEFINE: {build_define(os.path.join(ROOT, 'Verilator', 'build_key.txt'))}")
+            print(f"      BUILD DEFINE: {build_define(os.path.join(mr.SIM_DIR, 'TB_sienna_top_sim.build_key.txt' if mr.SIM == 'vcs' else 'build_key.txt'))}")
         built = key if "-- Done" in raw_log or "-- Running simulation" in raw_log else None  # a failed build leaves no binary to reuse
         w = OUT_WORD.findall(raw_log)
         print(f"      WORDS {t['name']}: {len(w)} outputs, sha1 {hashlib.sha1(' '.join(f'{a}:{b}' for a, b in w).encode()).hexdigest()}")
+        xw = next((k for k, (_, b) in enumerate(w) if fourstate.XZ.search(b)), None)  # the hash covers the words as printed; an unknown one fails the test
+        if xw is not None:
+            raw_log += "\n" + fourstate.fail_line(fourstate.Unknown(f"{'X' if re.search('[xX]', w[xw][1]) else 'Z'} in output word {xw} of test {t['name']} ({w[xw][1]!r})")) + "\n"
 
         # 3. Parse Log
         r = {
@@ -1859,8 +1869,13 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             "mode": t["mode"],
             "act": t["act"],
             "wall": wall,
-            **_parse_log(raw_log),
+            **_parse_log(raw_log, t["name"]),
         }
+        if "fired" in r and r["fired"].startswith("FAIL: "):
+            print(f"      {err(r['fired'])}")
+        elif re.search(r"^FAIL: [XZ] in output word", raw_log, re.M):
+            print(f"      {err(raw_log.rstrip().splitlines()[-1])}")
+            r.update(status="FAIL", failed=max(r["failed"], 1))
         if t.get("residual") or t.get("residual_every"):  # the hold sets and add beats each stream pass counted
             bad = _residual_pairs_bad(raw_log, N * N // lanes)
             res_ran += 1
@@ -1895,6 +1910,8 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             try:
                 r["truth"] = truth_test(N, fmt_name, lanes)
                 tl, tbad = truth_report(r["truth"])
+            except fourstate.Unknown as e:
+                tl, tbad = [], [f"[FAIL] truth: none ({fourstate.fail_line(e)} {t['name']})"]
             except (RuntimeError, ValueError, OSError, KeyError) as e:
                 tl, tbad = [], [f"[FAIL] truth: none ({e})"]
             print("      true-function gates (truth.py), every stage on its actual inputs:")
@@ -2748,7 +2765,7 @@ GEOM = {"n": 16, "tile_size": 4, "lanes": 32}  # set from the command line in pe
 def run(name: str, num_sets: int, build_dir: str) -> str:
     cfg = next(t for t in PIPELINE_TESTS if t["name"] == name)
     generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
-    cmd = ["make", "verilator", "TRACE=0", "EXTRA_FLAGS=-DPERF", f"VERILATOR_DIR={build_dir}",
+    cmd = ["make", mr.SIM_TARGET, "TRACE=0", "EXTRA_FLAGS=-DPERF", f"{'VCS' if mr.SIM == 'vcs' else 'VERILATOR'}_DIR={build_dir}",
            f"FMT={GEOM.get('fmt_name', 'fp32')}", f"N={GEOM['n']}", f"TILE={GEOM['tile_size']}", f"LANES={GEOM['lanes']}",
            "GEN_PKG=0"]  # the package generate_vectors just wrote
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
@@ -3076,7 +3093,7 @@ def one_config(name: str, args) -> tuple:
         raw = run(name, sets, args.build_dir)
     flags = [int(_tb_words(f"add_{k}.mem")[0]) for k in range(_tb_knobs()["num_sets"])] if res else None  # files past num_sets may be an earlier test's
     mdl = model(cfg, not args.slices)
-    if "RESULT: PASSED" not in raw or re.search(r"Assertion failed|%Error|%Fatal", raw):
+    if "RESULT: PASSED" not in raw or mr.FIRED.search(raw.replace("[FAIL]", "")):
         return [f"--- {name}: SIMULATION DID NOT PASS; numbers omitted", ""], [name] + ["-"] * 11 + ["FAIL"]
     a = analyse(events(raw), len(flags) if res else args.sets, cfg.get("accum_passes", 1), flags)
     s = a["sets"]
@@ -3560,7 +3577,7 @@ def _lane_codes(path: str, beats: int, lanes: int) -> np.ndarray:
     rows = [ln.split() for ln in open(path) if ln.strip()]
     if len(rows) != beats or any(len(r) != lanes for r in rows):
         raise ValueError(f"{path}: {len(rows)} output beats of {sorted({len(r) for r in rows})} lanes, the vectors have {beats} of {lanes}")
-    return truth.int8_codes(np.array([[int(x, 16) for x in r] for r in rows], np.int64))
+    return truth.int8_codes(np.array([fourstate.words(r, os.path.basename(path), start=k * lanes) for k, r in enumerate(rows)], np.int64))
 
 
 def _bench_check(name: str, gate, out: str, beats: int, lanes: int) -> None:
@@ -3571,6 +3588,9 @@ def _bench_check(name: str, gate, out: str, beats: int, lanes: int) -> None:
         for m in r.first:
             print(f"  miss (index, inputs..., got, true): {m}")
         ok, why = r.ok, f"{r.n} outputs, {r.over} over the bound"
+    except fourstate.Unknown as e:
+        ok, why = False, str(e)
+        print(fourstate.fail_line(e))
     except (OSError, ValueError) as e:
         ok, why = False, str(e)
     print(f"{name}: {'PASS' if ok else 'FAIL'} ({why})")
@@ -5821,6 +5841,90 @@ def test_gptfl_gate():
     assert not ok and L[-1] == "ACCURACY: FAIL (no gated case)"  # nothing gated is not a pass
 
 
+@selftest
+def test_vcs_commands():
+    """SIM=vcs: every make point names SIM=vcs, make exports SIENNA_SIM, each build target names vcs (never verilator) with the same define, -G overrides
+    as -pvalue+ and -D defines, the lane benches build on VCS, and the binaries and keys are VCS/<top>_sim."""
+    import copy
+    spec = copy.copy(SPEC)
+    spec.sim = "vcs"
+    opts = argparse.Namespace(model_dir="/m")
+    for name in spec.points(True, list(FORMATS)):
+        v, a = SPEC.argv(name, opts), spec.argv(name, opts)
+        assert a == (v + ["SIM=vcs"] if v[0] == "make" else v), (name, a)
+    env = {k: x for k, x in MAKE_ENV.items() if k not in ("SIM", "SIENNA_SIM")}
+    run = lambda *x: subprocess.run(["make", "-s", "-n", *x], cwd=ROOT, env=env, capture_output=True, text=True)
+    for args, want in ((("vcs", "GEN_PKG=0", "FMT=int8", "EXTRA_FLAGS=-GFAULT=8 -DBACK_TO_BACK", "LINK_STAGES=2"),
+                        ("-top TB_sienna_top", "+define+FMT_INT8", "-pvalue+TB_sienna_top.FAULT=8", "+define+BACK_TO_BACK", "-pvalue+TB_sienna_top.LINK_STAGES=2",
+                         "-o " + os.path.join(ROOT, "VCS", "TB_sienna_top_sim"), "./TB_sienna_top_sim  +vcs+dumpvarsoff")),
+                       (("vcs", "GEN_PKG=0", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv"), ("-top TB_model_run", "VCS/TB_model_run_sim.build_key.txt")),
+                       (("sim", "GEN_PKG=0", "SIM=vcs"), ("VCS/TB_sienna_top_sim.build_key.txt", "cd " + os.path.join(ROOT, "VCS") + " && ./TB_sienna_top_sim")),
+                       (("add-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_add_lanes", "+define+FMT_INT8", "VCS/add_lanes/sim  +vcs+dumpvarsoff")),
+                       (("rq-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_requant_lanes", "VCS/rq_lanes/sim")),
+                       (("sm-verilator", "SIM=vcs"), ("mesh-regression MATRIX_SIZE=16 SIM=vcs",)),
+                       (("gpnae-verilator", "SIM=vcs", "PYTHON=python3"), ("--run gate --tier 0 --sim vcs",))):
+        r = run(*args)
+        assert r.returncode == 0, (args, r.stderr[-300:])
+        for w in want:
+            assert w in r.stdout, (args, w, r.stdout[-600:])
+        assert not re.search(r"(?m)^\s*\$?\(?verilator |^verilator ", r.stdout) and "-debug" not in r.stdout, (args, r.stdout[-300:])
+    assert "-debug_access+all +define+ENABLE_TRACE" in run("vcs", "GEN_PKG=0", "TRACE=vcd").stdout
+    r = run("pipeline", "SIM=vcs", "PYTHON=python3", "N=8", "TILE=2")
+    assert r.returncode == 0 and "regression.py" in r.stdout, r.stdout[-300:]
+    r = subprocess.run(["make", "-s", "-p", "-n", "help", "SIM=vcs"], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert re.search(r"(?m)^SIENNA_SIM := vcs$", r.stdout), "make exports SIENNA_SIM"
+    r = subprocess.run([sys.executable, "-c", "import model_runner as m; print(m.SIM, m.SIM_TARGET, os.path.basename(m.SIM_DIR))".replace("os.path", "__import__('os').path")],
+                       cwd=ROOT, env=dict(env, SIENNA_SIM="vcs"), capture_output=True, text=True)
+    assert r.stdout.split() == ["vcs", "vcs", "VCS"], (r.stdout, r.stderr[-300:])
+    r = run("regression", "SIM=vcs", "SMALL=1", "FMT=int8", f"PYTHON={sys.executable}")
+    pts = [x for x in r.stdout.splitlines() if "--action point " in x]
+    assert pts and all(" --sim vcs" in x for x in pts) and " --sim vcs" in r.stdout.splitlines()[-1], r.stdout[-300:]
+
+
+@selftest
+def test_x_words_fail_by_name():
+    """A 4-state simulator's x or z: a count, a cycle count, a dumped word, a result file word, a lane bench code or the multi hash fails by name."""
+    clean = "  Total    : 64\n  Exact    : 64\n  Tol pass : 0\n  Failed   : 0\n  done asserted @ 900 (90 cycles)\n"
+    assert _parse_log(clean, "t")["status"] == "PASS" and _parse_log(clean, "t")["cyc"] == 90
+    r = _parse_log(clean.replace("Failed   : 0", "Failed   : x"), "mm_relu")
+    assert r["status"] == "FAIL" and r["fired"] == "FAIL: X in count of test mm_relu ('x')", r
+    r = _parse_log(clean.replace("(90 cycles)", "(X cycles)"), "mm_relu")
+    assert r["status"] == "FAIL" and r["fired"].startswith("FAIL: X in cycle count of test mm_relu"), r
+    assert _parse_log(clean + 'Error: "/t/sienna_top.sv", 40: TB_sienna_top.dut.a_credit_accept: at time 5 ns\n')["status"] == "ASSERT"
+    w = OUT_WORD.findall("Dropout -> Output (Lane 3) : dec=x hex=3fx00000\n")
+    assert w == [("3", "3fx00000")] and fourstate.XZ.search(w[0][1])
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "dump.txt")
+        open(p, "w").write("H b2b 0\nM P0 0 0 3f800000 3f80\nM P0 0 1 3f8x0000 3f80\n")
+        try:
+            read_truth_dump(p, 32, "mm_relu N8")
+            raise AssertionError("the truth dump's parser took an x word")
+        except fourstate.Unknown as e:
+            assert str(e).startswith("X in dumped word 2 of test mm_relu N8"), e
+        p = os.path.join(d, "l.out")
+        open(p, "w").write("S 0\n3f80\n3fz0\n")
+        try:
+            mr.read_outputs(p, "bf16", "conv1")
+            raise AssertionError("read_outputs took a z word")
+        except fourstate.Unknown as e:
+            assert str(e).startswith("Z in output word 1 of test conv1"), e
+        open(os.path.join(d, "m.out"), "w").write("S 0\n3f80\n")
+        assert mr.read_outputs(os.path.join(d, "m.out"), "bf16")[0][0] == 1.0
+        p = os.path.join(d, "rq.mem")
+        open(p, "w").write("01 02\n03 x4\n")
+        try:
+            _lane_codes(p, 2, 2)
+            raise AssertionError("_lane_codes took an x code")
+        except fourstate.Unknown as e:
+            assert str(e).startswith("X in output word 3 of test rq.mem"), e
+    try:
+        fourstate.field(rf"^MULTI_HASH ({fourstate.HEX}) over", "MULTI_HASH 00000000x0000000 over 96 words\n", "multi", "word hash", 16, flags=re.M)
+        raise AssertionError("the multi hash took an x")
+    except fourstate.Unknown as e:
+        assert str(e).startswith("X in word hash of test multi"), e
+    assert SPEC.verdict("int8/N8_T2/pipeline", "FAIL: X in output word 7 of test mm_relu ('xx')\n", 0).startswith("FAIL (X in output word 7")
+
+
 def selftest_main(argv=None) -> None:
     """Runs every registered self-test (the tools only, no simulator): PASS or FAIL per test, exit 1 if any fails."""
     argparse.ArgumentParser(description=selftest_main.__doc__).add_argument("--action", choices=ACTIONS, default="selftest")
@@ -5892,7 +5996,7 @@ class SiennaSpec(regress.Spec):
     title = "SIENNA REGRESSION"
     formats = tuple(FORMATS)
     sized = True
-    drop = ("GPNAE_TIER", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES")
+    drop = ("GPNAE_TIER", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES", "SIENNA_SIM")
 
     results_dir = None  # the --results a point or summary run names; the default point reads its twin's log there
 
@@ -5937,6 +6041,10 @@ class SiennaSpec(regress.Spec):
         return env
 
     def argv(self, name, opts):
+        v = self.verilator_argv(name, opts)
+        return v + ["SIM=vcs"] if self.sim == "vcs" and v[0] == "make" else v
+
+    def verilator_argv(self, name, opts):
         p, py = self.parse(name), sys.executable
         if p["kind"] == "selftest":
             return [py, "regression.py", "--action", "selftest"]
@@ -6064,10 +6172,10 @@ def idle_fault_main(argv) -> None:
     else:
         t = next(x for x in PIPELINE_TESTS if x["name"] == PKG_DEFAULT_TEST)
         generate_vectors({"n": 8, "tile_size": 2, "lanes": 32, **t, "fmt_name": "fp32"})  # the package and vectors TB_sienna_top reads
-        cmd = ["make", "verilator", "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
+        cmd = ["make", mr.SIM_TARGET, "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     text = r.stdout + r.stderr
-    fired = "a_idle_contract" in text and re.search(r"Assertion failed|%Error", text) is not None
+    fired = "a_idle_contract" in text and re.search(r'Assertion failed|%Error|^(?:Error|Fatal): "|: started at .* failed at', text, re.M) is not None
     planted = f"[FAULT {4 if a.set_port == 0 else 8}]" in text
     print("\n".join(x for x in text.splitlines() if "a_idle_contract" in x or "FAULT" in x)[:2000])
     v = "CAUGHT" if fired and planted else ("SURVIVED" if planted else "OTHER")
@@ -6090,13 +6198,19 @@ def multi_main(argv) -> None:
     generate_vectors({"n": a.n, "tile_size": a.tile, "lanes": a.lanes, **t, "num_sets": a.sets, "fmt_name": a.fmt_name})
     os.makedirs(RESULTS_DIR, exist_ok=True)
     lp = os.path.join(RESULTS_DIR, f"multi_{a.fmt_name}_N{a.n}_T{a.tile}.log")
-    cmd = ["make", "verilator", "TOP_MODULE=TB_sienna_multi", "TESTBENCH=TB_sienna_multi.sv", "TRACE=0", f"FMT={a.fmt_name}", f"N={a.n}",
+    cmd = ["make", mr.SIM_TARGET, "TOP_MODULE=TB_sienna_multi", "TESTBENCH=TB_sienna_multi.sv", "TRACE=0", f"FMT={a.fmt_name}", f"N={a.n}",
            f"TILE={a.tile}", f"LANES={a.lanes}", "GEN_PKG=0", f"EXTRA_FLAGS=-GCOPIES={a.copies} -GCOLLAPSE_K=1"]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     text = r.stdout + r.stderr
     open(lp, "w").write(text)
     print("\n".join(x for x in text.splitlines() if x.startswith(("MULTI", "RESULT", "  [FAIL]", "%Error", "[FATAL]")) or "Assertion failed" in x))
-    bad = r.returncode != 0 or "Assertion failed" in text or "%Error" in text or not re.search(r"^RESULT: PASSED", text, re.M) \
+    try:  # the copies' word hash: an x or z in it fails the run by name
+        fourstate.field(rf"^MULTI_HASH ({fourstate.HEX}) over", text, f"multi {a.fmt_name} N{a.n} T{a.tile}", "word hash", 16, flags=re.M)
+        xline = ""
+    except fourstate.Unknown as e:
+        xline = fourstate.fail_line(e)
+        print(xline)
+    bad = r.returncode != 0 or bool(xline) or mr.FIRED.search(text.replace("[FAIL]", "")) is not None or not re.search(r"^RESULT: PASSED", text, re.M) \
         or not re.search(rf"^MULTI COPIES={a.copies} ", text, re.M)
     print(f"MULTI: {'FAIL' if bad else 'PASS'} (COPIES={a.copies} {a.fmt_name} N={a.n} T={a.tile} {a.sets} sets of {a.test}, make exit {r.returncode}; {lp})")
     sys.exit(1 if bad else 0)

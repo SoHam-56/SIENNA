@@ -18,8 +18,8 @@ import test_config_pkg::*;
 // -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
 // +tier=T: the layer's lane tier (cfg_tier_i); +coef=<file>: "aaa dddddddd" (hex address, data) lines written through the lanes' load path
 // after every reset, before the configure, each once coef_ready_o is high.
-// +between=<file> (with +out_first=<file>): the layer runs to completion, its results go to out_first, then <file> is loaded with no reset
-// and the layer runs again into +out. +coef_busy=<file>: its "aaa dddddddd" writes, one a cycle from 40 cycles into the stream; the interlock must
+// +between=<file> (with +out_first=<file>): the layer runs to completion, <file> is loaded with no reset from the first cycle coef_ready_o
+// is high, the first run's results go to out_first and the layer runs again into +out. +coef_busy=<file>: its "aaa dddddddd" writes, one a cycle from 40 cycles into the stream; the interlock must
 // refuse every one.
 module TB_model_run #(
     parameter int FAULT       = 0,
@@ -50,6 +50,7 @@ module TB_model_run #(
   logic [31:0] coef_data_i = '0;
   logic coef_ready_o;  // sienna_top's load interlock
   bit restream = 0;  // +between: the second run streams and collects from the start again, with no reset
+  int t_done = 0, t_first_wr = 0;  // +between: the cycle done_o was seen and the cycle of the load's first write
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
   logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
@@ -465,6 +466,7 @@ module TB_model_run #(
       coef_wr_i   = 1'b1;
       coef_addr_i = a[8:0];
       coef_data_i = d;
+      if (nw == 0) t_first_wr = cycle;  // +between reports how soon after done_o the load began
       @(posedge clk_i);
       nw++;
     end
@@ -675,7 +677,10 @@ module TB_model_run #(
         end
       end
       streaming = 0;
-      if (pass == 0 && between) begin  // the first run is done: write it out, load the next image with no reset, run again
+      if (pass == 0 && between) begin  // the first run is done: load the next image from the first ready cycle, write the run out, run again
+        t_done = cycle;
+        coef_load_file(between_f);
+        $display("  [Between] loaded %s with no reset, its first write %0d cycles after done_o", between_f, t_first_wr - t_done);
         repeat (OUT_CAP + 4) @(posedge clk_i);
         fout = $fopen(first_f, "w");
         for (int k = 0; k < bounds.size(); k++) begin
@@ -685,8 +690,7 @@ module TB_model_run #(
           for (int i = lo; i < bounds[k]; i++) $fwrite(fout, "%h\n", res_q[i]);
         end
         $fclose(fout);
-        $display("  [Between] first run: %0d sets, %0d outputs; loading %s with no reset", bounds.size(), res_q.size(), between_f);
-        coef_load_file(between_f);
+        $display("  [Between] first run: %0d sets, %0d outputs", bounds.size(), res_q.size());
         #1 restream = 1;
         @(posedge clk_i);
         #1 restream = 0;

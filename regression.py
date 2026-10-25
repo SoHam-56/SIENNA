@@ -68,7 +68,7 @@ from conv_tests import _basic_pair, _general_pair, _kernel_size
 from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
-ACCUM_ZERO_PASSES = 4  # TB_sienna_top's accumulate pass: partial sets of zeros before the summed group
+ACCUM_ZERO_PASSES = 4  # TB_sienna (pipeline)'s accumulate pass: partial sets of zeros before the summed group
 ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ def _lane_seed(seed: int, lane: int) -> int:
 
 
 def set_dropout_seed(base: int, k: int) -> int:
-    # Set k's dropout seed, mirrored by set_seed() in TB_sienna_top.
+    # Set k's dropout seed, mirrored by set_seed() in TB_sienna (pipeline).
     return (base ^ ((0x85EBCA6B * k) & 0xFFFFFFFF)) & 0xFFFFFFFF
 
 
@@ -563,7 +563,7 @@ def _generate_vectors_int8(cfg: dict) -> None:
     residual = bool(cfg.get("residual") or cfg.get("residual_every"))
     groups = _residual_layout(cfg, passes, mixed, credits, act_type) if residual else None
     num_sets = groups[-1][0] + passes + groups[-1][2] if residual else cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
-    if not residual and num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+    if not residual and num_sets % passes:  # TB_sienna (pipeline)'s drains wait for every sum to close, so a stream must end on a whole group
         raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     use_bias = bool(cfg.get("bias", False))
     req_rng = np.random.RandomState(seed + 7000) if cfg.get("req_random") else None
@@ -932,7 +932,7 @@ def generate_vectors(cfg: dict) -> None:
     # Enough sets to use every credit, so the credit-overrun pass is reachable; whole accumulate groups only.
     credits = cfg.get("credits", SETS_IN_FLIGHT)  # a test may build the pipeline with fewer credits than the default
     num_sets = cfg.get("num_sets", len(mixed) or -(-(credits + 2) // passes) * passes)
-    if num_sets % passes:  # TB_sienna_top's drains wait for every sum to close, so a stream must end on a whole group
+    if num_sets % passes:  # TB_sienna (pipeline)'s drains wait for every sum to close, so a stream must end on a whole group
         raise ValueError(f"{cfg.get('name', 'manual_gen')}: {num_sets} sets is not a whole number of {passes}-pass accumulate groups")
     masks = []
     run = None
@@ -973,7 +973,7 @@ def generate_vectors(cfg: dict) -> None:
                 _golden_bits(grp, gbias, cfg, act_k, set_dropout_seed(drop_seed, k), fmt)[3]
             write_bits(os.path.join(TB_DIR, f"expected_output_{k}.mem"), Fk, fmt)  # empty for a partial set
             write_bits(os.path.join(TB_DIR, f"bound_output_{k}.mem"), np.zeros_like(Fk), fmt)
-            if k == passes - 1:  # TB_sienna_top's accumulate pass: zero partials with set 0's B, then group 0; the mesh's slot rotation runs on through them
+            if k == passes - 1:  # TB_sienna (pipeline)'s accumulate pass: zero partials with set 0's B, then group 0; the mesh's slot rotation runs on through them
                 Z = np.zeros_like(grp[0][0])
                 write_bits(os.path.join(TB_DIR, "expected_accum.mem"), _golden_bits([(Z, grp[0][1])] * ACCUM_ZERO_PASSES + grp, gbias, cfg,
                                                                                   act_k, set_dropout_seed(drop_seed, k), fmt)[3], fmt)
@@ -1142,7 +1142,7 @@ def dump_hardware_trace(
 # PART 2b: TRUE-FUNCTION GATES PER STAGE (truth.py)
 # =============================================================================
 # Each stage of a pipeline test is judged against the true function of the words that stage actually received, from
-# TB_sienna_top's truth dump of every pass: the single-set pass (P0), the back-to-back pass (B2B, in a -DBACK_TO_BACK build), each
+# TB_sienna (pipeline)'s truth dump of every pass: the single-set pass (P0), the back-to-back pass (B2B, in a -DBACK_TO_BACK build), each
 # streaming pass (S1..S4: plain, credit overrun, after a reset, the output hold) and the accumulate pass (A). The TB's bit-exact
 # (or fp32 tolerance) compare of the outputs stays as a diagnostic, still required.
 
@@ -1151,7 +1151,7 @@ TRUTH_SCALES = os.path.join(TB_DIR, "truth_scales.json")  # int8: each activated
 ACT_NAMES = {v: k for k, v in mr.ACTIVATION_CODES.items()}
 INT8_FIXED_OUT = mr.INT8_FIXED_OUT  # the converters' fixed output quantization (a convention), one owner
 TRUTH_STAGES = ("matmul", "narrow", "transfer", "requant", "add", "scale", "relu", "activation", "maxpool", "dropout")
-TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna_top's streaming passes, in order; every one is dumped and gated
+TRUTH_STREAMS = ("S1", "S2", "S3", "S4")  # TB_sienna (pipeline)'s streaming passes, in order; every one is dumped and gated
 
 
 def _tb_words(name: str) -> np.ndarray:
@@ -1217,7 +1217,7 @@ def _res_flags_of(k: int) -> dict:
 def _set_words(k: int, knobs: dict, N: int, fmt: str) -> dict:
     """Set k as the TB drives it: each column's pack entry, each entry's activation and (int8) requantize and lane words."""
     code0 = (knobs["mixed_acts"] >> (4 * (k % knobs["mixed_len"]))) & 15 if knobs["mixed_len"] else knobs["activation_code"]
-    if knobs.get("residual"):  # TB_sienna_top's act_of(k): a residual test's flags
+    if knobs.get("residual"):  # TB_sienna (pipeline)'s act_of(k): a residual test's flags
         code0 = (int(_tb_words(f"add_{k}.mem")[0]) >> 4) & 15
     ents = {0: {"act": ACT_NAMES[code0]}}
     col_ent = np.zeros(N, dtype=np.int64)
@@ -1499,7 +1499,7 @@ PIPELINE_TESTS = [
     {"name": "matmul_bias_tanh", "mode": "matmul", "matrix_type": "random", "act": "tanh", "bias": True},
     {"name": "matmul_accum3_bias_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear",
      "bias": True, "accum_passes": 3, "pool_h": 1, "pool_w": 1, "padding": 0},
-    # bf16 only: -0 and subnormal bias words beside zero-product rows; TB_sienna_top compares the mesh's bias queue entry with the row widened.
+    # bf16 only: -0 and subnormal bias words beside zero-product rows; TB_sienna (pipeline) compares the mesh's bias queue entry with the row widened.
     {"name": "bf16_bias_special_linear_nopool", "mode": "matmul", "matrix_type": "random", "act": "linear", "bias": True,
      "bias_special": True, "zero_rows": True, "pool_h": 1, "pool_w": 1, "padding": 0, "formats": ("bf16",)},
     # B from the mesh's weight cache: every set's B is written to its own tile once, then only A is sent.
@@ -1566,7 +1566,7 @@ PIPELINE_TESTS = [
 ]
 
 
-OUT_WORD = re.compile(r"Dropout -> Output \(Lane (\d+)\)\s*: dec=\S+\s+hex=([0-9a-fA-FxXzZ]+)")  # every L9 word TB_sienna_top prints, lane and word (x, z: 4-state)
+OUT_WORD = re.compile(r"Dropout -> Output \(Lane (\d+)\)\s*: dec=\S+\s+hex=([0-9a-fA-FxXzZ]+)")  # every L9 word TB_sienna (pipeline) prints, lane and word (x, z: 4-state)
 
 
 def build_define(key_file: str) -> str:
@@ -1580,13 +1580,13 @@ def build_define(key_file: str) -> str:
 
 
 def build_key(pkg_text: str) -> str:
-    """What a TB_sienna_top build depends on in a package: every line but the run-time knobs' (make's guard adds the inputs and flags)."""
+    """What a TB_sienna (pipeline) build depends on in a package: every line but the run-time knobs' (make's guard adds the inputs and flags)."""
     knob = re.compile(r"^\s*localparam\s+\w+\s+(?:" + "|".join(mr.TB_KNOBS) + r")\s*=")
     return "".join(x for x in pkg_text.splitlines(True) if not knob.match(x))
 
 
 def build_sources() -> list:
-    """Every SV file TB_sienna_top's build compiles (make -n lint's command line) and every include file in its -I directories."""
+    """Every SV file TB_sienna (pipeline)'s build compiles (make -n lint's command line) and every include file in its -I directories."""
     r = subprocess.run(["make", "-s", "-n", "lint", "GEN_PKG=0"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
     words = r.stdout.split()
     files = {w for w in words if w.endswith((".sv", ".svh", ".v")) and os.path.isfile(w)}
@@ -1681,7 +1681,7 @@ def _parse_log(raw: str, test: str = "-") -> dict:
 
 
 HOLD_ADD = re.compile(r"^\[HOLD/ADD\] hold sets done (\d+), add beats (\d+), add sets of (\d+) beats (\d+), add beats of other sets (\d+), "
-                      r"hold done with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # TB_sienna_top's line per stream pass
+                      r"hold done with an L3 grant (\d+), hold done with a bank done (\d+)", re.M)  # TB_sienna (pipeline)'s line per stream pass
 
 
 def _residual_pairs_bad(raw: str, per_lane: int) -> str:
@@ -1836,7 +1836,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
     os.makedirs(RESULTS_DIR, exist_ok=True)
     results = []
     tests_to_run = build_order(tests_to_run, N, T, lanes, fmt_name)
-    built = None  # the build key of the TB_sienna_top binary on disk, None until this run builds one
+    built = None  # the build key of the TB_sienna (pipeline) binary on disk, None until this run builds one
     res_cross, res_ran = [0, 0], 0  # residual tests' same-cycle crosses (RESIDUAL_CROSSES), each on its own, and the residual tests run
 
     for idx, t in enumerate(tests_to_run):
@@ -1848,7 +1848,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
         cfg = {"n": N, "tile_size": T, "lanes": lanes, "host_words": host_words or N, "fmt_name": fmt_name, **t}
         generate_vectors(cfg)
 
-        # 2. Build TB_sienna_top when the package this test wrote needs another build, then run it (streams live status)
+        # 2. Build TB_sienna (pipeline) when the package this test wrote needs another build, then run it (streams live status)
         key = build_key(open(os.path.join(TB_DIR, "test_config_pkg.sv")).read())
         log_path = os.path.join(RESULTS_DIR, f"{t['name']}.log")
         print(f"      {_D}{'build' if key != built else 'the build of the test before'}{_X}")
@@ -1856,7 +1856,7 @@ def run_regression(N: int, T: int, target_test: str = None, lanes: int = 32, hos
             os.remove(TRUTH_DUMP)  # a stale dump would be gated as this test's
         raw_log, wall = _run_make_live(log_path, fmt_name, N, T, lanes, build=key != built)
         if key != built:  # the build's precision define, from the flag line make wrote into build_key.txt
-            print(f"      BUILD DEFINE: {build_define(os.path.join(mr.SIM_DIR, 'TB_sienna_top_sim.build_key.txt' if mr.SIM == 'vcs' else 'build_key.txt'))}")
+            print(f"      BUILD DEFINE: {build_define(os.path.join(mr.SIM_DIR, 'TB_sienna_pipeline_sim.build_key.txt' if mr.SIM == 'vcs' else 'build_key.txt'))}")
         built = key if "-- Done" in raw_log or "-- Running simulation" in raw_log else None  # a failed build leaves no binary to reuse
         w = OUT_WORD.findall(raw_log)
         print(f"      WORDS {t['name']}: {len(w)} outputs, sha1 {hashlib.sha1(' '.join(f'{a}:{b}' for a, b in w).encode()).hexdigest()}")
@@ -2148,7 +2148,7 @@ TRANSFORMER = [
 
 
 def run_int8(a, sim, shapes) -> None:
-    """int8 on the layer engine, affinely quantized products: every case per stage on the true function from TB_model_run's dump
+    """int8 on the layer engine, affinely quantized products: every case per stage on the true function from TB_sienna (layer)'s dump
     (mr.layer_stage_gates: the requantize of each exact int32 sum, then the lane); the bit-exact model and the quantization error against the
     float product are reported, not gated."""
     rep = open(os.path.join(a.work, f"gemm_sweep_N{a.n}.log"), "w")
@@ -2266,7 +2266,7 @@ def gemm_main(argv=None):
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the float goldens follow")
     a = ap.parse_args(argv)
     if a.engine == "sets" and a.collapse_k == 0:
-        ap.error("--engine sets builds collapse-k 1 (TB_sienna_model); use --engine layer")
+        ap.error("--engine sets builds collapse-k 1 (TB_sienna (sets)); use --engine layer")
     mr.COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8" and (a.emulate or a.engine != "layer"):
         ap.error("int8 runs on the layer engine only")
@@ -2589,7 +2589,7 @@ def _shortcut_conv(convs: dict):
 
 
 def residual_tflite(sim, seed: int, work: str) -> list:
-    """The converter-made residual blocks through the TFLite importer and a hand-built ONNX-style block, on TB_model_run, gated per stage."""
+    """The converter-made residual blocks through the TFLite importer and a hand-built ONNX-style block, on TB_sienna (layer), gated per stage."""
     _tf_imports()
     bad = []
     x = np.random.default_rng(seed + 2).integers(-128, 128, (4, 8, 8, 16)).astype(np.int64)
@@ -2708,7 +2708,7 @@ def residual_mid_reset(sim, job, Y0, want) -> list:
 
 
 def residual_main(argv=None) -> None:
-    """int8 residual layers on sienna_top's layer contract (TB_model_run), each stage gated on the true function (the conv's requantize, the identity
+    """int8 residual layers on sienna_top's layer contract (TB_sienna (layer)), each stage gated on the true function (the conv's requantize, the identity
     requantize, hold_mem, the ADD, the fill, the lane); int8_residual_exact is a diagnostic. --tflite adds the converter-made residual blocks
     through the TFLite importer and a hand-built ONNX-style block, --mid-reset resets of the tiles case with hold_mem holding beats."""
     ap = argparse.ArgumentParser(description=residual_main.__doc__)
@@ -2915,7 +2915,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
     words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split()) if words is None else words
     rows = -(-words // P["HOST_WORDS"])
     m = dict(
-        # TB_sienna_top: one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
+        # TB_sienna (pipeline): one row per cycle, enable drops for a cycle, start, one cycle for the credit to land.
         host=rows + 3,
         # Broadcast T rows plus commit, the array feed of K products, the reducer's T^2 reads: whichever is longest.
         mesh=max(T + 2, K, T * T),
@@ -2923,7 +2923,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
         # then T^2 reads and the tree.
         mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 2 + T * T + LAT,
         per_lane=per_lane, LAT=LAT)
-    m["mesh_lat"] += (cfg.get("accum_passes", 1) - 1) * m["host"]  # each further depth pass launches one host interval later (TB_sienna_top is host-bound)
+    m["mesh_lat"] += (cfg.get("accum_passes", 1) - 1) * m["host"]  # each further depth pass launches one host interval later (TB_sienna (pipeline) is host-bound)
     act = cfg.get("act")
     windows = ((P["IN_ROWS"] + 2 * P["PADDING"] - P["POOL_H"]) // P["STRIDE_ROWS"] + 1) * \
               ((P["IN_COLS"] + 2 * P["PADDING"] - P["POOL_W"]) // P["STRIDE_COLS"] + 1)
@@ -3148,7 +3148,7 @@ def header(args) -> list:
     return ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
             f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  "
             f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
-            " Every number is measured from TB_sienna_top's PERF trace. Per set: load = host rows, wait = to mesh launch,",
+            " Every number is measured from TB_sienna (pipeline)'s PERF trace. Per set: load = host rows, wait = to mesh launch,",
             " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
             " stage occupancy (a partial sum, summed in the PEs, passes as a null), pool+out = to the set's completion pulse.",
             " A residual test's hold set passes the stage into hold_mem with no output; its activation is the add sets' stage.", ""]
@@ -3159,7 +3159,7 @@ def footer(args, summary: list) -> list:
     L += fmt_table(summary, summary_cols())
     L += [" latency = host start of the first output's first set to its completion pulse, on an idle pipeline; cycles/set",
           " counts each depth pass of an accumulate config as a set. host/mesh model: cycles per set the",
-          " design needs (host N+3 is TB_sienna_top's handshake; the mesh alone needs max(T+2, K, T^2)).",
+          " design needs (host N+3 is TB_sienna (pipeline)'s handshake; the mesh alone needs max(T+2, K, T^2)).",
           " mesh lat model: launch to result written, 3T+K+T^2+LAT+16; mesh lat: the same, measured on set 0."]
     unit = "TOPS (2 x MACs per second)" if FMT == "int8" else "GFLOPS"
     L += [f" * {unit} at an ASSUMED {args.clock_mhz:.0f} MHz clock, not a timing result; they count the set's"
@@ -3169,7 +3169,7 @@ def footer(args, summary: list) -> list:
 
 
 def perf_main(argv=None) -> None:
-    """Cycle, latency and throughput analysis of the streamed SIENNA pipeline from TB_sienna_top's PERF trace."""
+    """Cycle, latency and throughput analysis of the streamed SIENNA pipeline from TB_sienna (pipeline)'s PERF trace."""
     ap = argparse.ArgumentParser(description=perf_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="perf")
     ap.add_argument("--sets", type=int, default=24, help="streamed sets; 24 fits every accumulate and mixed pattern")
@@ -3906,9 +3906,19 @@ def test_truth_synthetic_dump():
         assert any(x.startswith(f"[FAIL] truth: {stage} ") and f"in passes {tag};" in x for x in bad), (plant.__name__, bad)
 
 
+TB_SIENNA = os.path.join(ROOT, "testbenches", "top", "TB_sienna.sv")  # the one top bench; each MODE's body is a generate branch
+
+
+def tb_branch(block: str, src: str = None) -> str:
+    """The text of one of TB_sienna's MODE branches (g_pipeline, g_layer, g_sets, g_copies), from its begin to the next branch."""
+    src = open(TB_SIENNA).read() if src is None else src
+    i = src.index(f"begin : {block}\n")
+    return src[i:src.index("\n  end else", i)]
+
+
 def _tb_b2b_files() -> tuple:
-    """The expected and bound files TB_sienna_top's back-to-back pass reads."""
-    src = open(os.path.join(ROOT, "testbenches", "top", "TB_sienna_top.sv")).read()
+    """The expected and bound files the pipeline mode's back-to-back pass reads."""
+    src = tb_branch("g_pipeline")
     blk = src[src.index("[STAGE] BACK TO BACK"):]
     blk = blk[:blk.index("collect_outputs")]
     get = lambda q: re.search(r'read_mem_file\("([^"]+)",\s*' + q + r"\)", blk).group(1)
@@ -4115,8 +4125,8 @@ def test_residual_stimulus():
 
 
 def _tb_hold_add_line(*v) -> str:
-    """TB_sienna_top's [HOLD/ADD] $display with the values v put in its %0d fields, from the TB's own source."""
-    src = open(os.path.join(ROOT, "testbenches", "top", "TB_sienna_top.sv")).read()
+    """The pipeline mode's [HOLD/ADD] $display with the values v put in its %0d fields, from the TB's own source."""
+    src = tb_branch("g_pipeline")
     fmt = re.search(r'\$display\("(\[HOLD/ADD\][^"]*)"', src).group(1)
     assert fmt.count("%0d") == len(v), (fmt, v)
     return fmt.replace("%0d", "{}").format(*v) + "\n"
@@ -4124,7 +4134,7 @@ def _tb_hold_add_line(*v) -> str:
 
 @selftest
 def test_residual_pairs_check():
-    """run_regression's residual counts on lines built from TB_sienna_top's own $display: per stream pass a hold set done per add set
+    """run_regression's residual counts on lines built from TB_sienna (pipeline)'s own $display: per stream pass a hold set done per add set
     below num_sets, every add set with exactly per_lane add beats, none for another set; a missing line fails."""
     with _scratch_tb_dir() as d:
         open(os.path.join(d, "test_knobs.mem"), "w").write("num_sets 4\n")
@@ -4330,14 +4340,14 @@ def test_parse_time_rejections():
     assert r.returncode != 0 and "FMT=fp16: not one of fp32 bf16 int8" in r.stderr, r.stderr
     for t in ("regression", "pack", "perf-analysis"):
         r = make_n(t, "COLLAPSE_K=0")
-        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna_top and the layer contract's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
+        assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
     for t in ("gemm", "model", "tflite"):  # the layer contract's runs build the mesh mode they are given
         r = make_n(t, "COLLAPSE_K=0", "MODEL_DIR=/m", "FMT=int8" if t == "tflite" else "FMT=fp32", "PYTHON=py")
         assert r.returncode == 0 and "--collapse-k 0" in r.stdout, (t, r.stdout + r.stderr)
     for ck, want in (("0", False), ("1", True)):  # make tflite adds the packed layers at N >= 16 on the collapse-k 1 mesh only
         r = make_n("tflite", "N=16", f"COLLAPSE_K={ck}", "FMT=int8", "PYTHON=py")
         assert r.returncode == 0 and ("--pack" in r.stdout) == want, (ck, r.stdout + r.stderr)
-    for t in ("pipeline", "verilator", "lint", "pkg", "sim", "build-key"):  # TB_sienna_top sets sienna_top's COLLAPSE_K from the package
+    for t in ("pipeline", "verilator", "lint", "pkg", "sim", "build-key"):  # TB_sienna (pipeline) sets sienna_top's COLLAPSE_K from the package
         r = make_n(t, "COLLAPSE_K=0")
         assert "COLLAPSE_K=0 reaches" not in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
@@ -4350,7 +4360,7 @@ def test_parse_time_rejections():
 @selftest
 def test_build_key_per_format():
     with tempfile.TemporaryDirectory() as d:  # make build-key with an empty dependency file: the key's flag line carries the build's define
-        open(os.path.join(d, "VTB_sienna_top__ver.d"), "w").close()
+        open(os.path.join(d, "VTB_sienna_pipeline__ver.d"), "w").close()
         key = lambda *a: subprocess.run(["make", "-s", "build-key", f"VERILATOR_DIR={d}", *a], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
         keys = {f: key(f"FMT={f}") for f in reg.FORMATS}
         keys["none"] = key("FMT=fp32", "FMT_DEF=")
@@ -4390,9 +4400,9 @@ def test_default_point():
     assert reg.OUT_WORD.findall("[DEBUG 5] Dropout -> Output (Lane 3)   : dec=1.0000  hex=3f800000") == [("3", "3f800000")]
     with tempfile.TemporaryDirectory() as d:
         k = os.path.join(d, "build_key.txt")
-        open(k, "w").write("abc  f.sv\nTB_sienna_top --timing +define+FMT_BF16 -Wno-X\n")
+        open(k, "w").write("abc  f.sv\nTB_sienna --timing +define+FMT_BF16 -Wno-X\n")
         assert reg.build_define(k) == "+define+FMT_BF16"
-        open(k, "w").write("abc  f.sv\nTB_sienna_top --timing -Wno-X\n")
+        open(k, "w").write("abc  f.sv\nTB_sienna --timing -Wno-X\n")
         assert reg.build_define(k) == "none" and reg.build_define(os.path.join(d, "missing")) == "unreadable"
     assert reg.twin_verdict(log, "# other host\n" + log) == "PASS"
     assert reg.twin_verdict(log.replace("311", "312"), log).startswith("FAIL (differs from fp32/N8_T2/pipeline at result line 2")
@@ -4692,9 +4702,15 @@ def test_model_points_skip_without_models():
 
 @selftest
 def test_tb_knobs_are_run_time():
-    # TB_sienna_top reads the TB-only settings from test_knobs.mem, so no knob value can reach its elaboration or the DUT's
-    src = open(os.path.join(TB_DIR, "top", "TB_sienna_top.sv")).read()
-    found = knob_references(build_sources())  # every file TB_sienna_top's build compiles or can include, the package's own declarations aside
+    # TB_sienna (pipeline) reads the TB-only settings from test_knobs.mem, so no knob value can reach its elaboration or the DUT's
+    whole = open(TB_SIENNA).read()
+    src = tb_branch("g_pipeline", whole)
+    others = [tb_branch(b, whole) for b in ("g_layer", "g_sets", "g_copies")]
+    with tempfile.TemporaryDirectory() as d:  # the pipeline mode elaborates TB_sienna.sv but its other branches: those are left out of the scan
+        mine = os.path.join(d, "TB_sienna.sv")
+        open(mine, "w").write(functools.reduce(lambda t, b: t.replace(b, ""), others, whole))
+        found = knob_references([mine if f == TB_SIENNA else f for f in build_sources()])  # every file the build compiles or can include, the package's own declarations aside
+    assert TB_SIENNA in build_sources() and all(b not in src for b in others), "the scan must see TB_sienna.sv's pipeline branch alone"
     assert not found and len(build_sources()) > 30, found
     with tempfile.TemporaryDirectory() as d:  # the scan finds a knob anywhere but a package declaration
         ref, pkg = os.path.join(d, "unit.svh"), os.path.join(d, "test_config_pkg.sv")
@@ -4714,7 +4730,7 @@ def test_tb_knobs_are_run_time():
         pkg = open(os.path.join(d, "test_config_pkg.sv")).read()
     want = {k: v for k, v, _ in items if k in mr.TB_KNOBS}
     assert knobs == {k.lower(): str(v) for k, v in want.items()} and len(knobs) == len(mr.TB_KNOBS), knobs
-    assert all(f"localparam int {k} = {v};" in pkg for k, v, _ in items)  # the package keeps every item (TB_sienna_multi reads them)
+    assert all(f"localparam int {k} = {v};" in pkg for k, v, _ in items)  # the package keeps every item (TB_sienna (copies) reads them)
 
 
 @selftest
@@ -4744,13 +4760,13 @@ def test_sim_reuses_only_its_own_build():
     cp = mk[mk.index("define copy_mem_files"):mk.index("endef", mk.index("define copy_mem_files"))]
     assert "cp $$d/$$p $(1)/" in cp and "cp -u" not in cp, cp  # every test's stimulus copied, whatever the timestamps: cp -u skipped a file of the same second
     rec = mk[mk.index("\nverilator: $(PKG_DEP)"):mk.index("\n\n", mk.index("\nverilator: $(PKG_DEP)") + 2)]  # make verilator: the key goes only after a whole build
-    assert rec.index("rm -f $(VERILATOR_DIR)/build_key.txt") < rec.index("$(VERILATOR) --binary") < rec.index("-f V$(TOP_MODULE).mk") < rec.index("> $(VERILATOR_DIR)/build_key.txt"), rec
+    assert rec.index("rm -f $(VERILATOR_DIR)/build_key.txt") < rec.index("$(VERILATOR) --binary") < rec.index("-f V$(BUILD_NAME).mk") < rec.index("> $(VERILATOR_DIR)/build_key.txt"), rec
     with tempfile.TemporaryDirectory() as d:  # the key itself: knob values leave it unchanged; any other item, an input file or a flag changes it
         pkg, vdir = fixture_pkg(d, "fp32"), os.path.join(d, "V")
         os.makedirs(vdir)
         rtl = os.path.join(d, "unit.sv")
         open(rtl, "w").write("module unit; endmodule\n")
-        open(os.path.join(vdir, "VTB_sienna_top__ver.d"), "w").write(f"{vdir}/x.cpp : {pkg} {rtl}\n")
+        open(os.path.join(vdir, "VTB_sienna_pipeline__ver.d"), "w").write(f"{vdir}/x.cpp : {pkg} {rtl}\n")
         key = lambda *a: subprocess.run(["make", "-s", "build-key", f"PKG_FILE={pkg}", f"VERILATOR_DIR={vdir}", *a], cwd=ROOT, env=MAKE_ENV,
                                         capture_output=True, text=True).stdout
         k0, body = key(), open(pkg).read()
@@ -4827,8 +4843,8 @@ def test_gpnae_target_tier():
 @selftest
 def test_layer_mode_check():
     line = "[LAYER] sets=4 outputs=64 cycles=99 a_rows=2/2 w_rows=2/2 epilogues=0/0 out_stall=0 in_stall=0"
-    tb = open(os.path.join(ROOT, "testbenches", "top", "TB_model_run.sv")).read()  # the mode printed is the elaborated mesh's, not the package's
-    assert "in_stall=%0d collapse_k=%0d" in tb and "dut.G_LAYER.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "TB_model_run's [LAYER] line lost the mesh's COLLAPSE_K"
+    tb = tb_branch("g_layer")  # the mode printed is the elaborated mesh's, not the package's
+    assert "in_stall=%0d collapse_k=%0d" in tb and "dut.G_LAYER.pipe.systolic_array_inst.COLLAPSE_K);" in tb, "the layer mode's [LAYER] line lost the mesh's COLLAPSE_K"
     old = mr.COLLAPSE_K
     try:
         for ck in (0, 1):
@@ -4950,7 +4966,7 @@ pipeline_complete_o asserted @ 3165000  (311 cycles)
 RESULT: PASSED
 """
 
-LOG_FIRED = ("[3165000] %Error: sienna_top.sv:1128: Assertion failed in TB_sienna_top.dut.a_pack_one_pass: "
+LOG_FIRED = ("[3165000] %Error: sienna_top.sv:1128: Assertion failed in TB_sienna.g_pipeline.dut.a_pack_one_pass: "
              "sienna_top: a packed set cannot be a partial sum or continue one\n")
 
 
@@ -4968,13 +4984,13 @@ def test_assertion_firing_fails():
 
 @selftest
 def test_assertion_without_error_prefix_fails():
-    r = reg._parse_log(LOG_CLEAN + "Assertion failed in TB_sienna_top.dut.a_credit_accept\n")
+    r = reg._parse_log(LOG_CLEAN + "Assertion failed in TB_sienna.g_pipeline.dut.a_credit_accept\n")
     assert r["status"] == "ASSERT", r
 
 
 @selftest
 def test_error_line_fails():
-    r = reg._parse_log(LOG_CLEAN + "%Error: TB_sienna_top.sv:12: some runtime error\n")
+    r = reg._parse_log(LOG_CLEAN + "%Error: TB_sienna.sv:12: some runtime error\n")
     assert r["status"] == "ASSERT", r
 
 
@@ -5689,7 +5705,7 @@ def test_build_retry():
     real_run, real_exists, real_pkg = mr.subprocess.run, mr.os.path.exists, mr.write_build_pkg
     R = lambda rc, out: subprocess.CompletedProcess([], rc, out, "")
     ierr = R(2, "%Error: Internal Error: ../V3TSP.cpp:353: No unmarked edges found in tour\nmake: *** [Makefile:431: verilator] Error 1\n")
-    other = R(2, "%Error: TB_model_run.sv:12: syntax error\nmake: *** [Makefile:431: verilator] Error 1\n")
+    other = R(2, "%Error: TB_sienna.sv:12: syntax error\nmake: *** [Makefile:431: verilator] Error 1\n")
     ok = R(0, "built\n")
     try:
         mr.write_build_pkg = lambda *a: None
@@ -5896,10 +5912,10 @@ def test_vcs_commands():
     env = {k: x for k, x in MAKE_ENV.items() if k not in ("SIM", "SIENNA_SIM")}
     run = lambda *x: subprocess.run(["make", "-s", "-n", *x], cwd=ROOT, env=env, capture_output=True, text=True)
     for args, want in ((("vcs", "GEN_PKG=0", "FMT=int8", "EXTRA_FLAGS=-GFAULT=8 -DBACK_TO_BACK", "LINK_STAGES=2"),
-                        ("-top TB_sienna_top", "+define+FMT_INT8", "-pvalue+TB_sienna_top.FAULT=8", "+define+BACK_TO_BACK", "-pvalue+TB_sienna_top.LINK_STAGES=2",
-                         "-o " + os.path.join(ROOT, "VCS", "TB_sienna_top_sim"), "./TB_sienna_top_sim  +vcs+dumpvarsoff")),
-                       (("vcs", "GEN_PKG=0", "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv"), ("-top TB_model_run", "VCS/TB_model_run_sim.build_key.txt")),
-                       (("sim", "GEN_PKG=0", "SIM=vcs"), ("VCS/TB_sienna_top_sim.build_key.txt", "cd " + os.path.join(ROOT, "VCS") + " && ./TB_sienna_top_sim")),
+                        ("-top TB_sienna", "-pvalue+TB_sienna.MODE=0", "+define+FMT_INT8", "-pvalue+TB_sienna.FAULT=8", "+define+BACK_TO_BACK",
+                         "-pvalue+TB_sienna.LINK_STAGES=2", "-o " + os.path.join(ROOT, "VCS", "TB_sienna_pipeline_sim"), "./TB_sienna_pipeline_sim  +vcs+dumpvarsoff")),
+                       (("vcs", "GEN_PKG=0", "TB_MODE=layer"), ("-top TB_sienna", "-pvalue+TB_sienna.MODE=1", "VCS/TB_sienna_layer_sim.build_key.txt")),
+                       (("sim", "GEN_PKG=0", "SIM=vcs"), ("VCS/TB_sienna_pipeline_sim.build_key.txt", "cd " + os.path.join(ROOT, "VCS") + " && ./TB_sienna_pipeline_sim")),
                        (("add-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_add_lanes", "+define+FMT_INT8", "VCS/add_lanes/sim  +vcs+dumpvarsoff")),
                        (("rq-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_requant_lanes", "VCS/rq_lanes/sim")),
                        (("sm-verilator", "SIM=vcs"), ("mesh-regression MATRIX_SIZE=16 SIM=vcs",)),
@@ -5931,7 +5947,7 @@ def test_x_words_fail_by_name():
     assert r["status"] == "FAIL" and r["fired"] == "FAIL: X in count of test mm_relu ('x')", r
     r = _parse_log(clean.replace("(90 cycles)", "(X cycles)"), "mm_relu")
     assert r["status"] == "FAIL" and r["fired"].startswith("FAIL: X in cycle count of test mm_relu"), r
-    assert _parse_log(clean + 'Error: "/t/sienna_top.sv", 40: TB_sienna_top.dut.a_credit_accept: at time 5 ns\n')["status"] == "ASSERT"
+    assert _parse_log(clean + 'Error: "/t/sienna_top.sv", 40: TB_sienna.g_pipeline.dut.a_credit_accept: at time 5 ns\n')["status"] == "ASSERT"
     w = OUT_WORD.findall("Dropout -> Output (Lane 3) : dec=x hex=3fx00000\n")
     assert w == [("3", "3fx00000")] and fourstate.XZ.search(w[0][1])
     with tempfile.TemporaryDirectory() as d:
@@ -5996,14 +6012,14 @@ def _engine():
 regress = _engine()
 KINDS = ("pipeline", "pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b", "model", "pack", "gemm", "tflite", "model-ck0", "gemm-ck0", "tflite-ck0",
          "residual")  # per N, tile size and format; model in fp32 and bf16, tflite and residual in int8
-PIPELINE_KINDS = KINDS[:4]  # TB_sienna_top's sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
+PIPELINE_KINDS = KINDS[:4]  # TB_sienna (pipeline)'s sweep: collapse-k 1 or 0 (-ck0), built plain or with -DBACK_TO_BACK (-b2b)
 CK0_SIZES = (8, 16)  # pipeline-ck0: the pipeline on the collapse-k 0 mesh, at the small sizes
 LAYER_CK0 = KINDS[-4:-1]  # the layer contract's kinds on the collapse-k 0 mesh, at every N (pack refuses collapse-k 0)
 B2B_SIZES = regress.SIZES  # pipeline-b2b at every N (pipeline-ck0-b2b also takes CK0_SIZES): the pipeline built with -DBACK_TO_BACK
 MODEL_COUNT = 3  # inferences per model and point, as the model sweeps run them
 UNIT_POINTS = ("add-lanes", "rq-lanes")  # int8 unit benches, run once per make regression when int8 is selected
-FAULT_POINTS = ("idle-fault-sp0", "idle-fault-sp1")  # a put on the unused contract must fire a_idle_contract: TB_model_run FAULT 4, TB_sienna_top FAULT 8 (fp32)
-MULTI_KIND = "pipeline-multi"  # TB_sienna_multi on sienna_top at COPIES = 2 (SET_PORT = 1), per format at N8_T2
+FAULT_POINTS = ("idle-fault-sp0", "idle-fault-sp1")  # a put on the unused contract must fire a_idle_contract: TB_sienna (layer) FAULT 4, TB_sienna (pipeline) FAULT 8 (fp32)
+MULTI_KIND = "pipeline-multi"  # TB_sienna (copies) on sienna_top at COPIES = 2 (SET_PORT = 1), per format at N8_T2
 DEFAULT_POINT = "default/N8_T2/pipeline"  # fp32's N8_T2 pipeline built with no precision define (FMT_DEF=): words and cycles must equal fp32's
 DEFAULT_TWIN = "fp32/N8_T2/pipeline"
 COMPARED = re.compile(r"cycles|^\s*(Total|Exact|Tol pass|Failed|Passed)\s*:|TRUTH:|stall|RESULT:|^\s*WORDS ")  # the lines whose words (hashes) and cycles a twin must repeat
@@ -6179,7 +6195,7 @@ class SiennaSpec(regress.Spec):
         need = {"fp32": [rf"^layer_{x}_bias .* max err " for x in acts],
                 "bf16": [rf"^  layer_{x}: 0 outputs differ from the bit-exact model$" for x in acts] + [r"^layer_bias_special .* 0 outputs differ from the bit-exact model$"],
                 "int8": [r"^GEMM int8: \d+ cases, 0 failing "] + [rf"^    {t}: \d+ outputs of the model differ from tier 0 of the reset image" for t in LANE_CASES]}[p["fmt"]]
-        if p["fmt"] != "int8":  # the layer contract's, and at fp32 T = 2 the set contract's (TB_sienna_model)
+        if p["fmt"] != "int8":  # the layer contract's, and at fp32 T = 2 the set contract's (TB_sienna (sets))
             need += [lane_case_line(t, n) for t, n in LANE_CASES.items()]
             if p["fmt"] == "fp32" and p["tile"] == 2 and p["ck"] == 1:
                 need += [lane_case_line("sets " + t, LANE_CASES[t]) for t in SET_LANE_CASES]
@@ -6201,7 +6217,7 @@ if "--results" in sys.argv[:-1]:  # point and summary runs: where the default po
 
 
 def idle_fault_main(argv) -> None:
-    """A put on the unused contract (TB_model_run FAULT 4 at SET_PORT 0 through make gemm, TB_sienna_top FAULT 8 at SET_PORT 1): IDLE FAULT: CAUGHT
+    """A put on the unused contract (TB_sienna (layer) FAULT 4 at SET_PORT 0 through make gemm, TB_sienna (pipeline) FAULT 8 at SET_PORT 1): IDLE FAULT: CAUGHT
     when the run fails with sienna_top's a_idle_contract message, SURVIVED when it does not fire, OTHER when the run fails some other way."""
     ap = argparse.ArgumentParser(prog="regression.py --action idle-fault")
     ap.add_argument("--set-port", type=int, choices=(0, 1), required=True)
@@ -6211,7 +6227,7 @@ def idle_fault_main(argv) -> None:
         cmd = ["make", "gemm", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "QUICK=1", f"PYTHON={sys.executable}"]
     else:
         t = next(x for x in PIPELINE_TESTS if x["name"] == PKG_DEFAULT_TEST)
-        generate_vectors({"n": 8, "tile_size": 2, "lanes": 32, **t, "fmt_name": "fp32"})  # the package and vectors TB_sienna_top reads
+        generate_vectors({"n": 8, "tile_size": 2, "lanes": 32, **t, "fmt_name": "fp32"})  # the package and vectors TB_sienna (pipeline) reads
         cmd = ["make", mr.SIM_TARGET, "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     text = r.stdout + r.stderr
@@ -6224,7 +6240,7 @@ def idle_fault_main(argv) -> None:
 
 
 def multi_main(argv) -> None:
-    """TB_sienna_multi on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets, every set against its golden, then MULTI: PASS or FAIL."""
+    """TB_sienna (copies) on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets, every set against its golden, then MULTI: PASS or FAIL."""
     ap = argparse.ArgumentParser(prog="regression.py --action multi")
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FORMATS))
     ap.add_argument("--n", type=int, default=8)
@@ -6238,7 +6254,7 @@ def multi_main(argv) -> None:
     generate_vectors({"n": a.n, "tile_size": a.tile, "lanes": a.lanes, **t, "num_sets": a.sets, "fmt_name": a.fmt_name})
     os.makedirs(RESULTS_DIR, exist_ok=True)
     lp = os.path.join(RESULTS_DIR, f"multi_{a.fmt_name}_N{a.n}_T{a.tile}.log")
-    cmd = ["make", mr.SIM_TARGET, "TOP_MODULE=TB_sienna_multi", "TESTBENCH=TB_sienna_multi.sv", "TRACE=0", f"FMT={a.fmt_name}", f"N={a.n}",
+    cmd = ["make", mr.SIM_TARGET, "TB_MODE=copies", "TRACE=0", f"FMT={a.fmt_name}", f"N={a.n}",
            f"TILE={a.tile}", f"LANES={a.lanes}", "GEN_PKG=0", f"EXTRA_FLAGS=-GCOPIES={a.copies} -GCOLLAPSE_K=1"]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     text = r.stdout + r.stderr

@@ -147,19 +147,19 @@ Read them as an indication of where the architecture stands.
 
 ## Getting started
 
-You need Verilator 5 with a C++20 compiler (its `--timing` mode needs coroutines), Python ≥ 3.10 with NumPy, and the `tflite` package for the model flows.
+You need Verilator 5 with a C++20 compiler (its `--timing` mode needs coroutines) and Python 3 with the packages in `requirements.txt` (NumPy, `tflite`, TensorFlow); "Standalone machine" below has the tested versions.
 
 ```bash
 git clone --recursive https://github.com/SoHam-56/SIENNA.git
 cd SIENNA
 make help                              # every target and the current configuration
 
-make regression SMALL=1 MODEL_DIR=<dir>  # every test at N = 8 and 16, the sizes a 16 GB machine can build
-make regression MODEL_DIR=<dir>          # every test at N = 8 to 64 (days one at a time: use make -jN, below)
+make regression SMALL=1                # every test at N = 8 and 16, the sizes a 16 GB machine can build
+make regression                        # every test at N = 8 to 64 (days one at a time: use make -jN, below)
 make pipeline FMT=bf16                 # the pipeline tests only (TEST=tanh narrows them)
 make tflite FMT=int8                   # int8 TFLite layers, checked against the exact result
 make residual FMT=int8                 # int8 residual layers (skip connections), every stage checked
-make model FMT=fp32 MODEL_DIR=<dir>    # MLPerf Tiny models end to end
+make model FMT=fp32                    # MLPerf Tiny models end to end (models/, or MODEL_DIR=<dir>)
 make perf-analysis FMT=bf16            # cycle-level throughput per stage
 make multi FMT=int8                    # two pipelines behind one host (COPIES=2)
 make check-fmt check-hier              # no format named outside the package; each build holds only its format's units
@@ -174,14 +174,14 @@ How `make regression` works:
 - Each point builds in a private copy of the working tree (its files that git does not ignore) and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`. The pipeline point builds its testbench once for each group of tests that share a hardware configuration and runs the others on that build.
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
 - `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
-- The model points (the four MLPerf Tiny models, in fp32 and bf16) need `MODEL_DIR`. Without it they show NOT RUN and the regression fails.
+- The model points run the four MLPerf Tiny models in fp32 and bf16 from `models/` (or `MODEL_DIR=<dir>`); a model whose input file is absent is skipped by name and listed under the table ("Standalone machine" below).
 - Run time, measured on 8-core machines on 2026-10-18 for the 199 points of `SMALL=1`: split by format and kind over 18 machines, each running `make -k -j8` over its points, with the four collapse-k 0 points at N = 16, tile size 2 alone on their own machines, the whole run took 85 minutes (its longest machine). The points' own times add up to 43 hours, but most points shared their machine with seven others, so that sum is not the time of a run one point at a time. N = 32 and 64 have not been timed with the current points.
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.
 - **`model_runner.py`** is the host software. It loads a `.tflite` model, lowers each layer to matrix multiplies, packs small ones, and runs them on the simulated hardware. It is laid out in layers (numerics, frontend, middle end, device protocol, backends), so a driver for real silicon replaces only the bottom of the file.
 
-The MLPerf Tiny models are not in this repository; point `MODEL_DIR` at a copy.
+The MLPerf Tiny reference models are in `models/` (Apache 2.0, from MLCommons; `models/NOTICE`).
 
 ---
 
@@ -192,6 +192,70 @@ SIENNA's activation engine grew out of TYTAN:
 > S. Pramanik, V. William, A. Raha, D. Das, A. Mukherjee and J. L. Paluh, "TYTAN: Taylor-series based Non-Linear Activation Engine for Deep Learning Accelerators," VDAT 2025, Springer. [Book](https://link.springer.com/book/9783032263049) · [arXiv:2512.23062](https://arxiv.org/abs/2512.23062)
 
 The [GPNAE](https://github.com/SoHam-56/GPNAE) repository has the design as published (tag [`tytan_vdat2025`](https://github.com/SoHam-56/GPNAE/tree/tytan_vdat2025)) and what changed since.
+
+## Standalone machine
+
+Everything here runs on any Linux machine; nothing depends on the authors' servers.
+
+**You need:** GNU make, git, a C++ compiler with C++20 coroutines (g++ 10 or later), Verilator built with that compiler (tested: 5.035 for every regression, and the released 5.052), and Python 3 with the packages in `requirements.txt` (tested with Python 3.11).
+
+```bash
+git clone --recursive https://github.com/SoHam-56/SIENNA.git && cd SIENNA
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+make -j2 regression SMALL=1 PYTHON=$PWD/.venv/bin/python
+models/fetch_cifar10.sh          # optional: CIFAR-10 for the resnet8 model (about 170 MB download)
+```
+
+**Choosing N in `make -jN`:** the largest process of one point peaks at about 0.8 GB at N = 8 and 1.5 GB at N = 16 (above), and each point also runs its C++ compiles side by side, so leave room beyond N times the peak; one point at a time fits in 16 GB.
+
+**What is skipped:** the model points run the MLPerf Tiny models in `models/` (the default `MODEL_DIR`). A model whose input file is not there is skipped by name inside its point and listed under the table as `skipped inside passing points: ...`: resnet8 without CIFAR-10 (`models/fetch_cifar10.sh` fetches it), kws without `marvin_617de221_0.wav` and ad01 without `normal_id_01_00000000_hist_librosa.bin` (neither may be redistributed here; copy them into `models/`). vww always runs. With `MODEL_DIR` pointing at a directory that holds no model, the model points show `SKIPPED (no MODEL_DIR)` and do not fail the run. `models/NOTICE` gives each file's source and license.
+
+---
+
+## Running with VCS
+
+`make regression` runs on Verilator by default. `SIM=vcs` runs the same points, through the same gates, on Synopsys VCS, a 4-state simulator: it also models unknown (X) and floating (Z) bit values, which Verilator, a 2-state simulator, turns into 0 or 1.
+
+**The authors have not run the VCS path yet** (no VCS license where it was written). The commands, gates and parsers are in place and were checked without VCS; your run is the first real one.
+
+**You need:** `vcs` on your `PATH` with a working license, the C++ compiler VCS uses, GNU make, and Python 3 with `pip install -r requirements.txt`.
+
+**Run it:**
+
+```bash
+make -j2 regression SIM=vcs SMALL=1
+```
+
+**Read the table** (also written to `testbenches/results/regression/regression.log`). Each row is one check: its name, its verdict, its time and its log. The last line is the overall verdict, for example `SIENNA REGRESSION PASS: 199 of 199 gated points passed`.
+
+| Verdict | Meaning |
+|---|---|
+| `PASS` | the check met the same gate as on Verilator: every output against its reference and the true function |
+| `FAIL (...)` | it did not; the bracket says why, the log (path on the row) says where |
+| `N/A (...)` | not used here: every point runs on VCS |
+
+**If a row fails,** send back `testbenches/results/regression/regression.log` and the log of each failing row. A line such as `FAIL: X in output word 37 of test <name>` means the design produced an unknown value where a number was expected: a real finding for the authors, not a set-up problem. A license or compile failure shows as `FAIL (exit N)` with VCS's message in the log.
+
+**Options:** `TRACE=vcd` waveforms, `XPROP=1` X-propagation, `RANDINIT=1 SEED=<n>` random register power-up instead of X. Without them a VCS build is plain: no debug access and no waveform.
+
+What maps to what:
+
+| Verilator | VCS | Note |
+|---|---|---|
+| `--binary --timing --assert` | `vcs -full64 -sverilog -timescale=1ns/1ps` | VCS runs delays and assertions natively |
+| `--top-module X` | `-top X` |  |
+| `-I<dir>`, `+define+X`, `-DX` (also in `EXTRA_FLAGS`) | `+incdir+<dir>`, `+define+X` |  |
+| `-G<name>=<value>` (sizes, `EXTRA_FLAGS`) | `-pvalue+<top>.<name>=<value>` | top-level parameters, as with `-G` |
+| `--trace` (`TRACE=vcd`, `fst`) | `-debug_access+all +define+ENABLE_TRACE` (`TRACE=vcd`; VCS writes VCD only) | without it, `+vcs+dumpvarsoff`: no waveform |
+| `--x-initial unique`, `+verilator+rand+reset+2` | `+vcs+initreg+random` (compile), `+vcs+initreg+<SEED>` (run): `RANDINIT=1 SEED=<n>` | VCS's default is X power-up, stricter than Verilator's zeros |
+| (none) | `-xprop=tmerge`: `XPROP=1` | X-propagation through `if` and `case` |
+| `+verilator+error+limit+N` | nothing | VCS carries on after `$error` by default |
+| `-j`, `--build-jobs`, `--threads`, `SIM_THREADS` | `-j<cores>` (compile) | VCS simulates on one thread |
+| `OPT_FAST=-O0`, `LARGE_CODE=1`, `USE_CCACHE` | not applicable | Verilator build workarounds |
+| `/* verilator lint_off ... */`, `lint_waivers.vlt` | ignored | comments to VCS; the waiver file is Verilator's |
+| `make sim`'s key from Verilator's dependency file | the same key over every source and include file | `make sim SIM=vcs` reuses a VCS build |
+| `perf-analysis` (`VERILATOR_DIR`) | the same flow (`VCS_DIR`) | not a regression point |
+| `check-hier`, `lint` | Verilator only | not regression points |
 
 ---
 

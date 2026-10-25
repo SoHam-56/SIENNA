@@ -97,6 +97,7 @@ module sienna_top #(
     input logic [8:0]               coef_addr_i,
     input logic [31:0]              coef_data_i,
     output logic                    coef_ready_o,  // every pipeline empty, every lane idle and no layer running: a write is taken, else refused
+    // coef_ready_o is combinational: it falls in the same cycle as cfg_load_i (layer contract) or a host put (set contract), not registered.
     credit_link_if.producer         out[COPIES*NUM_LANES]
 );
   localparam int DATA_WIDTH     = sienna_fmt_pkg::DATA_WIDTH;

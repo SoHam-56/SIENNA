@@ -181,9 +181,11 @@ How `make regression` works:
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.
-- **`model_runner.py`** is the host software. It loads a `.tflite` model, lowers each layer to matrix multiplies, packs small ones, and runs them on the simulated hardware. It is laid out in layers (numerics, frontend, middle end, device protocol, backends), so a driver for real silicon replaces only the bottom of the file.
+- **`scripts/model_runner.py`** is the host software. It loads a `.tflite` model, lowers each layer to matrix multiplies, packs small ones, and runs them on the simulated hardware. It is laid out in layers (numerics, frontend, middle end, device protocol, backends), so a driver for real silicon replaces only the bottom of the file.
 
 The MLPerf Tiny reference models are in `models/` (Apache 2.0, from MLCommons; `models/NOTICE`).
+
+The layout: `src/` holds the RTL by function (`top`: sienna_top and its set-side bundle; `pipeline`: sienna_pipe and sienna_sched; `lanes`: the requantize and ADD lanes; `fifo`, `pool`, `dropout`) with the synthesis file list `src/sienna_rtl.f`; `testbenches/top/` the one top bench TB_sienna, whose MODE (`make TB_MODE=pipeline|layer|sets|copies`) picks the pipeline regression, the layer contract, the set contract or COPIES copies; `testbenches/units/` the unit benches; `testbenches/` also holds the stimulus and fixtures the benches read; `scripts/` model_runner.py and the hierarchy check.
 
 ---
 

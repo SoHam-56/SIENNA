@@ -258,6 +258,23 @@ module sienna_top #(
     );
     assign unused_done_id = ^unused_id;
     assign unused_busy    = ^unused_busys;
+`ifndef SYNTHESIS
+    // a_coef_frozen: no lane's coefficient memory takes a write from a layer's configure to its done_o (tracked apart from the interlock).
+    logic [NUM_LANES-1:0] landed;  // per lane: its memory's write strobe, the only way its contents change after reset
+    for (genvar g = 0; g < NUM_LANES; g++) begin : G_LANDED
+      assign landed[g] = pipe.backend_lanes[g].gpnae.COEF.wr_i;
+    end
+    logic layer_on, landed_q, on_q;  // a layer configured and not yet done; both terms registered
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) layer_on <= 1'b0;
+      else if (cfg_load_i) layer_on <= 1'b1;
+      else if (done_o) layer_on <= 1'b0;
+    always_ff @(posedge clk_i or negedge rstn_i)
+      if (!rstn_i) {landed_q, on_q} <= 2'b00;
+      else {landed_q, on_q} <= {|landed, cfg_load_i || (layer_on && !done_o)};
+    a_coef_frozen: assert property (@(posedge clk_i) disable iff (!rstn_i) landed_q |-> !on_q)
+      else $error("sienna_top: a_coef_frozen: a lane's coefficient memory took a write while a layer was in flight");
+`endif
     // The set contract, unused: no credit, no completion, nothing busy.
     assign host[0].credit = 1'b0;
     for (genvar r = 0; r < 2; r++) begin : G_WC_IDLE
@@ -354,6 +371,23 @@ module sienna_top #(
           .maxpool_busy_o      (maxpool_busy_o[c]),
           .dropout_busy_o      (dropout_busy_o[c])
       );
+`ifndef SYNTHESIS
+      // a_coef_frozen: no lane of this copy takes a coefficient write while a set put to it has not completed (tracked apart from the interlock).
+      logic [NUM_LANES-1:0] landed;  // per lane: its memory's write strobe, the only way its contents change after reset
+      for (genvar g = 0; g < NUM_LANES; g++) begin : G_LANDED
+        assign landed[g] = pipe.backend_lanes[g].gpnae.COEF.wr_i;
+      end
+      logic [7:0] in_flight;  // sets put to this copy, less those completed
+      logic landed_q, on_q;  // both terms registered
+      always_ff @(posedge clk_i or negedge rstn_i)
+        if (!rstn_i) in_flight <= '0;
+        else in_flight <= in_flight + 8'(put[c]) - 8'(pipeline_complete_o[c]);
+      always_ff @(posedge clk_i or negedge rstn_i)
+        if (!rstn_i) {landed_q, on_q} <= 2'b00;
+        else {landed_q, on_q} <= {|landed, put[c] || (in_flight > 8'(pipeline_complete_o[c]))};
+      a_coef_frozen: assert property (@(posedge clk_i) disable iff (!rstn_i) landed_q |-> !on_q)
+        else $error("sienna_top: a_coef_frozen: copy %0d's coefficient memory took a write while a set was in flight", c);
+`endif
     end
 
     if (COPIES == 1) begin : G_ONE  // one pipeline: L2 is its own, and there is no turn

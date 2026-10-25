@@ -278,8 +278,7 @@ def _golden_bits(passes, bias, cfg: dict, act: str, drop_seed: int, fmt: str) ->
     N = cfg.get("n", 16)
     C = mesh_model.matmul(f, [(_pad_square(a, N), _pad_square(b, N)) for a, b in passes], N, cfg.get("tile_size", 4),
                           cfg.get("collapse_k", mr.COLLAPSE_K), bias)
-    rom = gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f)))
-    A = gpnae_model.Lane(f, rom).run(C, activation_to_code(act))
+    A = gpnae_model.Lane(f).run(C, activation_to_code(act))  # the lanes' reset coefficient memory, tier 0
     P = _maxpool_bits(A, cfg.get("pool_h", 2), cfg.get("pool_w", 2), cfg.get("padding", 1), f)
     return C, A, P, _dropout_bits(P, cfg, drop_seed, f)
 
@@ -765,7 +764,7 @@ def _packed_float(cfg, k, A, B, bias, sh, col_ent, acts, drop):
     Ab, Bb = fmt_bits(A, fmt), fmt_bits(B, fmt)
     bb = fmt_bits(b, fmt) if bias is not None else None
     C = mesh_model.matmul_packed(f, Ab, Bb, N, sh, bb) if sh else mesh_model.matmul(f, [(Ab, Bb)], N, cfg.get("tile_size", 4), 1, bb)
-    lane = gpnae_model.Lane(f, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", "src", "TYTAN", "Memory", gpnae_model.coeff_file(f))))
+    lane = gpnae_model.Lane(f)  # the lanes' reset coefficient memory, tier 0
     Aout = np.zeros_like(C)
     for e in sorted(set(col_ent.tolist())):
         cols = col_ent == e
@@ -3418,7 +3417,7 @@ def gpnae_tflite_main(argv=None):
     p.add_argument("--report", required=True)
     a = p.parse_args(argv)
     _tf_imports()
-    lane = gpnae_model.Lane(gpnae_model.INT8, gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", gpnae_model.coeff_file(gpnae_model.INT8))))
+    lane = gpnae_model.Lane(gpnae_model.INT8)  # the lanes' reset coefficient memory, tier 0
     q = np.arange(-128, 128, dtype=np.int64)
     rows = []
     for func, code, op in GPTFL_OPS:
@@ -5661,10 +5660,10 @@ def test_importer_records():
 
 # ── gpnae-tflite's gate (no TensorFlow: GPNAE's own case scales stand in for the converter's) ──
 
-def gptfl_rows(ladder=True, tfl=None):
-    """gpnae_tflite_judge's rows for the lane on INT8_CASES' tanh and sigmoid; tfl(hw, ex) gives the TFLite words (default ex)."""
-    rom = gpnae_model.read_rom(os.path.join(ROOT, "GPNAE", gpnae_model.coeff_file(gpnae_model.INT8)))
-    lane, q, rows = gpnae_model.Lane(gpnae_model.INT8, rom, ladder=ladder), np.arange(-128, 128, dtype=np.int64), []
+def gptfl_rows(mem=None, tfl=None):
+    """gpnae_tflite_judge's rows for the lane (on the coefficient memory mem, default the reset image) on INT8_CASES' tanh and sigmoid; tfl(hw, ex)
+    gives the TFLite words (default ex)."""
+    lane, q, rows = gpnae_model.Lane(gpnae_model.INT8, mem), np.arange(-128, 128, dtype=np.int64), []
     for func, code, op in GPTFL_OPS:
         for c in gpnae_model.INT8_CASES[func]:
             hw, ex = lane.run(q, code, gpnae_model.int8_params(c, code)), gpnae_model.exact_int8(q, code, c)
@@ -5676,8 +5675,10 @@ def gptfl_rows(ladder=True, tfl=None):
 def test_gptfl_gate():
     L, ok = gpnae_tflite_judge(gptfl_rows())
     assert ok and L[-2].startswith("ACCURACY: PASS (true function, truth.py") and "TFLITE AGREEMENT (characterization, not gated)" in L[-1], L[-3:]
-    L, ok = gpnae_tflite_judge(gptfl_rows(ladder=False))  # the 2a lane: sigmoid saturated past 3.5
-    assert not ok and L[-2].startswith("ACCURACY: FAIL") and "sigmoid worst 100.000% (7 LSB), 43 of 1280 over 10%" in L[-2], L[-3:]  # 34 with the one-code form
+    broken = gpnae_model.default_mem("int8")
+    broken.desc[0][gpnae_model.D_SIGP].bounds[0] = 2048  # sigmoid x >= 0 saturates from 1.0: the gate must fail it
+    L, ok = gpnae_tflite_judge(gptfl_rows(mem=broken))
+    assert not ok and L[-2].startswith("ACCURACY: FAIL") and "TRUTH int8 sigmoid: FAIL" in "\n".join(L) and "TRUTH int8 tanh: PASS" in "\n".join(L), L[-3:]
     L, ok = gpnae_tflite_judge(gptfl_rows(tfl=lambda hw, ex: 127 - hw))  # TFLite far off: characterization only, the verdict stands
     assert ok and L[-2].startswith("ACCURACY: PASS") and "tanh 0 of 1280 equal" in L[-1], L[-2:]
     off = [r[:4] + (np.clip(r[4] + 3 * (r[0] == "tanh"), -128, 127),) + r[5:] for r in gptfl_rows()]  # tanh 3 LSB high

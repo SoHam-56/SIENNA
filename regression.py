@@ -2332,7 +2332,7 @@ def gemm_main(argv=None):
 
 
 LANE_CASES = {"lanes_tier1": 1, "lanes_loaded": 0, "lanes_between": 0, "lanes_refused": 0}  # the gemm points' tier and load runs and their tiers
-SET_LANE_CASES = ("lanes_tier1", "lanes_loaded")  # those the set contract runs (no between or busy load there)
+SET_LANE_CASES = ("lanes_tier1", "lanes_loaded", "lanes_refused")  # those the set contract runs (no between load there)
 
 
 def lane_case_line(tag: str, tier: int) -> str:
@@ -2352,12 +2352,12 @@ def swapped_image(fmt: str):
 def lane_cases(fmt: str, layer: bool) -> list:
     """The lanes' tier and load cases: (tag, the job's extra keys, the tolerance its words are gated at, its expected tier label). tier 1; tier 0
     of the swapped image loaded after reset (it holds the 10% design); on the layer contract also that image loaded between two runs of the
-    layer with no reset, and writes while the layer streams, which the interlock must refuse."""
+    layer with no reset; and writes to the running activation's own words while it streams (busy_writes), which the interlock must refuse."""
     tol = gpnae_model.TIER_TOL
     out = [("lanes_tier1", {"tier": 1}, tol[1]), ("lanes_loaded", {"tier": 0, "coef": swapped_image(fmt)}, tol[2])]
     if layer:
-        out += [("lanes_between", {"tier": 0, "between": swapped_image(fmt)}, tol[2]), ("lanes_refused", {"tier": 0, "coef_busy": True}, tol[0])]
-    return out
+        out += [("lanes_between", {"tier": 0, "between": swapped_image(fmt)}, tol[2])]
+    return out + [("lanes_refused", {"tier": 0, "coef_busy": True}, tol[0])]
 
 
 def lane_features(a, sim, rep, contract: str = "") -> bool:
@@ -3750,6 +3750,30 @@ def pkg_guard(pkg: str, *args) -> tuple:
 
 
 @selftest
+def test_busy_writes_hit_the_running_activation():
+    g = gpnae_model  # a landed +coef_busy write must change the running activation's own words, so a bypassed interlock shows in its outputs
+    for fmt in reg.FORMATS:
+        for act, d in (("tanh", g.D_TANH), ("selu", g.D_SELU), ("sigmoid", g.D_SIGP)):
+            m = g.default_mem(fmt)
+            w = mr.busy_writes(m, act, 0)
+            ds = m.desc[0][d]
+            b = g.A_DESC + g.DESC_STRIDE * d
+            assert len(w) == 4 and all(ds.base <= a < ds.base + ds.np * (ds.deg + 1) or b <= a < b + g.DESC_STRIDE for a, _ in w), (fmt, act, w)
+            for a, v in w:  # each write alone changes the memory
+                m1 = g.default_mem(fmt)
+                m1.load(a, v)
+                assert m1.to_dict() != m.to_dict(), (fmt, act, a)
+            if fmt != "int8":
+                x = mr.word_bits(np.linspace(-3, 3, 241).astype(np.float32), fmt)
+                m2 = g.default_mem(fmt)
+                for a, v in w[:1]:  # the first word alone moves outputs
+                    m2.load(a, v)
+                f = fpu.FORMATS[fmt]
+                code = {"tanh": g.TANH, "selu": g.SELU, "sigmoid": g.SIGMOID}[act]
+                assert np.sum(g.Lane(f, m2).run(x, code) != g.Lane(f, m).run(x, code)) > 0, (fmt, act)
+
+
+@selftest
 def test_guard_passes_any_format():
     with tempfile.TemporaryDirectory() as d:  # the package carries no format: one geometry's package serves every define
         for f in reg.FORMATS:
@@ -4478,8 +4502,9 @@ def test_point_verdicts():
     tf = "; true function PASS worst 0.9% at 5%\n"
     lanes_ok = ("lanes_tier1               32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 1; 7 differ from tier 0 of the reset image" + tf +
                 "lanes_loaded              32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0 of the loaded image; 7 differ from tier 0 of the reset image" + tf)
+    lanes_ref = "lanes_refused             32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0; 0 differ from tier 0 of the reset image" + tf
     lanes_all = lanes_ok + ("lanes_between             32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0 of the loaded image; 7 differ from tier 0 of the reset image" + tf +
-                            "lanes_refused             32    48    24      12      2101  0 outputs differ from the bit-exact model of tier 0; 0 differ from tier 0 of the reset image" + tf)
+                            lanes_ref)
     lanes8 = "".join(f"    {t}: 31 outputs of the model differ from tier 0 of the reset image\n" for t in LANE_CASES)
     v = lambda p, t, rc=0: SPEC.verdict(p, t, rc)
     assert n32 > 20 and v("int8/N8_T2/pipeline", clean) == f"FAIL ({n32} tests ran, int8 has {len([t for t in PIPELINE_TESTS if 'int8' in t.get('formats', tuple(FORMATS))])})"
@@ -4513,7 +4538,9 @@ def test_point_verdicts():
              "FAIL (log: FAIL lanes_refused: 3 of 4 writes while busy refused)"),
             ("int8/N8_T2/gemm", "grid_1x64x16  1 64 16\n", 0, "FAIL (no 'GEMM int8: \\d+ cases, 0 failing ')"),
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
-             + lanes_all + lanes_ok.replace("lanes_", "sets lanes_"), 0, "PASS"),
+             + lanes_all + (lanes_ok + lanes_ref).replace("lanes_", "sets lanes_"), 0, "PASS"),
+            ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
+             + lanes_all + lanes_ok.replace("lanes_", "sets lanes_"), 0, "FAIL (no '" + lane_case_line("sets lanes_refused", 0).strip("^$") + "')"),
             ("fp32/N8_T4/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))
              + lanes_all, 0, "PASS"),  # the set contract's runs only at T = 2
             ("fp32/N8_T2/gemm", "grid_1x8x8 1\n" + "".join(f"layer_{x}_bias  64 48 40 240 7633  max err 9.3e-04 of the output range\n" for x in ("tanh", "sigmoid", "selu"))

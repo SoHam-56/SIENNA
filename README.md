@@ -205,12 +205,13 @@ Everything here runs on any Linux machine; nothing depends on the authors' serve
 git clone --recursive https://github.com/SoHam-56/SIENNA.git && cd SIENNA
 python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt   # every make below runs in this shell
 models/fetch_cifar10.sh          # optional: CIFAR-10 for the resnet8 model (a 163 MB download)
+models/fetch_inputs.sh           # optional: the kws and ad01 models' input files (MLCommons Tiny, about 170 kB)
 make -j2 regression SMALL=1
 ```
 
 **Choosing N in `make -jN`:** the largest process of one point peaks at about 0.8 GB at N = 8 and 1.5 GB at N = 16 (above), and each point also runs its C++ compiles side by side, so leave room beyond N times the peak; one point at a time fits in 16 GB.
 
-**What is skipped:** the model points run the MLPerf Tiny models in `models/` (the default `MODEL_DIR`). A model whose input file is not there is skipped by name inside its point and listed under the table as `skipped inside passing points: ...`: resnet8 without CIFAR-10 (`models/fetch_cifar10.sh` fetches it), kws without `marvin_617de221_0.wav` and ad01 without `normal_id_01_00000000_hist_librosa.bin` (neither may be redistributed here; copy them into `models/`). vww always runs. With `MODEL_DIR` pointing at a directory that holds no model, the model points show `SKIPPED (no MODEL_DIR)` and do not fail the run. `models/NOTICE` gives each file's source and license.
+**What is skipped:** the model points run the MLPerf Tiny models in `models/` (the default `MODEL_DIR`). A model whose input file is not there is skipped by name inside its point and listed under the table as `skipped inside passing points: ...`: resnet8 without CIFAR-10 (`models/fetch_cifar10.sh` fetches it), kws without `marvin_617de221_0.wav` and ad01 without `normal_id_01_00000000_hist_librosa.bin` (`models/fetch_inputs.sh` fetches both). vww always runs. With `MODEL_DIR` pointing at a directory that holds no model, the model points show `SKIPPED (no MODEL_DIR)` and do not fail the run. `models/NOTICE` gives each file's source and license.
 
 ---
 

@@ -91,36 +91,35 @@ The previous handshake tile (`PEMesh`, `MAC`, `RowInputQueue`, `ColumnInputQueue
 
 ## `GPNAE/`
 
-### Design — all live
+The lane since Batch B Stage 2 (2026-10-24): design D (bf16 D', option (i)) of `/proj/work/spramanik/sienna_report/gpnae_fit_study.log`. The published Taylor lane and B's `gpnae_poly` / `gpnae_poly_int8` are gone; the last commit that builds the Taylor lane is tagged `gpnae_taylor_final` (2f2db42).
+
+### Design
 
 | File | Lines | What it is |
 |---|---|---|
-| `src/gpnae.sv` | 385 | Top level plus `gpnae_control_unit` |
-| `src/SeLu.sv` | 173 | SELU. ~95 lines of commented-out earlier version at the end |
-| `src/sigtan.sv` | 43 | Sigmoid/tanh composition. Uses a tri-state mux — see issue 5 |
-| `src/fp32_down.sv` | 170 | 6-stage `x − 1.0` |
-| `src/fp32_up_down.sv` | 211 | Parallel `x + 1.0` and `x − 1.0`. `fp32_down` duplicated |
-| `src/TYTAN/controller.sv` | 192 | Polynomial sequencer with credit counter |
-| `src/TYTAN/datapath.v` | 58 | Horner's method: one multiplier, one adder |
-| `src/TYTAN/mac.sv` | 81 | Wires controller, datapath and `CoeffROM` together |
-| `src/TYTAN/LZC.v` | 44 | `cntlz8`, `cntlz24`. `cntlz8` collides with the ArithmeticLibrary copy |
-| `src/TYTAN/Memory/CoeffROM.v` | 27 | Thin wrapper over `rom_block` |
-| `src/TYTAN/Memory/ROM.v` | 28 | Registered-read ROM. Uses **`$readmemb`** |
-| `src/TYTAN/Memory/RAM.v` | 40 | Dual-port RAM backing the input FIFO |
-| `src/TYTAN/Memory/PE5B.v` | 42 | 32-to-5 priority encoder |
-| `src/TYTAN/Memory/InputFIFO.v` | 73 | Status-bitmap FIFO. No simultaneous read+write. Used by the published `gpnae.sv` only since 2026-10-07 |
-| `src/lane_fifo.sv` | 47 | Circular 32-entry FIFO with InputFIFO's read latency; the input FIFO of `gpnae_poly` and `gpnae_poly_int8` since 2026-10-07 (credit-legal puts while popping would reorder InputFIFO) |
-| `src/lane_link.sv` | 92 | The lanes' shared credit front end: L4 input credits (32 advertised, one per pop), `last` handling, the L5 output counter and the K-credit group start, `a_in_room` and `a_in_order` |
-| `src/TYTAN/Memory/taylor_coeffs.mem` | 30 | Coefficients, **binary** format. One short for tanh — see issue 2 |
+| `src/gpnae.sv` | 481 | The lane top: input FIFO and credit front end, capture into groups of K = 16, the barrel MAC, the post stage, bf16's tail, in-order emit; ports `tier_i` and the coefficient load path (`coef_wr_i`, `coef_addr_i`, `coef_data_i`) |
+| `src/gpnae_pkg.sv` | 85 | Memory map (128 coefficient words; descriptors at 128 + 16 (4 tier + d) + field; tail sets at 320 + 8 tier + field), the descriptor and tail structs, the element kinds |
+| `src/gpnae_coef_mem.sv` | 105 | The host-writable coefficient memory; its reset default is the generated section `fit_poly_coeffs.py` writes |
+| `src/gpnae_act_in.sv` | 255 | Input stage: piece select from abs(x) against the descriptor's bounds; floats square tanh's operand and split x log2 e into 2^-n and f for negative sigmoid; int8 rescales (int16Multiplier) and centres the operand |
+| `src/TYTAN/barrel_mac.sv` | 214 | Format-free barrel Horner: per-slot base, degree and fraction; a slot whose degree is below the group's pads with result 0 |
+| `src/gpnae_horner.sv` | 68 | One Horner step: fmt_mul then fmt_add in floats, a register then `fixedPointMultiplyAdd` in int8 |
+| `src/fixedPointMultiplyAdd.sv` | 50 | int8 step, sat16(floor(a x / 2^(11 + frac)) + c); fxMac's arithmetic, proven equal before fxMac left ArithmeticLibrary |
+| `src/gpnae_exp_split.sv` | 37 | fp32 k into its integer n and exact fraction f (2^-n P(f) range reduction) |
+| `src/gpnae_post.sv` | 256 | Post stage: lambda x, x P, P, 1 - P, the 2^-n scale and E(1 - E), the rails; int8's SELU requantize (int24Multiplier, int8Requantizer) |
+| `src/gpnae_tail.sv` | 281 | bf16 only: negative sigmoid below -1.5 in fp32 (2^-n P(f), Newton steps for 1/(1 + E)), eight contexts |
+| `src/lane_fifo.sv` | 47 | Circular 32-entry input FIFO |
+| `src/lane_link.sv` | 92 | The lanes' credit front end: L4 input credits, `last`, the L5 output counter and the K-credit group start |
 
-### Testbench
+### Scripts and benches
 
-| File | Lines | Status | Notes |
-|---|---|---|---|
-| `testbenches/TB_gpnae.sv` | 342 | live | No golden checking. Never uses `signal_tanh` — see issue 8 |
-| `testbenches/TB_gpnae_activations.sv` | ~185 | live | Numerical check of all three activations against goldens. Caught issues 5b and 5c |
-| `testbenches/TB_gpnae_selu_check.sv` | ~175 | live | Focused SELU reproducer written while isolating issue 3 |
-| `tb_gpnae.vcd` | — | untracked artifact | Waveform written under `+dump`; git-ignored (`*.vcd`), as are `noStart.ron` and `TB_gpnae_behav.wcfg` |
+| File | What it is |
+|---|---|
+| `gpnae_model.py` | Bit-exact model of the lane, the memory image and its load writes |
+| `fit_poly_coeffs.py` | Records the 1% designs, fits the 5% and 10% tiers, writes `gpnae_coef_default.json` and the RTL's reset section |
+| `regression.py` | `make regression`: lint, check-fmt, check-hier, the true-function gate per tier, protocol, load, cycles, faults |
+| `mutants.py` | One planted fault per new assertion and for the load and tier features |
+| `testbenches/TB_gpnae.sv` | The lane bench (plusargs: size, tier, +load, overlap, streaming, stalls, faults) |
+| `testbenches/TB_barrel_mac.sv` | barrel_mac bit for bit per define |
 
 ---
 
@@ -173,15 +172,4 @@ Present at both `GPNAE/ArithmeticLibrary/` and `SystolicMesh/ArithmeticLibrary/`
 
 ## Duplicated data files
 
-`taylor_coeffs.mem` exists in six places, currently all identical (md5 `5f5edfa7...`, 30 lines):
-
-```
-GPNAE/src/TYTAN/Memory/taylor_coeffs.mem        <- edit this one
-GPNAE/taylor_coeffs.mem
-Verilator/taylor_coeffs.mem
-VIVADO/SIENNA.ip_user_files/mem_init_files/taylor_coeffs.mem
-VIVADO/SIENNA.sim/sim_1/behav/xsim/taylor_coeffs.mem
-GPNAE/VIVADO/gpnae_vivado_sim.sim/sim_1/behav/xsim/taylor_coeffs.mem
-```
-
-The Makefile's `copy_mem_files` function sweeps `*.mem` and `*.hex` from eight directories into the simulation directory with `cp -u`, so which copy wins depends on modification time and directory order rather than on intent.
+None for the lanes since Batch B Stage 2: GPNAE's coefficients are the coefficient memory's reset section in `GPNAE/src/gpnae_coef_mem.sv`, generated with `GPNAE/gpnae_coef_default.json` by `fit_poly_coeffs.py`, and no lane reads a `.mem` file. The published Taylor lane's `taylor_coeffs.mem` copies went with it (tag `gpnae_taylor_final`).

@@ -484,10 +484,10 @@ module TB_model_run #(
     logic [DATA_WIDTH-1:0] v;
     logic [31:0] w32;
     bit finished;
-    int failed = 0, osp, mid_reset = 0, msp, tier = 0;
+    static int failed = 0, osp, mid_reset = 0, msp, tier = 0;
     string between_f, first_f;
-    int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0;
-    int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
+    static int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0;
+    static int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
 
     void'($value$plusargs("out_slots=%d", out_slots));
     void'($value$plusargs("out_stall_pct=%d", out_stall_pct));

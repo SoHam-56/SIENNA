@@ -241,6 +241,27 @@ def write_coef(path: str, mem) -> int:
     return len(w)
 
 
+def busy_writes(mem, act: str, tier: int = 0) -> list:
+    """Four load-path writes that would change act's own words at tier if one landed: its descriptor's first two coefficient words
+    inverted, its piece set pointed at another activation's words, and its first bound inverted (+coef_busy's corrupting writes)."""
+    g = gpnae_model
+    d = {"selu": g.D_SELU, "sigmoid": g.D_SIGP, "tanh": g.D_TANH}[act]
+    ds, other = mem.desc[tier][d], mem.desc[tier][g.D_TANH if d != g.D_TANH else g.D_SELU]
+    m = (1 << mem.act_w) - 1
+    b = g.A_DESC + g.DESC_STRIDE * (tier * g.NUM_DESC + d)
+    moved = g.Desc(**{k: v for k, v in vars(ds).items()})
+    moved.base = other.base if other.base != ds.base else (ds.base + 1) % g.COEF_WORDS
+    return [(ds.base, ~mem.words[ds.base] & m), (ds.base + 1, ~mem.words[ds.base + 1] & m), (b + g.F_SET, moved.set_word()),
+            (b, ~ds.bounds[0] & m)]
+
+
+def write_writes(path: str, w) -> int:
+    """(address, data) writes as a +coef= or +coef_busy= file; returns the count."""
+    with open(path, "w") as fh:
+        fh.write("".join(f"{a:03x} {d & 0xFFFFFFFF:08x}\n" for a, d in w))
+    return len(w)
+
+
 def pick_tier(tol: float) -> int:
     """The cheapest tier whose tolerance is within tol: a layer that tolerates 10% runs tier 2, 5% tier 1, anything tighter tier 0."""
     ok = [t for t, v in enumerate(gpnae_model.TIER_TOL) if v <= tol + 1e-12]
@@ -1404,8 +1425,10 @@ class RtlLayer:
         if job.get("between") is not None:  # the layer runs at the first image, then again after this image's load with no reset
             write_coef(bf, job["between"])
             lanes += [f"+between={bf}", f"+out_first={ff}"]
-        if job.get("coef_busy"):  # writes while the layer streams, which the interlock must refuse
-            lanes.append("+coef_busy")
+        if job.get("coef_busy"):  # writes to the running activation's own words while the layer streams, which the interlock must refuse
+            kf = os.path.join(self.work, f"{tag}.busy")
+            write_writes(kf, busy_writes(job.get("coef") or gpnae_model.default_mem(self.fmt_name), job["act"], int(job.get("tier", 0))))
+            lanes.append(f"+coef_busy={kf}")
         r = subprocess.run([self.bin, f"+layer={lf}", f"+out={of}", *dump, *lanes, *plusargs, *os.environ.get("SIM_ARGS", "").split()],
                            cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         if job.get("coef") is not None:
@@ -1509,8 +1532,9 @@ class RtlSets:
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
             raise RuntimeError("TB_sienna_model build failed")
 
-    def run(self, groups, act, tag, tier=0, coef=None):
-        """groups' sets through TB_sienna_model at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given."""
+    def run(self, groups, act, tag, tier=0, coef=None, busy=False):
+        """groups' sets through TB_sienna_model at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given;
+        busy: busy_writes to act's words while the sets stream, which the interlock must refuse (counted in busy_refused)."""
         sets_f = os.path.join(self.work, f"{tag}.sets")
         out_f = os.path.join(self.work, f"{tag}.out")
         n = write_sets(sets_f, groups, act)
@@ -1518,12 +1542,18 @@ class RtlSets:
         if coef is not None:
             write_coef(os.path.join(self.work, f"{tag}.coef"), coef)
             lanes.append(f"+coef={os.path.join(self.work, f'{tag}.coef')}")
+        if busy:
+            kf = os.path.join(self.work, f"{tag}.busy")
+            write_writes(kf, busy_writes(coef or gpnae_model.default_mem("fp32"), act, int(tier)))
+            lanes.append(f"+coef_busy={kf}")
         r = subprocess.run([self.bin, f"+sets={sets_f}", f"+out={out_f}"] + lanes + (["+host_gaps"] if self.host_gaps else []),
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
         if re.search(r"Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]", r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the model simulation")
+        b = re.search(r"\[MODEL\] coef busy: (\d+) writes while sets streamed, (\d+) refused", r.stdout)
+        self.busy_refused = (int(b.group(1)), int(b.group(2))) if b else None
         m = re.search(r"\[MODEL\] sets=(\d+) outputs=(\d+) cycles=(\d+) mesh_busy=(\d+) act_busy=(\d+) order_errors=(\d+)", r.stdout)
         if not m or int(m.group(6)) != 0:
             sys.stdout.write(r.stdout[-3000:])
@@ -1540,7 +1570,7 @@ class RtlSets:
         """One job as N x N sets in tile order -> (outputs, sets, cycles); a tile's result is its last set's, partial sets return none."""
         N = self.N
         groups, (P, C, rt, ct) = tile_job(job, N)
-        outs, n, cyc = self.run(groups, job["act"], tag, int(job.get("tier", 0)), job.get("coef"))
+        outs, n, cyc = self.run(groups, job["act"], tag, int(job.get("tier", 0)), job.get("coef"), bool(job.get("coef_busy")))
         Y = np.zeros((rt * N, ct * N), np.float32)
         k = 0
         for (r, c), passes, _ in groups:
@@ -1572,7 +1602,7 @@ class Emulator(RtlSets):
     def build(self):
         pass
 
-    def run(self, groups, act, tag, tier=0, coef=None):  # ReLU and linear only: the lanes' tier and memory do not apply
+    def run(self, groups, act, tag, tier=0, coef=None, busy=False):  # ReLU and linear only: the lanes' tier, memory and load path do not apply
         outs, n = [], 0
         for _, passes, bias in groups:
             acc = None

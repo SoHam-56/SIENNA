@@ -2840,28 +2840,26 @@ def analyse_res(ev, k_sets, flags, load, start, launch, written, reduce, g_up, g
                 reduce_to_written=[w - r for r, w in zip(reduce, written)], hold=hold)
 
 
-DEGREE = {"selu": 8, "sigmoid": 6, "tanh": 8}  # gpnae_poly coefficient table in fp32 and bf16; int8 takes gpnae_model.SETS_INT8's
+LANE_ACTS = ("selu", "sigmoid", "tanh")  # the activations the lanes run as polynomials
 FMT_KNOBS = tuple(fmt_pkg.FORMATS)  # the builds' formats, one define each
 
 
 def rtl_lat() -> tuple:
-    """sienna_fmt_pkg's unit latencies under each define, through fmt_pkg.py: ({fmt: (MUL_LATENCY, ADD_LATENCY)}, fxMac's, REQUANT_LATENCY, QUANT_ADD_LATENCY)."""
+    """sienna_fmt_pkg's unit latencies under each define, through fmt_pkg.py: ({fmt: (MUL_LATENCY, ADD_LATENCY)}, fixedPointMultiplyAdd's, REQUANT_LATENCY, QUANT_ADD_LATENCY)."""
     unit = {f: (fmt_pkg.get(f, "MUL_LATENCY"), fmt_pkg.get(f, "ADD_LATENCY")) for f in FMT_KNOBS}
-    fx = fmt_pkg.get("int8", "HORNER_STEP_LATENCY") - 1  # the int8 Horner step is one register, then fxMac
+    fx = fmt_pkg.get("int8", "HORNER_STEP_LATENCY") - 1  # the int8 Horner step is one register, then fixedPointMultiplyAdd
     return unit, fx, fmt_pkg.get("int8", "REQUANT_LATENCY"), fmt_pkg.get("int8", "QUANT_ADD_LATENCY")
 
 
-UNIT_LAT = FX_LAT = REQ_LAT = QADD_LAT = None  # mul_lat and add_lat per format, fxMac, int8Requantizer, add_lanes' ADD; perf_init() parses them
+UNIT_LAT = FX_LAT = REQ_LAT = QADD_LAT = None  # mul_lat and add_lat per format, the int8 Horner step's multiply-add, int8Requantizer, add_lanes' ADD; perf_init() parses them
 MUL_LAT = ADD_LAT = None  # valid in to done out; perf_init() sets fp32's, perf_main() the build's format's values
-MAC_LAT = {"fp32": 13, "bf16": 8, "int8": 3}  # barrel_mac's Horner loop: multiplier then adder, or fxMac behind a register stage
 FMT = "fp32"  # the build's format; perf_main() sets it
 
 
-def degree(act: str) -> int:
-    """The polynomial degree of act's coefficient set in the build's format: Task 10's SETS_INT8 in int8."""
-    if FMT == "int8":
-        return gpnae_model.SETS_INT8[mr.activation_to_code(act)][1]
-    return DEGREE[act]
+def lane_lat(f: str) -> dict:
+    """The gpnae lane's latencies in a format, from the package: the Horner step (LOOP), the input stage (ACT_IN), the post multiply and add."""
+    return {"LOOP": fmt_pkg.get(f, "HORNER_STEP_LATENCY"), "ACT_IN": fmt_pkg.get(f, "LANE_MUL_LATENCY") + 1, "ML": fmt_pkg.get(f, "LANE_MUL_LATENCY"),
+            "AL": fmt_pkg.get(f, "LANE_ADD_LATENCY"), "RQ": fmt_pkg.get(f, "REQUANT_LATENCY")}
 
 
 def pkg() -> dict:
@@ -2907,32 +2905,30 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
         m["hold"] = per_lane + 1  # a hold set passes the stage into hold_mem
     elif act in ("relu", "linear") and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = per_lane + 1  # from the first beat (TB g_eff): per_lane wide reads, g_done at byp_all_in, idle; FEED/LATCH precede or overlap the reads (per_lane >= 2)
-    elif act in DEGREE and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
+    elif act in LANE_ACTS and not cfg.get("mixed_acts") and cfg.get("accum_passes", 1) == 1:
         m["act"] = lane_stage(act, P, collapse)
     return m
 
 
 def lane_params() -> tuple:
-    """gpnae_poly's K and TAIL_CONTEXTS defaults and its bf16 TAIL_NEWTON, parsed from the RTL; fails if gpnae_lane overrides K or TAIL_CONTEXTS."""
-    poly = open(os.path.join(ROOT, "GPNAE", "src", "gpnae_poly.sv")).read()
-    inst = re.search(r"gpnae_poly #\((.*?)\) lane", open(os.path.join(ROOT, "src", "gpnae_lane.sv")).read(), re.S)
-    k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", poly) for n in ("K", "TAIL_CONTEXTS"))
-    nw = re.search(r"localparam int TAIL_NEWTON = FP32 \? 0 : (\d+);", poly)  # Task 1.14a: bf16 sigmoid x < 0's Newton steps
-    if not (k and t and nw and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
-        raise RuntimeError("regression.py --action perf: gpnae_poly's K / TAIL_CONTEXTS / TAIL_NEWTON not found, or gpnae_lane overrides them")
-    return int(k.group(1)), int(t.group(1)), int(nw.group(1))
+    """gpnae's K and TAIL_CONTEXTS defaults, parsed from the RTL; fails if sienna_pipe overrides them."""
+    src = open(os.path.join(ROOT, "GPNAE", "src", "gpnae.sv")).read()
+    inst = re.search(r"\bgpnae #\((.*?)\) gpnae", open(os.path.join(ROOT, "src", "sienna_pipe.sv")).read(), re.S)
+    k, t = (re.search(rf"parameter int\s+{n}\s*=\s*(\d+)", src) for n in ("K", "TAIL_CONTEXTS"))
+    if not (k and t and inst) or re.search(r"\.(K|TAIL_CONTEXTS)\s*\(", inst.group(1)):
+        raise RuntimeError("regression.py --action perf: gpnae's K / TAIL_CONTEXTS not found, or sienna_pipe overrides them")
+    return int(k.group(1)), int(t.group(1))
 
 
-GROUP_K = TAIL_CTX = TAIL_NEWTON = None  # gpnae_poly's K, TAIL_CONTEXTS and bf16 TAIL_NEWTON; perf_init() parses them
+GROUP_K = TAIL_CTX = None  # gpnae's K and TAIL_CONTEXTS; perf_init() parses them
 
 
 def perf_init() -> None:
     """Parses the RTL's unit latencies and lane parameters for the perf model; at perf's entry, not at import, so an unparsable RTL fails only perf."""
-    global UNIT_LAT, FX_LAT, REQ_LAT, QADD_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX, TAIL_NEWTON
+    global UNIT_LAT, FX_LAT, REQ_LAT, QADD_LAT, MUL_LAT, ADD_LAT, GROUP_K, TAIL_CTX
     UNIT_LAT, FX_LAT, REQ_LAT, QADD_LAT = rtl_lat()
     MUL_LAT, ADD_LAT = UNIT_LAT["fp32"]
-    GROUP_K, TAIL_CTX, TAIL_NEWTON = lane_params()
-DN_LAT = {"fp32": 6, "bf16": 5}  # sigmoid's P - 1: fp32_down's valid_stage6, or the format's fpAdder
+    GROUP_K, TAIL_CTX = lane_params()
 
 
 def lane_inputs(k: int, P: dict, collapse: bool) -> list:
@@ -2944,66 +2940,64 @@ def lane_inputs(k: int, P: dict, collapse: bool) -> list:
     return mr.bits_float(np.asarray(C, np.int64), FMT).astype(np.float64).flatten().tolist()  # bf16: each fp32 sum rounded once, as the lanes see it
 
 
-def in_tail(x: float, act: str) -> bool:
-    """gpnae_poly's sig_in_tail: past the fitted range, gpnae_tail computes the element."""
-    if FMT == "bf16" and act == "sigmoid" and x < 0: return True  # Task 1.14a: every negative bf16 sigmoid input takes the fp32 tail
-    return x < -4.0 if act == "selu" else abs(x) > (3.5 if act == "sigmoid" else 4.0)
+def lane_kinds(xs: list, act: str) -> tuple:
+    """Each element's kind and Horner rounds at tier 0 (gpnae_model): float inputs as the format's words; int8 has no per-element data here,
+    so every element is taken as a polynomial one (the activation's tier-0 degree), the worst case."""
+    code = mr.activation_to_code(act)
+    if FMT == "int8":
+        m = gpnae_model.default_mem("int8")
+        d = {1: [gpnae_model.D_SELU], 2: [gpnae_model.D_SIGP, gpnae_model.D_SIGN], 3: [gpnae_model.D_TANH]}[code]
+        r = max(m.desc[0][i].deg for i in d) + 1
+        return [gpnae_model.K_MUL if code == 1 else gpnae_model.K_PASS] * len(xs), [r] * len(xs)
+    f = fpu.FORMATS[FMT]
+    w = np.asarray(np.float32(xs)).view(np.uint32).astype(np.int64) >> (23 - f.m)
+    k, r = gpnae_model.Lane(f).rounds(w, code, 0)
+    return [int(v) for v in k], [int(v) for v in r]
 
 
-def tail_ops(x: float, act: str) -> int:
-    """gpnae_tail's cycles for one element alone, from its first state to T_DONE: each step is request, issue, unit, state update."""
-    cm, ca = (UNIT_LAT["fp32"][0] if FMT == "bf16" else MUL_LAT) + 2, (UNIT_LAT["fp32"][1] if FMT == "bf16" else ADD_LAT) + 2  # bf16's tail computes in fp32 since Task 1.14a
-    nwt = TAIL_NEWTON if FMT == "bf16" and act == "sigmoid" and x < 0 else 0  # gpnae_tail's NEWTON: Newton steps for this element
-    a = x if act == "selu" else -abs(x) if act == "sigmoid" else -2 * abs(x)  # e^a, a <= 0
-    if act == "tanh" and abs(x) >= 64.0:
-        a = -math.inf  # x's exponent at BIAS + 6: the underflow path
-    out = ca if act == "tanh" or (act == "sigmoid" and x >= 0) else 0  # 1 - 2s, 1 - s, or s as it is
-    # u = 1 - E, v = E u, w = 1 - v, s = E w, then the output step; with Newton: D = 1 + E, y = 1.5 - D/2, nwt rounds of t = D y, t = 2 - t, y = y t, then s = E y
-    close = ca + ca + nwt * (cm + ca + cm) + cm if nwt else ca + cm + ca + cm + out
-    if abs(a) > 104.0:  # e^a underflows: straight to the closing steps
-        return cm if act == "selu" else close
-    mant, m = math.frexp(abs(a))  # |a| = mant * 2^m, mant in [0.5, 1): the Taylor z = a / 2^m and m doublings back
-    z = -mant if m > 0 else a
-    m = max(m, 0)
-    ops = 10 * (cm + ca) + cm  # Taylor e^z - 1 from 1/11!: ten multiply-add rounds, then d = z * acc
-    if act == "selu":
-        return ops + m * (ca + cm) + cm  # m rounds of d = d * (d + 2), then lambda * alpha * d
-    ops += ca  # E = 1 + d
-    for j in range(m):  # E squared m times, cut short once E drops below 2^-63
-        if z * 2 ** j < -63 * math.log(2):
-            ops += 1
-            break
-        ops += cm
-    return ops + close
+def tail_ops(tier: int = 0) -> int:
+    """gpnae_tail's cycles for one element alone, start to T_DONE: each fp32 step is request, issue, unit, update (latency + 2)."""
+    ts = gpnae_model.default_mem("bf16").tail[tier]
+    cm, ca = UNIT_LAT["fp32"][0] + 2, UNIT_LAT["fp32"][1] + 2
+    return cm + (ts.deg + 1) * (cm + ca) + 2 * ca + ts.newton * (cm + ca + cm) + cm  # k; Horner; D and y0; Newton; E y
 
 
 def lane_cycles(xs: list, act: str, s: int) -> int:
-    """Cycle of a lane's last done_o, its first G_CAP at s: groups of GROUP_K run capture, load, MAC, post and emit in turn."""
-    int8, tanh, ncoef, loop = FMT == "int8", act == "tanh", degree(act) + 1, MAC_LAT[FMT]
+    """Cycle of a lane's last result put, its first G_CAP at s: groups of GROUP_K run capture (each into the input stage), the MAC, the post
+    issues and emit in turn; per group the MAC runs its highest element's rounds."""
+    L = lane_lat(FMT)
+    kinds, rounds = lane_kinds(xs, act)
+    K = gpnae_model
     for g in range(0, len(xs), GROUP_K):
-        grp = xs[g:g + GROUP_K]
-        n = len(grp)
-        # G_CAP n + 3, then G_LOAD n and G_LDRAIN to barrel_mac's RUN: the float lane loads while capturing unless tanh squares.
-        if int8:
-            run = s + 2 * n + MUL_LAT + 7 + (FX_LAT + 1 if tanh else 0)
-        else:
-            run = s + (2 * n + MUL_LAT + 7 if tanh else n + 5)
-        post = run + ncoef * max(n, loop + 1) + loop + 3 + n  # RUN rounds of max(n, loop + 1), DRAIN loop + 2, EMIT n: G_POST
-        if int8:  # result flag MUL_LAT (+ REQ_LAT for SELU) after the issue; sigmoid in place; tanh's saturated inputs read as unsaturated
-            # Task 1.16's block-float SELU post stage and ReLU max(q, z_in) kept these cycles (0 of 147 lane cycle counts changed)
-            lat = [MUL_LAT + REQ_LAT if act == "selu" else MUL_LAT if tanh else -1] * n
-        else:  # bf16 tanh below T_TINY returns x and SELU's lambda is 0x3F87 (Task 1.16) in the same cycles; Task 1.14bc built no RTL
-            lat = [(-1 if x >= 0 else DN_LAT[FMT]) if act == "sigmoid" else MUL_LAT for x in grp]
-        ready = [post + i + 2 + lat[i] for i in range(n)]
-        if not int8:  # tail elements start as captured, one per cycle, on TAIL_CTX contexts; unit contention is not modelled
+        kd, rd = kinds[g:g + GROUP_K], rounds[g:g + GROUP_K]
+        n, R = len(kd), max(rounds[g:g + GROUP_K])
+        t0 = s + n + 2 + L["ACT_IN"]  # the last capture's input-stage result loads with the start
+        d = t0 + R * max(n, L["LOOP"] + 1) + L["LOOP"] + 3 + n  # RUN rounds, DRAIN LOOP + 2, EMIT n: barrel_mac's done
+        exp = any(k == K.K_EXP for k in kd)
+        e0 = d + n + 1 + ((L["AL"] + 2) + n if exp else 0)  # G_EMIT, after the post issues (and fp32's second pass)
+        ready = []
+        for i, k in enumerate(kd):
+            iss = d + 1 + i
+            if FMT == "int8":
+                ready.append(iss + 1 + L["ML"] + L["RQ"] + 1 if act == "selu" else iss + 2)
+            elif k in (K.K_PASS, K.K_SAT):
+                ready.append(iss + 2)
+            elif k == K.K_REFL:
+                ready.append(iss + L["AL"] + 2)
+            elif k == K.K_EXP:
+                ready.append(d + n + L["AL"] + 3 + i + L["ML"] + 2)
+            elif k == K.K_TAIL:
+                ready.append(-1)  # set below
+            else:
+                ready.append(iss + L["ML"] + 2)
+        if FMT == "bf16":  # tail elements start as classified, one per cycle, on TAIL_CTX contexts; unit contention is not modelled
             free, last = [-1] * TAIL_CTX, -1
-            for i, x in enumerate(grp):
-                if in_tail(x, act):
+            for i, k in enumerate(kd):
+                if k == K.K_TAIL:
                     c = free.index(min(free))
-                    t0 = max(s + 4 + i, last + 1, free[c])
-                    ops = tail_ops(x, act)
-                    free[c], last, ready[i] = t0 + 2 + ops, t0, t0 + 3 + ops
-        e = post + n - 1  # G_EMIT from post + n: one element per cycle once its result is in
+                    t_s = max(s + 3 + i + L["ACT_IN"] + 1, last + 1, free[c])
+                    free[c], last, ready[i] = t_s + tail_ops() + 2, t_s, t_s + tail_ops() + 3
+        e = e0 - 1
         for r in ready:
             e = max(e + 1, r)
         s = e + 2  # G_NEXT, then the next group's G_CAP
@@ -3014,7 +3008,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     """Activation stage cycles of a lane set (median over the streamed sets): FEED to the cycle after every lane is collected."""
     per_lane, lanes = P["SRAM_DEPTH"] // P["NUM_LANES"], P["NUM_LANES"]
     start = per_lane + 3 + (REQ_LAT if FMT == "int8" else 0)  # last_i: FEED, LATCH, the wide reads, the fill count, the requantize
-    if FMT == "int8":  # no tail path: every set costs the same
+    if FMT == "int8":  # no per-element data here: every set costs the same (lane_kinds)
         return lane_cycles([0.0] * per_lane, act, start + 1) + 2
     out = []
     for k in range(P["NUM_SETS"]):
@@ -3030,12 +3024,12 @@ def packed_stage(P: dict, collapse: bool = True) -> int:
     for k in range(P["NUM_SETS"]):
         sw = _set_words(k, knobs, N, FMT)
         acts = [sw["ents"][int(sw["col_ent"][L % N])]["act"] for L in range(lanes)]
-        if not any(a in DEGREE for a in acts):  # every lane ReLU or linear: the bypass path
+        if not any(a in LANE_ACTS for a in acts):  # every lane ReLU or linear: the bypass path
             out.append(per_lane + 1)
             continue
         xs = [0.0] * (N * N) if FMT == "int8" else lane_inputs(k, P, collapse)  # int8 has no tail path: data-free
         col = lambda L: [xs[((L // N) * per_lane + i) * N + L % N] for i in range(per_lane)]  # sienna_top's elem() for a packed set
-        out.append(max(lane_cycles(col(L), a, start + 1) for L, a in enumerate(acts) if a in DEGREE) + 2)
+        out.append(max(lane_cycles(col(L), a, start + 1) for L, a in enumerate(acts) if a in LANE_ACTS) + 2)
     return med(out)
 
 
@@ -5309,44 +5303,42 @@ def perf_fmt(f):
 @perf_selftest
 def test_rtl_lat():
     assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 4)  # fxMac, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae_poly's K, TAIL_CONTEXTS
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
 def test_lane_stage_int8():
-    with perf_fmt("int8"):  # no tail path, so the stage is data-free; each value derived from gpnae_poly_int8 and barrel_mac, and measured
+    with perf_fmt("int8"):  # no tail path, so the stage is data-free; rs3_b2_perf_int8_n8/n16 measured each 2 below, as Batch A's model and sim differ
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
-        assert stage("selu", 16) == 96 and stage("tanh", 16) == 107  # sp_p16t2
-        assert stage("selu", 32) == 327 and stage("tanh", 32) == 365  # sp_p32t2, sp_p32t4
-        assert stage("selu", 8) == 53 and stage("tanh", 8) == 56  # sp_p8t2
+        assert stage("selu", 16) == 101 and stage("tanh", 16) == 109 and stage("sigmoid", 16) == 109
+        assert stage("selu", 8) == 56 and stage("tanh", 8) == 55 and stage("sigmoid", 8) == 55
 
 
 @perf_selftest
 def test_lane_group_float():
-    with perf_fmt("fp32"):  # one group, no tail element: last_i at per_lane + 3, so the first G_CAP at per_lane + 4
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 195 and pa.lane_cycles([0.0] * 2, "tanh", 6) + 2 == 183
-    with perf_fmt("bf16"):
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) + 2 == 143 and pa.lane_cycles([0.0] * 32, "tanh", 36) + 2 == 529
+    with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 88 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 64
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 184 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 253
+    with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 71 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 233
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 204 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 204
 
 
 @perf_selftest
-def test_tail_ops_fp32():
-    with perf_fmt("fp32"):  # multiply 8 + 2, add 5 + 2 cycles per gpnae_tail step, by hand
-        assert pa.tail_ops(5.0, "tanh") == 10 * 17 + 10 + 7 + 4 * 10 + 7 + 10 + 7 + 10 + 7  # a = -10: four squarings
-        assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # a = -5: three doublings
-        assert pa.tail_ops(60.0, "tanh") == 7 + 10 + 7 + 10 + 7  # |a| = 120 > 104: e^a underflows
-        assert pa.tail_ops(-4.5, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10  # x < 0 keeps s, no output step
-        assert pa.lane_cycles([5.0] + [0.0] * 7, "tanh", 12) + 2 == 16 + 3 + 268 + 8 + 2  # the tail result holds the group's emit
+def test_lane_kinds():
+    K = gpnae_model
+    with perf_fmt("fp32"):  # tier 0: below -6 the negative sigmoid is 2^-n P(f) on the MAC (no tail in fp32), above 0 P itself
+        k, r = pa.lane_kinds([-8.0, -3.0, 0.5, 5.0], "sigmoid")
+        assert k == [K.K_EXP, K.K_REFL, K.K_PASS, K.K_PASS] and r == [5, 8, 8, 8], (k, r)
+    with perf_fmt("bf16"):  # tier 0: below -1.5 the negative sigmoid goes to the fp32 tail
+        k, r = pa.lane_kinds([-3.0, -1.0, 0.5, 5.0], "sigmoid")
+        assert k == [K.K_TAIL, K.K_PASS, K.K_PASS, K.K_PASS] and r == [1, 4, 5, 5], (k, r)
 
 
 @perf_selftest
 def test_tail_ops_bf16():
-    with perf_fmt("bf16"):  # Task 1.14a: the tail in fp32 units (multiply 8 + 2, add 5 + 2), sigmoid x < 0 with two Newton steps, by hand
-        assert pa.TAIL_NEWTON == 2 and pa.in_tail(-0.01, "sigmoid") and not pa.in_tail(0.0, "sigmoid") and not pa.in_tail(-0.01, "tanh")
-        assert pa.tail_ops(-0.5, "sigmoid") == 10 * 17 + 10 + 7 + 7 + 7 + 2 * (10 + 7 + 10) + 10  # E = 1 + d, D, y0, two rounds, s = E y
-        assert pa.tail_ops(-200.0, "sigmoid") == 7 + 7 + 2 * (10 + 7 + 10) + 10  # e^a underflows: straight to the Newton steps
-        assert pa.tail_ops(4.0, "sigmoid") == 10 * 17 + 10 + 7 + 3 * 10 + 7 + 10 + 7 + 10 + 7  # x > 3.5 keeps the series and 1 - s
-        assert pa.tail_ops(-5.0, "selu") == 10 * 17 + 10 + 3 * 17 + 10  # fp32 units, as fp32's
+    with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 5 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
+        assert [pa.tail_ops(t) for t in range(3)] == [10 + 5 * 17 + 14 + 2 * 27 + 10, 10 + 3 * 17 + 14 + 27 + 10, 10 + 3 * 17 + 14 + 10] == [173, 112, 85]
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──

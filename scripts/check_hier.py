@@ -9,7 +9,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # the SIENNA repository
 UNITS = {  # every arithmetic unit of ArithmeticLibrary: per-format units, the generic integer units and the int8-only units
     "fp32Multiplier", "fp32Adder", "fp32Divider", "bf16Multiplier", "bf16Adder", "bf16WideMultiplier", "fp32ToBf16",
     "int8Multiplier", "int16Multiplier", "int24Multiplier", "int32Adder", "intMultiplier", "intAdder", "fixedPointMultiplyAdd",
@@ -57,7 +57,7 @@ def elaborate(fmt: str, sp: int, files: list, inc: list, verilator: str, out: st
     x = os.path.join(out, f"hier_{fmt}_sp{sp}.xml")
     top = BENCH[sp]
     cmd = [verilator, "--xml-only", "--xml-output", x, "--timing", "-Wno-fatal", "-Wno-lint", "-Wno-style", *d, *[f"-I{i}" for i in inc],
-           "--top-module", top, "--Mdir", os.path.join(out, f"obj_{fmt}_sp{sp}"), *files, os.path.join(ROOT, "testbenches", f"{top}.sv")]
+           "--top-module", top, "--Mdir", os.path.join(out, f"obj_{fmt}_sp{sp}"), *files, os.path.join(ROOT, "testbenches", "top", f"{top}.sv")]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
         errs = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith("%Error")]

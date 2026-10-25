@@ -279,6 +279,10 @@ module TB_sienna_top #(
       .west_write_reset_i         (west_write_reset_i),
       .drained_i                  (1'b0),
       .copy_sel_o                 (),
+      .coef_wr_i           (1'b0),  // the lanes keep their reset coefficient memory
+      .coef_addr_i         ('0),
+      .coef_data_i         ('0),
+      .coef_ready_o        (),
       .out                        (out_lnk),
       .pipeline_complete_o        (pipeline_complete_o),
       .done_set_id_o              (done_set_id_o),

@@ -48,6 +48,10 @@ module sienna_pipe #(
     input logic                     west_write_enable_i,
     input logic [HOST_WORDS-1:0][sienna_fmt_pkg::DATA_WIDTH-1:0] west_write_data_i,
     input logic                     west_write_reset_i,
+    input logic                     coef_wr_i,  // the lanes' coefficient memory load path, while they are idle (gpnae_pkg's map)
+    input logic [8:0]               coef_addr_i,
+    input logic [31:0]              coef_data_i,
+    output logic                    coef_ready_o,  // no set in the pipeline and every lane idle: a load path write is taken
 
     credit_link_if.producer         out[NUM_LANES],  // L9: lane k's pooled, dropped-out results, one word per put, while the consumer's credit is held
     // L9 lanes drift apart by up to FIFO2's 4 windows + maxpool's 2 windows ahead + the L9 slots: a consumer must not make one lane's credits wait on another lane's later windows.
@@ -431,8 +435,8 @@ module sienna_pipe #(
     end
   end
 
-  logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o: read by the coefficient load path, which this build has not
-  wire unused_lane_idle = ^lane_idle;
+  logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o
+  assign coef_ready_o = (&lane_idle) && (sets_out == '0) && !host_accept;
 
   generate
     genvar g;
@@ -462,9 +466,9 @@ module sienna_pipe #(
           .control_word_i(gpnae_ctrl[g]),
           .tier_i        (g_tier),
           .par_i         (g_par[g]),
-          .coef_wr_i     (1'b0),  // the lanes keep their reset coefficient memory
-          .coef_addr_i   ('0),
-          .coef_data_i   ('0),
+          .coef_wr_i     (coef_wr_i),
+          .coef_addr_i   (coef_addr_i),
+          .coef_data_i   (coef_data_i),
           .idle_o        (lane_idle[g])
       );
 

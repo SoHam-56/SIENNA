@@ -30,6 +30,7 @@ module sienna_sched #(
     input logic                     cfg_residual_i,  // add an M x N residual input, streamed with A
     input logic                     cfg_bias_i,      // add a bias row, streamed with the weights
     input logic [CONTROL_WIDTH-1:0] cfg_act_i,
+    input logic [1:0]               cfg_tier_i,  // the lanes' accuracy tier for the layer: 0 within 1%, 1 within 5%, 2 within 10%
     input logic                     cfg_train_i,
     input logic [LFSR_WIDTH-1:0]    cfg_seed_i,
     // Taken with cfg_load_i where the build has them (int8; 1-bit dummies in floats): the layer's requantize and lane words (D-2), and
@@ -97,6 +98,7 @@ module sienna_sched #(
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
+  logic [1:0] tier_q;
   logic [LFSR_WIDTH-1:0] seed_q;
   sienna_fmt_pkg::lane_entry_t lane_q;  // the layer's requantize and lane words
   logic [2:0] pk_shift_q;  // packing configuration, as the cfg_pack_* ports
@@ -144,6 +146,7 @@ module sienna_sched #(
     p_side_base.pack_shift    = pk_shift_q;
     p_side_base.pack_map      = pk_map_q;
     p_side_base.act           = {pk_act_q, act_q};
+    p_side_base.tier          = tier_q;
     p_side_base.entry         = {pk_lane_q, lane_q};
     p_side_base.scale         = p_scale;
     p_side_base.res_hold      = int_res && (is_p == dt - 1);  // the conv's words and clamp, linear: its beats wait in hold_mem
@@ -304,6 +307,7 @@ module sienna_sched #(
       cached <= 1'b0;
       train_q <= 1'b0;
       act_q <= '0;
+      tier_q <= '0;
       seed_q <= '0;
       lane_q <= '0;
       pk_shift_q <= '0;
@@ -346,6 +350,7 @@ module sienna_sched #(
         cached <= (r > 1) && (d <= DIM_W'(HALF));
         train_q <= cfg_train_i;
         act_q <= cfg_act_i;
+        tier_q <= cfg_tier_i;
         seed_q <= cfg_seed_i;
         lane_q <= cfg_lane_i;
         pk_shift_q <= cfg_pack_shift_i;

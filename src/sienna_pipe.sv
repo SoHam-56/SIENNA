@@ -166,6 +166,8 @@ module sienna_pipe #(
   logic [N/2-1:0][PEW-1:0] set_map[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] set_ents[NUM_IDS];
   logic [PACK_ENTRIES-1:0][CONTROL_WIDTH-1:0] g_ents;  // the activation stage's copy of its set's entry codes, taken at g_accept
+  logic [1:0] set_tier[NUM_IDS];  // each set's accuracy tier
+  logic [1:0] g_tier;  // the activation stage's copy, taken at g_accept
   logic g_pack;  // the activation stage's set is packed
   logic [PEW-1:0] lane_ent[NUM_LANES];  // the entry each lane uses for that set
   logic [PEW-1:0] p_lane_ent[NUM_LANES];  // and each pooling lane for the pooled set
@@ -458,7 +460,7 @@ module sienna_pipe #(
           .in            (l4),
           .out           (l5),
           .control_word_i(gpnae_ctrl[g]),
-          .tier_i        (2'd0),  // tier 0, within 1%
+          .tier_i        (g_tier),
           .par_i         (g_par[g]),
           .coef_wr_i     (1'b0),  // the lanes keep their reset coefficient memory
           .coef_addr_i   ('0),
@@ -760,6 +762,7 @@ module sienna_pipe #(
       host_next_id <= '0;
       g_pack    <= 1'b0;
       g_ents    <= '0;
+      g_tier    <= '0;
       g_hold    <= 1'b0;
       g_add     <= 1'b0;
       for (int k = 0; k < NUM_IDS; k++) begin
@@ -769,6 +772,7 @@ module sienna_pipe #(
         set_pack[k]  <= '0;
         set_map[k]   <= '0;
         set_ents[k]  <= '0;
+        set_tier[k]  <= '0;
         set_hold[k]  <= 1'b0;
         set_add[k]   <= 1'b0;
       end
@@ -783,6 +787,7 @@ module sienna_pipe #(
         set_pack[host_next_id] <= side.pack_shift;
         set_map[host_next_id]  <= side.pack_map;
         set_ents[host_next_id] <= side.act;
+        set_tier[host_next_id] <= side.tier;
         set_train[host_next_id] <= side.train;
         set_seed[host_next_id]  <= side.seed;
         set_hold[host_next_id] <= sienna_fmt_pkg::HAS_RESIDUAL_ADD && side.res_hold;  // no hold or add set where the build has no ADD
@@ -822,6 +827,7 @@ module sienna_pipe #(
       if (g_accept) begin
         g_pack <= (set_pack[g_next_id] != '0);
         g_ents <= set_ents[g_next_id];
+        g_tier <= set_tier[g_next_id];
         g_hold <= set_hold[g_next_id];
         g_add  <= set_add[g_next_id];
         for (int k = 0; k < NUM_LANES; k++) lane_ent[k] <= ent_of(set_map[g_next_id], set_pack[g_next_id], k % N);

@@ -32,7 +32,7 @@ LANE_EXPECTED = {  # inside the lanes (GPNAE's check_hier.py): the Horner step, 
     "int8": {"int16Multiplier", "int24Multiplier", "int8Requantizer", "fixedPointMultiplyAdd"},
 }
 LANE_EXPECTED["default"] = LANE_EXPECTED["fp32"]
-BENCH = {1: "TB_sienna_top", 0: "TB_model_run"}  # the set and the layer contract; a top with interface ports cannot be elaborated
+BENCH = {1: (0, "g_pipeline"), 0: (1, "g_layer")}  # TB_sienna's MODE and branch for the set and the layer contract; a top with interface ports cannot be elaborated
 
 
 def units_by_place(xml: str, top: str) -> tuple:
@@ -55,9 +55,10 @@ def units_by_place(xml: str, top: str) -> tuple:
 def elaborate(fmt: str, sp: int, files: list, inc: list, verilator: str, out: str) -> str:
     d = [] if fmt == "default" else [f"+define+FMT_{fmt.upper()}"]
     x = os.path.join(out, f"hier_{fmt}_sp{sp}.xml")
-    top = BENCH[sp]
+    mode, _ = BENCH[sp]
     cmd = [verilator, "--xml-only", "--xml-output", x, "--timing", "-Wno-fatal", "-Wno-lint", "-Wno-style", *d, *[f"-I{i}" for i in inc],
-           "--top-module", top, "--Mdir", os.path.join(out, f"obj_{fmt}_sp{sp}"), *files, os.path.join(ROOT, "testbenches", "top", f"{top}.sv")]
+           "--top-module", "TB_sienna", f"-GMODE={mode}", "--Mdir", os.path.join(out, f"obj_{fmt}_sp{sp}"), *files,
+           os.path.join(ROOT, "testbenches", "top", "TB_sienna.sv")]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
         errs = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith("%Error")]
@@ -80,7 +81,7 @@ def main() -> int:
     jobs = [(f, sp) for f in ("fp32", "bf16", "int8", "default") for sp in (1, 0)]
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as ex:  # one elaboration per core
         xmls = dict(zip(jobs, ex.map(lambda j: elaborate(*j, a.files, a.inc, a.verilator, a.out), jobs)))
-    places = {j: units_by_place(x, BENCH[j[1]]) for j, x in xmls.items()}
+    places = {j: units_by_place(x, f"TB_sienna.{BENCH[j[1]][1]}") for j, x in xmls.items()}
     bad = 0
     for (f, sp), (pipe, lanes, other) in places.items():
         ok = judge(f, pipe, lanes, other)

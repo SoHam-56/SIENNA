@@ -5,9 +5,9 @@
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
 #   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
-#   4. Device protocol  write_layer and read_outputs (TB_model_run's layer and result files), write_sets (TB_sienna_model's set file)
+#   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
-#   6. Backends         RtlLayer (TB_model_run), RtlSets (TB_sienna_model), Emulator (numpy)
+#   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
 #   7. Runtime          execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
 #   8. CLI              model_main, tflite_main, tflite_pack_main, main
 
@@ -239,7 +239,7 @@ def coef_writes(mem) -> list:
 
 
 def write_coef(path: str, mem) -> int:
-    """A load file for TB_model_run's and TB_sienna_model's +coef=: "aaa dddddddd" (hex address, data) per write; returns the count."""
+    """A load file for TB_sienna (layer)'s and TB_sienna (sets)'s +coef=: "aaa dddddddd" (hex address, data) per write; returns the count."""
     w = coef_writes(mem)
     with open(path, "w") as fh:
         fh.write("".join(f"{a:03x} {d & 0xFFFFFFFF:08x}\n" for a, d in w))
@@ -1087,7 +1087,7 @@ def bias_word_index(cfg, a, w) -> list:
 
 
 def write_layer(path, cfg, a, w, fmt, req=None, pack=None, epilogue=None, bias_words=None, add=None):
-    """TB_model_run's layer file: L (configuration), int8's Q (requantize), an int8 residual layer's A (the ADD's words but zp1), a packed
+    """TB_sienna (layer)'s layer file: L (configuration), int8's Q (requantize), an int8 residual layer's A (the ADD's words but zp1), a packed
     layer's P (shift, block map) and E (entries 1-7), rows of N words, int8's epilogue words."""
     if fmt == "int8" and cfg["residual"] and (add is None or int(add["zp1"]) != int(req["zp"])):  # zp1 is Q's zp, the conv output's
         raise ValueError("an int8 residual layer needs its ADD words (job['add']) with zp1 equal to the requantize zp")
@@ -1144,7 +1144,7 @@ def read_outputs(path, fmt="fp32", test=None):
 
 
 def write_sets(path, groups, act):
-    """TB_sienna_model's set file: the set count, then per set "partial code bias" and its A, B (and bias) words as fp32 hex; returns the count."""
+    """TB_sienna (sets)'s set file: the set count, then per set "partial code bias" and its A, B (and bias) words as fp32 hex; returns the count."""
     code = ACT_CODES[act]  # every activation: the set engine runs the lanes too
     lines = []
     n = 0
@@ -1170,7 +1170,7 @@ TB_DIR = os.path.join(ROOT, "testbenches")
 
 
 TB_KNOBS = ("ACTIVATION_CODE", "NUM_SETS", "HAS_BIAS", "WEIGHT_CACHE", "ACCUM_PASSES", "MIXED_LEN", "MIXED_ACTS", "PACKED", "TRAINING_MODE",
-            "DROPOUT_SEED", "RESIDUAL")  # TB_sienna_top reads these at run time (test_knobs.mem), so one build runs every test that agrees on the rest
+            "DROPOUT_SEED", "RESIDUAL")  # TB_sienna (pipeline) reads these at run time (test_knobs.mem), so one build runs every test that agrees on the rest
 
 
 def write_test_config(path: str, items: list) -> None:
@@ -1225,7 +1225,7 @@ def _config_items(cfg: dict, fmt: str, act_type: str, num_sets: int, credits: in
         ("DROPOUT_SEED", drop_seed, "int"),
         ("RESIDUAL", int(bool(cfg.get("residual") or cfg.get("residual_every"))), "int"),  # int8 residual: add_<k>.mem gives each set's flags
         ("ADDR_LINES", max(1, math.ceil(math.log2(sram_depth))), "int"),
-        ("COLLAPSE_K", COLLAPSE_K, "int"),  # TB_sienna_top sets sienna_top's mesh mode from it: a build item, not a run-time knob
+        ("COLLAPSE_K", COLLAPSE_K, "int"),  # TB_sienna (pipeline) sets sienna_top's mesh mode from it: a build item, not a run-time knob
     ]
 
 
@@ -1241,7 +1241,7 @@ def write_build_pkg(N: int, T: int, lanes: int, fmt: str) -> None:
 # ── 6. Backends: build(), run_job(job, tag) -> (outputs, sets, cycles) ───────
 
 def check_layer_mode(text, tag):
-    """Raises unless TB_model_run's [LAYER] line gives the elaborated mesh's collapse_k and it is COLLAPSE_K."""
+    """Raises unless TB_sienna (layer)'s [LAYER] line gives the elaborated mesh's collapse_k and it is COLLAPSE_K."""
     m = re.search(r"\[LAYER\] sets=.*\bcollapse_k=(\d+)", text)
     if not m:
         raise RuntimeError(f"{tag}: the [LAYER] line has no collapse_k: the mesh's mode is unknown")
@@ -1250,7 +1250,7 @@ def check_layer_mode(text, tag):
 
 
 def read_stage_dump(path, N, rt, ct, np_):
-    """TB_model_run's int8 stage dump (the lines after the last H) as tile grids (rt N x ct N) per pass p of each output tile: {"X": {p: grid},
+    """TB_sienna (layer)'s int8 stage dump (the lines after the last H) as tile grids (rt N x ct N) per pass p of each output tile: {"X": {p: grid},
     "R": {p: grid}, "Q": {p: (q1, q2, y)}, "np": np_}; set k is tile (c, r)'s pass k % np_ with k // np_ = c rt + r. Raises on a duplicate or missing element."""
     lines = open(path).read().splitlines()
     last = max((i for i, l in enumerate(lines) if l.startswith("H ")), default=-1)
@@ -1329,7 +1329,7 @@ def gate_transfer(name, want, got) -> "truth.Result":
 
 
 def layer_stage_gates(job, Y, stages, N) -> list:
-    """[(stage, truth.Result)] of an int8 layer from TB_model_run's stage dump: the conv's requantize on each exact int32 sum and its column's real
+    """[(stage, truth.Result)] of an int8 layer from TB_sienna (layer)'s stage dump: the conv's requantize on each exact int32 sum and its column's real
     scale; for a residual layer (job['add']) the identity requantize of the residual codes, hold_mem's transfer and the ADD on its real ratios, with
     the true clamps of job['clamps'] when given; the lane from the activation stage's input X to the output Y (ReLU and linear at truth.TARGET, the
     others at job['tol'], default their tier's tolerance, gpnae_model.TIER_TOL)."""
@@ -1385,32 +1385,32 @@ def layer_stage_gates(job, Y, stages, N) -> list:
 
 
 class RtlLayer:
-    """TB_model_run: one layer per run; software writes the configuration and the streams, then reads the results."""
+    """TB_sienna (layer): one layer per run; software writes the configuration and the streams, then reads the results."""
 
     def __init__(self, N, lanes, work, fmt_name="fp32", tile_size=4):
         self.N, self.lanes, self.work, self.fmt_name, self.T = N, lanes, work, fmt_name, tile_size
-        self.bin = os.path.join(SIM_DIR, "TB_model_run_sim")
+        self.bin = os.path.join(SIM_DIR, "TB_sienna_layer_sim")
         self.cycles = self.sets = self.words = 0
         self.first_hold = self.first_free = self.last_log = self.last_stages = None
         self.retries = 0  # Verilator internal-error rebuilds
 
     def build(self):
         write_build_pkg(self.N, self.T, self.lanes, self.fmt_name)
-        cmd = ["make", SIM_TARGET, "TOP_MODULE=TB_model_run", "TESTBENCH=TB_model_run.sv", "TRACE=0", f"FMT={self.fmt_name}", f"N={self.N}",
+        cmd = ["make", SIM_TARGET, "TB_MODE=layer", "TRACE=0", f"FMT={self.fmt_name}", f"N={self.N}",
                f"TILE={self.T}", f"LANES={self.lanes}", f"COLLAPSE_K={COLLAPSE_K}",
                "GEN_PKG=0"]  # the package write_build_pkg just wrote; the guard checks its COLLAPSE_K against this one
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 and "Internal Error" in r.stdout + r.stderr:  # Verilator's intermittent V3TSP error: one rebuild, never more
             self.retries += 1
-            print(f"[RETRY] Verilator internal error, rebuilding TB_model_run (retry {self.retries}): "
+            print(f"[RETRY] Verilator internal error, rebuilding TB_sienna (layer) (retry {self.retries}): "
                   f"{next((l for l in (r.stdout + r.stderr).splitlines() if 'Internal Error' in l), '').strip()}", flush=True)
             r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_model_run build failed")
+            raise RuntimeError("TB_sienna (layer) build failed")
 
     def run_job(self, job, tag, plusargs=()):
-        """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_model_run (with plusargs
+        """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_sienna (layer) (with plusargs
         and $SIM_ARGS), reads the results; int8 keeps the per-stage dump in last_stages, and every run its log, first hold_done cycle and the cycle its hold window closed."""
         N = self.N
         int8 = self.fmt_name == "int8"
@@ -1529,29 +1529,29 @@ class RtlLayer:
 
 
 class RtlSets:
-    """The TB_sienna_model binary, built once per configuration and run once per layer."""
+    """The TB_sienna (sets) binary, built once per configuration and run once per layer."""
 
     def __init__(self, N, lanes, work, host_gaps=False, tile_size=4):
         self.N, self.lanes, self.work, self.T = N, lanes, work, tile_size
-        self.host_gaps = host_gaps  # TB_sienna_top's handshake instead of a streaming host
-        self.bin = os.path.join(SIM_DIR, "TB_sienna_model_sim")
+        self.host_gaps = host_gaps  # TB_sienna (pipeline)'s handshake instead of a streaming host
+        self.bin = os.path.join(SIM_DIR, "TB_sienna_sets_sim")
         self.cycles = 0
         self.sets = 0
 
     def build(self):
         if COLLAPSE_K == 0:
-            raise ValueError("TB_sienna_model builds collapse-k 1")
+            raise ValueError("TB_sienna (sets) builds collapse-k 1")
         write_build_pkg(self.N, self.T, self.lanes, "fp32")
-        r = subprocess.run(["make", SIM_TARGET, "TOP_MODULE=TB_sienna_model", "TESTBENCH=TB_sienna_model.sv", "TRACE=0",
+        r = subprocess.run(["make", SIM_TARGET, "TB_MODE=sets", "TRACE=0",
                             "FMT=fp32", f"N={self.N}", f"TILE={self.T}", f"LANES={self.lanes}",
                             "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
             sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_sienna_model build failed")
+            raise RuntimeError("TB_sienna (sets) build failed")
 
     def run(self, groups, act, tag, tier=0, coef=None, busy=False):
-        """groups' sets through TB_sienna_model at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given;
+        """groups' sets through TB_sienna (sets) at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given;
         busy: busy_writes to act's words while the sets stream, which the interlock must refuse (counted in busy_refused)."""
         sets_f = os.path.join(self.work, f"{tag}.sets")
         out_f = os.path.join(self.work, f"{tag}.out")
@@ -1924,7 +1924,7 @@ def model_main(argv=None):
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
     a = ap.parse_args(argv)
     if a.engine == "sets" and a.collapse_k == 0:
-        ap.error("--engine sets builds collapse-k 1 (TB_sienna_model); use --engine layer")
+        ap.error("--engine sets builds collapse-k 1 (TB_sienna (sets)); use --engine layer")
     global COLLAPSE_K
     COLLAPSE_K = a.collapse_k
     if a.fmt_name == "int8":
@@ -2078,7 +2078,7 @@ def tflite_main(argv=None):
     sim = RtlLayer(a.n, a.lanes, a.work, "int8", a.tile_size)
     t0 = time.time()
     sim.build()
-    log(f"TB_model_run built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's), in {time.time() - t0:.0f} s")
+    log(f"TB_sienna (layer) built in int8, N={a.n} T={a.tile_size} lanes={a.lanes} for collapse-k {COLLAPSE_K} (each layer checks the mesh's), in {time.time() - t0:.0f} s")
     bad, covered, hw_bad, n_interp, n_exact, n_words = 0, False, 0, 0, 0, 0
     for path in paths:
         name = os.path.basename(path)[:-len(".tflite")]

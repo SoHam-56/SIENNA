@@ -19,7 +19,7 @@ MODEL_COUNT ?= 1
 # make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
 SMALL ?= 0
 QUICK ?= 0
-# Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna_top parameter; 0 is wires.
+# Register stages on sienna_top's host, staging, result and output links (L0, L1, L3, L9), a TB_sienna parameter; 0 is wires.
 LINK_STAGES ?= 0
 
 # make regression: only SMALL= and FMT= on make's command line narrow it, not exported ones.
@@ -29,13 +29,13 @@ ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
-# COLLAPSE_K is 0 or 1; TB_sienna_top and the layer contract's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
+# COLLAPSE_K is 0 or 1; TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
 ifneq ($(filter pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
-$(error COLLAPSE_K=0 reaches TB_sienna_top and the layer contract's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
+$(error COLLAPSE_K=0 reaches TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
 endif
 endif
 
@@ -144,8 +144,22 @@ DESIGN_FILES = \
 # TB_PKG_FILES compiles before TESTBENCH: a package must be declared before it is imported.
 TB_PKG_FILES = test_config_pkg.sv
 PKG_FILE     = $(TB_DIR)/$(TB_PKG_FILES)
-TESTBENCH  = TB_sienna_top.sv
-TOP_MODULE = TB_sienna_top
+TESTBENCH  = TB_sienna.sv
+TOP_MODULE = TB_sienna
+# TB_MODE picks TB_sienna's MODE (-GMODE, as the mesh bench takes MATRIX_SIZE): pipeline (0, the default: the pipeline regression on the set
+# contract), layer (1: model_runner's layer engine, the layer contract), sets (2: model_runner's set engine) or copies (3: COPIES copies).
+TB_MODE  ?= pipeline
+TB_MODES  = pipeline layer sets copies
+ifneq ($(words $(TB_MODE))$(filter $(TB_MODE),$(TB_MODES)),1$(TB_MODE))
+$(error TB_MODE=$(TB_MODE): one of $(TB_MODES))
+endif
+MODE_pipeline = 0
+MODE_layer    = 1
+MODE_sets     = 2
+MODE_copies   = 3
+TB_MODE_NUM   = $(MODE_$(TB_MODE))
+# Each mode builds under its own name (Verilator's --prefix, VCS's -o), so a flow that runs two modes keeps both builds in one directory.
+BUILD_NAME = $(TOP_MODULE)_$(TB_MODE)
 
 VERILATOR_DIR = $(PRJ_DIR)/Verilator
 
@@ -169,9 +183,9 @@ $(error Invalid TRACE=$(TRACE) — must be one of: 0, vcd, fst)
 endif
 
 ifeq ($(TRACE),fst)
-TRACE_FILE = TB_sienna_top.fst
+TRACE_FILE = TB_sienna.fst
 else ifeq ($(TRACE),vcd)
-TRACE_FILE = TB_sienna_top.vcd
+TRACE_FILE = TB_sienna.vcd
 else
 TRACE_FILE =
 endif
@@ -203,11 +217,13 @@ define copy_mem_files
 	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.hex found)"; fi
 endef
 
-# One verilation thread: Verilator 5.035 at -j 8 segfaulted in 3 of 63 TB_sienna_top builds on od-r7a-2xl (0 of 96 at -j 1, same wall time); the C++ build keeps every core.
+# One verilation thread: Verilator 5.035 at -j 8 segfaulted in 3 of 63 pipeline bench builds on od-r7a-2xl (0 of 96 at -j 1, same wall time); the C++ build keeps every core.
 VERILATOR_FLAGS = \
 	--timing \
 	--assert \
 	--top-module $(TOP_MODULE) \
+	--prefix V$(BUILD_NAME) \
+	-GMODE=$(TB_MODE_NUM) \
 	--threads $(SIM_THREADS) \
 	-j 1 \
 	--build-jobs $(shell nproc) \
@@ -253,10 +269,10 @@ endif
 
 # VCS: the same include paths and define, EXTRA_FLAGS' -G as -pvalue+ and -D as +define+, LINK_STAGES; sim.mk keeps it plain (TRACE=vcd adds waveforms).
 VCS_FLAGS = +incdir+$(SRC_DIR)/top +incdir+$(TB_DIR)/top +incdir+$(SM_DIR) +incdir+$(SM_LIB_DIR) +incdir+$(GPNAE_DIR) +incdir+$(MAXPOOL_DIR) +incdir+$(DROPOUT_DIR) \
-	$(FMT_DEF) $(call vcs_g,$(TOP_MODULE),$(filter -G%,$(EXTRA_FLAGS))) $(patsubst -D%,+define+%,$(filter -D%,$(EXTRA_FLAGS))) \
+	$(FMT_DEF) -pvalue+$(TOP_MODULE).MODE=$(TB_MODE_NUM) $(call vcs_g,$(TOP_MODULE),$(filter -G%,$(EXTRA_FLAGS))) $(patsubst -D%,+define+%,$(filter -D%,$(EXTRA_FLAGS))) \
 	$(filter +define+%,$(EXTRA_FLAGS)) $(if $(filter-out 0,$(LINK_STAGES)),-pvalue+$(TOP_MODULE).LINK_STAGES=$(LINK_STAGES))
-# A VCS build is <VCS_DIR>/<TOP_MODULE>_sim, run in VCS_DIR as Verilator's in VERILATOR_DIR; its key hashes every source and include file, as BUILD_KEY's dependency list does.
-VCS_BIN = $(VCS_DIR)/$(TOP_MODULE)_sim
+# A VCS build is <VCS_DIR>/<BUILD_NAME>_sim, run in VCS_DIR as Verilator's in VERILATOR_DIR; its key hashes every source and include file, as BUILD_KEY's dependency list does.
+VCS_BIN = $(VCS_DIR)/$(BUILD_NAME)_sim
 VCS_BUILD_KEY = { for f in $(sort $(DESIGN_FILES) $(TB_DIR)/top/$(TESTBENCH) $(wildcard $(TB_DIR)/top/*.svh $(SRC_DIR)/top/*.svh)); do md5sum "$$f"; done; \
 	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
 	echo '$(TOP_MODULE) $(VCS_OPTS) $(VCS_FLAGS)'; }
@@ -269,7 +285,7 @@ help:
 	@echo "Precision (one variable for every build and run):"
 	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
 	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna_top, the layer contract's model, gemm and tflite runs, and sm-verilator"
+	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna's pipeline mode, the layer contract's model, gemm and tflite runs, and sm-verilator"
 	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
 	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
 	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv)"
@@ -279,7 +295,7 @@ help:
 	@echo ""
 	@echo "Simulation Targets:"
 	@echo "  make verilator           - Simulate using Verilator (no waveform)"
-	@echo "  make sim                 - Run the last TB_sienna_top build on the stimulus in testbenches/, no build; refuses a build of other inputs or flags"
+	@echo "  make sim                 - Run the last TB_sienna build of TB_MODE on the stimulus in testbenches/, no build; refuses a build of other inputs or flags"
 	@echo "  make build-key           - Print the key make sim compares with the build's (inputs, package without the run-time knobs, flags)"
 	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
 	@echo "  make verilator TRACE=vcd - Simulate + write VCD waveform (larger)"
@@ -307,7 +323,7 @@ help:
 	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (model_runner.py --action tflite); needs FMT=int8"
 	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make multi FMT=bf16 [COPIES=2]    - TB_sienna_multi on sienna_top at COPIES copies (regression.py --action multi)"
+	@echo "  make multi FMT=bf16 [COPIES=2]    - TB_sienna's copies mode: sienna_top at COPIES copies (regression.py --action multi)"
 	@echo "  make idle-fault SET_PORT=0|1      - a put on the unused contract must fire a_idle_contract (regression.py --action idle-fault)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
 	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
@@ -332,7 +348,7 @@ help:
 	@echo ""
 	@echo "Current Configuration:"
 	@echo "  FMT        : $(FMT)  (N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K) TEST=$(PKG_TEST))"
-	@echo "  TOP_MODULE : $(TOP_MODULE)"
+	@echo "  TOP_MODULE : $(TOP_MODULE)  TB_MODE: $(TB_MODE) (MODE $(TB_MODE_NUM))"
 	@echo "  TESTBENCH  : $(TESTBENCH)"
 	@echo "  TRACE      : $(TRACE)"
 	@echo ""
@@ -401,16 +417,16 @@ PKG_DEP = pkg-geometry
 # ─────────────────────────────────────────────────────────────────────────────
 # Verilator — SIENNA Top
 # ─────────────────────────────────────────────────────────────────────────────
-# TB_sienna_top reads these package items at run time from test_knobs.mem, so a build serves every test that agrees on the rest.
+# TB_sienna's pipeline mode reads these package items at run time from test_knobs.mem, so a build serves every test that agrees on the rest.
 TB_KNOBS = ACTIVATION_CODE NUM_SETS HAS_BIAS WEIGHT_CACHE ACCUM_PASSES MIXED_LEN MIXED_ACTS PACKED TRAINING_MODE DROPOUT_SEED RESIDUAL
 # What a build depends on: each Verilator input but the package by checksum, the package without TB_KNOBS, and the flags.
-BUILD_KEY = { for f in $$(sed -e 's/^[^:]*://' -e 's/\\$$//' $(VERILATOR_DIR)/V$(TOP_MODULE)__ver.d | tr ' ' '\n' | sort -u); do \
+BUILD_KEY = { for f in $$(sed -e 's/^[^:]*://' -e 's/\\$$//' $(VERILATOR_DIR)/V$(BUILD_NAME)__ver.d | tr ' ' '\n' | sort -u); do \
 	  [ -z "$$f" ] || [ "$$f" = "$(PKG_FILE)" ] || md5sum "$$f"; done; \
 	awk '!($$1 == "localparam" && $$3 ~ /^($(subst $(space),|,$(TB_KNOBS)))$$/)' $(PKG_FILE); \
 	echo '$(TOP_MODULE) $(VERILATOR_FLAGS)'; }
 
 verilator: $(PKG_DEP)
-	@echo "=== Verilator simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
+	@echo "=== Verilator simulation: $(TOP_MODULE) $(TB_MODE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	@rm -f $(VERILATOR_DIR)/build_key.txt
 	$(VERILATOR) --binary \
@@ -418,13 +434,13 @@ verilator: $(PKG_DEP)
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/top/$(TESTBENCH) \
-		-o $(TOP_MODULE)_sim
+		-o $(BUILD_NAME)_sim
 	@echo "-- Compiling Verilator C++ model"
-	$(MAKE) -C $(VERILATOR_DIR) -f V$(TOP_MODULE).mk
+	$(MAKE) -C $(VERILATOR_DIR) -f V$(BUILD_NAME).mk
 	@$(BUILD_KEY) > $(VERILATOR_DIR)/build_key.txt
 	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running simulation"
-	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
+	cd $(VERILATOR_DIR) && ./$(BUILD_NAME)_sim $(SIM_ARGS)
 	@echo "-- Done"
 ifneq ($(TRACE),0)
 	@echo "-- Trace ($(TRACE)) : $(VERILATOR_DIR)/$(TRACE_FILE)"
@@ -437,14 +453,14 @@ ifeq ($(SIM),vcs)
 	@$(VCS_BUILD_KEY) | cmp -s - $(VCS_BIN).build_key.txt || { echo "ERROR: $(VCS_DIR) holds a build of other sources, package items or flags: make vcs"; exit 1; }
 	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running simulation (no build: $(VCS_DIR)'s inputs, package and flags are this run's)"
-	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim $(VCS_RUN) $(SIM_ARGS)
+	cd $(VCS_DIR) && ./$(BUILD_NAME)_sim $(VCS_RUN) $(SIM_ARGS)
 	@echo "-- Done"
 else
-	@[ -x $(VERILATOR_DIR)/$(TOP_MODULE)_sim ] && [ -r $(VERILATOR_DIR)/build_key.txt ] || { echo "ERROR: no finished build in $(VERILATOR_DIR): make verilator first"; exit 1; }
+	@[ -x $(VERILATOR_DIR)/$(BUILD_NAME)_sim ] && [ -r $(VERILATOR_DIR)/build_key.txt ] || { echo "ERROR: no finished build in $(VERILATOR_DIR): make verilator first"; exit 1; }
 	@$(BUILD_KEY) | cmp -s - $(VERILATOR_DIR)/build_key.txt || { echo "ERROR: $(VERILATOR_DIR) holds a build of other sources, package items or flags: make verilator"; exit 1; }
 	$(call copy_mem_files,$(VERILATOR_DIR))
 	@echo "-- Running simulation (no build: $(VERILATOR_DIR)'s inputs, package and flags are this run's)"
-	cd $(VERILATOR_DIR) && ./$(TOP_MODULE)_sim $(SIM_ARGS)
+	cd $(VERILATOR_DIR) && ./$(BUILD_NAME)_sim $(SIM_ARGS)
 	@echo "-- Done"
 endif
 
@@ -473,33 +489,33 @@ gpnae-verilator:
 # VCS
 # ─────────────────────────────────────────────────────────────────────────────
 vcs: $(PKG_DEP)
-	@echo "=== VCS simulation: $(TOP_MODULE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
+	@echo "=== VCS simulation: $(TOP_MODULE) $(TB_MODE)  FMT=$(FMT)  TRACE=$(TRACE) ==="
 ifeq ($(TRACE),fst)
 	@echo "-- WARNING: VCS's \$$dumpvars only produces VCD; this run will write"
-	@echo "            TB_sienna_top.vcd, not FST (need \$$fsdbDumpvars/Verdi for FST)."
+	@echo "            TB_sienna.vcd, not FST (need \$$fsdbDumpvars/Verdi for FST)."
 endif
 	@mkdir -p $(VCS_DIR)
 	@rm -f $(VCS_BIN).build_key.txt
-	$(VCS) $(VCS_OPTS) -top $(TOP_MODULE) -Mdir=$(VCS_DIR)/csrc_$(TOP_MODULE) -o $(VCS_BIN) $(VCS_FLAGS) \
+	$(VCS) $(VCS_OPTS) -top $(TOP_MODULE) -Mdir=$(VCS_DIR)/csrc_$(BUILD_NAME) -o $(VCS_BIN) $(VCS_FLAGS) \
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/top/$(TESTBENCH)
 	@$(VCS_BUILD_KEY) > $(VCS_BIN).build_key.txt
 	$(call copy_mem_files,$(VCS_DIR))
 	@echo "-- Running simulation"
-	cd $(VCS_DIR) && ./$(TOP_MODULE)_sim $(VCS_RUN) $(SIM_ARGS)
+	cd $(VCS_DIR) && ./$(BUILD_NAME)_sim $(VCS_RUN) $(SIM_ARGS)
 	@echo "-- Done"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Waveform viewer
 # ─────────────────────────────────────────────────────────────────────────────
 wave:
-	@if [ -f $(VERILATOR_DIR)/TB_sienna_top.fst ]; then \
+	@if [ -f $(VERILATOR_DIR)/TB_sienna.fst ]; then \
 		echo "-- Opening Verilator waveform (FST)"; \
-		$(WAVE) $(VERILATOR_DIR)/TB_sienna_top.fst; \
-	elif [ -f $(VERILATOR_DIR)/TB_sienna_top.vcd ]; then \
+		$(WAVE) $(VERILATOR_DIR)/TB_sienna.fst; \
+	elif [ -f $(VERILATOR_DIR)/TB_sienna.vcd ]; then \
 		echo "-- Opening Verilator waveform (VCD)"; \
-		$(WAVE) $(VERILATOR_DIR)/TB_sienna_top.vcd; \
+		$(WAVE) $(VERILATOR_DIR)/TB_sienna.vcd; \
 	elif compgen -G "$(VCS_DIR)/*.vpd" > /dev/null; then \
 		echo "-- Opening VCS waveform"; \
 		$(WAVE) $(VCS_DIR)/*.vpd; \
@@ -511,7 +527,7 @@ wave:
 # Lint / debug / perf
 # ─────────────────────────────────────────────────────────────────────────────
 lint: $(PKG_DEP)
-	@echo "=== Linting $(TOP_MODULE)  FMT=$(FMT) ==="
+	@echo "=== Linting $(TOP_MODULE) $(TB_MODE)  FMT=$(FMT) ==="
 	@mkdir -p $(VERILATOR_DIR)
 	$(VERILATOR) --lint-only \
 		$(VERILATOR_FLAGS) \
@@ -536,7 +552,7 @@ check-fmt:
 	elif ! /usr/bin/grep -q '^check-fmt: 1 RTL files outside the allowlist, 1 naming a precision$$' $$t/c4.log; then echo "check-fmt FAIL: C4 failed for another reason"; cat $$t/c4.log; exit 1; \
 	else echo "check-fmt OK: C4 planted EXP_W in sienna_pipe.sv fails"; fi; rm -rf $$t
 
-# check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna_top) and 0 (TB_model_run), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py), the lanes' set exactly.
+# check-hier: at fp32, bf16, int8 and no define, SET_PORT 1 (TB_sienna's pipeline mode) and 0 (its layer mode), Verilator's elaborated hierarchy holds only that precision's units (check_hier.py), the lanes' set exactly.
 check-hier: $(PKG_DEP)
 	@$(PYTHON) $(PRJ_DIR)/scripts/check_hier.py --verilator $(VERILATOR) --out $(PRJ_DIR)/Verilator_hier \
 	  --inc $(SRC_DIR)/top $(TB_DIR)/top $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR) --files $(DESIGN_FILES) $(PKG_FILE)
@@ -625,17 +641,17 @@ tflite:
 	@# the packed TFLite layers too, where a block of 8 fits N / 2 (N >= 16); the collapse-k 0 mesh refuses packed sets
 	$(if $(shell [ $(N) -ge 16 ] && [ $(COLLAPSE_K) = 1 ] && echo y),$(PYTHON) scripts/model_runner.py --action tflite --pack --n $(N) --tile-size $(TILE) --lanes $(LANES))
 
-# int8 residual layers and the residual-block TFLite models on TB_model_run (regression.py --action residual); int8 only
+# int8 residual layers and the residual-block TFLite models on TB_sienna's layer mode (regression.py --action residual); int8 only
 residual:
 	@[ "$(FMT)" = int8 ] || { echo "ERROR: make residual runs the int8 residual layers only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }
 	$(PYTHON) regression.py --action residual --n $(N) --tile $(TILE) --lanes $(LANES) --tflite --mid-reset
 
-# A put on the unused contract must fire a_idle_contract: SET_PORT=0 TB_model_run FAULT 4, SET_PORT=1 TB_sienna_top FAULT 8 (regression.py --action idle-fault).
+# A put on the unused contract must fire a_idle_contract: SET_PORT=0 TB_sienna's layer mode FAULT 4, SET_PORT=1 its pipeline mode FAULT 8 (regression.py --action idle-fault).
 idle-fault:
 	@case "$(SET_PORT)" in 0|1) ;; *) echo "ERROR: make idle-fault needs SET_PORT=0 or SET_PORT=1 (SET_PORT=$(SET_PORT))"; exit 1;; esac
 	$(PYTHON) regression.py --action idle-fault --set-port $(SET_PORT)
 
-# TB_sienna_multi on sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets in FMT at N, TILE and LANES (regression.py --action multi).
+# TB_sienna's copies mode: sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets in FMT at N, TILE and LANES (regression.py --action multi).
 COPIES ?= 2
 multi:
 	$(PYTHON) regression.py --action multi --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES) --copies $(COPIES)$(if $(TEST), --test $(TEST))

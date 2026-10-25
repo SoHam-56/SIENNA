@@ -2048,7 +2048,7 @@ module TB_sienna #(
     logic [31:0] coef_data_i = '0;
     logic coef_ready_o;  // sienna_top's load interlock
     bit restream = 0;  // +between: the second run streams and collects from the start again, with no reset
-    int t_done = 0, t_first_wr = 0;  // +between: the cycle done_o was seen and the cycle of the load's first write
+    int t_between_done = 0, t_first_wr = 0;  // +between: the cycle done_o was seen and the cycle of the load's first write
     logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
     logic busy_o, done_o, set_done_o;
     logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
@@ -2676,9 +2676,9 @@ module TB_sienna #(
         end
         streaming = 0;
         if (pass == 0 && between) begin  // the first run is done: load the next image from the first ready cycle, write the run out, run again
-          t_done = cycle;
+          t_between_done = cycle;
           coef_load_file(between_f);
-          $display("  [Between] loaded %s with no reset, its first write %0d cycles after done_o", between_f, t_first_wr - t_done);
+          $display("  [Between] loaded %s with no reset, its first write %0d cycles after done_o", between_f, t_first_wr - t_between_done);
           repeat (OUT_CAP + 4) @(posedge clk_i);
           fout = $fopen(first_f, "w");
           for (int k = 0; k < bounds.size(); k++) begin

@@ -390,7 +390,7 @@ module TB_sienna_top #(
         end
         if (stream_on) begin
           stream_bounds.push_back(stream_results.size());
-          stream_ids.push_back(int'(done_set_id_o));
+          stream_ids.push_back($isunknown(done_set_id_o) ? -1 : int'(done_set_id_o));  // an unknown id never matches
         end
         if (acc_on) acc_bounds.push_back(acc_results.size());
         if (tr_on && tr_fd) foreach (w[i]) $fdisplay(tr_fd, "D %s %0d %0d %h", tr_pass, tr_k[int'(done_set_id_o)], i, w[i]);
@@ -402,8 +402,8 @@ module TB_sienna_top #(
   function automatic bit lanes_home(output string why);
     automatic int pin = TB_POOL_BYPASS ? out_adv : 16;
     for (int l = 0; l < NUM_LANES; l++)
-      if (int'(dut.G_SET.G_COPY[0].pipe.l4_cnt[l]) != 32 || int'(dut.G_SET.G_COPY[0].pipe.l5_out[l]) != TB_L5 || int'(dut.G_SET.G_COPY[0].pipe.pin_cnt[l]) != pin || out_held[l] != out_adv ||
-          out_owed[l] != 0) begin
+      if (dut.G_SET.G_COPY[0].pipe.l4_cnt[l] !== 32 || dut.G_SET.G_COPY[0].pipe.l5_out[l] !== TB_L5 || dut.G_SET.G_COPY[0].pipe.pin_cnt[l] !== pin || out_held[l] !== out_adv ||
+          out_owed[l] !== 0) begin
         why = $sformatf("lane %0d: L4 %0d (32), L5 %0d (%0d), pool input %0d (%0d), L9 %0d (%0d), L9 owed %0d (0)", l, dut.G_SET.G_COPY[0].pipe.l4_cnt[l],
                         dut.G_SET.G_COPY[0].pipe.l5_out[l], TB_L5, dut.G_SET.G_COPY[0].pipe.pin_cnt[l], pin, out_held[l], out_adv, out_owed[l]);
         return 0;
@@ -536,6 +536,10 @@ module TB_sienna_top #(
     if (EXACT_GOLDEN) begin  // narrow formats: the golden is bit-exact, so only identical bits pass
       info = $sformatf("exp=%h act=%h", expected, actual);
       return expected === actual;
+    end
+    if ($isunknown(actual)) begin  // an x or z word fails, whatever its real value would be
+      info = $sformatf("exp=%h act=%h (unknown bits)", expected, actual);
+      return 1'b0;
     end
     exp_r = f32(32'(expected));
     act_r = f32(32'(actual));
@@ -671,8 +675,8 @@ module TB_sienna_top #(
     repeat (10) begin
       @(negedge clk_i);
       // Review Focus 1: while reset is held every producer count is 0 and no consumer advertises a credit.
-      if (host_cnt != 0 || wc_cnt[0] || wc_cnt[1] || dut.G_SET.G_COPY[0].pipe.l1_cnt != 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 0 || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l0_out != 0 ||
-          dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt != 0 || host_lnk[0].credit || wc_lnk[0].credit || wc_lnk[1].credit || dut.G_SET.G_COPY[0].pipe.l3_grant ||
+      if (host_cnt !== 0 || wc_cnt[0] || wc_cnt[1] || dut.G_SET.G_COPY[0].pipe.l1_cnt !== 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt !== 0 || dut.G_SET.G_COPY[0].pipe.sets_out !== 0 || dut.G_SET.G_COPY[0].pipe.l0_out !== 0 ||
+          dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt !== 0 || host_lnk[0].credit || wc_lnk[0].credit || wc_lnk[1].credit || dut.G_SET.G_COPY[0].pipe.l3_grant ||
           dut.G_SET.G_COPY[0].pipe.l6_credit || dut.G_SET.G_COPY[0].pipe.systolic_array_inst.stg_credit) begin
         failed++;
         $display("  [FAIL] In reset: host %0d, regions %0d %0d, staging %0d, act banks %0d, sets %0d, granted %0d, results %0d; credits out %0b%0b%0b%0b%0b%0b",
@@ -681,7 +685,7 @@ module TB_sienna_top #(
       end
       // The lane links too: no L4, L5, pooling-input or L9 count and no credit while reset is held.
       for (int l = 0; l < NUM_LANES; l++)
-        if (dut.G_SET.G_COPY[0].pipe.l4_cnt[l] != 0 || dut.G_SET.G_COPY[0].pipe.l5_out[l] != 0 || dut.G_SET.G_COPY[0].pipe.pin_cnt[l] != 0 || dut.G_SET.G_COPY[0].pipe.l4_cr[l] || dut.G_SET.G_COPY[0].pipe.l5_cr[l] || dut.G_SET.G_COPY[0].pipe.pin_cr[l]) begin
+        if (dut.G_SET.G_COPY[0].pipe.l4_cnt[l] !== 0 || dut.G_SET.G_COPY[0].pipe.l5_out[l] !== 0 || dut.G_SET.G_COPY[0].pipe.pin_cnt[l] !== 0 || dut.G_SET.G_COPY[0].pipe.l4_cr[l] || dut.G_SET.G_COPY[0].pipe.l5_cr[l] || dut.G_SET.G_COPY[0].pipe.pin_cr[l]) begin
           failed++;
           $display("  [FAIL] In reset: lane %0d L4 %0d, L5 %0d, pool input %0d; credits out %0b%0b%0b", l, dut.G_SET.G_COPY[0].pipe.l4_cnt[l], dut.G_SET.G_COPY[0].pipe.l5_out[l],
                    dut.G_SET.G_COPY[0].pipe.pin_cnt[l], dut.G_SET.G_COPY[0].pipe.l4_cr[l], dut.G_SET.G_COPY[0].pipe.l5_cr[l], dut.G_SET.G_COPY[0].pipe.pin_cr[l]);
@@ -1527,7 +1531,7 @@ module TB_sienna_top #(
         waited++;
       end
       repeat (40) @(posedge clk_i);
-      if (!drained || tb_inflight != 0 || host_cnt != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l0_out != HOST_SLOTS || !lanes_home(why)) begin
+      if (!drained || tb_inflight !== 0 || host_cnt !== HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out !== 0 || dut.G_SET.G_COPY[0].pipe.l0_out !== HOST_SLOTS || !lanes_home(why)) begin
         failed++;
         $display("  [FAIL] Hold: not home after the drain: drained %0b, in flight %0d, host %0d (%0d), sets %0d, granted %0d; %s", drained,
                  tb_inflight, host_cnt, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l0_out, why);
@@ -1630,8 +1634,8 @@ module TB_sienna_top #(
       $display("  [FAIL] %0d cycles of output after reset with nothing started", stray);
     end
     // Review Focus 1: every consumer advertised its slots again and every producer counted them from 0.
-    if (host_cnt != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.l1_cnt != 2 || dut.G_SET.G_COPY[0].pipe.l0_out != HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out != 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
-        int'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt) != PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage != 0) begin
+    if (host_cnt !== HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.l1_cnt !== 2 || dut.G_SET.G_COPY[0].pipe.l0_out !== HOST_SLOTS || dut.G_SET.G_COPY[0].pipe.sets_out !== 0 || dut.G_SET.G_COPY[0].pipe.l6_cnt !== 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
+        dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt !== PER_LANE || !wc_cnt[0] || !wc_cnt[1] || dut_stage !== 0) begin
       failed++;
       $display("  [FAIL] Not idle after reset: host %0d (%0d), staging %0d (2), granted %0d (%0d), sets %0d (0), act banks %0d (2), results %0d (%0d), regions %0d %0d (1 1), stages %0d",
                host_cnt, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.l1_cnt, dut.G_SET.G_COPY[0].pipe.l0_out, HOST_SLOTS, dut.G_SET.G_COPY[0].pipe.sets_out, dut.G_SET.G_COPY[0].pipe.l6_cnt, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt, PER_LANE,
@@ -1756,8 +1760,8 @@ module TB_sienna_top #(
       end
     end
     // Credits: one set of beats and one bank spent; drained, every link holds all its slots again.
-    if (acc_beats != PER_LANE || acc_banks != 1 || dut.G_SET.G_COPY[0].pipe.l6_cnt != 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
-        int'(dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt) != PER_LANE || dut.G_SET.G_COPY[0].pipe.l1_cnt != 2 || host_cnt != HOST_SLOTS) begin
+    if (acc_beats !== PER_LANE || acc_banks !== 1 || dut.G_SET.G_COPY[0].pipe.l6_cnt !== 2 || !dut.G_SET.G_COPY[0].pipe.l3_armed ||
+        dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt !== PER_LANE || dut.G_SET.G_COPY[0].pipe.l1_cnt !== 2 || host_cnt !== HOST_SLOTS) begin
       failed++;
       $display("  [FAIL] Accumulate pass credits: beats %0d (%0d), banks %0d (1), act banks held %0d (2), results held %0d (%0d), staging %0d (2), host %0d (%0d)",
                acc_beats, PER_LANE, acc_banks, dut.G_SET.G_COPY[0].pipe.l6_cnt, dut.G_SET.G_COPY[0].pipe.systolic_array_inst.res_cnt, PER_LANE, dut.G_SET.G_COPY[0].pipe.l1_cnt, host_cnt, HOST_SLOTS);

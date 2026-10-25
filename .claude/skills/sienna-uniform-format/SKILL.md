@@ -104,7 +104,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   used by the pipeline golden in hardware order: product n to slot n mod U, continuing across depth
   passes; the reducer's pairwise tree with the bias as its last input; pooling max; GPNAE Horner.
   Every bf16 output must match exactly.
-- **GPNAE**: its format-generic framework (`number_formats.py`, TB_gpnae) run in bf16, accuracy
+- **GPNAE**: its format-generic framework (`gpnae_model.py`, TB_gpnae) run in bf16, accuracy
   per activation against the TensorFlow-style reference, as for TYTAN.
 - **System**: the regression in bf16 (bit-exact golden; 29 tests after adding a zero-rows test
   and a signed-zero test that keeps -0), the four models in bf16 with accuracy against float, the
@@ -171,8 +171,6 @@ later, architectural step: it is what gives a throughput gain; int8 alone gives 
 - A format that is not fp32 must not silently pick an fp32 unit: generate blocks must be exhaustive
   and fail elaboration on an unsupported format.
 - Any golden that computes in float64 and compares with a tolerance will pass broken bf16 hardware.
-- Never write the fp32 coefficient files; `gpnae_tests.py:write_coeff_rom()` only writes
-  `taylor_coeffs_<fmt>.mem` (exists), and the poly lane needs the same guard.
 - Verilator demotes an elaboration-time `$error` to a warning (USERERROR); use `$fatal` and lint
   with `-Werror-USERFATAL`, or a bad format elaborates.
 - A string parameter passed down to `$readmemb` was not found by Verilator; pick the file with a

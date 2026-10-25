@@ -484,7 +484,7 @@ def _write_residual_groups(cfg: dict, groups: list, reals: list, seed: int, req_
             for _ in range(ADD_TRIES):
                 fixed = layer.get(L, (None,) * 7)  # a later group of a layer: its (s2 / s1, z2, s_out factor) and output words
                 R, add, ra = _add_draw(arng, q1, rq["s_out"], rq["zp"], act_g, cfg.get("zp_random", False), fixed[6], fixed[4],
-                                       act_g != "relu" and g % 2 == 1)
+                                       act_g != "relu" and (g % 2 == 1 or act_g in cfg.get("tight_acts", ())))
                 F = _golden_int8_residual(parts, hw_bias, rq, R, add, ra, cfg, act_g, set_dropout_seed(drop_seed, g0 + P))[4]
                 off, codes = _off_rails(F, ra)
                 if off >= 0.25 and codes >= min(16, F.size // 4):  # 16 codes, or a quarter of a small set's outputs (N = 8 pooled: 16)
@@ -1550,7 +1550,7 @@ PIPELINE_TESTS = [
      "req_random": True, "zp_random": True, "formats": ("int8",)},
     {"name": "int8_residual_sigmoid_selu_nopool", "mode": "matmul", "matrix_type": "random", "act": "sigmoid", "residual": True,
      "mixed_acts": ["sigmoid", "selu"], "pool_h": 1, "pool_w": 1, "padding": 0, "req_random": True, "zp_random": True, "num_sets": 16,
-     "formats": ("int8",)},
+     "tight_acts": ("sigmoid",), "formats": ("int8",)},  # SELU's output calibrates on the clamped sums, so only sigmoid shows its clamp
     {"name": "int8_residual_train", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual": True, "training": True,
      "req_random": True, "zp_random": True, "formats": ("int8",)},
     {"name": "int8_residual_then_relu_nopool", "mode": "matmul", "matrix_type": "random", "act": "relu", "residual_every": 2,

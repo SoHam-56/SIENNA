@@ -1,0 +1,5 @@
+# Python packages make regression needs (tested with Python 3.11): pip install -r requirements.txt
+numpy==1.26.4
+# the model, tflite and residual flows: the .tflite reader, and TensorFlow for the converter-made residual blocks and the interpreter references
+tflite==2.18.0
+tensorflow==2.18.1

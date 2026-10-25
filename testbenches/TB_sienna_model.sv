@@ -226,7 +226,7 @@ module TB_sienna_model;
             end
         end
         bounds.push_back(res_q.size());
-        done_ids.push_back(int'(done_set_id_o));
+        done_ids.push_back($isunknown(done_set_id_o) ? -1 : int'(done_set_id_o));  // an unknown id never matches
         last_done <= cycle;
       end
       if (systolic_busy_tb) busy_mesh <= busy_mesh + 1;
@@ -506,7 +506,7 @@ module TB_sienna_model;
     @(negedge clk_i);
     drain_chk = 1'b0;
     repeat (2) @(posedge clk_i);
-    if (lane_home != '1 || host_cnt != 2'd2) begin
+    if (lane_home !== '1 || host_cnt !== 2'd2) begin
       $display("[FATAL] credits not all back after the last set: host %0d of 2, lanes home %b", host_cnt, lane_home);
       $finish;
     end

@@ -1,0 +1,23 @@
+SIENNA models/: third-party files, each byte-identical to its source
+
+The four MLPerf Tiny reference models, the CIFAR-10 sample indices and the image-classification label file come from
+MLCommons Tiny, https://github.com/mlcommons/tiny (commit 4addd0fa08d216e20637637874e084895f289da4, checked 2026-10-24),
+Copyright MLCommons, licensed under the Apache License 2.0 (LICENSE-Apache-2.0.md, that repository's LICENSE.md). Unmodified.
+
+  pretrainedResnet.tflite       benchmark/training/image_classification/trained_models/pretrainedResnet.tflite
+  kws_ref_model_float32.tflite  benchmark/training/keyword_spotting/trained_models/kws_ref_model_float32.tflite
+  vww_96_float.tflite           benchmark/training/visual_wake_words/trained_models/vww_96_float.tflite
+  ad01_fp32.tflite              benchmark/training/anomaly_detection/trained_models/ad01_fp32.tflite
+  perf_samples_idxs.npy         benchmark/training/image_classification/perf_samples_idxs.npy
+  y_labels.csv                  benchmark/evaluation/datasets/ic01/y_labels.csv
+
+Not in this directory:
+
+  CIFAR-10 (University of Toronto, https://www.cs.toronto.edu/~kriz/cifar.html; Krizhevsky, "Learning Multiple Layers of
+  Features from Tiny Images", 2009): the page states no redistribution license, so it is not committed. fetch_cifar10.sh
+  downloads it from that page into data/ (git-ignored); without it the resnet8 model is skipped.
+
+  marvin_617de221_0.wav (the kws model's input clip, benchmark/runner/sd_card/) and normal_id_01_00000000_hist_librosa.bin
+  (the ad01 model's input, benchmark/reference_submissions/anomaly_detection/datasets/dcase01/): byte-identical copies are in
+  MLCommons Tiny at the commit above (Apache 2.0). They are not committed here; fetch_inputs.sh downloads both into this directory
+  (git-ignored) and checks each sha256. Without them the kws and ad01 models are skipped.

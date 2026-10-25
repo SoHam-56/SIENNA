@@ -195,6 +195,7 @@ module TB_sienna_multi #(
   // Within REL_TOL, or within the golden model's fp32 error bound for this output.
   function automatic bit close(input logic [31:0] e, input logic [31:0] a, input logic [31:0] bnd);
     real er = f32(e), ar = f32(a), br = f32(bnd), d;
+    if ($isunknown(a)) return 0;  // an x or z word fails, whatever its real value would be
     if (EXACT_GOLDEN) return e === a;  // narrow formats: bit-exact golden
     d = (er > ar) ? er - ar : ar - er;
     if (br > 0.0 && d <= br) return 1;
@@ -303,7 +304,7 @@ module TB_sienna_multi #(
     read_mem_file($sformatf("matrix_west_%0d.mem", k), wq);
     read_mem_file($sformatf("matrix_north_%0d.mem", k), nq);
     wait_copy_credit(c);
-    if (int'(copy_sel_o) != c) begin
+    if (copy_sel_o !== c) begin
       failed++;
       $display("  [FAIL] set %0d: copy_sel_o %0d, the host's turn %0d", k, copy_sel_o, c);
     end
@@ -404,11 +405,11 @@ module TB_sienna_multi #(
     rstn_i = 1;
     repeat (OUT_CAP + 64 + 8 * LINK_STAGES) begin
       @(posedge clk_i);
-      if (ov != '0 || pipeline_complete_o != '0) stray++;
+      if (ov !== '0 || pipeline_complete_o !== '0) stray++;
     end
     begin
-      automatic bit home = (lane_home == '1) && wcnt[0] && wcnt[1] && copy_sel_o == '0 && dut.G_SET.G_MULTI.wc_got[0] == '0 && dut.G_SET.G_MULTI.wc_got[1] == '0 && stray == 0;
-      for (int c = 0; c < COPIES; c++) if (hcnt[c] != 2'd2) home = 0;
+      automatic bit home = (lane_home === '1) && wcnt[0] && wcnt[1] && copy_sel_o === '0 && dut.G_SET.G_MULTI.wc_got[0] === '0 && dut.G_SET.G_MULTI.wc_got[1] === '0 && stray == 0;
+      for (int c = 0; c < COPIES; c++) if (hcnt[c] !== 2'd2) home = 0;
       if (!home) begin
         $display("[FAIL] not home after the mid-stream reset: copy 0 staging %0d (2), copy %0d staging %0d (2), regions %0d %0d (1 1), turn %0d (0), region returns %b %b (0 0), lanes home %0d of %0d, %0d stray output cycles",
                  hcnt[0], COPIES - 1, hcnt[COPIES-1], wcnt[0], wcnt[1], copy_sel_o, dut.G_SET.G_MULTI.wc_got[0], dut.G_SET.G_MULTI.wc_got[1], $countones(lane_home), NL,
@@ -504,7 +505,7 @@ module TB_sienna_multi #(
     out_stall_pct = 0;
     repeat (OUT_CAP + 4) @(posedge clk_i);
     for (int c = 0; c < COPIES; c++)
-      if (hcnt[c] != 2'd2) begin
+      if (hcnt[c] !== 2'd2) begin
         failed++;
         $display("  [FAIL] copy %0d holds %0d of its 2 staging credits after the last set", c, hcnt[c]);
       end
@@ -512,7 +513,7 @@ module TB_sienna_multi #(
       failed++;
       $display("  [FAIL] region credits not back after the last set: %0d %0d", wcnt[0], wcnt[1]);
     end
-    if (lane_home != '1) begin
+    if (lane_home !== '1) begin
       failed++;
       $display("  [FAIL] L9 slots not all credited back: lanes home %b", lane_home);
     end

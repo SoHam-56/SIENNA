@@ -40,6 +40,12 @@ module TB_model_run #(
   logic [15:0] cfg_m_i = '0, cfg_kb_i = '0, cfg_n_i = '0;
   logic [CONTROL_WIDTH-1:0] cfg_act_i = '0;
   logic [1:0] cfg_tier_i = '0;
+  logic coef_wr_i = 1'b0;
+  logic [8:0] coef_addr_i = '0;
+  logic [31:0] coef_data_i = '0;
+  /* verilator lint_off UNUSEDSIGNAL */
+  logic coef_ready_o;  // sienna_top's load interlock
+  /* verilator lint_on UNUSEDSIGNAL */
   logic [LFSR_WIDTH-1:0] cfg_seed_i = '0;
   logic busy_o, done_o, set_done_o;
   logic [7:0] cfg_req_zp_i = '0, cfg_req_min_i = '0, cfg_req_max_i = '0, cfg_gp_zout_i = '0;
@@ -201,6 +207,10 @@ module TB_model_run #(
       .gpnae_busy_o        (),
       .maxpool_busy_o      (),
       .dropout_busy_o      (),
+      .coef_wr_i           (coef_wr_i),
+      .coef_addr_i         (coef_addr_i),
+      .coef_data_i         (coef_data_i),
+      .coef_ready_o        (coef_ready_o),
       .out                 (out_lnk)
   );
 

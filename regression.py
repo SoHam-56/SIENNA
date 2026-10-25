@@ -4433,14 +4433,14 @@ def test_point_commands():
             assert r.returncode == 0 and "--lint-only" in r.stdout and ("-DBACK_TO_BACK" in r.stdout.split()) == want, (extra, r.stdout[-300:], r.stderr[-300:])
     r = make_n("pipeline", "FMT=int8", "N=8", "TILE=2", "COLLAPSE_K=0", "PYTHON=py")
     assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr
-    saved = {k: os.environ.get(k) for k in ("GPNAE_MODEL", "TEST", "N", "LINK_STAGES")}
-    os.environ.update(GPNAE_MODEL="hw", TEST="selu", N="32", LINK_STAGES="1")
+    saved = {k: os.environ.get(k) for k in ("GPNAE_TIER", "TEST", "N", "LINK_STAGES")}
+    os.environ.update(GPNAE_TIER="2", TEST="selu", N="32", LINK_STAGES="1")
     try:
         env = regress.point_env(SPEC, "fp32/N32_T2/pipeline", "s -j4 --jobserver-auth=3,4", 8)
     finally:
         for k, v in saved.items():
             os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
-    assert env["TRACE"] == "0" and env["OPT_FAST"] == "-O0" and env["SIM_THREADS"] == "2" and not {"GPNAE_MODEL", "TEST", "N", "LINK_STAGES"} & set(env)
+    assert env["TRACE"] == "0" and env["OPT_FAST"] == "-O0" and env["SIM_THREADS"] == "2" and not {"GPNAE_TIER", "TEST", "N", "LINK_STAGES"} & set(env)
     pe = lambda n: regress.point_env(SPEC, n, "s", 8).get("OPT_FAST")
     assert [pe(f"fp32/N{n}_T2/{k}") for n, k in ((8, "pack"), (16, "pack"), (8, "gemm"), (16, "gemm"))] == ["-O0"] * 4  # the short pack and gemm simulations build at -O0 at every N
     assert pe("fp32/N8_T2/pipeline") is None and pe("fp32/N16_T4/pipeline") is None and pe("int8/N8_T2/tflite") is None and pe("bf16/N16_T4/model") is None and pe("selftest") is None  # the long ones keep -Os below N = 32
@@ -4748,11 +4748,11 @@ def test_regression_target():
 
 
 @selftest
-def test_gpnae_target_model():
+def test_gpnae_target_tier():
     r = make_n("gpnae-verilator", "FMT=bf16", "PYTHON=py")
-    assert r.returncode == 0 and "py regression.py --lane poly --format bf16 --model exact" in r.stdout, r.stdout + r.stderr
-    r = make_n("gpnae-verilator", "FMT=bf16", "GPNAE_MODEL=hw", "PYTHON=py")
-    assert r.returncode == 0 and "--model hw" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "py regression.py --format bf16 --run gate --tier 0" in r.stdout, r.stdout + r.stderr
+    r = make_n("gpnae-verilator", "FMT=bf16", "GPNAE_TIER=2", "PYTHON=py")
+    assert r.returncode == 0 and "--tier 2" in r.stdout, r.stdout + r.stderr
 
 
 @selftest
@@ -5884,7 +5884,7 @@ class SiennaSpec(regress.Spec):
     title = "SIENNA REGRESSION"
     formats = tuple(FORMATS)
     sized = True
-    drop = ("GPNAE_MODEL", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES")
+    drop = ("GPNAE_TIER", "TEST", "QUICK", "COLLAPSE_K", "N", "TILE", "LANES", "MODEL_DIR", "MODEL_COUNT", "GEN_PKG", "LINK_STAGES")
 
     results_dir = None  # the --results a point or summary run names; the default point reads its twin's log there
 

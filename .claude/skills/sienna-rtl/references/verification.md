@@ -33,7 +33,7 @@ golden value. It is what caught the SELU λ·α constant bug and `tanh(0)`.
 
 **Tolerance caveat.** None of the tolerance checks measure float-relative error.
 `TB_SystolicMesh.sv` and `TB_SystolicArray.sv` use `$signed()` on FP32 bit
-patterns; `TB_sienna_top.sv` uses `$bitstoshortreal`, which Verilator maps to
+patterns; `TB_sienna.sv (pipeline mode)` uses `$bitstoshortreal`, which Verilator maps to
 the 64-bit `$bitstoreal`. Both end up comparing integer bit patterns rather
 than values. See known-issues #7 — including a portable `f32()` replacement.
 
@@ -65,7 +65,7 @@ For FSM-level stalls use `testbenches/pipeline_lane_status.txt`. Since the credi
 
 ### Testbench mechanics
 
-`TB_sienna_top.sv` (474 lines) loads the three `.mem` files into queues, resets, drives the west and north write ports in parallel `fork`/`join` threads, pulses `start_pipeline_i`, then waits on `pipeline_complete_o` with a 5000-cycle heartbeat and a 200,000-cycle timeout. Since 2026-10-07 the TB is the L0 host producer instead (a `credit_counter` and a `credit_link_checker`; put and sideband driven on the falling edge, one put per set while it holds a staging credit) and the L9 consumer per lane (`+out_slots`, `+out_stall_pct`, a checker per lane, and a 500-cycle full hold after a second reset).
+`TB_sienna.sv (pipeline mode)` (474 lines) loads the three `.mem` files into queues, resets, drives the west and north write ports in parallel `fork`/`join` threads, pulses `start_pipeline_i`, then waits on `pipeline_complete_o` with a 5000-cycle heartbeat and a 200,000-cycle timeout. Since 2026-10-07 the TB is the L0 host producer instead (a `credit_counter` and a `credit_link_checker`; put and sideband driven on the falling edge, one put per set while it holds a staging credit) and the L9 consumer per lane (`+out_slots`, `+out_stall_pct`, a checker per lane, and a 500-cycle full hold after a second reset).
 
 Results are captured **on the fly** at the L9 output links, one queue per lane; at each `pipeline_complete_o` the set is rebuilt in window order (lane L's j-th word is window `j*NUM_LANES + L`), because under output stalls lanes no longer finish in lockstep. Before 2026-10-07 the TB pushed `dut.dropout_data_out[lane]` whenever `dut.dropout_valid_out[lane]` was high, in lane-index order.
 

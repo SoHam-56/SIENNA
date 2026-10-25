@@ -22,7 +22,7 @@ Module-by-module reference. Line numbers are from the working tree at the time o
 
 ---
 
-## Top level (`src/sienna_top.sv`)
+## Top level (`src/top/sienna_top.sv`)
 
 740 lines. Instantiates one `SystolicMesh`, one `fwft` (FIFO1), and a `NUM_LANES`-wide generate block containing a `gpnae`, an `fwft` (FIFO2), a `Maxpool_2D` and a `dropout` per lane. `NUM_LANES` is 8.
 
@@ -89,7 +89,7 @@ Since 2026-09-25 the mesh is pipelined: sets flow through it back to back. The o
 
 ### SystolicArray
 
-Output-stationary and synchronous. Two operand banks hold A (T×K) and B (K×T), so the next set is written while one feeds; `commit_i` queues the bank just written, `load_ready_o` says one is free. The feeder walks k over a set on row 0 and a queued set follows k=K-1 with no gap; row r and column c see the same command r and c cycles later. Each `ProcessingElement` takes one product per cycle into one of U partial sums and switches to the next of `ACC_BANKS` (default 4) banks every K products. A bank is final when its last add is written back; `set_final_o` means every PE's oldest bank is final. `next_final_o` says the set after it is final too. The reader reads a pixel's U partials through the read port and pulses `release_i` after the last pixel, which frees the bank. A bank comes back about 3K cycles after its set starts, which is why three banks held N=16 to ~18.6 cycles per set and four reach the reducer's rate. Unit test: `SystolicMesh/testbenches/TB_SystolicArray.sv` (`-GN= -GK= -GREAD_GAP=`), 14 configurations; steady state is K+2 cycles per set for K ≥ 16.
+Output-stationary and synchronous. Two operand banks hold A (T×K) and B (K×T), so the next set is written while one feeds; `commit_i` queues the bank just written, `load_ready_o` says one is free. The feeder walks k over a set on row 0 and a queued set follows k=K-1 with no gap; row r and column c see the same command r and c cycles later. Each `ProcessingElement` takes one product per cycle into one of U partial sums and switches to the next of `ACC_BANKS` (default 4) banks every K products. A bank is final when its last add is written back; `set_final_o` means every PE's oldest bank is final. `next_final_o` says the set after it is final too. The reader reads a pixel's U partials through the read port and pulses `release_i` after the last pixel, which frees the bank. A bank comes back about 3K cycles after its set starts, which is why three banks held N=16 to ~18.6 cycles per set and four reach the reducer's rate. Unit test: `SystolicMesh/testbenches/units/TB_SystolicArray.sv` (`-GN= -GK= -GREAD_GAP=`), 14 configurations; steady state is K+2 cycles per set for K ≥ 16.
 
 ### Mesh control
 
@@ -108,7 +108,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 - Results per output tile, column blocks outer and row tiles inner; `done_o` after the layer's last set.
 - The set issuer derives the loops, the accumulate flags, the bias pass, the identity pass of a residual and the dropout seeds; the weight loader fills half `c%2` of the mesh's weight cache only while it holds that region's L2 credit (one put opens the fill; the credit returns when the fill's last set, marked `wc_last`, is broadcast).
 - Since 2026-10-07 the two streams are credit links (`a_rows`, `w_rows`, L10): a set's N A rows (and N B rows if uncached) are granted at once per staging credit held, one set ahead; results leave on the L9 links `out[NUM_LANES]`.
-- Testbench `TB_model_run.sv`; `model_runner.py --engine layer` (default, backend `RtlLayer`) and `regression.py --action gemm` format the streams with `format_layer()`, which only rearranges data.
+- Testbench `TB_sienna.sv (layer mode)`; `model_runner.py --engine layer` (default, backend `RtlLayer`) and `regression.py --action gemm` format the streams with `format_layer()`, which only rearranges data.
 
 ---
 
@@ -125,7 +125,7 @@ Three concurrent parts, no mesh-wide state machine. The host's last row may arri
 | `3'b100` / `3'b101` | ReLU / linear, exact (bypass) |
 | any other | tanh |
 
-`tier_i` (0, 1, 2) picks the accuracy tier, the sets fitted to 1%, 5% and 10%; `sienna_pipe` takes it per set from the set side (`set_side_t.tier`, the set contract) or from `cfg_tier_i` (the layer contract), with the activation. `coef_wr_i`, `coef_addr_i` (9 bits) and `coef_data_i` (32 bits) write the coefficient memory; `sienna_top` fans one load port out to every lane behind an interlock: `coef_ready_o` is high only while no set is in any pipeline, every lane's `idle_o` is high and no layer runs, and a write while it is low is refused (`a_load_ready` and each lane's `a_load_idle` fire if one lands anyway; each lane's `a_coef_quiet` checks its writes against its own count of elements in, apart from `idle_o`, which is per element, not per set). `coef_ready_o` is combinational: it falls in the cycle of `cfg_load_i` or a host put. `a_coef_frozen` (sienna_top, both contracts) checks the lanes' memory write strobes against an in-flight count of its own (configure to `done_o`; sets put less sets completed), apart from the interlock's terms. The tests write the running activation's own words while it streams (`busy_writes`, `lanes_refused` on both contracts), so a write that lands moves outputs, and `lanes_between` loads from the first ready cycle after `done_o`. The host loads between layers. The memory's reset contents are the fitted image (`GPNAE/gpnae_coef_default.json`), so a host that never loads gets the fitted lane.
+`tier_i` (0, 1, 2) picks the accuracy tier, the sets fitted to 1%, 5% and 10%; `sienna_pipe` takes it per set from the set side (`set_side_t.tier`, the set contract) or from `cfg_tier_i` (the layer contract), with the activation. `coef_wr_i`, `coef_addr_i` (9 bits) and `coef_data_i` (32 bits) write the coefficient memory; `sienna_top` fans one load port out to every lane behind an interlock: `coef_ready_o` is high only while no set is in any pipeline, every lane's `idle_o` is high and no layer runs, and a write while it is low is refused (`a_load_ready` and each lane's `a_load_idle` fire if one lands anyway; each lane's `a_coef_quiet` checks its writes against its own count of elements in, apart from `idle_o`, which is per element, not per set). `coef_ready_o` is combinational: it falls in the cycle of `cfg_load_i` or a host put. `a_coef_frozen` (sienna_top, both contracts) checks the lanes' memory write strobes against an in-flight count of its own (configure to `done_o`; sets put less sets completed), apart from the interlock's terms. The tests write the running activation's own words while it streams (`busy_writes`, `lanes_refused` on both contracts), so a write that lands moves outputs, and `lanes_between` loads from the first ready cycle after `done_o`. The host loads between layers. The memory's reset contents are the fitted image (`GPNAE/scripts/gpnae_coef_default.json`), so a host that never loads gets the fitted lane.
 
 ### Structure
 
@@ -161,24 +161,24 @@ The adder and multiplier handle NaN, infinity and signaling-NaN explicitly and e
 
 ## Maxpool and dropout
 
-`Maxpool/Maxpool_2D.sv` — since 2026-10-07 on credit links (`in`, `out`; `start`/`done` and the valid ports are gone): the streaming path SIENNA uses grants a 2x2 window's 4 element credits at once, only with an output credit reserved, up to 2 windows ahead. The batch path (padded multi-output windows, `TB_maxpool_int8` only) keeps the five states (`IDLE → COLLECT_INPUT → PROCESS → OUTPUT_RESULTS → FINISH`). Collects `IN_ROWS × IN_COLS` values into a 2-D buffer, computes one output pixel per cycle in `PROCESS`, then streams the buffer out. The `is_greater()` function does sign-magnitude comparison when `IS_FP32` is set, because a raw `$signed` compare is wrong for FP32 negatives; `−infinity` (`32'hFF800000`) is the identity element.
+`src/pool/Maxpool_2D.sv` — since 2026-10-07 on credit links (`in`, `out`; `start`/`done` and the valid ports are gone): the streaming path SIENNA uses grants a 2x2 window's 4 element credits at once, only with an output credit reserved, up to 2 windows ahead. The batch path (padded multi-output windows, `TB_maxpool_int8` only) keeps the five states (`IDLE → COLLECT_INPUT → PROCESS → OUTPUT_RESULTS → FINISH`). Collects `IN_ROWS × IN_COLS` values into a 2-D buffer, computes one output pixel per cycle in `PROCESS`, then streams the buffer out. The `is_greater()` function does sign-magnitude comparison when `IS_FP32` is set, because a raw `$signed` compare is wrong for FP32 negatives; `−infinity` (`32'hFF800000`) is the identity element.
 
-`Dropout/dropout.sv` — a 32-bit LFSR (taps 31/21/1/0) compared against a threshold derived from `DROPOUT_P_PERCENT`. Three paths: inference (`training_mode` low) passes data straight through combinationally; drop emits zero; keep routes through an `fp32Multiplier` by the scale constant. **The top level hardwires `training_mode` to `1'b0`**, so in the assembled pipeline dropout is always a pass-through and the multiplier is never exercised.
+`src/dropout/dropout.sv` — a 32-bit LFSR (taps 31/21/1/0) compared against a threshold derived from `DROPOUT_P_PERCENT`. Three paths: inference (`training_mode` low) passes data straight through combinationally; drop emits zero; keep routes through an `fp32Multiplier` by the scale constant. **The top level hardwires `training_mode` to `1'b0`**, so in the assembled pipeline dropout is always a pass-through and the multiplier is never exercised.
 
 ---
 
 ## fwft FIFO
 
-`src/fwft.sv` — first-word-fall-through FIFO on credit links since 2026-10-07: `credit_link_if.consumer in` advertises `FIFO_DEPTH` (16 for FIFO2) after reset and returns one credit per pop; `credit_link_if.producer out` puts the oldest word while it holds the consumer's credit. Overwrite-on-full is removed and `a_fifo_room` fires on a put into a full FIFO. The dispatcher's almost-full threshold is replaced by one credit counter per lane (L7). Before 2026-10-07 it never back-pressured: a write into a full FIFO overwrote the oldest entry (known-issues #14).
+`src/fifo/fwft.sv` — first-word-fall-through FIFO on credit links since 2026-10-07: `credit_link_if.consumer in` advertises `FIFO_DEPTH` (16 for FIFO2) after reset and returns one credit per pop; `credit_link_if.producer out` puts the oldest word while it holds the consumer's credit. Overwrite-on-full is removed and `a_fifo_room` fires on a put into a full FIFO. The dispatcher's almost-full threshold is replaced by one credit counter per lane (L7). Before 2026-10-07 it never back-pressured: a write into a full FIFO overwrote the oldest entry (known-issues #14).
 
 ---
 
 ## Parameter propagation
 
-`regression.py` writes `testbenches/test_config_pkg.sv` (with model_runner.py's `write_sv_package()`); `TB_sienna_top.sv` imports it and passes the values down to `sienna_top`, which derives its local parameters and passes them to the leaf modules. The chain is:
+`regression.py` writes `testbenches/test_config_pkg.sv` (with model_runner.py's `write_sv_package()`); `TB_sienna.sv (pipeline mode)` imports it and passes the values down to `sienna_top`, which derives its local parameters and passes them to the leaf modules. The chain is:
 
 ```
-regression.py  →  test_config_pkg.sv  →  TB_sienna_top  →  sienna_top  →  leaf modules
+regression.py  →  test_config_pkg.sv  →  TB_sienna (pipeline)  →  sienna_top  →  leaf modules
 ```
 
 `SRAM_DEPTH` and `FIFO_DEPTH` default to `N*N`. `IN_ROWS`/`IN_COLS` are set to `N`. `ADDR_LINES` is `ceil(log2(SRAM_DEPTH))`. GPNAE's own widths are fixed locally in `sienna_top` (`GPNAE_ADDR_LINES = 5`, so 32-deep lanes) and are *not* driven from the package.

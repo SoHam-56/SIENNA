@@ -3,7 +3,7 @@ name: sienna-int8
 description: Use when building or verifying SIENNA's int8 build (sub-project 2 of sienna-uniform-format) - int8 mesh with int32 accumulation, the generic affine requantize stage (int8Requantizer), fixed-point GPNAE, int8 pooling and dropout, the TFLite oracle, or the int8 golden models. Also use when someone asks how SIENNA's int8 results are gated and how they compare with the TFLite interpreter, why GPNAE is fixed point in int8, or what 2a covers against 2b.
 ---
 
-> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/pipeline/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 
 # SIENNA: the int8 build (sub-project 2a)
 
@@ -111,7 +111,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 
 - Requantize parameters of an accumulate group come from its activated pass, the last, like `activation_function_i`;
   the bias comes with the first pass (the mesh's rule). Partial passes may carry anything: the regression gives them decoys.
-- The requantize stage is `src/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 4 cycles
+- The requantize stage is `src/lanes/requant_lanes.sv` (one `tfliteRequant` per lane, channel `(k * PER_LANE + b) % N`), 4 cycles
   (`req_lat()`; 3 before the split below) at the lane feed; `sienna_top` holds each set's parameters by set id and copies the per-channel words at `g_accept`.
   It rounds with `sienna_fmt_pkg::REQ_ROUNDING`, G0's variant (Task 3); `model_runner._check_rounding()` checks that the
   package, `ipu.REQ_ROUNDING` and `rounding.txt` agree.
@@ -169,12 +169,12 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   pipelines each beat's destination (ReLU / linear flag, activation bank, element index) beside it for `req_lat()`
   cycles. An int8 ReLU or linear set leaves the activation stage once its last wide read is in; its bank is marked
   full, once, when that beat leaves (a partial set waits out a drain). N = 32 ReLU 39 -> 36 cycles per set, as fp32 (36.5 since the split);
-  GPNAE sets unchanged (the lanes, not the drain, hold the stage). `TB_sienna_top` fails if a drain held a waiting
+  GPNAE sets unchanged (the lanes, not the drain, hold the stage). `TB_sienna (pipeline)` fails if a drain held a waiting
   result and never overlapped. D-8 in `sienna_layer`: `mult_buf` / `shift_buf` load without reset.
 - Drain-overlap hardening (2026-10-01): int8 has 37 tests. `int8_mixed_bypass_lane_nopool` (relu, tanh, linear, selu,
   no pooling, `zp_random` and `req_random`) drains a ReLU or linear set into a GPNAE set's fill, and
   `int8_accum2_mixed_bypass_nopool` puts a partial set behind each draining one; both are bit-exact at N = 16 and 32.
-  `TB_sienna_top` fails a pass in which a draining ReLU or linear set still holds the stage while the next set could
+  `TB_sienna (pipeline)` fails a pass in which a draining ReLU or linear set still holds the stage while the next set could
   start (1b4bf1a's RTL at `req_lat()` 3: 3 cycles per set) or a partial set passes during a drain, and prints the
   overlap-into-lane-set and partial-set-held counts. `sienna_top`'s `a_rq_one_set` (int8, simulation only: a set's first
   beat never enters the requantize pipeline while a beat is in it) is stricter than the real bank-reuse hazard: each beat
@@ -201,7 +201,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   remove it, Soham's option. The split also costs every int8 GPNAE lane set (tanh, SELU) one cycle per set wherever
   activation is the bottleneck (lane stage 53 -> 54 at N = 8): G4 (4e3d15a) to final (ff5ecb1), tanh 56 -> 57 at
   N = 8, 107 -> 108 at N = 16, 365 -> 366 at N = 32 and 64; SELU 52 -> 54 at N = 8 (+3.8%), 96 -> 97, 327 -> 328
-  (perf runs g8p_* against fnp_* / fn64p_*); mesh- and host-bound points and fp32 / bf16 are unchanged. With it, `TB_sienna_top`'s drain-overlap absence check counts only
+  (perf runs g8p_* against fnp_* / fn64p_*); mesh- and host-bound points and fp32 / bf16 are unchanged. With it, `TB_sienna (pipeline)`'s drain-overlap absence check counts only
   cycles that do not accept the next set (`!g_accept`): the last beat can now leave in the accept cycle, which held
   nothing; 1b4bf1a's RTL still fails the check.
 - Taylor lane capture fix (Soham 2026-10-01, GPNAE a3d580c): `gpnae`'s G_CAP read the FIFO head as soon as `empty_o`

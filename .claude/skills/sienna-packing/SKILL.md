@@ -3,7 +3,7 @@ name: sienna-packing
 description: Use when designing, building or verifying SIENNA's multi-job packing - several small jobs (images, layers or whole small models smaller than the mesh) sharing one N x N set through block-diagonal weights, the per-set block size, the PE's out-of-block skip, per-block activation and int8 output parameters, the packed lane order, the packer and unpacker in model_runner. Also use when someone asks how a large synthesized mesh (say N = 64) runs 2x2 / 8x8 / 16x16 workloads without idling, or why packed float results equal unpacked ones bit for bit.
 ---
 
-> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
+> **Names since the restructure (Batch A Stage 4, 2026-10-24).** `sienna_top` is the one top: today's pipeline body is `src/pipeline/sienna_pipe.sv`, `sienna_layer` is `sienna_sched` under `sienna_top` with `SET_PORT = 0`, `sienna_multi` is `sienna_top` with `SET_PORT = 1, COPIES > 1`. The format is the build's define (`make FMT=` gives `+define+FMT_<FMT>`): `EXP_W`, `MAN_W`, `IS_INT`, `ACC_W` and `OUT_W` are gone from SIENNA's RTL and test_config_pkg, in favour of `sienna_fmt_pkg`'s constants (`DATA_WIDTH`, `ACC_DATA_WIDTH`, `RESULT_DATA_WIDTH`, `HAS_REQUANT_EPILOGUE`, `HAS_RESIDUAL_ADD`, the latencies) and bundles (`lane_entry_t`, `requant_scale_t`, `add_params_t`). File:line references below predate it.
 
 # SIENNA: multi-job packing
 
@@ -70,7 +70,7 @@ Storage estimate (arithmetic, not synthesized): an int8 entry is about 96 bits, 
 to N/2 blocks is about 0.9 kbit per set id, about 14 kbit for 16 ids at N = 64. Per-column copies of every int8
 parameter would be about 98 kbit at N = 64, which is why the table.
 
-`sienna_layer` takes the same as layer configuration; `TB_model_run`'s layer file gains them. Packing is refused
+`sienna_layer` takes the same as layer configuration; `TB_sienna (layer)`'s layer file gains them. Packing is refused
 (elaboration error, or an assertion on accept for runtime values) when: N does not divide NUM_LANES; the build pools
 (POOL_H * POOL_W > 1) and pack_shift_i != 0; COLLAPSE_K = 0 and pack_shift_i != 0; a map entry is >= P; accumulate is
 set with pack_shift_i != 0 (no multi-pass packing).
@@ -193,7 +193,7 @@ of the one failure (`pkg_ck0_16_int8`, packed tests on collapse-k 0, deviation 1
 `pkg_perf_*` measurement runs and the 11 audit runs (`pkg_vacprobe`, `pkg_neg_*`). Task 10 added 12 `pk10_*` runs
 (`packing_gate.log` section 7 lists the three lints on one line). The final gate (section 8) is 106 runs on 8d7a4b2 +
 b1a2c31, all pass: Task 9's 93 configurations, the 8 perf sweeps, `make model FMT=bf16`, `model_runner --engine sets`
-(TB_sienna_model) and TB_sienna_multi in three formats; each identical to Task 9's baseline and to Task 9's own run,
+(TB_sienna (sets)) and TB_sienna (copies) in three formats; each identical to Task 9's baseline and to Task 9's own run,
 the sets-engine and multi runs identical to the three_formats_v4 tree, `make model`'s first inference per model identical
 to a 2026-09-30 run, and no assertion fired in any of them. Mesh sweep N = 8 (matmul), 16 (collapse-k 1 and 0) and 32 (T = 2-32) in
 fp32, bf16 and int8: READY, every row of `mg_mesh16_*`, `mg_mesh32_*_T4`, `g3i_N32_*`, `g3i_N8_*` identical in result
@@ -232,7 +232,7 @@ n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis.
 - `sienna_layer`'s `a_pack_shape` has never been seen to fire: `pack_precheck` refuses its cases first, so only a
   hand-written layer file reaches it.
 - `sienna_layer`'s assertions that mix its inputs (`cfg_load_i`, `a_valid_i`, `w_valid_i`) with state, `a_pack_shape`
-  among them, are aligned only because `TB_model_run` drives 1 ns after the edge; an edge-driving host would be
+  among them, are aligned only because `TB_sienna (layer)` drives 1 ns after the edge; an edge-driving host would be
   checked one edge late (not converted to registered terms, Task 9 audit).
 - The packed TFLite models have full-range clamps only (TFLite folds their ReLU into the zero point); a non-trivial
   per-entry clamp is covered by `TB_requant_lanes` and `int8_packed_zp_random_nopool`, not end to end.
@@ -240,7 +240,7 @@ n:1 mux = n - 1 mux2 per bit, no sharing across lanes; estimates, not synthesis.
   entry 0 (the set's activation).
 - Untested: an unpacked set with `pack_map_i[0] != 0`; a weight-cached packed B reused with a different shift; packed
   sets interleaved with unpacked accumulate pairs; the outputs of empty blocks (partial packing) are not compared.
-- `PACK_ENTRIES` is a parameter of `sienna_top` and `sienna_layer`, but 8 is hard-coded in `TB_model_run`,
+- `PACK_ENTRIES` is a parameter of `sienna_top` and `sienna_layer`, but 8 is hard-coded in `TB_sienna (layer)`,
   `model_runner.PACK_ENTRIES` and `regression.py`.
 - Without a pre-packing reference (pass/fail only): SIENNA regression N = 16 T = 2, 8, 16 and N = 32 fp32 / bf16;
   N = 8 is compared only to Task 5's packing tree.

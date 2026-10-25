@@ -1275,9 +1275,9 @@ def _transfer(fmt: str, want, got) -> "truth.Result":
                         int(bad.size), 0, 0, 0, [(int(i), int(got[i]), int(want[i])) for i in bad[:truth.FIRST]])
 
 
-def _act_bound(func: str) -> float:
-    """An activation stage's bound: ReLU and linear at the 1% target, the lane activations at the 10% waiver."""
-    return truth.TARGET if func in ("relu", "linear") else truth.BOUND
+def _act_bound(func: str, tier: int = 0) -> float:
+    """An activation stage's bound: ReLU and linear at the 1% target, the lane activations at their tier's tolerance (1% at tier 0)."""
+    return truth.TARGET if func in ("relu", "linear") else gpnae_model.TIER_TOL[tier]
 
 
 def truth_test(N: int, fmt: str, lanes: int) -> dict:
@@ -3489,16 +3489,19 @@ def pack_models_main(argv=None) -> None:
 GPTFL_OPS = (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic"))  # (truth.py function, GPNAE control word, TFLite op)
 
 
+LANE_TOL = gpnae_model.TIER_TOL[0]  # the reset image's tier 0: the lanes gate at 1%
+
+
 def gpnae_tflite_judge(rows):
     """Report lines and pass flag: each row (func, op, quant, q, hw, tfl, ex) gated on truth.py, TFLite agreement characterization only."""
     L = ["GPNAE int8 lane (gpnae_model, bit-exact with the RTL at G2) on every int8 input, quantization from TFLite's converter (BUILTIN_REF)",
          "Gate: truth.py, the lane's words against the true function of the real input (bound "
-         f"max({100 * truth.BOUND:g}% |t|, one output step), target {100 * truth.TARGET:g}%); TFLite agreement is characterization, not gated",
+         f"max({100 * LANE_TOL:g}% |t|, one output step), target {100 * truth.TARGET:g}%); TFLite agreement is characterization, not gated",
          f"{'op':<9}{'s_in':>11}{'z_in':>6}{'truth':>6}{'worst':>9}{'LSB':>4}{'>bound':>7}{'>1%':>5}"
          f"{'equal':>7}{'|d|=1':>7}{'max |d|':>8}{'TFLite-exact':>13}{'lane-exact':>11}"]
     res = {}
     for func, op, quant, q, hw, tfl, ex in rows:
-        r = truth.gate("int8", func, q, hw, quant=quant)
+        r = truth.gate("int8", func, q, hw, quant=quant, bound=LANE_TOL)
         res.setdefault(func, []).append(r)
         d = np.abs(hw - tfl)
         L.append(f"{op:<9}{quant[0]:>11.6f}{quant[1]:>6}{'PASS' if r.ok else 'FAIL':>6}{truth.worst_text(r.worst):>9}{r.worst_lsb:>4}{r.over:>7}"
@@ -3510,9 +3513,9 @@ def gpnae_tflite_judge(rows):
     merged = {f: truth.merge(rs) for f, rs in res.items()}
     L += [truth.line(m) for m in merged.values()]
     ok = all(m.ok for m in merged.values())
-    body = "; ".join(f"{f} worst {truth.worst_text(m.worst)} ({m.worst_lsb} LSB), {m.over} of {m.n} over {100 * truth.BOUND:g}%, "
+    body = "; ".join(f"{f} worst {truth.worst_text(m.worst)} ({m.worst_lsb} LSB), {m.over} of {m.n} over {100 * LANE_TOL:g}%, "
                      f"{m.over_target} over {100 * truth.TARGET:g}%" for f, m in merged.items())
-    L.append(f"ACCURACY: {'PASS' if ok else 'FAIL'} (true function, truth.py, int8; bound {100 * truth.BOUND:g}%, target {100 * truth.TARGET:g}%: {body})")
+    L.append(f"ACCURACY: {'PASS' if ok else 'FAIL'} (true function, truth.py, int8; bound {100 * LANE_TOL:g}%, target {100 * truth.TARGET:g}%: {body})")
     agree = "; ".join(f"{op} {sum(int((r[4] == r[5]).sum()) for r in rows if r[1] == op)} of {sum(r[3].size for r in rows if r[1] == op)} equal, "
                       f"max |d| {max(int(np.abs(r[4] - r[5]).max()) for r in rows if r[1] == op)}" for op in dict.fromkeys(r[1] for r in rows))
     L.append(f"TFLITE AGREEMENT (characterization, not gated): {agree}")

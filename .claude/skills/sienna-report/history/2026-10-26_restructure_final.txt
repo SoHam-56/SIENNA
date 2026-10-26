@@ -126,3 +126,4 @@ Every value is at or below its estimate except bf16 sigmoid far (26.63 against 2
 Tiers 1 and 2: 7.2 to 10.8 cycles per element (bf16 sigmoid far 18.6 and 14.2). The published TYTAN lane: 747 cycles per tanh.
 In the pipeline (perf_final.log): the activation stage at N = 64, T = 2 takes 449 cycles a set in fp32, 301 in bf16 and 355 (SELU) /
 387 (tanh, sigmoid) in int8, against 670 / 1060 (fp32 SELU / tanh), 540 / 759 (bf16) and 329 / 367 (int8) on the base tree.
+At N = 8 and 16 sigmoid is slower than on the base tree (fp32 +14% at N = 8; bf16 +4.7% at N = 16 and 1.94x at N = 8).

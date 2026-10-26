@@ -25,6 +25,15 @@ the perf section's `events()`; was perf_analysis.py). Check the render with a he
 | 3 | Real models (MLPerf Tiny) for each N and tile size | runs `ms_N*_T*_{fp32,bf16}` (`cmds/model_sweep.sh`, `model_runner.py --tile-size`) |
 | 4 | Number formats: fp32, bf16, int8 | g4 runs, int8 perf runs `g8p_N*_T*_int8`, GEMM runs `s22_gemm_*` and `g8_gemm_int8`, `history/2026-09-28_gpnae_gate.txt` |
 
+## Final sweep (Stage 5 R2, 2026-10-26)
+
+- `sienna_report/perf_final.log`: perf-analysis at every N, tile size and format (runs `s5_r2p_*`, `s5_r2p2_*`), cycles measured, µs and
+  FLOPS derived at 950 MHz, against B (`rs2_perf2_*`, N = 8 and 16 only) and the base tree (`rs2_base_perf_*`; N = 32/64 from
+  report_refresh.log). Built by `sienna_jobs/cmds/stage5/r2/perf_table.py` and `perf_final.py`.
+- `sienna_report/restructure_final.log`: what the restructure changed, R1 and R2 verdicts, lane accuracy per tier in %, cycles per element.
+- Per-point R2 verdicts: `/proj/scratch/spramanik/stage5/r2_regression/{si,sm}/regression.log` (latest attempt of each point, provenance
+  in `r2_provenance.tsv`). Copies of both logs are in `history/` as `2026-10-26_*.txt`.
+
 ## Rules
 
 - Every number is measured in simulation or labeled as an estimate. The 950 MHz clock is an assumption.

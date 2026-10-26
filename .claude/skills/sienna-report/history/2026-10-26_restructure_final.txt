@@ -1,0 +1,128 @@
+SIENNA RESTRUCTURE, FINAL REPORT (Stage 5: R1 and R2)                                                   2026-10-26
+=====================================================================================================================
+Author: Claude, for Soham Pramanik. Reports behind it: implementation-plan/stage5-regression-report.md (R1),
+stage5-sweep-report.md (R2), restructure_batchA_comparison.log, batchB-stage2-report.md, stage5pre-merge-layout-report.md.
+Every figure below is MEASURED in Verilator 5.035 simulation unless it says otherwise. Accuracy is in percent of the true value.
+
+
+1. WHAT THE RESTRUCTURE CHANGED (B = Phase 2 reference, tags phase2_B, to GitHub main)
+---------------------------------------------------------------------------------------------------------------------
+repo                B          main now   commits  diff against B
+SIENNA              a81ff7e    649450b    112      63 files, +7136 -5540   (local, unpushed: 4ba233c, 59b8d6d, docs)
+GPNAE               edc7e6e    a439c6c     53      69 files, +6244 -39834
+SystolicMesh        c9d1941    ea85621     48      24 files, +895 -557     (local, unpushed: docs)
+ArithmeticLibrary   a6fe672    bc90a93     53      640 files, +6371 -107524
+
+Batch A (format package and one top)
+  - ArithmeticLibrary: sienna_fmt_pkg with a define map (+define+FMT_FP32/BF16/INT8; no define builds fp32), one math module per
+    function and width (bf16Multiplier, bf16Adder, bf16WideMultiplier, fp32ToBf16, int8/16/24 multipliers, int32Adder), the
+    fmt_mul/fmt_add wrappers, the generic int8Requantizer and int8QuantizedAdder (no TFLite-named units), reference benches on
+    SoftFloat DPI and a C integer reference, truefn.py, check_fmt, equivalence and exhaustive harnesses.
+  - SIENNA, GPNAE, SystolicMesh: one top module per repo with a DATA_WIDTH datapath; the define picks the math; no per-format copies.
+    sienna_top is SIENNA's only top (SET_PORT 0 layer contract, 1 set contract; COPIES).
+  - Equivalence: the Batch A heads equal B in every output word (71.2 M), cycle (429 592), simulation time and true-function
+    verdict over 11 515 files (restructure_batchA_comparison.log).
+Batch B (GPNAE's activation lane, design D)
+  - Fitted polynomial pieces per function instead of the Taylor series of e^x; a constant past the point where the function is within
+    tolerance of its limit; a barrel multiply-add unit that starts a step every cycle.
+  - Programmable coefficient memory (128 words: coefficients, piece bounds, degrees), reset contents = the fitted sets, written by the
+    host between layers; a write while any element is in flight is refused (interlock, coef_ready_o), checked by assertions and the
+    fault points.
+  - Three accuracy tiers per function, gated at their own tolerance: tier 0 1%, tier 1 5%, tier 2 10%; each layer picks its tier.
+  - Every lane output gated against numpy float64 (the true function) at its tier's tolerance; the bit-exact model is a diagnostic.
+  - Removed: the published Taylor lane (kept as tag gpnae_taylor_final), the old coefficient ROM, every Vivado file and target, dead
+    benches and scripts (deletions authorized by Soham, 2026-10-24/25).
+VCS and standalone machine
+  - SIM=vcs in every repo (targets, X/Z detection, === / !== compares on DUT data), never run here (no license, by ruling).
+  - requirements.txt, no /proj paths, models/ with the four MLPerf Tiny models (Apache 2.0, NOTICE), fetch scripts:
+    models/fetch_cifar10.sh (CIFAR-10, md5-checked) and models/fetch_inputs.sh (the kws and ad01 inputs, sha256-checked).
+Uniform layout (pure rearrangement)
+  - Every repo: src/ by function, testbenches/top/ + testbenches/units/, scripts/, one Makefile. SIENNA's four top benches folded into
+    TB_sienna with MODE (make TB_MODE=pipeline|layer|sets|copies); src/sienna_rtl.f is the synthesis file list.
+Generic int8 path
+  - The int8 pipeline is framework-neutral: int32 sums, the generic per-channel requantize (int8Requantizer), the int8 ADD
+    (int8QuantizedAdder) and fixed-point GPNAE; TFLite is one front end in model_runner, not a name in the RTL.
+
+
+2. R1: SMALL=1 FROM THE FRESH CLONE (2026-10-25)
+---------------------------------------------------------------------------------------------------------------------
+repo                head       README regression
+ArithmeticLibrary   bc90a93    PASS 73 of 73
+SystolicMesh        ea85621    PASS 57 of 57
+GPNAE               a439c6c    PASS 40 of 40
+SIENNA              649450b    PASS 205 of 205 (after two testbench fixes, 08d6587 and 649450b, both name-resolution only)
+Also passed: SIENNA lint matrix 69 checks; mutants GPNAE 18 of 18, SIENNA 10 of 10; check-fmt, check-hier; Batch A comparison
+27 of 27 pipeline roles identical outside the activation lanes (130 617 216 stage words).
+
+
+3. R2: THE FULL SWEEP, N = 8 TO 64, EVERY TILE SIZE, THREE FORMATS (2026-10-25/26)
+---------------------------------------------------------------------------------------------------------------------
+Trees: SIENNA 4ba233c and 59b8d6d (two fix commits on 649450b, below), SystolicMesh ea85621 (standalone clone).
+SIENNA SMALL=1 was rerun on 59b8d6d (205 of 205 PASS); no R1 SIENNA point is reused. SystolicMesh's 57 N = 8/16 points are R1's
+(its code did not change).
+
+                 points  PASS  FAIL (real cause)  not completed  not run (needs > 256 GB node, ruled out for cost)
+SIENNA            447     424         11                 4                    8
+SystolicMesh      123     116          0                 1                    6
+(At the time of writing, SystolicMesh int8/N64_T16/mesh-ck0 is being rerun; see stage5-sweep-report.md for its final state.)
+
+Real failure, open:
+  int8/N32_T{2,4,8,16,32}/residual and int8/N64_T{2,4,8,16,32,64}/residual: "RESIDUAL: FAIL tiles (its gate cannot tell a wrong ADD)"
+  at N = 32 and "... deep_uncached ..." at N = 64. Every stage gate in these points passes (requantize, identity, hold_mem, ADD,
+  activation) and 0 outputs differ from the bit-exact model. The failing line is the test's own power check: the deliberately wrong
+  ADD (zp_1 taken as 0) must fail the ADD gate. In the drawn case zp_1 x s_1/s_out is under one output step (N = 32 tiles: zp_1 = -2,
+  ratio 0.211; N = 64 deep_uncached: zp_1 = -3, ratio 0.134), so the wrong ADD moves outputs by at most 1 code and passes the decimal
+  rule. Testbench stimulus cause, not RTL. N = 8 and 16 draw other values and pass. Fix not made: it needs Soham's choice of stimulus
+  constraint or power-check precondition.
+Not completed: SIENNA fp32 and bf16 model-ck0 / gemm-ck0 at N64_T2 (builds stopped after 6 to 10 h on 768 GB nodes; bf16 model-ck0 on
+  a full scratch quota, the other three not diagnosed); SystolicMesh int8/N64_T16/mesh-ck0 (truth dump truncated by the quota).
+Not run: SIENNA {fp32, bf16} {model, gemm}-ck0 at N64_T4, int8 {gemm, tflite}-ck0 at N64_T2 and T4; SystolicMesh mesh-ck0 at N64_T2
+  and T4 in every format.
+
+Fix commits (SIENNA, local, unpushed, each test first):
+  4ba233c  collapse-k 0 points at N = 64 build with the large code model (LARGE_CODE=1 in the Makefile, set by regression.py);
+           test_large_code failed before.
+  59b8d6d  TB_sienna's output hold lasts SETS_IN_FLIGHT + 2 sets at the slower of the host's put and the mesh's set interval
+           max(T+2, K, T^2). int8/N64_T32 pipeline and pipeline-b2b failed "the host was not blocked when the hold ended"
+           (1156-cycle hold against a 1024-cycle mesh interval); with the 17408-cycle hold the entry fills and the test passes.
+
+
+4. LANE ACCURACY PER TIER, WORST RELATIVE ERROR AGAINST THE TRUE FUNCTION (percent)
+---------------------------------------------------------------------------------------------------------------------
+GPNAE make regression (R1, a439c6c), every input of each gate; lane / held-out where both exist:
+lane          tier 0 (1%)          tier 1 (5%)          tier 2 (10%)
+fp32 SELU     0.2485 / 0.2485      3.2419 / 3.2420      5.2396 / 5.2393
+fp32 sigmoid  0.2479 / 0.2479      3.0197 / 3.0197      5.6495 / 5.6495
+fp32 tanh     0.4970 / 0.4969      3.4760 / 3.4760      8.0677 / 8.0669
+bf16 SELU     0.9428               4.5041               8.7740           (every finite input)
+bf16 sigmoid  0.7748               2.9729               9.1572
+bf16 tanh     0.9602               4.7404               7.9376
+int8 SELU     0.6879 / 0.6778      4.0693 / 4.4680      7.7028 / 6.8644
+int8 sigmoid  within one step      within one step      within one step
+int8 tanh     within one step      3.7262 / 3.7277      4.9365 / 4.9515
+ReLU, linear  0.0000 in every format and tier
+(int8: worst among outputs more than one output step from the true value; the gate is |hw - t| <= max(tol |t|, one step).)
+
+SIENNA, every lane output of all 439 R2 points with a result (lane_worst.py over the merged results; 0 outputs over any bound):
+format  SELU (1%)   sigmoid (1%)       tanh (1%)          lower tiers
+fp32    0.2480%     0.2480%            0.4970%            -
+bf16    0.9430%     0.7750%            0.9600%            -
+int8    0.7710%     within one step    within one step    tanh 3.407% at 5%, 4.223% at 10% (gemm lane cases)
+
+
+5. CYCLES PER ELEMENT, ONE LANE, TIER 0 (GPNAE cycles points, R1), against the study's estimate
+---------------------------------------------------------------------------------------------------------------------
+lane           N(0,1)   U[-8,8]   far     estimate (N / U / far)
+fp32 SELU      12.82    12.82      7.07   13 / 13 / 13
+fp32 sigmoid   13.82    15.08     12.51   17 / 17 / 17
+fp32 tanh      12.82    12.82      7.07   15 / 15 / 15
+bf16 SELU       8.19     8.17      6.45    9 / 9 / 9
+bf16 sigmoid   11.84    14.55     26.63   11.9 / 14.5 / 26.1
+bf16 tanh       8.19     8.18      6.45   10 / 10 / 10
+int8 SELU       9.76     9.74      6.02   12 / 12 / 12
+int8 sigmoid   10.76    10.76      6.02   13 / 13 / 13
+int8 tanh      10.76    10.76      6.02   13 / 13 / 13
+Every value is at or below its estimate except bf16 sigmoid far (26.63 against 26.1) and U[-8,8] (14.55 against 14.5).
+Tiers 1 and 2: 7.2 to 10.8 cycles per element (bf16 sigmoid far 18.6 and 14.2). The published TYTAN lane: 747 cycles per tanh.
+In the pipeline (perf_final.log): the activation stage at N = 64, T = 2 takes 449 cycles a set in fp32, 301 in bf16 and 355 (SELU) /
+387 (tanh, sigmoid) in int8, against 670 / 1060 (fp32 SELU / tanh), 540 / 759 (bf16) and 329 / 367 (int8) on the base tree.

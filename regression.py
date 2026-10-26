@@ -2466,31 +2466,35 @@ RES_SEED = ("deep_cached", "deep_uncached", "relu6_conv_linear_add", "resnet_rel
 
 def residual_case(name: str, N: int, rng, min_wrong_steps: int = 2) -> tuple:
     """One int8 residual layer job (random codes, per-channel words and ADD scales; the ADD words from an AddRecord named after the layer), its
-    bit-exact output (a diagnostic) and the ADD outputs of two wrong ADDs (zp_1 taken as 0, no ADD) the stage gate must reject; the output
-    scale is halved until the zp_1 = 0 ADD lands min_wrong_steps or more output steps from the right one at some output (0: as drawn)."""
+    bit-exact output (a diagnostic) and the ADD outputs of two wrong ADDs (zp_1 taken as 0, no ADD) the stage gate must reject; the conv's zero
+    point zp_1 moves away from 0 until the zp_1 = 0 ADD lands min_wrong_steps or more output steps from the right one at some output (0: as drawn)."""
     M, K, C, conv_act, add_act, lane_act = RES_CASES[name](N)
     A_q = rng.randint(-128, 128, (M, K)).astype(np.int64)
     W_q = rng.randint(-127, 128, (K, C)).astype(np.int64)
     s_w = np.exp(rng.uniform(np.log(1e-3), np.log(2e-2), C))
     hw_bias = rng.randint(-2000, 2000, C).astype(np.int64)
     acc = wrap32(imatmul(A_q, W_q) + hw_bias[None, :])
-    rq = requant_params(acc, 0.02, s_w, "linear" if conv_act == "none" else "relu", np.random.RandomState(rng.randint(1 << 30)))
-    rq["amin"], rq["amax"] = ipu.activation_clamp(conv_act, rq["s_out"], rq["zp"])
-    q1 = requantize(acc, rq)
+    seed, conv = rng.randint(1 << 30), "linear" if conv_act == "none" else "relu"
+    rq = requant_params(acc, 0.02, s_w, conv, np.random.RandomState(seed))
     s2, z2 = rq["s_out"] * 2.0 ** rng.uniform(-3.0, 3.0), int(rng.randint(-100, 101))
     R_q = rng.randint(-128, 128, (M, C)).astype(np.int64)
-    y = rq["s_out"] * (q1 - rq["zp"]) + s2 * (R_q - z2)
-    _, s_out, z_out = quant_act(np.maximum(y, 0.0) if add_act == "relu" else y)
-    s_out *= 2.0 ** rng.uniform(-0.5, 0.5)
-    for _ in range(24):  # a finer output step until a gate can tell the zp_1 = 0 ADD from the right one (no rng draw, so other cases keep theirs)
+    widen = 2.0 ** rng.uniform(-0.5, 0.5)
+    zp0, away = int(rq["zp"]), (1 if rq["zp"] > 0 else -1)
+    for zp in [zp0] + [zp0 + away * k for k in range(1, 256) if -128 <= zp0 + away * k <= 127]:  # no rng draw here, so the draw stays as it was
+        if zp != zp0:  # the same words and scale, the conv's zero point moved: the same real outputs, so the ADD's scale and clamp barely move
+            rq = requant_params(acc, 0.02, s_w, conv, np.random.RandomState(seed), zq=(zp, *ipu.activation_clamp(conv_act, rq["s_out"], zp)))
+        rq["amin"], rq["amax"] = ipu.activation_clamp(conv_act, rq["s_out"], rq["zp"])
+        q1 = requantize(acc, rq)
+        y = rq["s_out"] * (q1 - rq["zp"]) + s2 * (R_q - z2)
+        _, s_out, z_out = quant_act(np.maximum(y, 0.0) if add_act == "relu" else y)
+        s_out *= widen
         lo, hi = ipu.activation_clamp(add_act, s_out, z_out)
         add = mr.add_record_words(mr.AddRecord(float(rq["s_out"]), int(rq["zp"]), float(s2), z2, float(s_out), int(z_out), int(lo), int(hi), name))
         right = mr.qadd_codes(q1, R_q, add)
         if min_wrong_steps <= 0 or int(np.max(np.abs(right - mr.qadd_codes(q1, R_q, dict(add, zp1=0))))) >= min_wrong_steps:
             break
-        s_out /= 2.0
     else:
-        raise ValueError(f"residual {name} N={N}: zp_1 = {rq['zp']}, no output scale puts the zp_1 = 0 ADD {min_wrong_steps} steps away")
+        raise ValueError(f"residual {name} N={N}: no conv zero point puts the zp_1 = 0 ADD {min_wrong_steps} steps away")
     ra = mr.add_lane_params(add, s_out, right)
     want = mr.int8_residual_exact(A_q, W_q, hw_bias, rq, R_q, add, ra, lane_act)
     wrong = (mr.qadd_codes(q1, R_q, dict(add, zp1=0)), q1)  # the ADD's outputs with zp_1 taken as the add set's 0, and with no ADD
@@ -4085,14 +4089,20 @@ def test_residual_add_discriminates():
 
 @selftest
 def test_residual_wrong_add_margin():
-    """Every residual case the regression runs draws a wrong ADD (zp_1 dropped) at least two output steps from the right one, so its ADD gate can reject it."""
+    """Every residual case the regression runs draws a wrong ADD (zp_1 dropped) two or more output steps from the right one, so its ADD gate can
+    reject it, and keeps at least 75% of its as-drawn share of ADD outputs inside the clamp."""
     sizes = sorted({SPEC.parse(p)["n"] for p in SPEC.points(False, ["int8"]) if p.endswith("/residual")})
     assert sizes == [8, 16, 32, 64], sizes
+    inside = lambda job, c: float(np.mean((c > job["add"]["amin"]) & (c < job["add"]["amax"])))
     for N in sizes:
         for name in RES_CASES:
-            job, _, wrong, q1, R_q = residual_case(name, N, np.random.RandomState(RES_SEED_BASE + RES_SEED.index(name)))
-            steps = int(np.max(np.abs(mr.qadd_codes(q1, R_q, job["add"]) - wrong[0])))
+            cases = [residual_case(name, N, np.random.RandomState(RES_SEED_BASE + RES_SEED.index(name)), min_wrong_steps=w) for w in (2, 0)]
+            (job, _, wrong, q1, R_q), (job0, _, _, q10, R_q0) = cases
+            right = mr.qadd_codes(q1, R_q, job["add"])
+            steps = int(np.max(np.abs(right - wrong[0])))
             assert steps >= 2 and residual_rejects(job, q1, R_q, wrong)[0], f"{name} N={N}: the wrong ADD is {steps} steps away"
+            share, share0 = inside(job, right), inside(job0, mr.qadd_codes(q10, R_q0, job0["add"]))
+            assert share >= 0.75 * share0, f"{name} N={N}: {share:.1%} of the ADD outputs inside the clamp, as drawn {share0:.1%}"
     for name, N in (("tiles", 32), ("deep_uncached", 64)):  # the unconstrained draw these two had: within one step, which the gate cannot tell
         job, _, wrong, q1, R_q = residual_case(name, N, np.random.RandomState(RES_SEED_BASE + RES_SEED.index(name)), min_wrong_steps=0)
         assert int(np.max(np.abs(mr.qadd_codes(q1, R_q, job["add"]) - wrong[0]))) <= 1, (name, N)

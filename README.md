@@ -1,14 +1,14 @@
 # SIENNA
 
-**A neural-network inference accelerator in SystemVerilog that runs real TensorFlow Lite models in fp32, bf16 and int8.**
+**A neural-network inference accelerator in SystemVerilog that runs real MLPerf Tiny models in fp32, bf16 and int8.**
 
-SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid or tanh on a bank of polynomial activation lanes, then pools and applies dropout. Every stage works on a different set of data at the same time. A Python host stack lowers TFLite models onto it, so a whole ResNet-8 inference runs on the hardware in simulation.
+SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid or tanh on a bank of polynomial activation lanes, then pools and applies dropout. Every stage works on a different set of data at the same time. A Python host stack lowers models onto it through framework-neutral layer records, with importers for TFLite, ONNX and PyTorch quantized layers, so a whole ResNet-8 inference runs on the hardware in simulation.
 
 | | |
 |---|---|
 | **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
 | **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
-| **within 1%** of the exact functions | SELU, sigmoid and tanh on every activation lane, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.96%, int8 0.77%) |
+| **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.96%, int8 SELU 0.77%; int8 sigmoid and tanh within one output step) |
 | **58× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 12.8 cycles for tanh on one fp32 lane) |
 | **up to 16× faster** on small layers | by packing many small matrix multiplies into one |
 
@@ -50,7 +50,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 ### Throughput while streaming sets
 
-Measured in Verilator simulation (`make perf-analysis`), 24 sets per run, with the activation applied to every set; the FLOPS count the matrix multiply only (2N³ per set). Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
+Measured in Verilator simulation (`make perf-analysis`), 24 sets per run, with the activation applied to every set; the FLOPS count the matrix multiply only (2N³ per set). Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8), then the time per set in µs at 950 MHz:
 
 | Activation | N = 16 (GFLOPS) | N = 32 (TFLOPS) | N = 64 (TFLOPS) |
 |---|---|---|---|
@@ -59,9 +59,16 @@ Measured in Verilator simulation (`make perf-analysis`), 24 sets per run, with t
 | sigmoid | 42 · 38 · 71 | 0.13 · 0.13 · 0.16 | 0.95 · 0.80 · 1.29 |
 | tanh | 45 · 86 · 71 | 0.14 · 0.21 · 0.16 | 1.11 · 1.66 · 1.29 |
 
-N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes. Larger tiles are limited by the mesh instead, which needs T² cycles a set: at N = 64 a ReLU set takes 256 cycles at T = 16 (1.95 TFLOPS) and 4 096 at T = 64 (0.12 TFLOPS). Every N and tile size is in `perf_final.log` of the project report.
+| Time per set (µs) | N = 16 | N = 32 | N = 64 |
+|---|---|---|---|
+| ReLU / linear, no pooling | 0.020 · 0.020 · 0.020 | 0.037 · 0.037 · 0.038 | 0.071 · 0.071 · 0.071 |
+| SELU | 0.183 · 0.096 · 0.106 | 0.473 · 0.317 · 0.374 | 0.473 · 0.317 · 0.374 |
+| sigmoid | 0.196 · 0.217 · 0.115 | 0.514 · 0.516 · 0.407 | 0.553 · 0.656 · 0.407 |
+| tanh | 0.183 · 0.096 · 0.115 | 0.473 · 0.317 · 0.407 | 0.473 · 0.317 · 0.407 |
 
-Against the tree before the restructure (main up to 9fa414e), at N = 32 and 64 the new activation lanes take 20% to 60% fewer cycles per set for SELU and tanh in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 takes 5% to 8% more (SELU 329 → 355, tanh 367 → 387). At N = 8 and 16 the picture is mixed: fp32 SELU and tanh take up to 34% fewer cycles (none fewer at T = 16), but sigmoid takes more, 14% more in fp32 at N = 8 and in bf16 4.7% more at N = 16 and 1.94 times as many at N = 8. The earlier sweeps did not measure sigmoid at N = 32 or 64.
+N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes. Larger tiles are limited by the mesh instead, which needs T² cycles a set: at N = 64 a ReLU set takes 256 cycles at T = 16 (0.27 µs, 1.95 TFLOPS) and, in bf16 and int8, 4 096 at T = 64 (4.3 µs, 0.12 TFLOPS); fp32 at T = 64 is still being measured. Every N and tile size is in `perf_final.log` of the project report.
+
+Against the tree before the restructure (main up to 9fa414e), at N = 32 and 64 the new activation lanes take 20% to 60% fewer cycles per set for SELU and tanh in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 takes 5% to 8% more (SELU 329 → 355, tanh 367 → 387). At N = 8 and 16: fp32 SELU and tanh take up to 34% fewer cycles (0% to 2% fewer at T = 16), bf16 SELU and tanh 42% to 52% fewer, and int8 up to 5.8% more. Sigmoid is slower there: 14% more in fp32 at N = 8, and in bf16 4.7% more at N = 16 and 1.94 times as many at N = 8. The earlier sweeps did not measure sigmoid at N = 32 or 64.
 
 ### MLPerf Tiny models
 
@@ -139,11 +146,12 @@ Read them as an indication of where the architecture stands.
 - `make regression` runs SIENNA's tests (the pipeline, the models, packed layers, the GEMM sweep and the int8 TFLite layers) at every size: N = 8, 16, 32 and 64, every tile size each N allows, in fp32, bf16 and int8, then prints one table of verdicts. SystolicMesh, GPNAE and ArithmeticLibrary each have their own `make regression` for their parts.
 - The pipeline regression runs 32 tests in fp32, 33 in bf16 and 50 in int8 (nine of them residual layers) at every tile size. They pass on 8 × 8 to 64 × 64 meshes at every tile size, in both mesh modes at N = 8 and 16 and built back to back at every N. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model and the true function in all three formats from 8 × 8 to 64 × 64 at every tile size, except the collapse-k 0 points listed below (SystolicMesh's `make regression`).
-- **The final sweep (2026-10-25/26, every N, tile size and format) has gaps but no open failure.** SIENNA passes 435 of its 447 points:
-  - The int8 `residual` points pass at every N and tile size. Each case builds a deliberately wrong ADD (its first zero point dropped) and requires the ADD gate to reject it. The test draws its scales so that this wrong ADD lands at least two output steps from the right answer: at N = 32 and 64 the first draws put it within one step, where no gate could tell them apart.
-  - Not completed: the four fp32 and bf16 `model-ck0` and `gemm-ck0` points at N = 64, T = 2. Their builds stopped after 6 to 10 hours, one of them on a full disk quota; the other three are not diagnosed (a full disk quota or the large-code link are the suspects).
-  - Not run: the eight collapse-k 0 points at N = 64 with T = 4 (every format) or T = 2 (int8). They need a machine with more than 256 GB of memory.
-  - SystolicMesh passes 116 of 123: its six collapse-k 0 points at N = 64, T = 2 and 4, were not run for the same reason, and `int8/N64_T16/mesh-ck0` did not complete (a full disk quota truncated a result file).
+- **The final sweep (2026-10-25/26, every N, tile size and format) is not complete.** SIENNA passes 435 of its 447 points; 4 did not complete and 8 were not run:
+  - The int8 `residual` points pass at every N and tile size. Each case builds a deliberately wrong ADD (its first zero point dropped) and requires the ADD gate to reject it. The test moves the conv's zero point away from 0, with the same scales, until that wrong ADD lands at least two output steps from the right answer: at N = 32 (`tiles`, -2 → -5) and 64 (`deep_uncached`, -3 → -8) the first draws put it within one step. Those two cases keep 84.9% and 100% of their ADD outputs inside the clamp (84.8% and 100% as drawn); every other case is unchanged.
+  - Not completed, and not diagnosed: `fp32/N64_T2/model-ck0`, `fp32/N64_T2/gemm-ck0` and `bf16/N64_T2/gemm-ck0`. Their builds stopped after 6 to 10 hours (peaks 443 GB and 262 GB). The suspects are a full disk quota and the large-code link, which then lacked `-Wl,--no-relax`; a link past 2 GB of code is still unproven.
+  - Not completed: `bf16/N64_T2/model-ck0`, on a full disk quota.
+  - Not run, by a cost ruling (not a memory limit): the eight collapse-k 0 points at N = 64 with T = 4 (fp32 and bf16 `model-ck0` and `gemm-ck0`) or T = 2 and 4 (int8 `gemm-ck0` and `tflite-ck0`). They were sized for 512 and 768 GB machines, which were ruled out for cost. Their memory was not measured; by the measured doubling for each halving of T, T = 4 would need about 200 GB in fp32, 110 GB in bf16 and 40 GB in int8, and int8 T = 2 about 90 GB (estimates).
+  - SystolicMesh passes 116 of 123. `int8/N64_T16/mesh-ck0` did not complete (a full disk quota truncated a result file). Its six collapse-k 0 points at N = 64, T = 2 and 4, were not run under the same cost ruling.
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
 - Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (for activations, the tolerance of the lane's tier: 1%, 5% or 10%), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it, not gated: 447 of the 198 656 layer outputs differ from it.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random, and with it held mid-stream until the host is blocked.
@@ -179,12 +187,12 @@ Activate the venv in the shell that runs make: some checks call `python3` direct
 How `make regression` works:
 - It is a list of *points*. A point is one check at one configuration, e.g. `bf16/N8_T2/pipeline` (the pipeline tests in bf16 at N = 8, tile size 2); the checks are `pipeline`, `model`, `pack`, `gemm`, `tflite` and `residual`. At every N the pipeline also runs as `pipeline-b2b` (built with `-DBACK_TO_BACK`, which adds the back-to-back pass to every test), and at N = 8 and 16 as `pipeline-ck0` (the collapse-k 0 mesh) and `pipeline-ck0-b2b` (both). `default/N8_T2/pipeline` builds fp32 with no define and must equal `fp32/N8_T2/pipeline`, and `<format>/N8_T2/pipeline-multi` runs two pipelines behind one host. `python3 regression.py --action points` lists them.
 - Each point is its own make target, so `make -j4 regression SMALL=1` runs four at a time, each simulating on a quarter of the cores; `make regression/bf16/N8_T2/pipeline` runs one alone.
-- Pick N in `make -jN` for your memory; a bare `make -j` starts every point at once. Measured, the largest process of one point peaks at about 0.8 GB at N = 8, 1.5 GB at N = 16, 3.4 GB at N = 32 and 13 to 18 GB at N = 64. The collapse-k 0 points (`-ck0`) need far more at small tiles: about 52 GB at N = 32, T = 2, and at N = 64 about 96 GB at T = 8 and 48 GB at T = 16 (T = 2 and 4 need more than 256 GB); each point also runs its C++ compiles side by side, which these peaks do not add up, so leave room beyond N times the peak. Measured on 8-core machines: every point one at a time on 16 GB machines (all of `SMALL=1`), and `make -j4 regression SMALL=1 FMT=int8` on one 128 GB machine; other `-jN` and memory combinations were not measured.
+- Pick N in `make -jN` for your memory; a bare `make -j` starts every point at once. Measured, the largest process of one point peaks at about 0.8 GB at N = 8, 1.5 GB at N = 16, 3.4 GB at N = 32 and 13 to 18 GB at N = 64. The collapse-k 0 points (`-ck0`) need far more at small tiles: about 52 GB at N = 32, T = 2, and at N = 64 about 96 GB at T = 8, 48 GB at T = 16 and 262 to 443 GB at T = 2 (bf16, fp32); T = 4 was not measured (about 200 GB in fp32 by estimate); each point also runs its C++ compiles side by side, which these peaks do not add up, so leave room beyond N times the peak. Measured on 8-core machines: every point one at a time on 16 GB machines (all of `SMALL=1`), and `make -j4 regression SMALL=1 FMT=int8` on one 128 GB machine; other `-jN` and memory combinations were not measured.
 - Each point builds in a private copy of the working tree (its files that git does not ignore) and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`. The pipeline point builds its testbench once for each group of tests that share a hardware configuration and runs the others on that build.
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
 - `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
 - The model points run the four MLPerf Tiny models in fp32 and bf16 from `models/` (or `MODEL_DIR=<dir>`); a model whose input file is absent is skipped by name and listed under the table ("Standalone machine" below).
-- Run time of `SMALL=1` (205 points), measured on 8-core machines on 2026-10-25: split by format and kind over 19 machines, each running `make -k -j8` over its points, the whole run took 84 minutes (its longest machine). At N = 32 and 64 (final sweep, 8- and 16-core machines, one point or a few per machine) the longest points were fp32/N64_T64/pipeline (19.4 hours alone), fp32/N64_T8/model-ck0 (9.5 hours) and int8/N64_T64/pipeline (9.6 hours); 88 of the 110 N = 32 points took under an hour, and the longest, fp32/N32_T2/model-ck0, 4.4 hours.
+- Run time of `SMALL=1` (205 points), measured on 2026-10-25: split by format and kind over 19 machines with 8 to 32 cores, each running `make -k -j8` over its points, the whole run took 84 minutes (its longest machine). At N = 32 and 64 (final sweep, one point or a few per machine) the longest points were fp32/N64_T64/model (22.4 hours, sharing an 8-core machine with two other points), fp32/N64_T64/pipeline (19.4 hours alone on a 32-core machine), fp32/N64_T64/pipeline-b2b (19.0 hours), bf16/N64_T64/model (14.6 hours) and bf16/N64_T64/pipeline and pipeline-b2b (13.5 hours each); 88 of the 110 N = 32 points took under an hour, and the longest, fp32/N32_T2/model-ck0, 4.4 hours.
 
 Two Python scripts drive everything:
 - **`regression.py`** proves the hardware right: stimulus, golden models and every check behind `make regression`.

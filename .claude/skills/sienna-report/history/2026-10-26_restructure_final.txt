@@ -8,9 +8,9 @@ Every figure below is MEASURED in Verilator 5.035 simulation unless it says othe
 1. WHAT THE RESTRUCTURE CHANGED (B = Phase 2 reference, tags phase2_B, to GitHub main)
 ---------------------------------------------------------------------------------------------------------------------
 repo                B          main now   commits  diff against B
-SIENNA              a81ff7e    649450b    112      63 files, +7136 -5540   (local, unpushed: 4ba233c, 59b8d6d, docs)
+SIENNA              a81ff7e    649450b    112      63 files, +7136 -5540   (local, unpushed: 4ba233c, 59b8d6d, e554074, 2b4a720, d657042, docs)
 GPNAE               edc7e6e    a439c6c     53      69 files, +6244 -39834
-SystolicMesh        c9d1941    ea85621     48      24 files, +895 -557     (local, unpushed: docs)
+SystolicMesh        c9d1941    ea85621     48      24 files, +895 -557     (local, unpushed: a6fa405, docs)
 ArithmeticLibrary   a6fe672    bc90a93     53      640 files, +6371 -107524
 
 Batch A (format package and one top)
@@ -30,7 +30,7 @@ Batch B (GPNAE's activation lane, design D)
     fault points.
   - Three accuracy tiers per function, gated at their own tolerance: tier 0 1%, tier 1 5%, tier 2 10%; each layer picks its tier.
   - Every lane output gated against numpy float64 (the true function) at its tier's tolerance; the bit-exact model is a diagnostic.
-  - Removed: the published Taylor lane (kept as tag gpnae_taylor_final), the old coefficient ROM, every Vivado file and target, dead
+  - Removed: the published Taylor lane (kept as tag gpnae_taylor_final), the old coefficient ROM, the FPGA-only benches and targets, dead
     benches and scripts (deletions authorized by Soham, 2026-10-24/25).
 VCS and standalone machine
   - SIM=vcs in every repo (targets, X/Z detection, === / !== compares on DUT data), never run here (no license, by ruling).
@@ -61,27 +61,40 @@ Trees: SIENNA 4ba233c, 59b8d6d and e554074 (three fix commits on 649450b, below)
 SIENNA SMALL=1 was rerun on 59b8d6d (205 of 205 PASS); no R1 SIENNA point is reused. SystolicMesh's 57 N = 8/16 points are R1's
 (its code did not change).
 
-                 points  PASS  FAIL (real cause)  not completed  not run (needs > 256 GB node, ruled out for cost)
+                 points  PASS  FAIL (real cause)  not completed  not run (512/768 GB nodes, ruled out for cost)
 SIENNA            447     435          0                 4                    8
-SystolicMesh      123     116          0                 1                    6
-(At the time of writing, SystolicMesh int8/N64_T16/mesh-ck0 is being rerun; see stage5-sweep-report.md for its final state.)
+SystolicMesh      123     117          0                 0                    6
+(SystolicMesh int8/N64_T16/mesh-ck0 failed on a full scratch quota and passed on its rerun, job 5960925.)
 
-Real failure, fixed (e554074): the 11 int8 residual points at N = 32 and 64 failed the test's own power check, "its gate cannot tell a
-  wrong ADD" (tiles at N = 32: zp_1 = -2, ratio 0.211; deep_uncached at N = 64: zp_1 = -3, ratio 0.134), with every stage gate passing and
-  0 outputs off the bit-exact model. The wrong ADD (zp_1 taken as 0) landed within one output step of the right one, which the decimal
-  rule accepts. Soham's ruling (a): the stimulus halves a case's output scale, with no further random draw, until that wrong ADD lands two
-  or more steps away; the check and the rule are unchanged, and only those two cases' stimulus changes. test_residual_wrong_add_margin
-  (failed before: tiles N = 32, 1 step) checks every case at every N. Rerun on e554074: all 18 int8 residual points PASS (N = 8 to 64, every
-  tile size; 144 of 144 cases 'the ADD gate rejects zp_1 = 0: True'; jobs 5961653-5961656), selftest 88 of 88 (job 5961651).
-Not completed: SIENNA fp32 and bf16 model-ck0 / gemm-ck0 at N64_T2 (builds stopped after 6 to 10 h on 768 GB nodes; bf16 model-ck0 on
-  a full scratch quota, the other three not diagnosed: the scratch quota or the large-code link, whose flags lack -Wl,--no-relax); SystolicMesh int8/N64_T16/mesh-ck0 (truth dump truncated by the quota).
-Not run: SIENNA {fp32, bf16} {model, gemm}-ck0 at N64_T4, int8 {gemm, tflite}-ck0 at N64_T2 and T4; SystolicMesh mesh-ck0 at N64_T2
+Real failure, fixed (e554074, then 2b4a720): the 11 int8 residual points at N = 32 and 64 failed the test's own power check, "its gate
+  cannot tell a wrong ADD" (tiles at N = 32: zp_1 = -2, ratio 0.211; deep_uncached at N = 64: zp_1 = -3, ratio 0.134), with every stage gate
+  passing and 0 outputs off the bit-exact model. The wrong ADD (zp_1 taken as 0) landed within one output step of the right one, which the
+  decimal rule accepts. Soham's ruling (a): constrain the stimulus; the check and the rule stay as they are.
+  - e554074 halved the ADD's output scale until the wrong ADD was two steps away. The final review found that this saturated most outputs:
+    25.3% (tiles) and 33.4% (deep_uncached) inside the clamp, against 84.8% and 100% as drawn. Re-centering the output zero point cannot
+    recover it (best over every zero point, measured: 25.3% and 33.5%), because a quartered step cannot cover the same real range.
+  - 2b4a720 moves the conv's zero point away from 0 instead (tiles -2 -> -5, deep_uncached -3 -> -8), with the same words and scales, so the
+    real outputs and the ADD's scale stay as drawn: 84.9% and 100% of the ADD outputs inside the clamp, the conv's own codes 40.3% and 30.4%
+    (as drawn 40.2% and 30.4%), the wrong ADD 2 steps away and rejected. No random draw changes; every other case at every N is as drawn.
+  - test_residual_wrong_add_margin (selftest) checks every case at every N the regression lists: the margin (2 steps or more, the gate
+    rejects it) and at least 75% of the as-drawn in-clamp share (failed on e554074: tiles N = 32, 25.3% against 84.8%).
+  - Rerun on 7422e87 (2b4a720 and the --no-relax link): all 18 int8 residual points PASS (N = 8 to 64, every tile size; 144 of 144 cases 'the ADD gate
+    rejects zp_1 = 0: True'; jobs 5963277-5963280); selftest 88 of 88 (job 5963276).
+Not completed: SIENNA fp32 and bf16 model-ck0 / gemm-ck0 at N64_T2 (builds stopped after 6 to 10 h on 768 GB nodes, peaks 443 GB
+  fp32 and 262 GB bf16; bf16 model-ck0 on a full scratch quota, the other three not diagnosed: the scratch quota, or the large-code link,
+  which then lacked -Wl,--no-relax). Link check since (d657042, with --no-relax): fp32 gemm-ck0 at N64_T8 built in 6169 s (peak 96 GB) to
+  a 1.42 GB binary (.text 1.10 GB) and passed its GEMM sweep; int8 at N64_T8 0.57 GB (.text 0.35 GB), passed. No binary built in this
+  sweep passed 2 GB, so a link past 2 GB of code is still unproven (only N64_T2 and T4 would need it; they did not complete or were not run).
+Not run (sized for 512/768 GB nodes, which Soham ruled out for cost; memory at T = 4 not measured, about 200 / 110 / 40 GB in
+  fp32 / bf16 / int8 by the measured doubling per halving of T, an estimate): SIENNA {fp32, bf16} {model, gemm}-ck0 at N64_T4, int8 {gemm, tflite}-ck0 at N64_T2 and T4; SystolicMesh mesh-ck0 at N64_T2
   and T4 in every format.
 
 Fix commits (SIENNA, local, unpushed, each test first):
   4ba233c  collapse-k 0 points at N = 64 build with the large code model (LARGE_CODE=1 in the Makefile, set by regression.py);
+  d657042  (and SystolicMesh a6fa405) LARGE_CODE also links with -Wl,--no-relax, which 4ba233c left out;
            test_large_code failed before.
-  e554074  residual stimulus: the output scale halved until the zp_1 = 0 ADD is two or more output steps away (above).
+  e554074  residual stimulus: the output scale halved until the zp_1 = 0 ADD is two or more output steps away (superseded).
+  2b4a720  residual stimulus: the conv's zero point moved instead, keeping the as-drawn in-clamp share (above).
   59b8d6d  TB_sienna's output hold lasts SETS_IN_FLIGHT + 2 sets at the slower of the host's put and the mesh's set interval
            max(T+2, K, T^2). int8/N64_T32 pipeline and pipeline-b2b failed "the host was not blocked when the hold ended"
            (1156-cycle hold against a 1024-cycle mesh interval); with the 17408-cycle hold the entry fills and the test passes.
@@ -103,7 +116,7 @@ int8 tanh     within one step      3.7262 / 3.7277      4.9365 / 4.9515
 ReLU, linear  0.0000 in every format and tier
 (int8: worst among outputs more than one output step from the true value; the gate is |hw - t| <= max(tol |t|, one step).)
 
-SIENNA, every lane output of all 439 R2 points with a result (lane_worst.py over the merged results; 0 outputs over any bound):
+SIENNA, every lane output of the 435 passing R2 points (lane_worst.py over the merged results; 0 outputs over any bound):
 format  SELU (1%)   sigmoid (1%)       tanh (1%)          lower tiers
 fp32    0.2480%     0.2480%            0.4970%            -
 bf16    0.9430%     0.7750%            0.9600%            -

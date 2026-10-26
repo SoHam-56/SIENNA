@@ -12,8 +12,9 @@ References: B = the Phase 2 reference tree. Its measured cycles are runs rs2_per
             B has no perf run at N = 32 or 64.
             base = main up to 9fa414e: runs rs2_base_perf_* at N = 8 and 16, every tile size; at N = 32 (T = 4) and N = 64 (T = 2, 4, 8) the
             cycles recorded in report_refresh.log and n64_sweep.log (ReLU, SELU and tanh only; sigmoid was not in those sweeps).
-            '-' = no record for that config at that N and T.
-Missing: fp32 N64 T64: its perf job had not finished when this log was written, so it is not measured here.
+            '-' = no record for that config at that N and T. The reference runs' rows were saved on 2026-10-25 (r2_perf_refs.json);
+            the runs themselves have since been removed from sienna_cr.
+Missing: none
 
 --- fp32 --------------------------------------------------------------------------------------------------------------
   N   T config              cps    lat   us/set  FLOPs/set  TFLOPS  %peak |   B cps base cps  new/B new/base
@@ -85,10 +86,10 @@ Missing: fp32 N64 T64: its perf job had not finished when this log was written, 
  64  32 SELU             1024.0   1707    1.078     524288   0.486   6.2% |       -        -      -        -
  64  32 sigmoid          1024.0   1785    1.078     524288   0.486   6.2% |       -        -      -        -
  64  32 tanh             1024.0   1707    1.078     524288   0.486   6.2% |       -        -      -        -
- 64  64 ReLU, no pool  not measured (job not finished)
- 64  64 SELU           not measured (job not finished)
- 64  64 sigmoid        not measured (job not finished)
- 64  64 tanh           not measured (job not finished)
+ 64  64 ReLU, no pool    4096.0   4455    4.312     524288   0.122   1.6% |       -        -      -        -
+ 64  64 SELU             4096.0   4875    4.312     524288   0.122   1.6% |       -        -      -        -
+ 64  64 sigmoid          4096.0   4953    4.312     524288   0.122   1.6% |       -        -      -        -
+ 64  64 tanh             4096.0   4875    4.312     524288   0.122   1.6% |       -        -      -        -
 
 --- bf16 --------------------------------------------------------------------------------------------------------------
   N   T config              cps    lat   us/set  FLOPs/set  TFLOPS  %peak |   B cps base cps  new/B new/base

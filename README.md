@@ -61,7 +61,7 @@ Measured in Verilator simulation (`make perf-analysis`), 24 sets per run, with t
 
 N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes. Larger tiles are limited by the mesh instead, which needs T² cycles a set: at N = 64 a ReLU set takes 256 cycles at T = 16 (1.95 TFLOPS) and 4 096 at T = 64 (0.12 TFLOPS). Every N and tile size is in `perf_final.log` of the project report.
 
-Against the tree before the restructure (main up to 9fa414e), the new activation lanes take 20% to 60% fewer cycles per set in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 takes 2% to 8% more (N = 64: SELU 329 → 355, tanh 367 → 387 cycles).
+Against the tree before the restructure (main up to 9fa414e), at N = 32 and 64 the new activation lanes take 20% to 60% fewer cycles per set for SELU and tanh in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 takes 5% to 8% more (SELU 329 → 355, tanh 367 → 387). At N = 8 and 16 the picture is mixed: fp32 SELU and tanh take up to 34% fewer cycles (none fewer at T = 16), but sigmoid takes more, 14% more in fp32 at N = 8 and in bf16 4.7% more at N = 16 and 1.94 times as many at N = 8. The earlier sweeps did not measure sigmoid at N = 32 or 64.
 
 ### MLPerf Tiny models
 

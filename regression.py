@@ -2459,13 +2459,15 @@ RES_CASES = {  # name: N -> (rows M, depth K, columns C, conv clamp, ADD's fused
     "shallow_cached": lambda N: (2 * N, N - 3, N, "none", "relu", "relu"),  # dt 1, rt 2: the hold set is the first pass and the bias pass, cached
     "shallow_uncached": lambda N: (N, N - 1, N, "relu6", "none", "sigmoid"),  # dt 1, rt 1: uncached, a lane after the ADD
 }
+RES_SEED_BASE = 5  # --seed's default: case k draws from RandomState(RES_SEED_BASE + RES_SEED.index(k))
 RES_SEED = ("deep_cached", "deep_uncached", "relu6_conv_linear_add", "resnet_relu", "tanh_after_add", "tiles", "shallow_cached",
             "shallow_uncached")  # seed offsets: the first six sorted, as they were, then each later case appended
 
 
-def residual_case(name: str, N: int, rng) -> tuple:
+def residual_case(name: str, N: int, rng, min_wrong_steps: int = 2) -> tuple:
     """One int8 residual layer job (random codes, per-channel words and ADD scales; the ADD words from an AddRecord named after the layer), its
-    bit-exact output (a diagnostic) and the ADD outputs of two wrong ADDs (zp_1 taken as 0, no ADD) the stage gate must reject."""
+    bit-exact output (a diagnostic) and the ADD outputs of two wrong ADDs (zp_1 taken as 0, no ADD) the stage gate must reject; the output
+    scale is halved until the zp_1 = 0 ADD lands min_wrong_steps or more output steps from the right one at some output (0: as drawn)."""
     M, K, C, conv_act, add_act, lane_act = RES_CASES[name](N)
     A_q = rng.randint(-128, 128, (M, K)).astype(np.int64)
     W_q = rng.randint(-127, 128, (K, C)).astype(np.int64)
@@ -2480,9 +2482,16 @@ def residual_case(name: str, N: int, rng) -> tuple:
     y = rq["s_out"] * (q1 - rq["zp"]) + s2 * (R_q - z2)
     _, s_out, z_out = quant_act(np.maximum(y, 0.0) if add_act == "relu" else y)
     s_out *= 2.0 ** rng.uniform(-0.5, 0.5)
-    lo, hi = ipu.activation_clamp(add_act, s_out, z_out)
-    add = mr.add_record_words(mr.AddRecord(float(rq["s_out"]), int(rq["zp"]), float(s2), z2, float(s_out), int(z_out), int(lo), int(hi), name))
-    ra = mr.add_lane_params(add, s_out, mr.qadd_codes(q1, R_q, add))
+    for _ in range(24):  # a finer output step until a gate can tell the zp_1 = 0 ADD from the right one (no rng draw, so other cases keep theirs)
+        lo, hi = ipu.activation_clamp(add_act, s_out, z_out)
+        add = mr.add_record_words(mr.AddRecord(float(rq["s_out"]), int(rq["zp"]), float(s2), z2, float(s_out), int(z_out), int(lo), int(hi), name))
+        right = mr.qadd_codes(q1, R_q, add)
+        if min_wrong_steps <= 0 or int(np.max(np.abs(right - mr.qadd_codes(q1, R_q, dict(add, zp1=0))))) >= min_wrong_steps:
+            break
+        s_out /= 2.0
+    else:
+        raise ValueError(f"residual {name} N={N}: zp_1 = {rq['zp']}, no output scale puts the zp_1 = 0 ADD {min_wrong_steps} steps away")
+    ra = mr.add_lane_params(add, s_out, right)
     want = mr.int8_residual_exact(A_q, W_q, hw_bias, rq, R_q, add, ra, lane_act)
     wrong = (mr.qadd_codes(q1, R_q, dict(add, zp1=0)), q1)  # the ADD's outputs with zp_1 taken as the add set's 0, and with no ADD
     req = dict(rq, mx=ra["mx"], shx=ra["shx"], mout=ra["mout"], shout=ra["shout"], zout=ra["zout"])  # Q: the conv's zp and clamp, the lane's words
@@ -2720,7 +2729,7 @@ def residual_main(argv=None) -> None:
     ap.add_argument("--tflite", action="store_true")
     ap.add_argument("--mid-reset", action="store_true")
     ap.add_argument("--collapse-k", type=int, choices=[0, 1], default=1, help="the mesh's COLLAPSE_K the layer engine builds")
-    ap.add_argument("--seed", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=RES_SEED_BASE)
     ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "residual"))
     a = ap.parse_args(argv)
     if a.mid_reset and "tiles" not in a.cases:
@@ -4072,6 +4081,21 @@ def test_residual_add_discriminates():
                 d = float(np.mean(np.asarray(v) != F))
                 assert d >= 0.10, f"{name}: an add set ({act}) differs from '{k}' in {d:.0%} of its outputs, under 10%"
             prev = q1
+
+
+@selftest
+def test_residual_wrong_add_margin():
+    """Every residual case the regression runs draws a wrong ADD (zp_1 dropped) at least two output steps from the right one, so its ADD gate can reject it."""
+    sizes = sorted({SPEC.parse(p)["n"] for p in SPEC.points(False, ["int8"]) if p.endswith("/residual")})
+    assert sizes == [8, 16, 32, 64], sizes
+    for N in sizes:
+        for name in RES_CASES:
+            job, _, wrong, q1, R_q = residual_case(name, N, np.random.RandomState(RES_SEED_BASE + RES_SEED.index(name)))
+            steps = int(np.max(np.abs(mr.qadd_codes(q1, R_q, job["add"]) - wrong[0])))
+            assert steps >= 2 and residual_rejects(job, q1, R_q, wrong)[0], f"{name} N={N}: the wrong ADD is {steps} steps away"
+    for name, N in (("tiles", 32), ("deep_uncached", 64)):  # the unconstrained draw these two had: within one step, which the gate cannot tell
+        job, _, wrong, q1, R_q = residual_case(name, N, np.random.RandomState(RES_SEED_BASE + RES_SEED.index(name)), min_wrong_steps=0)
+        assert int(np.max(np.abs(mr.qadd_codes(q1, R_q, job["add"]) - wrong[0]))) <= 1, (name, N)
 
 
 @selftest

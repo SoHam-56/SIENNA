@@ -57,31 +57,31 @@ Also passed: SIENNA lint matrix 69 checks; mutants GPNAE 18 of 18, SIENNA 10 of 
 
 3. R2: THE FULL SWEEP, N = 8 TO 64, EVERY TILE SIZE, THREE FORMATS (2026-10-25/26)
 ---------------------------------------------------------------------------------------------------------------------
-Trees: SIENNA 4ba233c and 59b8d6d (two fix commits on 649450b, below), SystolicMesh ea85621 (standalone clone).
+Trees: SIENNA 4ba233c, 59b8d6d and e554074 (three fix commits on 649450b, below), SystolicMesh ea85621 (standalone clone).
 SIENNA SMALL=1 was rerun on 59b8d6d (205 of 205 PASS); no R1 SIENNA point is reused. SystolicMesh's 57 N = 8/16 points are R1's
 (its code did not change).
 
                  points  PASS  FAIL (real cause)  not completed  not run (needs > 256 GB node, ruled out for cost)
-SIENNA            447     424         11                 4                    8
+SIENNA            447     435          0                 4                    8
 SystolicMesh      123     116          0                 1                    6
 (At the time of writing, SystolicMesh int8/N64_T16/mesh-ck0 is being rerun; see stage5-sweep-report.md for its final state.)
 
-Real failure, open:
-  int8/N32_T{2,4,8,16,32}/residual and int8/N64_T{2,4,8,16,32,64}/residual: "RESIDUAL: FAIL tiles (its gate cannot tell a wrong ADD)"
-  at N = 32 and "... deep_uncached ..." at N = 64. Every stage gate in these points passes (requantize, identity, hold_mem, ADD,
-  activation) and 0 outputs differ from the bit-exact model. The failing line is the test's own power check: the deliberately wrong
-  ADD (zp_1 taken as 0) must fail the ADD gate. In the drawn case zp_1 x s_1/s_out is under one output step (N = 32 tiles: zp_1 = -2,
-  ratio 0.211; N = 64 deep_uncached: zp_1 = -3, ratio 0.134), so the wrong ADD moves outputs by at most 1 code and passes the decimal
-  rule. Testbench stimulus cause, not RTL. N = 8 and 16 draw other values and pass. Fix not made: it needs Soham's choice of stimulus
-  constraint or power-check precondition.
+Real failure, fixed (e554074): the 11 int8 residual points at N = 32 and 64 failed the test's own power check, "its gate cannot tell a
+  wrong ADD" (tiles at N = 32: zp_1 = -2, ratio 0.211; deep_uncached at N = 64: zp_1 = -3, ratio 0.134), with every stage gate passing and
+  0 outputs off the bit-exact model. The wrong ADD (zp_1 taken as 0) landed within one output step of the right one, which the decimal
+  rule accepts. Soham's ruling (a): the stimulus halves a case's output scale, with no further random draw, until that wrong ADD lands two
+  or more steps away; the check and the rule are unchanged, and only those two cases' stimulus changes. test_residual_wrong_add_margin
+  (failed before: tiles N = 32, 1 step) checks every case at every N. Rerun on e554074: all 18 int8 residual points PASS (N = 8 to 64, every
+  tile size; 144 of 144 cases 'the ADD gate rejects zp_1 = 0: True'; jobs 5961653-5961656), selftest 88 of 88 (job 5961651).
 Not completed: SIENNA fp32 and bf16 model-ck0 / gemm-ck0 at N64_T2 (builds stopped after 6 to 10 h on 768 GB nodes; bf16 model-ck0 on
-  a full scratch quota, the other three not diagnosed); SystolicMesh int8/N64_T16/mesh-ck0 (truth dump truncated by the quota).
+  a full scratch quota, the other three not diagnosed: the scratch quota or the large-code link, whose flags lack -Wl,--no-relax); SystolicMesh int8/N64_T16/mesh-ck0 (truth dump truncated by the quota).
 Not run: SIENNA {fp32, bf16} {model, gemm}-ck0 at N64_T4, int8 {gemm, tflite}-ck0 at N64_T2 and T4; SystolicMesh mesh-ck0 at N64_T2
   and T4 in every format.
 
 Fix commits (SIENNA, local, unpushed, each test first):
   4ba233c  collapse-k 0 points at N = 64 build with the large code model (LARGE_CODE=1 in the Makefile, set by regression.py);
            test_large_code failed before.
+  e554074  residual stimulus: the output scale halved until the zp_1 = 0 ADD is two or more output steps away (above).
   59b8d6d  TB_sienna's output hold lasts SETS_IN_FLIGHT + 2 sets at the slower of the host's put and the mesh's set interval
            max(T+2, K, T^2). int8/N64_T32 pipeline and pipeline-b2b failed "the host was not blocked when the hold ended"
            (1156-cycle hold against a 1024-cycle mesh interval); with the 17408-cycle hold the entry fills and the test passes.

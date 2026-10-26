@@ -4505,7 +4505,7 @@ def test_large_code():
         assert "LARGE_CODE" not in SPEC.env(n, {}) and not any("LARGE_CODE" in a for a in SPEC.argv(n, type("O", (), {"model_dir": "/m"})())), n
     run = lambda env: subprocess.run(["make", "-s", "-n", "verilator", "GEN_PKG=0"], cwd=ROOT, env=env, capture_output=True, text=True).stdout
     on, off = run(dict(MAKE_ENV, LARGE_CODE="1")), run(MAKE_ENV)  # the point's environment reaches the build, as model_runner's make inherits it
-    assert all(f in on for f in ("-CFLAGS -mcmodel=large", "-CFLAGS -fno-pie", "-LDFLAGS -no-pie")) and "mcmodel" not in off, (on[-400:], off[-400:])
+    assert all(f in on for f in ("-CFLAGS -mcmodel=large", "-CFLAGS -fno-pie", "-LDFLAGS -no-pie", "-LDFLAGS -Wl,--no-relax")) and "mcmodel" not in off, (on[-400:], off[-400:])
 
 
 @selftest

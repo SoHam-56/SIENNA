@@ -257,10 +257,10 @@ VERILATOR_FLAGS += $(FMT_DEF)
 
 # Hook for one-off defines, e.g. make verilator EXTRA_FLAGS=-DBACK_TO_BACK; SIM_ARGS go to the simulator (e.g. +verilator+rand+reset+2)
 VERILATOR_FLAGS += $(EXTRA_FLAGS)
-# LARGE_CODE=1: the large code model, for a binary past 2 GB (collapse-k 0 at N = 64: regression.py sets it there).
+# LARGE_CODE=1: the large code model, for a binary past 2 GB (collapse-k 0 at N = 64: regression.py sets it there); --no-relax as ld cannot relax GOTPCREL past 2 GB.
 LARGE_CODE ?= 0
 ifeq ($(LARGE_CODE),1)
-VERILATOR_FLAGS += -CFLAGS -mcmodel=large -CFLAGS -fno-pie -LDFLAGS -no-pie
+VERILATOR_FLAGS += -CFLAGS -mcmodel=large -CFLAGS -fno-pie -LDFLAGS -no-pie -LDFLAGS -Wl,--no-relax
 endif
 ifneq ($(LINK_STAGES),0)
 VERILATOR_FLAGS += -GLINK_STAGES=$(LINK_STAGES)

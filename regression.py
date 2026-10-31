@@ -5464,20 +5464,20 @@ def test_rtl_lat():
 
 @perf_selftest
 def test_lane_stage_int8():
-    with perf_fmt("int8"):  # no tail path, so the stage is data-free; rs3_b2_perf_int8_n8/n16 measured each 2 below, as Batch A's model and sim differ
+    with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4)
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
-        assert stage("selu", 16) == 101 and stage("tanh", 16) == 109 and stage("sigmoid", 16) == 109
-        assert stage("selu", 8) == 56 and stage("tanh", 8) == 55 and stage("sigmoid", 8) == 55
+        assert stage("selu", 16) == 93 and stage("tanh", 16) == 93 and stage("sigmoid", 16) == 93
+        assert stage("selu", 8) == 52 and stage("tanh", 8) == 47 and stage("sigmoid", 8) == 47
 
 
 @perf_selftest
 def test_lane_group_float():
     with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
         assert pa.lane_cycles([0.0] * 8, "selu", 12) == 88 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 64
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 184 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 253
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 142 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 253  # sigmoid: F2's 5 rounds
     with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
         assert pa.lane_cycles([0.0] * 8, "selu", 12) == 71 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 233
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 204 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 204
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 170 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 170  # F1's 34-cycle shorter tail
 
 
 @perf_selftest
@@ -5485,7 +5485,7 @@ def test_lane_kinds():
     K = gpnae_model
     with perf_fmt("fp32"):  # tier 0: below -6 the negative sigmoid is 2^-n P(f) on the MAC (no tail in fp32), above 0 P itself
         k, r = pa.lane_kinds([-8.0, -3.0, 0.5, 5.0], "sigmoid")
-        assert k == [K.K_EXP, K.K_REFL, K.K_PASS, K.K_PASS] and r == [5, 8, 8, 8], (k, r)
+        assert k == [K.K_EXP, K.K_REFL, K.K_PASS, K.K_PASS] and r == [5, 5, 5, 5], (k, r)  # F2's pieces are degree 4, as the 2^-n P(f) set
     with perf_fmt("bf16"):  # tier 0: below -1.5 the negative sigmoid goes to the fp32 tail
         k, r = pa.lane_kinds([-3.0, -1.0, 0.5, 5.0], "sigmoid")
         assert k == [K.K_TAIL, K.K_PASS, K.K_PASS, K.K_PASS] and r == [1, 4, 5, 5], (k, r)
@@ -5494,7 +5494,7 @@ def test_lane_kinds():
 @perf_selftest
 def test_tail_ops_bf16():
     with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 5 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
-        assert [pa.tail_ops(t) for t in range(3)] == [10 + 5 * 17 + 14 + 2 * 27 + 10, 10 + 3 * 17 + 14 + 27 + 10, 10 + 3 * 17 + 14 + 10] == [173, 112, 85]
+        assert [pa.tail_ops(t) for t in range(3)] == [10 + 3 * 17 + 14 + 2 * 27 + 10, 10 + 3 * 17 + 14 + 27 + 10, 10 + 3 * 17 + 14 + 10] == [139, 112, 85]  # F1: tier 0 degree 2
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──

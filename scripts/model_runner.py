@@ -1396,6 +1396,27 @@ def layer_stage_gates(job, Y, stages, N) -> list:
     return out
 
 
+BUILD_ERR = re.compile(r"%Error|\berror\b|\*\*\*|Killed|terminated|relocation truncated|No space left|Disk quota", re.I)  # Verilator, g++, ld, make, the OOM killer, a full disk
+
+
+def build_failed(r, name, binary):
+    """A failed make: writes its whole output beside the binary, prints its error lines (wherever they fall), its last lines and that path, and raises."""
+    log = binary + "_build.log"
+    out = r.stdout + r.stderr
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "w") as fh:
+            fh.write(r.stdout + r.stderr)
+    except OSError as e:  # a full disk is itself a cause: say so, and still print the lines
+        log = f"{log} (not written: {e})"
+    lines = [x.rstrip() for x in out.splitlines() if x.strip()]
+    hits = [x for x in lines if BUILD_ERR.search(x)]
+    hits = hits if len(hits) <= 16 else hits[:8] + [f"... {len(hits) - 16} more error lines ..."] + hits[-8:]
+    sys.stdout.write("\n".join([f"-- {name} build failed (make exited {r.returncode}); error lines:", *(x[:300] for x in hits),
+                                 "-- its last lines:", *(x[:300] for x in lines[-12:]), f"-- whole build output: {log}"]) + "\n")
+    raise RuntimeError(f"{name} build failed (whole output: {log})")
+
+
 class RtlLayer:
     """TB_sienna (layer): one layer per run; software writes the configuration and the streams, then reads the results."""
 
@@ -1418,8 +1439,7 @@ class RtlLayer:
                   f"{next((l for l in (r.stdout + r.stderr).splitlines() if 'Internal Error' in l), '').strip()}", flush=True)
             r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
-            sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_sienna (layer) build failed")
+            build_failed(r, "TB_sienna (layer)", self.bin)
 
     def run_job(self, job, tag, plusargs=()):
         """One job as one layer -> (outputs, sets, cycles): refuses what the RTL cannot run, writes the layer file, runs TB_sienna (layer) (with plusargs
@@ -1562,8 +1582,7 @@ class RtlSets:
                             "GEN_PKG=0"],  # the package write_build_pkg just wrote, which is fp32
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(self.bin):
-            sys.stdout.write(r.stdout[-4000:] + r.stderr[-4000:])
-            raise RuntimeError("TB_sienna (sets) build failed")
+            build_failed(r, "TB_sienna (sets)", self.bin)
 
     def run(self, groups, act, tag, tier=0, coef=None, busy=False):
         """groups' sets through TB_sienna (sets) at the lanes' tier, after loading the coefficient image coef (a gpnae_model.Mem) when given;

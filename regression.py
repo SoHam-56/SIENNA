@@ -5821,6 +5821,39 @@ def test_build_retry():
 
 
 @selftest
+def test_build_failure_keeps_its_error():
+    """A failed TB_sienna build prints its error lines wherever they fall in the output (a link error behind 10 kB of g++ lines), its last lines
+    and the path of its whole output, which is kept beside the binary; RtlSets builds the same way."""
+    real_run, real_exists, real_pkg = mr.subprocess.run, mr.os.path.exists, mr.write_build_pkg
+    noise = "g++ -Os -c VTB_sienna_layer__ALL.cpp\n" * 400
+    link = subprocess.CompletedProcess([], 2, noise + "make[1]: Leaving directory\n",
+                                       "x.o: relocation truncated to fit: R_X86_64_REX_GOTPCRELX against `.bss'\ncollect2: error: ld returned 1 exit status\n"
+                                       + "make[1]: *** [VTB_sienna_layer.mk:72: TB_sienna_layer_sim] Error 1\n" + "ld: warning: noise\n" * 300)
+    tmp = tempfile.mkdtemp()
+    try:
+        mr.write_build_pkg = lambda *a: None
+        mr.os.path.exists = lambda p: False
+        mr.subprocess.run = lambda *a, **k: link
+        for sim in (mr.RtlLayer(8, 32, tmp, "fp32", 2), mr.RtlSets(8, 32, tmp, tile_size=2)):
+            sim.bin = os.path.join(tmp, os.path.basename(sim.bin))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    sim.build()
+                    raise AssertionError("a failed build passed")
+                except RuntimeError as e:
+                    msg = str(e)
+            out, log = buf.getvalue(), sim.bin + "_build.log"
+            assert "relocation truncated to fit" in out and "collect2: error: ld returned 1" in out and "Error 1" in out, out[-600:]
+            assert log in out and log in msg and len(out) < 6000, (log, msg, len(out))
+            whole = open(log).read()
+            assert whole.startswith(noise) and "relocation truncated" in whole and whole.endswith("ld: warning: noise\n"), len(whole)
+    finally:
+        mr.subprocess.run, mr.os.path.exists, mr.write_build_pkg = real_run, real_exists, real_pkg
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@selftest
 def test_pack_float_reference():
     """float_layer_over passes a layer whose int32 bias folds the input zero point (fold_bias) and fails one that drops the fold, a bug the host,
     the golden and the per-stage requantize gate would share; ReLU's reference clamps at 0."""

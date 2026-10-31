@@ -1669,6 +1669,9 @@ def _parse_log(raw: str, test: str = "-") -> dict:
         cyc = ex(rf"asserted @ \d+\s+\(({D}) cycles\)", "cycle count")
     except fourstate.Unknown as e:
         return {"status": "FAIL", "total": 0, "exact": 0, "tol": 0, "failed": 1, "cyc": 0, "fired": fourstate.fail_line(e)}
+    if not re.search(r"COEF IMAGE : checks [1-9]\d*\s+differ \d+", raw):  # the lanes' coefficient-image check must have run
+        return {"status": "FAIL", "total": tot, "exact": exact, "tol": tol, "failed": max(fail, 1), "cyc": cyc,
+                "fired": f"FAIL: no coefficient-image check in test {test}"}
     return {
         "status": "PASS" if fail == 0 and tot > 0 else "FAIL",
         "total": tot,
@@ -5007,6 +5010,7 @@ def test_formats_match_fmt_mk():
 LOG_CLEAN = """  Total     : 512
   Exact     : 512
   Tol pass  : 0
+ COEF IMAGE : checks 2  differ 0
   Failed    : 0
 pipeline_complete_o asserted @ 3165000  (311 cycles)
 RESULT: PASSED
@@ -5038,6 +5042,22 @@ def test_assertion_without_error_prefix_fails():
 def test_error_line_fails():
     r = reg._parse_log(LOG_CLEAN + "%Error: TB_sienna.sv:12: some runtime error\n")
     assert r["status"] == "ASSERT", r
+
+
+@selftest
+def test_coef_image_check_required():
+    """A pipeline log without the coefficient-image check's line, or with no check run, fails; the check's own difference fails through Failed."""
+    r = reg._parse_log(LOG_CLEAN.replace(" COEF IMAGE : checks 2  differ 0\n", ""), "mm")
+    assert r["status"] == "FAIL" and r["fired"] == "FAIL: no coefficient-image check in test mm", r
+    assert reg._parse_log(LOG_CLEAN.replace("checks 2", "checks 0"))["status"] == "FAIL"
+    assert reg._parse_log(LOG_CLEAN.replace("differ 0", "differ 1").replace("Failed    : 0", "Failed    : 1"))["status"] == "FAIL"
+    mr.coef_image_ran("[LAYER] COEF IMAGE : checks 2  differ 0\n", "t", 1)
+    for text, loads in (("[LAYER] COEF IMAGE : checks 1  differ 0\n", 1), ("[LAYER] COEF IMAGE : checks 3  differ 1\n", 0), ("no line\n", 0)):
+        try:
+            mr.coef_image_ran(text, "t", loads)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"coef_image_ran accepted {text!r} with {loads} loads")
 
 
 @selftest
@@ -5987,7 +6007,7 @@ def test_vcs_commands():
 @selftest
 def test_x_words_fail_by_name():
     """A 4-state simulator's x or z: a count, a cycle count, a dumped word, a result file word, a lane bench code or the multi hash fails by name."""
-    clean = "  Total    : 64\n  Exact    : 64\n  Tol pass : 0\n  Failed   : 0\n  done asserted @ 900 (90 cycles)\n"
+    clean = "  Total    : 64\n  Exact    : 64\n  Tol pass : 0\n COEF IMAGE : checks 1  differ 0\n  Failed   : 0\n  done asserted @ 900 (90 cycles)\n"
     assert _parse_log(clean, "t")["status"] == "PASS" and _parse_log(clean, "t")["cyc"] == 90
     r = _parse_log(clean.replace("Failed   : 0", "Failed   : x"), "mm_relu")
     assert r["status"] == "FAIL" and r["fired"] == "FAIL: X in count of test mm_relu ('x')", r
@@ -6307,7 +6327,7 @@ def multi_main(argv) -> None:
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     text = r.stdout + r.stderr
     open(lp, "w").write(text)
-    print("\n".join(x for x in text.splitlines() if x.startswith(("MULTI", "RESULT", "  [FAIL]", "%Error", "[FATAL]")) or "Assertion failed" in x))
+    print("\n".join(x for x in text.splitlines() if x.startswith(("MULTI", "RESULT", "  [FAIL]", "[FAIL]", "%Error", "[FATAL]")) or "Assertion failed" in x))
     try:  # the copies' word hash: an x or z in it fails the run by name
         fourstate.field(rf"^MULTI_HASH ({fourstate.HEX}) over", text, f"multi {a.fmt_name} N{a.n} T{a.tile}", "word hash", 16, flags=re.M)
         xline = ""
@@ -6315,7 +6335,7 @@ def multi_main(argv) -> None:
         xline = fourstate.fail_line(e)
         print(xline)
     bad = r.returncode != 0 or bool(xline) or mr.FIRED.search(text.replace("[FAIL]", "")) is not None or not re.search(r"^RESULT: PASSED", text, re.M) \
-        or not re.search(rf"^MULTI COPIES={a.copies} ", text, re.M)
+        or not re.search(rf"^MULTI COPIES={a.copies} ", text, re.M) or not re.search(r"^MULTI COEF IMAGE : checks [1-9]\d*\s+differ 0$", text, re.M)
     print(f"MULTI: {'FAIL' if bad else 'PASS'} (COPIES={a.copies} {a.fmt_name} N={a.n} T={a.tile} {a.sets} sets of {a.test}, make exit {r.returncode}; {lp})")
     sys.exit(1 if bad else 0)
 

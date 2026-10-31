@@ -215,6 +215,7 @@ define copy_mem_files
 		done; \
 	done; \
 	if [ $$copied -eq 0 ]; then echo "   (no *.mem/*.hex found)"; fi
+	@$(PYTHON) $(PRJ_DIR)/GPNAE/scripts/gpnae_model.py contents $(FMT) $(1)/coef_default.mem && echo "   Wrote coef_default.mem ($(FMT) reset image, TB_sienna's coefficient-image check)"
 endef
 
 # One verilation thread: Verilator 5.035 at -j 8 segfaulted in 3 of 63 pipeline bench builds on od-r7a-2xl (0 of 96 at -j 1, same wall time); the C++ build keeps every core.

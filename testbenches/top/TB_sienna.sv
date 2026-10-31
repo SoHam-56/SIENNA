@@ -10,6 +10,7 @@ import test_config_pkg::*;
 //   2 sets: one network layer's sets on the set contract (SET_PORT = 1), as model_runner's set engine drives it;
 //   3 copies: COPIES copies of sienna_top on the set contract (SET_PORT = 1).
 // Each mode's branch is the body of the bench it replaces, unchanged; its notes and plusargs are at the branch's head.
+// Every mode checks each lane's coefficient memory after every reset and load against the host's image (tb_coef_check.svh; coef_default.mem, <file>.img).
 module TB_sienna #(
     parameter int MODE        = 0,
     parameter int LINK_STAGES = 0,  // sienna_top's register stages on L0, L1, L3 and L9 (each copy's in mode 3)
@@ -20,6 +21,7 @@ module TB_sienna #(
   if (MODE == 0) begin : g_pipeline
     // LINK_STAGES: register stages on sienna_top's links; FAULT 1: a put with no credit and no rows, 3: a host link one bit wide.
     // FAULT (TB_sienna's parameter): also 6: 8 L5 slots per lane (a_l5_starved); 7: output links one bit wider; 8: a put on the unused A row link (a_idle_contract)
+    // FAULT 9: the reset image's word 7 flipped after it is read, so the coefficient-image check must fail
     // The build's format, from the define through sienna_fmt_pkg; EXP_W, MAN_W and IS_INT only decode words; protocol keys on the package's HAS_ flags.
     localparam int DATA_WIDTH = sienna_fmt_pkg::DATA_WIDTH, ACC_DATA_WIDTH = sienna_fmt_pkg::ACC_DATA_WIDTH;
     localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;
@@ -116,6 +118,11 @@ module TB_sienna #(
     // ── Links: this TB is the host (L0) and the weight-cache writer (L2), each with a counter and a checker ──
     `include "sienna_set_side.svh"
     `include "tb_side_pack.svh"
+`define TB_CC_LANES NUM_LANES
+`define TB_CC_MEM(i) dut.G_SET.G_COPY[0].pipe.backend_lanes[i].gpnae.COEF
+    `include "tb_coef_check.svh"
+`undef TB_CC_LANES
+`undef TB_CC_MEM
     tb_add_words_t add_words_i;  // the set's ADD words (apply_add)
     localparam int SIDE_W = $bits(set_side_t);
     credit_link_if #(.DATA_W(SIDE_W + ((FAULT == 3) ? 1 : 0)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
@@ -718,6 +725,12 @@ module TB_sienna #(
         $display("  [FAULT 1] put with no credit and no rows @ %0t", $time);
       end
       repeat (5) @(posedge clk_i);
+      cc_image("coef_default.mem");
+      if (FAULT == 9) begin
+        cc_img[7] ^= 32'd1;
+        $display("  [FAULT 9] the reset image's word 7 flipped");
+      end
+      cc_check("reset");
       $display("  Reset complete @ %0t", $time);
     endtask
 
@@ -1984,6 +1997,8 @@ module TB_sienna #(
       $display(" Total    : %0d", total_elements);
       $display(" Exact    : %0d", exact_passed);
       $display(" Tol pass : %0d  (rel <= %.1f%%)", tol_passed, REL_TOL * 100.0);
+      failed += cc_bad;  // a lane memory that differs from its image fails the run
+      $display(" COEF IMAGE : checks %0d  differ %0d", cc_checks, cc_bad);
       $display(" Failed   : %0d", failed);
       $display("----------------------------------------------");
       if (failed == 0) $display(" RESULT: PASSED");
@@ -2018,6 +2033,7 @@ module TB_sienna #(
     // int8 +dump=<file>: per stage "X k e code" (activation input), "R k e code" (hold beat), "Q k e q1 q2 y" (ADD); k the set in issue order, e its tile element.
     // +out_slots=S (1..64) L9 slots per lane, +out_stall_pct=P and +in_stall_pct=P random stalls; -DTB_OUT_STALL_PCT / -DTB_IN_STALL_PCT set the defaults.
     // FAULT 1: an A row put with no credit; 2: a W row put with no credit; 3: the A link one bit wide too many; 4: a put on the unused set contract's L0 (a_idle_contract).
+    // FAULT 5: the sixth write of every +coef / +between load driven with bit 0 flipped, so the coefficient-image check must fail.
     // +mid_reset=C: a first pass is reset C cycles into its stream (once the A producer holds credits); every count must come home with no stray output, then the clean pass runs.
     // int8 +hold_wait: the reset waits, from C, for a cycle at which hold_mem holds unread hold beats; +hold_check: a reset outside that window fails.
     // -DTB_STALE_HOME keeps the A counter's count through that reset, to show the home check firing.
@@ -2034,6 +2050,11 @@ module TB_sienna #(
     localparam int PACK_ENTRIES = 8, WC_TILES = 128;
     `include "sienna_set_side.svh"
     `include "tb_side_pack.svh"
+`define TB_CC_LANES NUM_LANES
+`define TB_CC_MEM(i) dut.G_LAYER.pipe.backend_lanes[i].gpnae.COEF
+    `include "tb_coef_check.svh"
+`undef TB_CC_LANES
+`undef TB_CC_MEM
 
     localparam int STALL_CYCLES = 50_000;  // this long with nothing moving is a hang
     localparam int RCW = $clog2(N + 1);  // a set's N row credits in one cycle
@@ -2467,7 +2488,7 @@ module TB_sienna #(
         end
         coef_wr_i   = 1'b1;
         coef_addr_i = a[8:0];
-        coef_data_i = d;
+        coef_data_i = (FAULT == 5 && nw == 5) ? d ^ 32'd1 : d;  // FAULT 5: one word corrupted after packing
         if (nw == 0) t_first_wr = cycle;  // +between reports how soon after done_o the load began
         @(posedge clk_i);
         nw++;
@@ -2475,7 +2496,10 @@ module TB_sienna #(
       #1 coef_wr_i = 1'b0;
       $fclose(fc);
       $display("[LAYER] coef: %0d load-path writes from %s", nw, cf);
+      if (FAULT == 5) $display("  [FAULT 5] write 5 of %s driven with bit 0 flipped", cf);
       @(posedge clk_i);
+      cc_image({cf, ".img"});  // the image the host packed into cf
+      cc_check({"load ", cf});
     endtask
 
     initial begin
@@ -2610,6 +2634,8 @@ module TB_sienna #(
       #1 rstn_i = 1;
       por_n = 1;
       repeat (3) @(posedge clk_i);
+      cc_image("coef_default.mem");
+      cc_check("reset");
 
       for (int pass = (mid_reset > 0 || between) ? 0 : 1; pass < 2; pass++) begin
         if (!(between && pass == 1)) coef_load();  // the lanes' coefficient memory, reset to its default with the rest (+between: loaded above)
@@ -2721,6 +2747,8 @@ module TB_sienna #(
           mid_check = 1;
           repeat (OUT_CAP + 64 + 8 * LINK_STAGES) @(posedge clk_i);
           mid_check = 0;
+          cc_image("coef_default.mem");
+          cc_check("mid-stream reset");
           // Home: no row credit held (the layer grants per set), both staging and region credits back, every L9 slot re-advertised.
           if (a_cnt !== 0 || w_cnt !== 0 || dut.G_LAYER.sched.l0_cnt !== 2 || !dut.G_LAYER.sched.wc_has[0] || !dut.G_LAYER.sched.wc_has[1] || lane_home !== '1 || stray !== 0 ||
               busy_o) begin
@@ -2778,6 +2806,8 @@ module TB_sienna #(
         for (int i = lo; i < bounds[k]; i++) $fwrite(fout, "%h\n", res_q[i]);
       end
       $fclose(fout);
+      failed += cc_bad;  // a lane memory that differs from its image fails the layer
+      $display("[LAYER] COEF IMAGE : checks %0d  differ %0d", cc_checks, cc_bad);
       if (failed == 0)
         $display("[LAYER] sets=%0d outputs=%0d cycles=%0d a_rows=%0d/%0d w_rows=%0d/%0d epilogues=%0d/%0d out_stall=%0d in_stall=%0d collapse_k=%0d",
                  bounds.size(), res_q.size(), t_done - t0 + 1, ai, na, wi, nw, ei, ne, osp, in_stall_pct,
@@ -2841,6 +2871,11 @@ module TB_sienna #(
     localparam int PACK_ENTRIES = 8;
     `include "sienna_set_side.svh"
     `include "tb_side_pack.svh"
+`define TB_CC_LANES NUM_LANES
+`define TB_CC_MEM(i) dut.G_SET.G_COPY[0].pipe.backend_lanes[i].gpnae.COEF
+    `include "tb_coef_check.svh"
+`undef TB_CC_LANES
+`undef TB_CC_MEM
     credit_link_if #(.DATA_W($bits(set_side_t)), .CRW(1)) host_lnk[1] ();  // L0 of sienna_top's one copy
     // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
     credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
@@ -3116,6 +3151,10 @@ module TB_sienna #(
       coef_wr = 1'b0;
       $fclose(fc);
       $display("[MODEL] coef: %0d load-path writes from %s", n, cf);
+      @(posedge clk_i);
+      #1;
+      cc_image({cf, ".img"});  // the image the host packed into cf
+      cc_check({"load ", cf});
     endtask
 
     // +coef_busy=<file>: the writes, one a cycle on the falling edge, each counted refused when coef_ready is low as it is driven.
@@ -3210,6 +3249,8 @@ module TB_sienna #(
       north_write_reset_i = 0;
       west_write_reset_i = 0;
       @(negedge clk_i);
+      cc_image("coef_default.mem");
+      cc_check("reset");
       coef_load();
       if (fault_put) begin  // before the staging credits are advertised
         $display("  [FAULT put] a host put with %0d credits held", host_cnt);
@@ -3323,6 +3364,7 @@ module TB_sienna #(
         $display("[MODEL] coef busy: %0d writes while sets streamed, %0d refused", busy_tries, busy_refused);
         if (busy_refused != busy_tries) $display("[FAIL] +coef_busy: %0d of %0d writes taken while sets streamed", busy_tries - busy_refused, busy_tries);
       end
+      $display("[MODEL] COEF IMAGE : checks %0d  differ %0d", cc_checks, cc_bad);
       $display("[MODEL] sets=%0d outputs=%0d cycles=%0d mesh_busy=%0d act_busy=%0d order_errors=%0d out_stall=%0d", n_sets,
                res_q.size(), last_done - t0 + 1, busy_mesh, busy_act, bad_ids, osp);
       $finish;
@@ -3354,6 +3396,11 @@ module TB_sienna #(
     localparam int SW = $clog2(COPIES + 1);
     `include "sienna_set_side.svh"
     `include "tb_side_pack.svh"
+`define TB_CC_LANES COPIES * NUM_LANES
+`define TB_CC_MEM(i) dut.G_SET.G_COPY[(i) / NUM_LANES].pipe.backend_lanes[(i) % NUM_LANES].gpnae.COEF
+    `include "tb_coef_check.svh"
+`undef TB_CC_LANES
+`undef TB_CC_MEM
     // The layer contract's row links (L10), unused at SET_PORT = 1: nothing is ever put on them.
     credit_link_if #(.DATA_W(N * DATA_WIDTH), .CRW($clog2(N + 1))) idle_rows[2] ();
     for (genvar r = 0; r < 2; r++) begin : G_IDLE_ROWS
@@ -3728,6 +3775,8 @@ module TB_sienna #(
         @(posedge clk_i);
         if (ov !== '0 || pipeline_complete_o !== '0) stray++;
       end
+      cc_image("coef_default.mem");
+      cc_check("mid-stream reset");
       begin
         automatic bit home = (lane_home === '1) && wcnt[0] && wcnt[1] && copy_sel_o === '0 && g_copies.dut.G_SET.G_MULTI.wc_got[0] === '0 && g_copies.dut.G_SET.G_MULTI.wc_got[1] === '0 && stray == 0;
         for (int c = 0; c < COPIES; c++) if (hcnt[c] !== 2'd2) home = 0;
@@ -3761,6 +3810,8 @@ module TB_sienna #(
       rstn_i = 1;
       por_n = 1;
       repeat (4) @(negedge clk_i);
+      cc_image("coef_default.mem");
+      cc_check("reset");
       if (mid_reset > 0) cut_pass(mid_reset);
       if (!cached_mode) begin
         for (int k = 0; k < NUM_SETS; k++) put_set(k, 0, 0, 0);
@@ -3869,6 +3920,8 @@ module TB_sienna #(
             end
         $display("MULTI_HASH %016h over %0d words", h, words);
       end
+      failed += cc_bad;  // a lane memory that differs from its image fails the run
+      $display("MULTI COEF IMAGE : checks %0d  differ %0d", cc_checks, cc_bad);
       // A ternary of two strings prints as a number under Verilator, so branch instead.
       if (failed == 0) $display("RESULT: PASSED");
       else $display("RESULT: FAILED");

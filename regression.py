@@ -2832,6 +2832,40 @@ def events(raw: str) -> dict:
     return ev
 
 
+LINK_OUT = {}  # config: link_bytes() of its run, for the report's .json
+SIDE_FIELDS = ("wc_last", "weight_tile", "weight_cached", "accumulate", "bias_valid", "train", "seed", "pack_shift", "pack_map", "act", "tier", "entry",
+               "scale", "res_hold", "res_add", "add")  # set_side_t's fields in order (sienna_set_side.svh), each sized by side_bits()
+
+
+def side_bits(fmt: str, n: int, wc_tiles: int = 128, pack_entries: int = 8, lfsr: int = 32, control: int = 3) -> int:
+    """The host link's data bits, $bits(set_side_t), from its fields and the format package's struct widths."""
+    w = lambda t: fmt_pkg.width(fmt, t)
+    f = {"wc_last": 1, "weight_tile": clog2(wc_tiles), "weight_cached": 1, "accumulate": 1, "bias_valid": 1, "train": 1, "seed": lfsr, "pack_shift": 3,
+         "pack_map": n // 2 * clog2(pack_entries), "act": pack_entries * control, "tier": 2, "entry": pack_entries * w("lane_entry_t"),
+         "scale": n * w("requant_scale_t"), "res_hold": 1, "res_add": 1, "add": w("add_params_t")}
+    return sum(f[k] for k in SIDE_FIELDS)
+
+
+def link_bytes(raw: str, cps: float, knobs: dict, fmt: str, n: int, mhz: float = 950.0) -> dict:
+    """Bytes per set on each external link over the first stream pass: the TB's host puts (HOST_START), its per-set row queues and the output words
+    it received, times each link's width; bias rows and cache fills from the stimulus knobs; in / out GB/s at cps; None without a pass."""
+    ps = [m.start() for m in re.finditer(r"^PERF \d+ PASS ", raw, re.M)]
+    if not ps or not cps:
+        return None
+    body = raw[ps[0]:ps[1] if len(ps) > 1 else len(raw)]
+    sets = len(re.findall(r"^PERF \d+ DONE ", body, re.M))
+    if not sets:
+        return None
+    dw, aw = fmt_pkg.get(fmt, "DATA_WIDTH"), fmt_pkg.get(fmt, "ACC_DATA_WIDTH")
+    words = lambda side: sum(int(x) for x in re.findall(rf"^\s*{side}\s+queue\s*:\s*(\d+) words", body, re.M))
+    puts = len(re.findall(r"^PERF \d+ HOST_START ", body, re.M))
+    per = {"put": puts * side_bits(fmt, n) / 8 / sets, "bias": (aw * n / 8 if knobs.get("has_bias") else 0.0) / max(1, knobs.get("accum_passes", 1)),
+           "west": words("West") * dw / 8 / sets, "north": words("North") * dw / 8 / sets,
+           "wc": None if knobs.get("weight_cache") else 0.0, "coef": 0.0, "out": len(OUT_WORD.findall(body)) * dw / 8 / sets}
+    gbs = lambda b: b / cps * mhz / 1000  # bytes per set over cps cycles at mhz MHz, in GB/s
+    return {"sets": sets, "bytes": per, "in_gbs": gbs(sum(v or 0.0 for k, v in per.items() if k != "out")), "out_gbs": gbs(per["out"])}
+
+
 def leaves(ev: dict, kind: str, idle: int) -> tuple:
     """Cycles a state machine leaves and re-enters its idle state: one pair per set it takes."""
     up, down, prev = [], [], idle
@@ -3183,7 +3217,16 @@ def one_config(name: str, args) -> tuple:
           + (f", hold set {mdl['hold']} (measured {med(a['hold'])})" if res and "hold" in mdl else ""),
           f"  Matmul rate  : {flop} {op} per set -> {flop / steady:.1f} {op}/cycle, {rate_s(steady)}"
           f" at an ASSUMED {args.clock_mhz:.0f} MHz, {100 * flop / 2 / steady / args.n ** 2:.1f}% of the mesh's"
-          f" {args.n ** 2} MAC/cycle" if steady else "", ""]
+          f" {args.n ** 2} MAC/cycle" if steady else ""]
+    lb = LINK_OUT[name] = link_bytes(raw, steady, _tb_knobs(), FMT, args.n, args.clock_mhz)
+    if lb:
+        b = lb["bytes"]
+        wc = "not counted" if b["wc"] is None else f"{b['wc']:.1f} B"  # a cached config's fills are not in the TB's row queues
+        L += [f"  Links per set: host put {b['put']:.1f} B, bias {b['bias']:.1f} B, west rows {b['west']:.1f} B, north rows {b['north']:.1f} B, weight cache "
+              f"{wc}, coefficients 0 B (the reset image), output {b['out']:.1f} B "
+              f"(the first pass's {lb['sets']} sets: puts and words the TB counted x each link's width); at the measured cycles per set and an ASSUMED "
+              f"{args.clock_mhz:.0f} MHz: in {lb['in_gbs']:.2f} GB/s, out {lb['out_gbs']:.2f} GB/s"]
+    L += [""]
     rates = [f"{steady:.1f}", f"{flop / steady:.1f}", f"{rate(steady):.3f}" if FMT == "int8" else f"{rate(steady):.1f}",
              f"{100 * flop / 2 / steady / args.n ** 2:.0f}%"] if steady else ["-"] * 4  # one output (int8_residual_one_pair): no interval
     row = [name, a["first_latency"], *rates, lim, stage[lim], mdl["host"], mdl["mesh"], mdl["mesh_lat"], first["mesh"], "pass"]
@@ -3252,7 +3295,7 @@ def perf_main(argv=None) -> None:
             lines += d
             rows.append(r)
             print("\n".join(d), flush=True)
-        json.dump({"lines": lines, "rows": rows}, open(os.path.splitext(args.report)[0] + ".json", "w"))
+        json.dump({"lines": lines, "rows": rows, "links": LINK_OUT}, open(os.path.splitext(args.report)[0] + ".json", "w"))
         L = header(args) + lines + footer(args, rows)
     open(args.report, "w").write("\n".join(L) + "\n")
     print("\n".join(L[-len(rows if not args.merge else parts) - 8:]))
@@ -5531,6 +5574,22 @@ def test_perf_reuses_build():
             pa.PERF_BUILT.clear()
             pa.PERF_BUILT.update(old[4])
     assert cmds == [mr.SIM_TARGET, "sim", mr.SIM_TARGET, "sim", mr.SIM_TARGET], cmds  # a run that did not reach its simulation leaves no build to reuse
+
+
+@selftest
+def test_link_bytes():
+    # bytes per set on each link from the first pass's counted puts, row words and output words; the host link's width from set_side_t
+    names = re.findall(r"^\s*(?:logic|sienna_fmt_pkg::\w+)\s*(?:\[[^\]]*\]\s*)*(\w+);", open(os.path.join(ROOT, "src", "top", "sienna_set_side.svh")).read(), re.M)
+    assert tuple(names) == pa.SIDE_FIELDS, names
+    assert (pa.side_bits("fp32", 8), pa.side_bits("int8", 16)) == (104, 1353)  # $bits(set_side_t), printed by TB_sienna builds (jobs 6098469, 6098470)
+    out = "".join(f"[DEBUG 1] Dropout -> Output (Lane {l})   : dec=0  hex=3f800000\n" for l in range(8))
+    raw = "  West  queue : 64 words\nPERF 5 PASS 0 0\n" + "".join(
+        f"PERF {9 + k} HOST_START {k}\n  West  queue : 64 words\n  North queue : 64 words\n{out}PERF {20 + k} DONE {k}\n" for k in range(4))
+    raw += "PERF 99 PASS 4 0\nPERF 100 HOST_START 0\n  West  queue : 64 words\n" + out
+    lb = pa.link_bytes(raw, 20.0, {"has_bias": 1, "accum_passes": 1, "weight_cache": 0}, "fp32", 8)
+    assert lb["sets"] == 4 and lb["bytes"] == {"put": 13.0, "bias": 32.0, "west": 256.0, "north": 256.0, "wc": 0.0, "coef": 0.0, "out": 32.0}, lb
+    assert abs(lb["in_gbs"] - (13 + 32 + 512) / 20 * 0.95) < 1e-9 and abs(lb["out_gbs"] - 32 / 20 * 0.95) < 1e-9, lb
+    assert pa.link_bytes("PERF 9 DONE 0\n", 20.0, {}, "fp32", 8) is None  # no stream pass: no figures, not zeros
 
 
 @perf_selftest

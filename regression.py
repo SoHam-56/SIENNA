@@ -4586,7 +4586,7 @@ def test_point_commands():
     cores = regress._cores()
     assert f"-j 1 --build-jobs {cores} " in make_n("verilator").stdout  # one verilation thread (-j 8 segfaulted 3 of 63 times on od-r7a-2xl), every core for the C++ build
     assert f"-j 1 --build-jobs {cores} " in make_n("-C", "SystolicMesh", "verilator").stdout  # one verilation thread there too (V3TSP.cpp:353 at -j 8 --threads 8)
-    assert f"-j {cores} --build-jobs {cores} " in make_n("-C", "GPNAE", "verilator").stdout  # Verilator takes every core in GPNAE
+    assert f"-j 1 --build-jobs {cores} " in make_n("-C", "GPNAE", "verilator").stdout  # and in GPNAE
     for args in (("lint", "GEN_PKG=0"), ("-C", "SystolicMesh", "lint"), ("-C", "GPNAE", "verilator")):  # every Verilator build of this tree takes SIM_THREADS
         out = make_n(*args, "SIM_THREADS=3").stdout
         assert "--threads 3" in out and "--threads 8" not in out, (args, out[:300])

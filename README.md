@@ -8,7 +8,7 @@ SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid o
 |---|---|
 | **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
 | **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
-| **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.96%, int8 SELU 0.77%; int8 sigmoid and tanh within one output step) |
+| **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.77%, int8 SELU 0.77%; int8 sigmoid and tanh within one output step) |
 | **58× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 12.8 cycles for tanh on one fp32 lane) |
 | **up to 16× faster** on small layers | by packing many small matrix multiplies into one |
 
@@ -155,6 +155,7 @@ Read them as an indication of where the architecture stands.
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
 - Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (for activations, the tolerance of the lane's tier: 1%, 5% or 10%), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it, not gated: 447 of the 198 656 layer outputs differ from it.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random, and with it held mid-stream until the host is blocked.
+- After every reset and every coefficient load, the testbench reads each lane's coefficient memory and compares it, field by field, with the image the host meant to write; a difference fails the run and names the word (`make coef-fault` shows it failing on one corrupted word).
 - `make check-fmt` fails if any SIENNA RTL file outside the format package's allowlist names a format, and `make check-hier` fails if a build's hierarchy holds another format's units, at both host contracts.
 - The default point builds fp32 with no define and must give the same words and cycles as the fp32 point; `pipeline-multi` runs two pipelines behind one host (`COPIES = 2`) in every format.
 

@@ -2784,15 +2784,25 @@ CONFIGS = [t["name"] for t in PIPELINE_TESTS]
 GEOM = {"n": 16, "tile_size": 4, "lanes": 32}  # set from the command line in perf_main()
 
 
+PERF_BUILT = {}  # build directory: the package key (build_key) of the build perf made there in this run, None after a run that did not simulate
+
+
+def _pkg_key() -> str:
+    return build_key(open(os.path.join(TB_DIR, "test_config_pkg.sv")).read())
+
+
 def run(name: str, num_sets: int, build_dir: str) -> str:
+    """One config's PERF trace; a config whose package differs from the last build's only in run-time knobs runs that build (make sim)."""
     cfg = next(t for t in PIPELINE_TESTS if t["name"] == name)
     generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
-    cmd = ["make", mr.SIM_TARGET, "TRACE=0", "EXTRA_FLAGS=-DPERF", f"{'VCS' if mr.SIM == 'vcs' else 'VERILATOR'}_DIR={build_dir}",
+    key = _pkg_key()
+    cmd = ["make", "sim" if PERF_BUILT.get(build_dir) == key else mr.SIM_TARGET, "TRACE=0", "EXTRA_FLAGS=-DPERF", f"{'VCS' if mr.SIM == 'vcs' else 'VERILATOR'}_DIR={build_dir}",
            f"FMT={GEOM.get('fmt_name', 'fp32')}", f"N={GEOM['n']}", f"TILE={GEOM['tile_size']}", f"LANES={GEOM['lanes']}",
            f"COLLAPSE_K={mr.COLLAPSE_K}", "GEN_PKG=0"]  # the package generate_vectors just wrote
     if mr.COLLAPSE_K == 0 and GEOM["n"] >= 64:  # past 2 GB of code: the large code model, as SiennaSpec.env gives the collapse-k 0 points
         cmd.append("LARGE_CODE=1")
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    PERF_BUILT[build_dir] = key if "-- Running simulation" in r.stdout else None  # make sim refuses a build of other inputs or flags itself
     raw_dir = os.path.join(os.path.dirname(REPORT), "raw")
     os.makedirs(raw_dir, exist_ok=True)
     open(os.path.join(raw_dir, f"{name}_N{GEOM['n']}.log"), "w").write(r.stdout + r.stderr)  # to re-parse without a rerun
@@ -5501,6 +5511,26 @@ def test_perf_collapse_k0():
     names = pa.perf_configs(pa.CONFIGS, "int8", 0)
     assert names and not any(t.get("packed") for t in PIPELINE_TESTS if t["name"] in names), names  # the collapse-k 0 mesh refuses packed sets
     assert any(t.get("packed") for t in PIPELINE_TESTS if t["name"] in pa.perf_configs(pa.CONFIGS, "int8", 1))
+
+
+@selftest
+def test_perf_reuses_build():
+    # perf builds once per package and runs the build on disk (make sim) for a config whose package differs only in run-time knobs
+    keys, cmds = iter(["A", "A", "B", "B", "B"]), []
+    outs = iter(["-- Running simulation\n-- Done", "-- Running simulation (no build)\n-- Done", "-- Running simulation\n-- Done", "build failed", "x"])
+    old = (pa.generate_vectors, pa.subprocess.run, pa.REPORT, pa._pkg_key, dict(pa.PERF_BUILT))
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            pa.generate_vectors, pa.REPORT, pa._pkg_key = (lambda cfg: None), os.path.join(d, "perf", "report.log"), (lambda: next(keys))
+            pa.subprocess.run = lambda cmd, **k: cmds.append(cmd[1]) or subprocess.CompletedProcess(cmd, 0, next(outs), "")
+            pa.PERF_BUILT.clear()
+            for _ in range(5):
+                pa.run("matmul_random_tanh", 24, d)
+        finally:
+            pa.generate_vectors, pa.subprocess.run, pa.REPORT, pa._pkg_key = old[:4]
+            pa.PERF_BUILT.clear()
+            pa.PERF_BUILT.update(old[4])
+    assert cmds == [mr.SIM_TARGET, "sim", mr.SIM_TARGET, "sim", mr.SIM_TARGET], cmds  # a run that did not reach its simulation leaves no build to reuse
 
 
 @perf_selftest

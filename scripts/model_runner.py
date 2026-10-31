@@ -239,11 +239,23 @@ def coef_writes(mem) -> list:
 
 
 def write_coef(path: str, mem) -> int:
-    """A load file for TB_sienna (layer)'s and TB_sienna (sets)'s +coef=: "aaa dddddddd" (hex address, data) per write; returns the count."""
+    """A +coef= load file ("aaa dddddddd" per write) and beside it <path>.img, the image the bench checks the lanes against; returns the count."""
     w = coef_writes(mem)
     with open(path, "w") as fh:
         fh.write("".join(f"{a:03x} {d & 0xFFFFFFFF:08x}\n" for a, d in w))
+    mem.write_contents(path + ".img")
     return len(w)
+
+
+COEF_IMAGE = re.compile(r"COEF IMAGE : checks (\d+)\s+differ (\d+)")  # TB_sienna's coefficient-image check line, every mode
+
+
+def coef_image_ran(text: str, tag: str, loads: int) -> None:
+    """The bench's coefficient-image check ran, after reset and each of loads loads at least, and found no difference; else RuntimeError."""
+    m = COEF_IMAGE.search(text)
+    if not m or int(m.group(1)) < 1 + loads or int(m.group(2)) != 0:
+        raise RuntimeError(f"{tag}: the coefficient-image check " + (f"ran {m.group(1)} times, {m.group(2)} differing" if m else "did not report") +
+                           f" (at least {1 + loads} checks, none differing, expected)")
 
 
 def busy_writes(mem, act: str, tier: int = 0) -> list:
@@ -1443,6 +1455,7 @@ class RtlLayer:
                            cwd=os.path.dirname(self.bin), capture_output=True, text=True)
         if job.get("coef") is not None:
             os.remove(cf)
+            os.remove(cf + ".img")
         self.first_Y = None
         if FIRED.search(r.stdout + r.stderr) is None:  # a count with an x or z fails the layer by name (a ValueError its callers report)
             for pat, what in ((rf"\[LAYER\] sets=\S+ outputs=\S+ cycles=({fourstate.DEC})", "cycle count"), (rf"\[LAYER\] sets=({fourstate.DEC})", "set count")):
@@ -1462,6 +1475,7 @@ class RtlLayer:
         if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")
+        coef_image_ran(r.stdout, tag, int(job.get("coef") is not None) + int(job.get("between") is not None))
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
         e = re.search(r"epilogues=(\d+)/(\d+)", r.stdout)
         if not m or m.group(4) != m.group(5) or m.group(6) != m.group(7) or (int8 and (not e or e.group(1) != e.group(2))):
@@ -1472,6 +1486,7 @@ class RtlLayer:
         if job.get("between") is not None:
             self.first_Y = self._tiles(read_outputs(ff, self.fmt_name), rt, ct, int8, tag)[:M, :C]
             os.remove(bf)
+            os.remove(bf + ".img")
             os.remove(ff)
         if int8:
             self.last_stages = read_stage_dump(df, N, rt, ct, -(-cfg["kb"] // N) + cfg["residual"])
@@ -1570,6 +1585,7 @@ class RtlSets:
         if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
             sys.stdout.write((r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the model simulation")
+        coef_image_ran(r.stdout, tag, int(coef is not None))
         try:  # a count with an x or z fails the model run by name
             fourstate.field(rf"\[MODEL\] sets=\S+ outputs=\S+ cycles=({fourstate.DEC})", r.stdout, tag, "cycle count")
         except fourstate.Unknown as e:

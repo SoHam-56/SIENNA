@@ -2789,12 +2789,20 @@ def run(name: str, num_sets: int, build_dir: str) -> str:
     generate_vectors({**GEOM, **cfg, "num_sets": num_sets})
     cmd = ["make", mr.SIM_TARGET, "TRACE=0", "EXTRA_FLAGS=-DPERF", f"{'VCS' if mr.SIM == 'vcs' else 'VERILATOR'}_DIR={build_dir}",
            f"FMT={GEOM.get('fmt_name', 'fp32')}", f"N={GEOM['n']}", f"TILE={GEOM['tile_size']}", f"LANES={GEOM['lanes']}",
-           "GEN_PKG=0"]  # the package generate_vectors just wrote
+           f"COLLAPSE_K={mr.COLLAPSE_K}", "GEN_PKG=0"]  # the package generate_vectors just wrote
+    if mr.COLLAPSE_K == 0 and GEOM["n"] >= 64:  # past 2 GB of code: the large code model, as SiennaSpec.env gives the collapse-k 0 points
+        cmd.append("LARGE_CODE=1")
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     raw_dir = os.path.join(os.path.dirname(REPORT), "raw")
     os.makedirs(raw_dir, exist_ok=True)
     open(os.path.join(raw_dir, f"{name}_N{GEOM['n']}.log"), "w").write(r.stdout + r.stderr)  # to re-parse without a rerun
     return r.stdout + r.stderr
+
+
+def perf_configs(names: list, fmt: str, ck: int) -> list:
+    """The configs perf runs in fmt on a collapse-k ck mesh: int8-only tests in int8 only; the collapse-k 0 mesh refuses packed sets."""
+    cfg = {t["name"]: t for t in PIPELINE_TESTS}
+    return [c for c in names if fmt in cfg[c].get("formats", FMT_KNOBS) and not (ck == 0 and cfg[c].get("packed"))]
 
 
 def events(raw: str) -> dict:
@@ -3174,7 +3182,7 @@ def one_config(name: str, args) -> tuple:
 
 def header(args) -> list:
     return ["=" * 100, " SIENNA PIPELINE PERFORMANCE (measured in simulation, cycles)", "=" * 100,
-            f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  "
+            f" Generated {time.strftime('%Y-%m-%d %H:%M')}  N={args.n}  TILE={args.tile_size}  lanes={args.lanes}  collapse-k {mr.COLLAPSE_K}  "
             f"{args.sets} streamed sets per config, streaming host (one row of N words per operand per cycle)",
             " Every number is measured from TB_sienna (pipeline)'s PERF trace. Per set: load = host rows, wait = to mesh launch,",
             " mesh = launch to result written (sets overlap inside it), wait = to the activation stage, activ = activation",
@@ -3211,6 +3219,7 @@ def perf_main(argv=None) -> None:
     ap.add_argument("--report", default=REPORT)
     ap.add_argument("--reparse", help="directory of saved traces (<config>_N<n>.log) to analyse instead of simulating")
     ap.add_argument("--slices", action="store_true", help="the build has COLLAPSE_K=0 (depth slices); for the model only")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K perf builds and models (0: depth slices)")
     ap.add_argument("--merge", nargs="*", help="combine the .json parts of earlier runs into --report, in order")
     ap.add_argument("--format", dest="fmt_name", default="fp32", choices=sorted(FMT_KNOBS), help="number format of the build (its define)")
     args = ap.parse_args(argv)
@@ -3218,8 +3227,9 @@ def perf_main(argv=None) -> None:
     global MUL_LAT, ADD_LAT, FMT
     MUL_LAT, ADD_LAT = UNIT_LAT[args.fmt_name]
     FMT = args.fmt_name
-    fmts = {t["name"]: t.get("formats", tuple(UNIT_LAT)) for t in PIPELINE_TESTS}
-    args.configs = [c for c in args.configs if args.fmt_name in fmts[c]]  # int8-only tests run only in int8
+    mr.COLLAPSE_K = args.collapse_k
+    args.slices = args.slices or args.collapse_k == 0
+    args.configs = perf_configs(args.configs, args.fmt_name, args.collapse_k)
     GEOM.update(n=args.n, tile_size=args.tile_size, lanes=args.lanes, fmt_name=args.fmt_name)
     os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)  # the .json part lands there first
     if args.merge:
@@ -4387,7 +4397,7 @@ def test_guard_missing_file():
 def test_parse_time_rejections():
     r = make_n("pipeline", "FMT=fp16")
     assert r.returncode != 0 and "FMT=fp16: not one of fp32 bf16 int8" in r.stderr, r.stderr
-    for t in ("regression", "pack", "perf-analysis"):
+    for t in ("regression", "pack"):
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode != 0 and "COLLAPSE_K=0 reaches TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs" in r.stderr, (t, r.stderr)
     for t in ("gemm", "model", "tflite"):  # the layer contract's runs build the mesh mode they are given
@@ -5466,6 +5476,31 @@ def perf_fmt(f):
         yield
     finally:
         pa.FMT, pa.MUL_LAT, pa.ADD_LAT = old
+
+
+@selftest
+def test_perf_collapse_k0():
+    # make perf-analysis builds the collapse-k 0 mesh it is given; at N = 64 that build takes the large code model, as the regression points' do
+    for ck in ("0", "1"):
+        r = make_n("perf-analysis", f"COLLAPSE_K={ck}", "PYTHON=py")
+        assert r.returncode == 0 and f"--collapse-k {ck}" in r.stdout, (ck, r.stdout + r.stderr)
+    cmds, old = [], (pa.generate_vectors, pa.subprocess.run, pa.REPORT, mr.COLLAPSE_K, dict(pa.GEOM))
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            pa.generate_vectors, pa.REPORT = (lambda cfg: None), os.path.join(d, "perf", "report.log")
+            pa.subprocess.run = lambda cmd, **k: cmds.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")
+            for n, ck in ((64, 0), (16, 0), (64, 1)):
+                mr.COLLAPSE_K = ck
+                pa.GEOM.update(n=n, tile_size=4, lanes=32, fmt_name="fp32")
+                pa.run("matmul_random_tanh", 24, d)
+        finally:
+            pa.generate_vectors, pa.subprocess.run, pa.REPORT, mr.COLLAPSE_K = old[:4]
+            pa.GEOM.clear()
+            pa.GEOM.update(old[4])
+    assert [("COLLAPSE_K=0" in c, "COLLAPSE_K=1" in c, "LARGE_CODE=1" in c) for c in cmds] == [(True, False, True), (True, False, False), (False, True, False)], cmds
+    names = pa.perf_configs(pa.CONFIGS, "int8", 0)
+    assert names and not any(t.get("packed") for t in PIPELINE_TESTS if t["name"] in names), names  # the collapse-k 0 mesh refuses packed sets
+    assert any(t.get("packed") for t in PIPELINE_TESTS if t["name"] in pa.perf_configs(pa.CONFIGS, "int8", 1))
 
 
 @perf_selftest

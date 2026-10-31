@@ -29,12 +29,12 @@ ifneq ($(filter-out 0 1,$(REG_SMALL))$(words $(REG_SMALL)),1)
 $(error Invalid SMALL=$(SMALL): must be 0 or 1)
 endif
 
-# COLLAPSE_K is 0 or 1; TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
+# COLLAPSE_K is 0 or 1; TB_sienna's pipeline mode (perf-analysis included) and the layer contract's model, gemm and tflite runs take it from the package (the guard checks it), pack and make regression's points do not.
 ifneq ($(filter-out 0 1,$(COLLAPSE_K))$(words $(COLLAPSE_K)),1)
 $(error Invalid COLLAPSE_K=$(COLLAPSE_K): must be 0 or 1)
 endif
 ifeq ($(COLLAPSE_K),0)
-ifneq ($(filter pack perf-analysis regression regression-summary regression/%,$(MAKECMDGOALS)),)
+ifneq ($(filter pack regression regression-summary regression/%,$(MAKECMDGOALS)),)
 $(error COLLAPSE_K=0 reaches TB_sienna's pipeline mode and the layer contract's model, gemm and tflite runs: pack refuses it (a_pack_collapsed) and make regression's points choose their own)
 endif
 endif
@@ -636,7 +636,8 @@ perf-analysis:
 		--n $(N) \
 		--tile-size $(TILE) \
 		--lanes $(LANES) \
-		--format $(FMT)
+		--format $(FMT) \
+		--collapse-k $(COLLAPSE_K)
 
 tflite:
 	@[ "$(FMT)" = int8 ] || { echo "ERROR: make tflite runs the int8 TFLite models only and needs FMT=int8 (FMT=$(FMT))"; exit 1; }

@@ -3064,6 +3064,18 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
+LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 323), ("int8", "tanh", 32, 323))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4)
+
+
+def lane_target_cycles(fmt: str, act: str, n: int) -> int:
+    """The activation stage model's cycles per set of one target at tier 0: floats on one lane's elements as the N = 8 sets give them (fp32 none past -6, bf16 one on the tail), int8 data-free."""
+    per = n * n // 32
+    if fmt == "int8":
+        return lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
+    xs = ([-2.0] if fmt == "bf16" else [-0.5]) + [0.5] * (per - 1)
+    return lane_cycles(xs, act, per + 3 + 1) + 2
+
+
 def packed_stage(P: dict, collapse: bool = True) -> int:
     """Activation stage cycles of a packed set (median over the streamed sets): lane L runs column L % N's entry down its rows; ReLU and linear lanes do not bound it."""
     N, per_lane, lanes = P["N"], P["SRAM_DEPTH"] // P["NUM_LANES"], P["NUM_LANES"]
@@ -5468,6 +5480,15 @@ def test_lane_stage_int8():
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
         assert stage("selu", 16) == 93 and stage("tanh", 16) == 93 and stage("sigmoid", 16) == 93
         assert stage("selu", 8) == 52 and stage("tanh", 8) == 47 and stage("sigmoid", 8) == 47
+
+
+@perf_selftest
+def test_lane_cycle_targets():
+    """The lanes' tier-0 image meets each target of LANE_TARGETS in the activation stage model."""
+    for fmt, act, n, want in LANE_TARGETS:
+        with perf_fmt(fmt):
+            got = pa.lane_target_cycles(fmt, act, n)
+        assert got <= want, f"{fmt} {act} N = {n}: the model gives {got} cycles per set, the target is {want} or fewer"
 
 
 @perf_selftest

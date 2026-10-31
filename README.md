@@ -55,20 +55,20 @@ Measured in Verilator simulation (`make perf-analysis`), 24 sets per run, with t
 | Activation | N = 16 (GFLOPS) | N = 32 (TFLOPS) | N = 64 (TFLOPS) |
 |---|---|---|---|
 | ReLU / linear, no pooling | 410 · 410 · 410 | 1.78 · 1.78 · 1.73 | 7.43 · 7.43 · 7.43 |
-| SELU | 45 · 86 · 77 | 0.14 · 0.21 · 0.18 | 1.11 · 1.66 · 1.40 |
-| sigmoid | 42 · 38 · 71 | 0.13 · 0.13 · 0.16 | 0.95 · 0.80 · 1.29 |
-| tanh | 45 · 86 · 71 | 0.14 · 0.21 · 0.16 | 1.11 · 1.66 · 1.29 |
+| SELU | 45 · 86 · 84 | 0.14 · 0.21 · 0.19 | 1.11 · 1.66 · 1.40 |
+| sigmoid | 54 · 45 · 84 | 0.16 · 0.15 · 0.19 | 0.95 · 0.80 · 1.29 |
+| tanh | 45 · 86 · 84 | 0.14 · 0.21 · 0.19 | 1.11 · 1.66 · 1.29 |
 
 | Time per set (µs) | N = 16 | N = 32 | N = 64 |
 |---|---|---|---|
 | ReLU / linear, no pooling | 0.020 · 0.020 · 0.020 | 0.037 · 0.037 · 0.038 | 0.071 · 0.071 · 0.071 |
-| SELU | 0.183 · 0.096 · 0.106 | 0.473 · 0.317 · 0.374 | 0.473 · 0.317 · 0.374 |
-| sigmoid | 0.196 · 0.217 · 0.115 | 0.514 · 0.516 · 0.407 | 0.553 · 0.656 · 0.407 |
-| tanh | 0.183 · 0.096 · 0.115 | 0.473 · 0.317 · 0.407 | 0.473 · 0.317 · 0.407 |
+| SELU | 0.183 · 0.096 · 0.098 | 0.473 · 0.317 · 0.340 | 0.473 · 0.317 · 0.374 |
+| sigmoid | 0.152 · 0.182 · 0.098 | 0.413 · 0.435 · 0.340 | 0.553 · 0.656 · 0.407 |
+| tanh | 0.183 · 0.096 · 0.098 | 0.473 · 0.317 · 0.340 | 0.473 · 0.317 · 0.407 |
 
-N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes. Larger tiles are limited by the mesh instead, which needs T² cycles a set: at N = 64 a ReLU set takes 256 cycles at T = 16 (0.27 µs, 1.95 TFLOPS) and 4 096 at T = 64 (4.3 µs, 0.12 TFLOPS). Every N and tile size is in `perf_final.log` of the project report.
+The N = 16 and 32 sigmoid and int8 cells are with the 2026-10-31 coefficient images (fp32 sigmoid in 3 pieces of degree 4, a shorter bf16 sigmoid tail, int8 pieces of degree 3); the N = 64 cells of those rows predate them and were not rerun. N = 16 and 32 use T = 4 and 32 activation lanes; N = 64 uses 128 lanes and T = 2, 4 or 8, which give the same result. Peak is 486 GFLOPS at N = 16, 1.95 TFLOPS at N = 32 and 7.78 TFLOPS at N = 64. With ReLU the pipeline keeps pace with the host. Sets with SELU, sigmoid or tanh are limited by the activation lanes. Larger tiles are limited by the mesh instead, which needs T² cycles a set: at N = 64 a ReLU set takes 256 cycles at T = 16 (0.27 µs, 1.95 TFLOPS) and 4 096 at T = 64 (4.3 µs, 0.12 TFLOPS). Every N and tile size is in `perf_final.log` of the project report.
 
-Against the tree before the restructure (main up to 9fa414e), at N = 32 and 64 the new activation lanes take 20% to 60% fewer cycles per set for SELU and tanh in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 takes 5% to 8% more (SELU 329 → 355, tanh 367 → 387). At N = 8 and 16: fp32 SELU and tanh take up to 34% fewer cycles (0% to 2% fewer at T = 16), bf16 SELU and tanh 42% to 52% fewer, and int8 up to 5.8% more. Sigmoid is slower there: 14% more in fp32 at N = 8, and in bf16 4.7% more at N = 16 and 1.94 times as many at N = 8. The earlier sweeps did not measure sigmoid at N = 32 or 64.
+Against the tree before the restructure (main up to 9fa414e), at N = 32 and 64 the new activation lanes take 20% to 60% fewer cycles per set for SELU and tanh in fp32 and bf16 (N = 64, T = 2: tanh 1 060 → 449 cycles in fp32, 759 → 301 in bf16), and int8 at N = 32 takes 2% to 12% fewer (T = 2: SELU 329 → 323, tanh 367 → 323; N = 64 was not rerun since the int8 pieces went to degree 3). At N = 8 and 16 (T = 2): fp32 SELU and tanh take up to 34% fewer cycles (0% to 2% fewer at T = 16), bf16 SELU and tanh 42% to 52% fewer, int8 2% to 16% fewer, and fp32 sigmoid 16% fewer at N = 8 (141 → 119) and 47% fewer at N = 16 (272 → 144). bf16 sigmoid is compared with the Phase 2 tree instead, because the base tree's bf16 sigmoid failed the 1% gate (106% worst): it takes 0.54 times that tree's cycles at N = 8 (299 → 160) and 0.30 times at N = 16 (580 → 173). The earlier sweeps did not measure sigmoid at N = 32 or 64.
 
 ### MLPerf Tiny models
 

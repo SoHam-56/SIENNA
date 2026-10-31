@@ -331,6 +331,7 @@ help:
 	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
 	@echo "  make multi FMT=bf16 [COPIES=2]    - TB_sienna's copies mode: sienna_top at COPIES copies (regression.py --action multi)"
 	@echo "  make idle-fault SET_PORT=0|1      - a put on the unused contract must fire a_idle_contract (regression.py --action idle-fault)"
+	@echo "  make coef-fault SET_PORT=0|1      - one word off in a lane's coefficient image must fail the image check (regression.py --action coef-fault)"
 	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
 	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
 	@echo "  make regression [MODEL_DIR=<d>]   - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
@@ -657,6 +658,11 @@ idle-fault:
 	@case "$(SET_PORT)" in 0|1) ;; *) echo "ERROR: make idle-fault needs SET_PORT=0 or SET_PORT=1 (SET_PORT=$(SET_PORT))"; exit 1;; esac
 	$(PYTHON) regression.py --action idle-fault --set-port $(SET_PORT)
 
+# The coefficient-image check must fail on one word off: SET_PORT=0 TB_sienna's layer mode FAULT 5 (a load word corrupted), SET_PORT=1 its pipeline mode FAULT 9 (the reset image's word).
+coef-fault:
+	@case "$(SET_PORT)" in 0|1) ;; *) echo "ERROR: make coef-fault needs SET_PORT=0 or SET_PORT=1 (SET_PORT=$(SET_PORT))"; exit 1;; esac
+	$(PYTHON) regression.py --action coef-fault --set-port $(SET_PORT)
+
 # TB_sienna's copies mode: sienna_top at COPIES copies (SET_PORT = 1): one pipeline test's sets in FMT at N, TILE and LANES (regression.py --action multi).
 COPIES ?= 2
 multi:
@@ -744,4 +750,4 @@ clean-all: clean
 
 .PHONY: default help verilator vcs sm-verilator gpnae-verilator \
         wave lint debug perf list-files check-files clean clean-all \
-        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key
+        gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

@@ -8,7 +8,7 @@ SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid o
 |---|---|
 | **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
 | **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
-| **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.77%, int8 SELU 0.77%; int8 sigmoid and tanh within one output step) |
+| **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.77%, int8 SELU 0.69%; int8 sigmoid and tanh within one output step) |
 | **58× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 12.8 cycles for tanh on one fp32 lane) |
 | **up to 32× faster** on small layers | by packing many small matrix multiplies into one (32 jobs on the 64 × 64 mesh) |
 
@@ -31,7 +31,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
   - `COPIES` puts several pipelines behind one set-contract host, which sends sets to them in turn.
 - **Layer engine.** On the layer contract, `sienna_sched` runs a whole network layer on its own. It splits the layer into sets, reuses weights, and adds the bias and any skip connection. It handles depthwise convolution and, in int8, the rescaling of each output channel. In int8 it also adds residual (skip) connections, where a layer's output is the sum of a convolution and an earlier tensor. Each output tile becomes two sets: the first holds the convolution's int8 result in a small on-chip buffer (N² bytes), the second brings the earlier tensor through the mesh unchanged (multiplied by the identity matrix) and adds the two with one int8 adder per activation lane. Measured in simulation, the add adds 6 cycles of latency to each beat of that second set (an add set finishes 6 cycles later than a plain one), and the set after it waits until the adders are empty. The host only streams the data in.
 - **Packing.** A layer much smaller than the mesh would leave most of it idle. Several such layers are packed side by side into one matrix multiply, each in its own block, and run together. The hardware ignores everything outside each layer's block, so every result is identical to running the layers one at a time.
-- **Number format chosen at build time.** One define makes the whole pipeline fp32, bf16 or int8 (int32 sums, then a per-channel rescale to int8 for any scale within the host encoder's domain): `make FMT=bf16` builds with `+define+FMT_BF16`, and no define builds fp32. Only the format package (`sienna_fmt_pkg`) and the arithmetic units read the define; every other module takes its widths, latencies and format-dependent steps from the package, and carries plain words. A build contains only its own format's multipliers, adders and activation lanes (`make check-hier` checks this). bf16 multiplies bf16 numbers but adds them up in fp32 and rounds each finished result to bf16 once, because summing in bf16 lets rounding errors pile up over long dot products. bf16 and int8 builds match bit-exact Python models of the hardware, and every int8 output is checked against the exact real-valued result.
+- **Number format chosen at build time.** One define makes the whole pipeline fp32, bf16 or int8 (int32 sums, then a per-channel rescale to int8 for any scale within the host encoder's domain): `make FMT=bf16` builds with `+define+FMT_BF16`, and no define builds fp32. Only the format package (`sienna_fmt_pkg`) and the arithmetic units read the define; every other module takes its widths, latencies and format-dependent steps from the package, and carries plain words. A build contains only its own format's multipliers, adders and activation lanes (the regression checks this). bf16 multiplies bf16 numbers but adds them up in fp32 and rounds each finished result to bf16 once, because summing in bf16 lets rounding errors pile up over long dot products. bf16 and int8 builds match bit-exact Python models of the hardware, and every int8 output is checked against the exact real-valued result.
 
 ---
 
@@ -39,7 +39,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 
 > All numbers are measured in cycle-accurate Verilator simulation of the RTL. Times assume a **950 MHz** clock, the frequency the published TYTAN activation engine reached in a 45 nm process ([paper](#publication)). Synthesis of the full SIENNA pipeline is planned.
 >
-> Every figure below was measured on 2026-10-31 and 2026-11-01 on today's RTL, at every N and tile size, in both mesh modes; bandwidths are derived from the measured cycles and the bytes the testbench counted on each link.
+> SIENNA's throughput, latency, bandwidth, model and packing figures below were measured on 2026-10-31 and 2026-11-01 on today's RTL, at every N and tile size, in the default mesh mode and in collapse-k 0 except the builds listed under Verification. Bandwidths are derived from the measured cycles and the bytes the testbench counted on each link. Comparisons with earlier trees use those trees' own measurements, and the other accelerators' figures are their published ones.
 
 **How a set is timed.** A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 
@@ -79,11 +79,11 @@ N = 16 and 32 use tile size T = 4 and 32 activation lanes; N = 64 uses 128 lanes
 | bf16, 64 | 0.181 µs | 7.43 TFLOPS | 233 / 116 | 0.467 µs | 1.66 TFLOPS | 52 / 6.9 |
 | int8, 64 | 0.164 µs | 7.43 TOPS | 125 / 58 | 0.471 µs | 1.54 TOPS | 26 / 3.2 |
 
-The tanh sets return less because they are pooled (2 × 2, padding 1) before they leave. An int8 set's settings word is large (138 bytes at N = 8, 358 at N = 64: it carries a requantize scale for every output column), so at N = 8 it is almost half of what the host sends. Weight-cache fills and coefficient loads add nothing here: these runs reuse no weights and keep the reset coefficients. Every configuration is in `perf_final.log` of the project report.
+The tanh sets return less because they are pooled (2 × 2, padding 1) before they leave. An int8 set's settings word is large (138 bytes at N = 8, 358 at N = 64: it carries a requantize scale for every output column), so at N = 8 it is almost half of what the host sends. Weight-cache fills and coefficient loads add nothing here: these runs reuse no weights and keep the reset coefficients. Every configuration is in [`docs/perf_final.txt`](docs/perf_final.txt).
 
-**Mesh mode.** The mesh can also split each product's depth across N / T smaller arrays and add their partial sums (collapse-k 0). In every configuration measured that way (N = 8 to 64, every tile size and format, except the builds listed under Verification) it gives the same cycles per set, because the activation lanes or the host set the pace, and a first result up to 57 cycles sooner (int8, N = 64, T = 2: 156 → 99 cycles).
+**Mesh mode.** The mesh can also split each product's depth across N / T smaller arrays and add their partial sums (collapse-k 0). In every configuration measured that way (N = 8 to 64, every tile size and format, except the builds listed under Verification) it gives the same cycles per set, because the activation lanes or the host set the pace, and a first result up to 57 cycles sooner (int8, N = 64, T = 2: 156 → 99 cycles; at N = 8, T = 4 it is 1 cycle later).
 
-Against the tree before the restructure (main up to 9fa414e), at N = 64 (T = 2) the activation lanes take 33% fewer cycles per set for SELU and 58% fewer for tanh in fp32 (670 → 449, 1 060 → 449), 44% and 60% fewer in bf16 (540 → 301, 759 → 301), and 2% and 12% fewer in int8 (329 → 323, 367 → 323). At N = 8 and 16 (T = 2): fp32 SELU and tanh take 12% to 34% fewer cycles, bf16 42% to 52% fewer, int8 2% to 16% fewer, and fp32 sigmoid 16% fewer at N = 8 (141 → 119) and 47% fewer at N = 16 (272 → 144). bf16 sigmoid is compared with the Phase 2 tree instead, because the base tree's bf16 sigmoid failed the 1% gate: it takes 0.54 times that tree's cycles at N = 8 (299 → 160) and 0.30 times at N = 16 (580 → 173). At N = 16, T = 16 the mesh sets the pace (256 cycles in every format and activation); there bf16 tanh takes 3.4% more than the Phase 2 tree (256 against 248). The earlier sweeps did not measure sigmoid at N = 32 or 64.
+Against the tree before the restructure (main up to 9fa414e), at N = 64 (T = 2) the activation lanes take 33% fewer cycles per set for SELU and 58% fewer for tanh in fp32 (670 → 449, 1 060 → 449), 44% and 60% fewer in bf16 (540 → 301, 759 → 301), and 2% and 12% fewer in int8 (329 → 323, 367 → 323). At N = 8 and 16 (T = 2): fp32 SELU and tanh take 12% to 34% fewer cycles, bf16 42% to 52% fewer, int8 2% to 16% fewer, and fp32 sigmoid 16% fewer at N = 8 (141 → 119) and 47% fewer at N = 16 (272 → 144). bf16 sigmoid is compared with the Phase 2 tree instead, because the base tree's bf16 sigmoid failed the 1% gate: it takes 0.54 times that tree's cycles at N = 8 (299 → 160) and 0.30 times at N = 16 (580 → 173). At N = 16, T = 16 the mesh sets the pace (256 cycles in every format and activation); there bf16 tanh takes 3.4% more than the Phase 2 tree (256 against 248) and 1.9% more than the base tree (256 against 251). The earlier sweeps did not measure sigmoid at N = 32 or 64.
 
 ### MLPerf Tiny models
 
@@ -107,7 +107,7 @@ The bandwidth counts the words the host streamed for every layer (inputs and wei
 | MobileNet | same class in 102 of 102 | same class in 105 of 105 | 0.38% |
 | Autoencoder | anomaly score within 0.002% in 136 of 136 | within 0.23% in 140 of 140 | 0.33% |
 
-int8 versions of these four models do not run yet: the int8 path runs single TFLite layers and residual blocks (the `tflite` and `residual` points), not whole MLPerf Tiny models.
+int8 versions of these four models do not run yet: in int8 the host stack runs single quantized layers and residual blocks imported from TFLite or ONNX (the `tflite` and `residual` points), not whole MLPerf Tiny models.
 
 ### Packing small layers
 
@@ -120,7 +120,7 @@ Small jobs of 2 output columns each, run one at a time and packed into shared se
 | 32 jobs, linear, 2 048 rows each (N = 64) | fp32 · bf16 · int8 | 77.9 · 77.7 · 77.2 µs | 2.43 · 2.43 · 2.41 µs | **32×** |
 | 32 jobs, tanh, 2 048 rows each (N = 64) | fp32 · bf16 · int8 | 390 · 300 · 357 µs | 15.4 · 10.4 · 11.2 µs | **25× · 29× · 32×** |
 
-A packed layer takes the same cycles as one of its jobs alone whenever the mesh or the host sets the pace, so the speedup reaches the number of jobs. With fp32 and bf16 tanh the activation lanes take longer on a packed set than on one job's set, so the speedup is lower. N = 8 to 64 in every format is in `perf_final.log`.
+A packed layer takes the same cycles as one of its jobs alone whenever the mesh or the host sets the pace, so the speedup reaches the number of jobs. With fp32 and bf16 tanh the activation lanes take longer on a packed set than on one job's set, so the speedup is lower. N = 8 to 64 in every format is in [`docs/perf_final.txt`](docs/perf_final.txt).
 
 ### Compared with other accelerators
 
@@ -147,7 +147,7 @@ A packed layer takes the same cycles as one of its jobs alone whenever the mesh 
 | Image classification (ResNet-8) | 14.0 µs | 54.1 µs | 98.5 µs | 340 µs | 2.69 ms | 41.7 ms |
 | Keyword spotting (DS-CNN) | 8.4 µs | 31.4 µs | 66.5 µs | 108 µs | 567 µs | 11.5 ms |
 | Visual wake words (MobileNet) | 39.2 µs | 102.7 µs | 118 µs | 362 µs | 1.63 ms | 24.4 ms |
-| Anomaly detection (autoencoder) | 6.5 µs | 18.6 µs | 69.0 µs | 132 µs | 57.6 µs | 1.17 ms |
+| Anomaly detection (autoencoder) | 6.5 µs | 53.6 µs | 69.0 µs | 132 µs | 57.6 µs | 1.17 ms |
 
 These are not like-for-like:
 - **MLPerf Tiny:** the entries are measured on production boards running int8 models, with the whole system in the loop.
@@ -159,21 +159,56 @@ Read them as an indication of where the architecture stands.
 
 ---
 
+## Interface
+
+`sienna_top` is the one module to instantiate. Every stream port is a *credit link* (`credit_link_if`, in ArithmeticLibrary): the receiver grants one credit per free slot on `credit`, and the sender may assert `put` with `data` only while it holds one. After reset the receiver advertises its slots, so neither side needs a ready/valid handshake or a FIFO of its own.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `SET_PORT` | 0 | 0: the layer contract (configure a layer, stream its rows); 1: the set contract (one put per N × N set) |
+| `N`, `TILE_SIZE` | 16, 4 | mesh size and systolic array (tile) size; `TILE_SIZE` divides `N` |
+| `NUM_LANES` | 32 | activation lanes |
+| `COLLAPSE_K` | 1 | 1: one full-depth array per output tile; 0: split the depth over N / T arrays and add their partial sums |
+| `COPIES` | 1 | pipelines behind one set-contract host, which puts sets to them in turn (`copy_sel_o`) |
+| `WC_TILES` | 128 | weight-cache tiles per copy |
+| `LINK_STAGES` | 0 | register stages on the internal links, for timing |
+| `OUT_MAX` | 64 | the most output credits a consumer may grant per lane |
+
+The format (fp32, bf16 or int8) is not a parameter: it is the build's define (`+define+FMT_BF16`, `+define+FMT_INT8`, none for fp32), and `sienna_fmt_pkg` derives every width from it.
+
+| Port group | Contract | What it carries |
+|---|---|---|
+| `cfg_*_i`, `cfg_load_i`, `busy_o`, `done_o` | layer | a layer's sizes (`M`, depth, `N`), activation, accuracy tier (`cfg_tier_i`: 1%, 5% or 10%), bias and residual flags, int8 requantize and ADD words, packing; taken while idle |
+| `a_rows`, `w_rows` (credit links) | layer | the input rows and the weight rows, one row of N words per put; `w_bias_i` and `w_req_scale_i` ride with each block's bias row (int8) |
+| `host[COPIES]` (credit link), `bias_i` | set | one put per set; its data is the set's settings (`sienna_set_side.svh`) |
+| `north_*`, `west_*` | set | the two operand matrices, one row per write, into the copy whose turn it is |
+| `wc_region[2]` (credit link), `wc_write_*` | set | weight-cache fills, so a reused weight matrix is sent once |
+| `coef_wr_i`, `coef_addr_i`, `coef_data_i`, `coef_ready_o` | both | the activation lanes' coefficient memory; a write is taken only while `coef_ready_o` is high (every pipeline empty), otherwise refused |
+| `out[COPIES*NUM_LANES]` (credit links) | both | results, one word per put on each lane's link; a slow consumer holds the pipeline back |
+| `pipeline_complete_o`, `done_set_id_o`, `set_done_o`, `*_busy_o` | both | completion and status |
+
+`scripts/model_runner.py` drives the layer contract from a model, and `testbenches/top/TB_sienna.sv` drives both contracts; either is a working example.
+
+---
+
 ## Verification
 
-- `make regression` runs SIENNA's tests (the pipeline, the models, packed layers, the GEMM sweep and the int8 TFLite layers) at every size: N = 8, 16, 32 and 64, every tile size each N allows, in fp32, bf16 and int8, then prints one table of verdicts. SystolicMesh, GPNAE and ArithmeticLibrary each have their own `make regression` for their parts.
+- `make regression` runs SIENNA's tests (the pipeline, the models, packed layers, the GEMM sweep and the int8 imported layers) at every size: N = 8, 16, 32 and 64, every tile size each N allows, in fp32, bf16 and int8, then prints one table of verdicts. SystolicMesh, GPNAE and ArithmeticLibrary each have their own `make regression` for their parts.
 - The pipeline regression runs 32 tests in fp32, 33 in bf16 and 50 in int8 (nine of them residual layers) at every tile size. They pass on 8 × 8 to 64 × 64 meshes at every tile size, in both mesh modes at N = 8 and 16 and built back to back at every N. Each test streams several sets, and every element of every stage is checked.
 - The systolic mesh matches its bit-exact model and the true function in all three formats from 8 × 8 to 64 × 64 at every tile size, except the collapse-k 0 points listed below (SystolicMesh's `make regression`).
 - **Coverage at every N, tile size and format** (the final sweep of 2026-10-25/26, then the collapse-k 0 points it left, run on 2026-10-31/11-01): SIENNA passes 441 of its 447 points and SystolicMesh 120 of its 123; the rest were not run:
   - The int8 `residual` points pass at every N and tile size. Each case builds a deliberately wrong ADD (its first zero point dropped) and requires the ADD gate to reject it. The test moves the conv's zero point away from 0, with the same scales, until that wrong ADD lands at least two output steps from the right answer: at N = 32 (`tiles`, -2 → -5) and 64 (`deep_uncached`, -3 → -8) the first draws put it within one step. Those two cases keep 84.9% and 100% of their ADD outputs inside the clamp (84.8% and 100% as drawn); every other case is unchanged.
-  - Collapse-k 0 at N = 64 passes at T = 8 to 64 in every format, at T = 4 in bf16 and int8, and at T = 2 in int8 (SIENNA's `gemm-ck0`, `model-ck0` and `tflite-ck0`, and SystolicMesh's `mesh-ck0`).
-  - Not run, at N = 64 with collapse-k 0: SIENNA's fp32 `gemm-ck0` and `model-ck0` at T = 4, whose simulator passes 2 GB of code and cannot link (glibc's startup objects are built for the small code model: "relocation truncated to fit"; a Verilator and toolchain limit, not the RTL), and its fp32 and bf16 `gemm-ck0` and `model-ck0` at T = 2, which build more code still (estimated past the same limit, so not built). The fp32 and bf16 performance runs at T = 2 and the fp32 one at T = 4 are missing for the same reasons.
-  - Not run, SystolicMesh at N = 64 with collapse-k 0: fp32 at T = 4 (the same 2 GB link limit), fp32 at T = 2 (left out by decision) and bf16 at T = 2 (its verilation needs more than 256 GB). So fp32 and bf16 collapse-k 0 at N = 64, T = 2, and fp32 at T = 4, are not covered at either level; int8 at T = 2 and every other format and tile size are.
+  - Collapse-k 0 at N = 64 passes at T = 8 to 64 in every format, at T = 4 in bf16 and int8, and at T = 2 in int8: SIENNA's `gemm-ck0` in every format, `model-ck0` in fp32 and bf16 (there are no int8 model points) and `tflite-ck0` in int8 (only int8 has them), and SystolicMesh's `mesh-ck0`.
+  - Not run, at N = 64 with collapse-k 0:
+  - SIENNA's fp32 `gemm-ck0` at T = 4 compiled and then failed to link: "relocation truncated to fit" from glibc's startup objects, which are built for the small code model and cannot reach code past the 2 GB that model allows. This is a Verilator and toolchain limit, not the RTL. Its `model-ck0` builds the same simulator and was not run.
+  - The fp32 performance run at T = 4 ran out of memory compiling at 16 compile jobs on a 256 GB machine (three tries); that its link would also fail is inferred from the same mesh's link failure below.
+  - fp32 and bf16 `gemm-ck0`, `model-ck0` and performance at T = 2 build more code still; estimated past the same limit, they were not built.
+  - Not run, SystolicMesh at N = 64 with collapse-k 0: fp32 at T = 4 (it compiled and failed at the same link), fp32 at T = 2 (left out by decision) and bf16 at T = 2 (its verilation needs more than 256 GB). So fp32 and bf16 collapse-k 0 at N = 64, T = 2, and fp32 at T = 4, are not covered at either level; int8 at T = 2 and every other format and tile size are.
 - The arithmetic models are also checked against references of their own (hand-derived corners, an integer round-to-nearest-even, float64), so a rounding bug shared by an RTL unit and its model still fails ArithmeticLibrary's and SystolicMesh's regressions.
 - Every int8 output (layers, the rescale, the residual add and the activations) is checked against the exact real-valued result: it must lie within one output step or 1% of it (for activations, the tolerance of the lane's tier: 1%, 5% or 10%), including SAME-padded convolutions with per-channel scales and input zero points, and residual blocks converted from TensorFlow Lite and ONNX-style layers. Agreement with the TensorFlow Lite interpreter is reported beside it, not gated: 447 of the 198 656 layer outputs differ from it.
 - A protocol checker on every credit link and assertions in every stage run in every simulation, and a firing assertion fails the run. Results stay identical with the output stalled at random, and with it held mid-stream until the host is blocked.
-- After every reset and every coefficient load, the testbench reads each lane's coefficient memory and compares it, field by field, with the image the host meant to write; a difference fails the run and names the word (`make coef-fault` shows it failing on one corrupted word).
-- `make check-fmt` fails if any SIENNA RTL file outside the format package's allowlist names a format, and `make check-hier` fails if a build's hierarchy holds another format's units, at both host contracts.
+- After every reset and every coefficient load, the testbench reads each lane's coefficient memory and compares it, field by field, with the image the host meant to write; a difference fails the run and names the word, and a regression point shows it failing on one corrupted word.
+- The regression fails if any SIENNA RTL file outside the format package's allowlist names a format, or if a build's hierarchy holds another format's units, at both host contracts.
 - The default point builds fp32 with no define and must give the same words and cycles as the fp32 point; `pipeline-multi` runs two pipelines behind one host (`COPIES = 2`) in every format.
 
 ---
@@ -186,11 +221,14 @@ You need Verilator 5 with a C++20 compiler (its `--timing` mode needs coroutines
 git clone --recursive https://github.com/SoHam-56/SIENNA.git
 cd SIENNA
 
-make regression SMALL=1                # every test at N = 8 and 16, the sizes a 16 GB machine can build
-make regression                        # every test at N = 8 to 64 (days one at a time: use make -jN, below)
-make verilator TRACE=fst               # one simulation with a waveform
-make wave                              # open that waveform
-make clean                             # remove the builds and logs
+make regression SMALL=1                     # every test at N = 8 and 16, the sizes a 16 GB machine can build
+make regression                             # every test at N = 8 to 64 (days one at a time: use make -jN, below)
+make regression/bf16/N8_T2/pipeline         # one point of the regression
+make model FMT=bf16 [MODEL_DIR=<dir>]       # the four MLPerf Tiny models on the RTL (fp32 or bf16)
+make verilator FMT=bf16 N=16 TILE=4 TRACE=fst   # one simulation with a waveform (vcs: the same on Synopsys VCS)
+make wave                                   # open that waveform
+make lint                                   # Verilator lint of the RTL
+make clean                                  # remove the builds and logs
 ```
 
 Activate the venv in the shell that runs make: some checks call `python3` directly, and without the venv that is the system's Python, which may lack NumPy.
@@ -200,10 +238,10 @@ Activate the venv in the shell that runs make: some checks call `python3` direct
 How `make regression` works:
 - It is a list of *points*. A point is one check at one configuration, e.g. `bf16/N8_T2/pipeline` (the pipeline tests in bf16 at N = 8, tile size 2); the checks are `pipeline`, `model`, `pack`, `gemm`, `tflite` and `residual`. At every N the pipeline also runs as `pipeline-b2b` (built with `-DBACK_TO_BACK`, which adds the back-to-back pass to every test), and at N = 8 and 16 as `pipeline-ck0` (the collapse-k 0 mesh) and `pipeline-ck0-b2b` (both). `default/N8_T2/pipeline` builds fp32 with no define and must equal `fp32/N8_T2/pipeline`, and `<format>/N8_T2/pipeline-multi` runs two pipelines behind one host. `python3 regression.py --action points` lists them.
 - Each point is its own make target, so `make -j4 regression SMALL=1` runs four at a time, each simulating on a quarter of the cores; `make regression/bf16/N8_T2/pipeline` runs one alone.
-- Pick N in `make -jN` for your memory; a bare `make -j` starts every point at once. Measured, the largest process of one point peaks at about 0.8 GB at N = 8, 1.5 GB at N = 16, 3.4 GB at N = 32 and 13 to 18 GB at N = 64. The collapse-k 0 points (`-ck0`) need far more at small tiles: about 52 GB at N = 32, T = 2, and at N = 64 about 48 GB at T = 16, 96 GB at T = 8 (fp32; bf16 about half, int8 a fifth), and at T = 4 213 GB in fp32 (113 GB bf16, 40 GB int8) and at T = 2 92 GB in int8. Each point also runs its C++ compiles side by side, which these peaks do not include: the fp32 T = 4 build with 16 compiles beside it passed 256 GB, so leave room beyond N times the peak. fp32 and bf16 at N = 64, T = 2, and fp32 at T = 4, are not built (Verification). Measured on 8-core machines: every point one at a time on 16 GB machines (all of `SMALL=1`), and `make -j4 regression SMALL=1 FMT=int8` on one 128 GB machine; other `-jN` and memory combinations were not measured.
+- Pick N in `make -jN` for your memory; a bare `make -j` starts every point at once. Measured, the largest process of one point peaks at about 0.8 GB at N = 8, 1.5 GB at N = 16, 3.4 GB at N = 32 and 13 to 18 GB at N = 64. The collapse-k 0 points (`-ck0`) need far more at small tiles: about 52 GB at N = 32, T = 2, and at N = 64 about 48 GB at T = 16, 96 GB at T = 8 (fp32; bf16 about half, int8 a fifth), and at T = 4 213 GB in fp32 (118 GB bf16, 42 GB int8) and at T = 2 97 GB in int8. Each point also runs its C++ compiles side by side, which these peaks do not include: the fp32 T = 4 build with 16 compiles beside it passed 256 GB, so leave room beyond N times the peak. fp32 and bf16 at N = 64, T = 2, and fp32 at T = 4, are not built (Verification). Measured on 8-core machines: every point one at a time on 16 GB machines (all of `SMALL=1`), and `make -j4 regression SMALL=1 FMT=int8` on one 128 GB machine; other `-jN` and memory combinations were not measured.
 - Each point builds in a private copy of the working tree (its files that git does not ignore) and writes its log to `testbenches/results/regression/`. The run ends with one table there, `regression.log`. The pipeline point builds its testbench once for each group of tests that share a hardware configuration and runs the others on that build.
 - A point passes only on its own verdict (every test passed, every output matched its reference). The regression fails if any point fails or did not run.
-- `FMT=int8` narrows it to one format. `make regression-summary` prints the table again from the logs.
+- `FMT=int8` narrows it to one format.
 - The model points run the four MLPerf Tiny models in fp32 and bf16 from `models/` (or `MODEL_DIR=<dir>`); a model whose input file is absent is skipped by name and listed under the table ("Standalone machine" below).
 - Run time of `SMALL=1` (205 points), measured on 2026-10-25: split by format and kind over 19 machines with 8 to 32 cores, each running `make -k -j8` over its points, the whole run took 84 minutes (its longest machine). At N = 32 and 64 (final sweep, one point or a few per machine) the longest points were fp32/N64_T64/model (22.4 hours, sharing an 8-core machine with two other points), fp32/N64_T64/pipeline (19.4 hours alone on a 32-core machine), fp32/N64_T64/pipeline-b2b (19.0 hours), bf16/N64_T64/model (14.6 hours) and bf16/N64_T64/pipeline and pipeline-b2b (13.5 hours each); 88 of the 110 N = 32 points took under an hour, and the longest, fp32/N32_T2/model-ck0, 4.4 hours.
 
@@ -213,7 +251,7 @@ Two Python scripts drive everything:
 
 The MLPerf Tiny reference models are in `models/` (Apache 2.0, from MLCommons; `models/NOTICE`).
 
-The layout: `src/` holds the RTL by function (`top`: sienna_top and its set-side bundle; `pipeline`: sienna_pipe and sienna_sched; `lanes`: the requantize and ADD lanes; `fifo`, `pool`, `dropout`) with the synthesis file list `src/sienna_rtl.f`; `testbenches/top/` the one top bench TB_sienna, whose MODE (`make TB_MODE=pipeline|layer|sets|copies`) picks the pipeline regression, the layer contract, the set contract or COPIES copies; `testbenches/units/` the unit benches; `testbenches/` also holds the stimulus and fixtures the benches read; `scripts/` model_runner.py and the hierarchy check.
+The layout: `src/` holds the RTL by function (`top`: sienna_top and its set-side bundle; `pipeline`: sienna_pipe and sienna_sched; `lanes`: the requantize and ADD lanes; `fifo`, `pool`, `dropout`) with the synthesis file list `src/sienna_rtl.f`; `testbenches/top/` the one top bench TB_sienna, whose mode picks the pipeline regression, the layer contract, the set contract or COPIES copies; `testbenches/units/` the unit benches; `testbenches/` also holds the stimulus and fixtures the benches read; `scripts/` model_runner.py and the hierarchy check.
 
 ---
 
@@ -229,7 +267,7 @@ The [GPNAE](https://github.com/SoHam-56/GPNAE) repository has the design as publ
 
 Everything here runs on any Linux machine; nothing depends on the authors' servers.
 
-**You need:** GNU make, git, a C++ compiler with C++20 coroutines (g++ 10 or later), Verilator 5.035 built with that compiler (the version every regression runs on), and Python 3 with the packages in `requirements.txt` (tested with Python 3.11). The released Verilator 5.052 is not supported yet: it runs SystolicMesh's regression and SIENNA's fp32 and int8 points, but stops on bf16 builds (gpnae_tail.sv), on GPNAE's lane bench (a zero-delay warning in TB_gpnae) and on the lint gates (its new warnings, and its removal of --xml-only, which check-hier reads). A Verilator configured with a g++ older than 10 omits the `-fcoroutines` its `--timing` builds need: put a `g++` wrapper that adds it first on `PATH`.
+**You need:** GNU make, git, a C++ compiler with C++20 coroutines (g++ 10 or later), Verilator 5.035 built with that compiler (the version every regression runs on), and Python 3 with the packages in `requirements.txt` (tested with Python 3.11). The released Verilator 5.052 is not supported yet: it runs SystolicMesh's regression and SIENNA's fp32 and int8 points, but stops on bf16 builds (gpnae_tail.sv), on GPNAE's lane bench (a zero-delay warning in TB_gpnae) and on the lint gates (its new warnings, and its removal of --xml-only, which the hierarchy check reads). A Verilator configured with a g++ older than 10 omits the `-fcoroutines` its `--timing` builds need: put a `g++` wrapper that adds it first on `PATH`.
 
 ```bash
 git clone --recursive https://github.com/SoHam-56/SIENNA.git && cd SIENNA
@@ -288,7 +326,7 @@ What maps to what:
 | `/* verilator lint_off ... */`, `lint_waivers.vlt` | ignored | comments to VCS; the waiver file is Verilator's |
 | `make sim`'s key from Verilator's dependency file | the same key over every source and include file | `make sim SIM=vcs` reuses a VCS build |
 | `perf-analysis` (`VERILATOR_DIR`) | the same flow (`VCS_DIR`) | not a regression point |
-| `check-hier`, `lint` | Verilator only | not regression points |
+| the hierarchy check, `lint` | Verilator only | not regression points |
 
 ---
 

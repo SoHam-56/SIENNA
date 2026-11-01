@@ -1205,6 +1205,7 @@ module TB_sienna #(
     // The monitor reads registered state on the falling edge, never a combinational view of start.
     int ov_mesh_g = 0, ov_g_p = 0, max_in_flight = 0, n_started = 0, bp_mesh = 0, bp_act = 0;
     int pool_with_result = 0;  // pooling busy while a mesh result waited on an idle activation stage, so activation could have overlapped it
+    int mesh_staged_g = 0;  // activation busy while the mesh held a staged set, so the mesh could have overlapped it
     int stream_id_base;  // sets started before the stream, which consumed ids
     wire mesh_computing = dut.G_SET.G_COPY[0].pipe.systolic_array_inst.mesh_busy;  // a set between staging and a written result
     // A finished set waits for a result bank: the mesh is held up by the consumer.
@@ -1216,6 +1217,7 @@ module TB_sienna #(
       @(negedge clk_i);
       if (stream_on) begin
         if (mesh_computing && gpnae_busy_tb) ov_mesh_g++;
+        if (gpnae_busy_tb && (mesh_computing || dut.G_SET.G_COPY[0].pipe.systolic_array_inst.in_full[dut.G_SET.G_COPY[0].pipe.systolic_array_inst.in_rd])) mesh_staged_g++;
         if (gpnae_busy_tb && maxpool_busy_tb) ov_g_p++;
         // A finished result sits in the mesh, not being pushed, while pooling runs and the activation stage has neither taken it nor granted its beats.
         if (maxpool_busy_tb && res_ready && !dut.G_SET.G_COPY[0].pipe.wide_rd_valid && int'(dut.G_SET.G_COPY[0].pipe.g_state) == 0 && !dut.G_SET.G_COPY[0].pipe.l3_armed) pool_with_result++;
@@ -1372,6 +1374,7 @@ module TB_sienna #(
       ov_mesh_g = 0;
       ov_g_p = 0;
       pool_with_result = 0;
+      mesh_staged_g = 0;
       max_in_flight = 0;
       bp_mesh = 0;
       bp_act = 0;
@@ -1573,10 +1576,12 @@ module TB_sienna #(
       $display("  [Stream] mesh stalled on full result banks: %0d cycles", bp_mesh);
       $display("  [Stream] activation stalled on full activation banks: %0d cycles", bp_act);
       if (hold) $display("  [Stream] overlap requirements not applied: the hold pass's output stalls by design");
-      else if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1) begin
+      else if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1 && mesh_staged_g > 0) begin
         failed++;
-        $display("  [FAIL] Overlap: the mesh never computed while the activation stage held a set");
-      end else if (ov_mesh_g == 0)
+        $display("  [FAIL] Overlap: the mesh held a staged set for %0d cycles while the activation stage held a set, yet never computed then", mesh_staged_g);
+      end else if (ov_mesh_g == 0 && SETS_IN_FLIGHT > 1)
+        $display("  [Stream] mesh/activation overlap not reachable: no set was staged for the mesh while the activation stage held one (host-bound)");
+      else if (ov_mesh_g == 0)
         $display("  [Stream] mesh/activation overlap not reachable: SETS_IN_FLIGHT 1 admits one set at a time");
       // Only a failure if a mesh result was waiting while pooling ran; with the mesh slowest there is nothing to overlap.
       if (!hold && ov_g_p == 0 && pool_with_result > 0) begin

@@ -67,6 +67,18 @@ The bandwidth counts the words the host streamed for every layer (inputs and wei
 
 int8 versions of these four models do not run yet: in int8 the host stack runs single quantized layers and residual blocks imported from TFLite or ONNX (the `tflite` and `residual` points), not whole MLPerf Tiny models.
 
+### Inference: a Transformer encoder (BERT-Tiny)
+
+`make bert` runs BERT-Tiny (Google's `bert_uncased_L-2_H-128_A-2`: 2 layers, width 128, 2 heads, feed-forward 512) on 128-token masked sentences. Every matrix product runs on the layer engine as a plain GEMM: the fused Q K V projection, Q Kᵀ and P V for each head (the attention operands are activations, not weights, which the layer contract does not care about), the attention output and both feed-forward layers, the pooler as a tanh job on the activation lanes, and the masked-language-model head on the [MASK] row. Softmax, LayerNorm, GELU (which the lanes do not have), the embedding lookup and the residual adds run on the host in float64. The golden is the same model run on the CPU in float64, which agrees with the Hugging Face implementation to 1.3 × 10⁻⁷; the gate compares the end of the pipeline with it, the final hidden states, the pooled output and the logits, and requires the same top-1 token at [MASK]. T = 4, three sentences each:
+
+| Build | Encoder, 128 tokens | Pooler and MLM head | Whole run | Hidden states vs golden | Top-1 at [MASK] |
+|---|---|---|---|---|---|
+| fp32, N = 16, 32 lanes | 231,296 cycles, 243 µs | 249,026 cycles | 480,322 cycles, 506 µs | ≤ 3.7 × 10⁻⁶ | same as golden, 3 of 3 |
+| bf16, N = 16, 32 lanes | 231,296 cycles, 243 µs | 248,484 cycles | 479,780 cycles, 505 µs | ≤ 1.7 × 10⁻² | same as golden, 3 of 3 |
+| fp32, N = 64, 128 lanes | 18,560 cycles, 19.5 µs | 63,375 cycles | 81,935 cycles, 86 µs | ≤ 3.7 × 10⁻⁶ | same as golden, 3 of 3 |
+
+The encoder's 54.5 M multiply-accumulates take 19.5 µs at N = 64 (2.8 TFLOPS, 70% of the mesh's slots); the 128 × 128 attention products fit the mesh exactly. The head is slow for a different reason: it works on one row (the [MASK] token), so the 30,522-wide vocabulary projection fills 1 of N rows of every set and takes three quarters of the run; a host that batches the masked rows of many sentences, or keeps the vocabulary projection on the CPU, avoids it. The pooler's tanh is within the 1% tier's bound (0.49% of the largest output in fp32). BERT-Tiny itself is a weak model: it predicts "france" for "the capital of france is [MASK]", and so does the Hugging Face reference.
+
 **How a set is timed.** The rest of this section measures the engine rather than a model. A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 
 | N = 16, fp32, ReLU set, T = 4 | Cycles | Time |
@@ -229,6 +241,8 @@ make regression SMALL=1                     # every test at N = 8 and 16, the si
 make regression                             # every test at N = 8 to 64 (days one at a time: use make -jN, below)
 make regression/bf16/N8_T2/pipeline         # one point of the regression
 make model FMT=bf16 [MODEL_DIR=<dir>]       # the four MLPerf Tiny models on the RTL (fp32 or bf16)
+models/fetch_bert_tiny.sh && make bert      # BERT-Tiny's encoder on the RTL (fp32 or bf16; BERT_SEQ=, BERT_TIER=)
+make model-pack N=64 LANES=128              # layers of different MLPerf Tiny models in one packed set
 make verilator FMT=bf16 N=16 TILE=4 TRACE=fst   # one simulation with a waveform (vcs: the same on Synopsys VCS)
 make wave                                   # open that waveform
 make lint                                   # Verilator lint of the RTL

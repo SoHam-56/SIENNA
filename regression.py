@@ -5014,7 +5014,8 @@ def test_regression_target():
     assert r.returncode != 0 and "FMT=fp16: not one of" in r.stderr, r.stderr
     r = make_n("regression", "SMALL=2")
     assert r.returncode != 0 and "Invalid SMALL=2" in r.stderr, r.stderr
-    assert recipe("model", "MODEL_DIR=/m")[-1].split()[-2:] == ["--count", "1"] and recipe("model", "MODEL_DIR=/m", "MODEL_COUNT=3")[-1].split()[-2:] == ["--count", "3"]
+    cmd = lambda *a: " ".join(w for w in " ".join(recipe("model", "MODEL_DIR=/m", *a)).split() if w != "\\")  # the recipe's continuation lines, as one command
+    assert "--count 1 " in cmd() and "--count 3 " in cmd("MODEL_COUNT=3") and cmd().endswith("--tier 0") and "--models selu --tier 1" in cmd("MODELS=selu", "TIER=1")
     assert make_n("check").returncode != 0  # the gate's old name is gone
     r = make_n("gemm", "COLLAPSE_K=0", "FMT=fp32", "PYTHON=py")
     assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr

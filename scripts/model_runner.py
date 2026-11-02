@@ -2590,7 +2590,9 @@ def model_pack_main(argv=None):
         cyc_p = st["cycles"]
         tot_p += cyc_p
         names = ", ".join(f"{n}.L{li:02d}" for n, li, _, _ in g)
-        log(f"\n== set {gi}: {names}; b = {b}, {len(g)} of {N // b} blocks, {job['shape'][0]} rows: {st['sets']} sets, {cyc_p} cycles packed")
+        same = len({n for n, _, _, _ in g}) < len(g)
+        log(f"\n== set {gi}: {names}; b = {b}, {len(g)} of {N // b} blocks, {job['shape'][0]} rows: {st['sets']} sets, {cyc_p} cycles packed"
+            + (" (layers of one model side by side: two of its inferences in flight, not one)" if same else ""))
         cyc_a = 0
         for (name, li, j, _), outs in zip(g, unpack(Y, recipe)):
             yp = np.vstack(outs)

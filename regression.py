@@ -5583,7 +5583,7 @@ def test_bert_main_reference_only():
         with contextlib.redirect_stdout(buf):
             mr.bert_main(["--bert-dir", d, "--no-sim", "--seq", "16", "--text", "the plays [MASK] .", "--work", os.path.join(d, "work")])
         out = buf.getvalue()
-        assert "float64 reference: [MASK] ->" in out and "BERT GATE: not run" in out, out
+        assert "CPU golden (float64): [MASK] ->" in out and "BERT GATE: not run" in out, out
 
 
 # ── tool: perf section (was test_perf_analysis.py) ──

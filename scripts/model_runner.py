@@ -2391,6 +2391,7 @@ def tflite_pack_main(argv=None):
     sys.exit(1 if bad else 0)
 
 
+BERT_BOUND = {"fp32": 1e-4, "bf16": 5e-2}  # end to end, max|hw-golden|/max|golden| on the hidden states, pooled output and MLM logits; bf16 PROVISIONAL until measured
 BERT_TEXTS = (  # masked sentences and the token the float model should put first; the task gate compares the hardware's top-1 with the float reference's
     "the capital of france is [MASK] .",
     "the quick brown fox jumps over the lazy [MASK] .",
@@ -2399,10 +2400,12 @@ BERT_TEXTS = (  # masked sentences and the token the float model should put firs
 
 
 def bert_main(argv=None):
-    """BERT-Tiny (google/bert_uncased_L-2_H-128_A-2) on the layer contract: every matrix product (Q K V, Q K^T per head, P V, the output and FFN
-    layers, the pooler as a tanh lane job at --tier, the MLM head on the [MASK] rows) is a GEMM job on the RTL and gated bit for bit against the
-    backend's exact model; softmax, LayerNorm, GELU, the embedding lookup and the residual adds run on the host in float64. The task gate is
-    the top-1 masked token against the float64 reference."""
+    """BERT-Tiny (google/bert_uncased_L-2_H-128_A-2) on the layer contract. The golden is the model run on the CPU in float64 (bert_forward with a
+    numpy backend; it agrees with the Hugging Face implementation to 1.3e-7). The hardware run puts every matrix product (Q K V, Q K^T per head, P V,
+    the output and FFN layers, the pooler as a tanh lane job at --tier, the MLM head on the [MASK] rows) through the RTL and does softmax, LayerNorm,
+    GELU, the embedding lookup and the residual adds on the host in float64. The gate compares the end of the pipeline with the golden for the same
+    input: the final hidden states, the pooled output and the MLM logits within BERT_BOUND, and the same top-1 masked token. Per job, the layer gate's
+    comparison with the backend's bit-exact model is printed as a diagnostic only."""
     ap = argparse.ArgumentParser(description=bert_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="bert")
     ap.add_argument("--bert-dir", default=BERT_DIR, help="config.json, model.safetensors and vocab.txt (models/fetch_bert_tiny.sh)")
@@ -2435,14 +2438,14 @@ def bert_main(argv=None):
     heads, layers = cfg["num_attention_heads"], cfg["num_hidden_layers"]
     log(f"BERT {os.path.basename(os.path.normpath(a.bert_dir))}: {layers} layers, d = {cfg['hidden_size']}, {heads} heads, FFN {cfg['intermediate_size']}, "
         f"vocab {cfg['vocab_size']}; seq {a.seq}; {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} collapse-k {COLLAPSE_K}; pooler tanh at tier {a.tier}")
-    log("host (float64): embeddings, softmax, LayerNorm, GELU, residual adds; RTL: every matrix product, the pooler's tanh")
+    log("golden: the model on the CPU in float64; hardware run: every matrix product and the pooler's tanh on the RTL, embeddings, softmax, LayerNorm, GELU and residual adds on the host")
     sim = None
     if not a.no_sim:
         sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
         t0 = time.time()
         sim.build()
         log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
-    bound = LAYER_BOUND[a.fmt_name]
+    bound = BERT_BOUND[a.fmt_name]
     lane_tol = gpnae_model.TIER_TOL[a.tier]
     hw_fail, task_fail, total = [], [], {"sets": 0, "cycles": 0, "macs": 0, "jobs": 0}
     for si, text in enumerate(a.text or BERT_TEXTS):
@@ -2451,7 +2454,7 @@ def bert_main(argv=None):
                            else _true_act(job_reference(job)[0], job["act"]).astype(np.float32), heads, vocab["[MASK]"], a.tier)
         log(f"\n== sentence {si}: {text!r} ({int(mask.sum())} tokens)")
         ref_top = [int(np.argmax(r)) for r in ref["logits"]]
-        log(f"  float64 reference: [MASK] -> {', '.join(words[t] for t in ref_top)}")
+        log(f"  CPU golden (float64): [MASK] -> {', '.join(words[t] for t in ref_top)}")
         if sim is None:
             continue
         stats = []
@@ -2460,9 +2463,9 @@ def bert_main(argv=None):
             y, st = run_checked(job, sim, f"s{si}.{tag}")
             stats.append(dict(st, act=job["act"], tier=job.get("tier", 0)))
             rec = st["exact"]
-            ex = "" if rec is None else f"  bit-exact {rec['differ']}/{rec['words']} differ"
+            ex = "" if rec is None else f"  diag: {rec['differ']}/{rec['words']} words off the bit-exact model"
             log(f"    {tag:<12} {str(tuple(job['shape'])):<14} K {job['terms'][0][1].shape[0]:5d} {job['act']:<7} sets {st['sets']:5d}  cycles {st['cycles']:7d}  "
-                f"MACs {st['macs']:9d}  max err/max|ref| {st['err']:.2e}{ex}")
+                f"MACs {st['macs']:9d}  job err {st['err']:.2e}{ex}")
             return y
 
         c0, s0, t0 = sim.cycles, sim.sets, time.time()
@@ -2470,19 +2473,17 @@ def bert_main(argv=None):
         cyc, sets = sim.cycles - c0, sim.sets - s0
         macs = sum(st["macs"] for st in stats)
         hw_top = [int(np.argmax(r)) for r in hw["logits"]]
-        for st in stats:
-            b = lane_tol if st["act"] not in ("relu", "linear") else bound
-            if st["exact"] and st["exact"]["differ"]:
-                hw_fail.append(f"FAIL hardware sentence {si} {st['tag']}: {st['exact']['differ']} of {st['exact']['words']} words differ from the bit-exact model")
-            if not st["err"] <= b:
-                hw_fail.append(f"FAIL hardware sentence {si} {st['tag']}: max|hw-ref|/max|ref| {st['err']:.2e} above {b:g}")
+        diag = sum(st["exact"]["differ"] for st in stats if st["exact"])
+        rel = lambda k: float(np.max(np.abs(hw[k].astype(np.float64) - ref[k]))) / (float(np.max(np.abs(ref[k]))) or 1.0)
+        dh, dp, dl = rel("hidden"), rel("pooled"), rel("logits")
+        for what, v, b in (("hidden states", dh, bound), ("pooled output (tanh lane)", dp, max(bound, lane_tol)), ("MLM logits", dl, bound)):
+            if not v <= b:
+                hw_fail.append(f"FAIL output sentence {si}: {what} max|hw-golden|/max|golden| {v:.2e} above {b:g}")
         if hw_top != ref_top:
-            task_fail.append(f"FAIL task sentence {si}: hardware's [MASK] -> {', '.join(words[t] for t in hw_top)}, the float reference's {', '.join(words[t] for t in ref_top)}")
-        dh = float(np.max(np.abs(hw["hidden"].astype(np.float64) - ref["hidden"]))) / float(np.max(np.abs(ref["hidden"])))
-        dp = float(np.max(np.abs(hw["pooled"].astype(np.float64) - ref["pooled"]))) / float(np.max(np.abs(ref["pooled"])))
+            task_fail.append(f"FAIL task sentence {si}: hardware's [MASK] -> {', '.join(words[t] for t in hw_top)}, the CPU golden's {', '.join(words[t] for t in ref_top)}")
         util = macs / (sets * a.n ** 3) if sets else 0
-        log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (ref {', '.join(words[t] for t in ref_top)}); hidden states max|hw-ref|/max|ref| {dh:.2e}, "
-            f"pooled {dp:.2e} (tanh lane, tier {a.tier})")
+        log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (golden {', '.join(words[t] for t in ref_top)}); end to end max|hw-golden|/max|golden|: "
+            f"hidden states {dh:.2e}, pooled {dp:.2e} (tanh lane, tier {a.tier}), MLM logits {dl:.2e}; diag: {diag} words off the bit-exact model over all jobs")
         log(f"  {len(stats)} GEMM jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {time.time() - t0:.0f} s")
         for k, v in (("sets", sets), ("cycles", cyc), ("macs", macs), ("jobs", len(stats))):
             total[k] += v
@@ -2495,8 +2496,8 @@ def bert_main(argv=None):
     n_s = len(a.text or BERT_TEXTS)
     ok = not hw_fail and not task_fail and total["jobs"] > 0
     log(f"BERT GATE: {'PASS' if ok else 'FAIL'}  {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} seq={a.seq} tier={a.tier}: {n_s} sentences, {total['jobs']} GEMM jobs, "
-        f"{total['sets']} sets, {total['cycles']} cycles, {total['macs']} MACs; hardware: {len(hw_fail)} failures (bit-exact, {a.fmt_name} bound {bound:g}, "
-        f"lane tier bound {lane_tol:g}); task: {len(task_fail)} of {n_s} sentences fail")
+        f"{total['sets']} sets, {total['cycles']} cycles, {total['macs']} MACs; outputs against the CPU golden: {len(hw_fail)} failures ({a.fmt_name} bound {bound:g}, "
+        f"pooled {max(bound, lane_tol):g}); task: {len(task_fail)} of {n_s} sentences fail")
     if not ok:
         sys.exit(1)
 

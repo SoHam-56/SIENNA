@@ -24,3 +24,6 @@ Not in this directory:
 
 ## lstm_ecg5000.npz
 Trained here by `regression.py --action lstm-model` on ECG5000 (UCR time-series archive, Chen et al. 2015; fetched by models/fetch_ecg5000.sh, not committed). Weights under this directory's license.
+
+## selu_cifar10.npz
+Trained here by `regression.py --action selu-model` on CIFAR-10 (Krizhevsky 2009; fetched by models/fetch_cifar10.sh train, not committed): a self-normalizing convnet (Klambauer et al. 2017), 78.6% test top-1. Weights under this directory's license.

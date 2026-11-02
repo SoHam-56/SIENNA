@@ -286,85 +286,30 @@ VCS_BUILD_KEY = { for f in $(sort $(DESIGN_FILES) $(TB_DIR)/top/$(TESTBENCH) $(w
 default: help
 
 help:
-	@echo "=== SIENNA Hardware Simulation Makefile ==="
+	@echo "=== SIENNA ==="
+	@echo "  FMT=fp32|bf16|int8 picks the number format (default fp32); N, TILE, LANES the mesh size, tile size and lanes (default 16, 4, 32)."
 	@echo ""
-	@echo "Precision (one variable for every build and run):"
-	@echo "  FMT=fp32|bf16|int8      - number format (default fp32); any other value stops make"
-	@echo "  N, TILE, LANES          - mesh size, tile size, activation lanes (default 16, 4, 32)"
-	@echo "  COLLAPSE_K=1|0          - mesh COLLAPSE_K (default 1), for TB_sienna's pipeline mode, the layer contract's model, gemm and tflite runs, and sm-verilator"
-	@echo "  TEST=<name>             - make pkg / build test (default matmul_relu_nopool); pipeline: name filter"
-	@echo "  make pkg                - Write testbenches/test_config_pkg.sv + that test's stimulus for FMT, N, TILE, TEST"
-	@echo "  GEN_PKG=0               - Build the package already on disk (after gen-matmul/gen-conv)"
-	@echo "  verilator, lint, debug, perf and vcs run make pkg first; the format is the define's (+define+FMT_<FMT>), never the package's"
-	@echo "  FMT_DEF=                - Build with no precision define, which must elaborate fp32"
-	@echo "  NOTE: so a default make verilator rewrites the tracked testbenches/test_config_pkg.sv; don't commit it"
+	@echo "  make regression SMALL=1           - every test at N = 8 and 16 (FMT=<f> narrows it to one format)"
+	@echo "  make regression                   - every test at N = 8 to 64 (use make -jN; see the README for memory)"
+	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
+	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32 or bf16)"
+	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
+	@echo "  make vcs                          - the same on Synopsys VCS; SIM=vcs runs make regression on VCS (README: Running with VCS)"
+	@echo "  make wave                         - open the last waveform"
+	@echo "  make lint                         - Verilator lint of the RTL"
+	@echo "  make clean                        - remove the builds and logs"
 	@echo ""
-	@echo "Simulation Targets:"
-	@echo "  make verilator           - Simulate using Verilator (no waveform)"
-	@echo "  make sim                 - Run the last TB_sienna build of TB_MODE on the stimulus in testbenches/, no build; refuses a build of other inputs or flags"
-	@echo "  make build-key           - Print the key make sim compares with the build's (inputs, package without the run-time knobs, flags)"
-	@echo "  make verilator TRACE=fst - Simulate + write FST waveform (recommended)"
-	@echo "  make verilator TRACE=vcd - Simulate + write VCD waveform (larger)"
-	@echo "  make vcs                 - Simulate using Synopsys VCS (no waveform); SIM=vcs runs every flow below on VCS (README: Running with VCS)"
-	@echo "  make vcs       TRACE=vcd - Simulate + write VCD waveform"
-	@echo "  make vcs       TRACE=fst - VCS has no native FST dump; still writes VCD"
-	@echo ""
-	@echo "Individual Module Targets:"
-	@echo "  make sm-verilator      - Systolic Mesh only: its model checks, then its regression in FMT at N, TILE, COLLAPSE_K (SM_CHECKS=0 skips the checks)"
-	@echo "  make gpnae-verilator   - GPNAE only: the lane sienna_top uses, every input of its gate in FMT against the true function"
-	@echo "  make gpnae-verilator GPNAE_TIER=1 - the same at accuracy tier 1 (5%; 2 is 10%, 0 the default 1%)"
-	@echo ""
-	@echo "Analysis Targets:"
-	@echo "  make lint              - Run Verilator lint check"
-	@echo "  make check-fmt         - no RTL outside the allowlist names a precision, and a planted EXP_W fails (C4)"
-	@echo "  make check-hier        - each define's hierarchy, at SET_PORT 0 and 1, holds only that precision's units, the lanes' exactly"
-	@echo "  make debug             - Build with GDB back-trace"
-	@echo "  make perf              - Build with performance profiling"
-	@echo ""
-	@echo "Format-aware Run Targets (all take FMT, N, LANES, and TILE):"
-	@echo "  make pipeline FMT=int8            - Full pipeline regression (TEST=<substring> narrows it)"
-	@echo "  make model FMT=bf16 [MODEL_DIR=<d>] - MLPerf Tiny models on the RTL (scripts/model_runner.py; no int8; default models/)"
-	@echo "  make gemm FMT=int8 [QUICK=1]      - GEMM shape sweep on sienna_top's layer contract (regression.py --action gemm)"
-	@echo "  make perf-analysis FMT=bf16       - Cycle/latency/throughput report (regression.py --action perf)"
-	@echo "  make tflite FMT=int8              - Single-layer TFLite int8 models, each output on the true function (scripts/model_runner.py --action tflite); needs FMT=int8"
-	@echo "  make residual FMT=int8            - int8 residual layers and the residual-block TFLite models, each stage on the true function (regression.py --action residual); needs FMT=int8"
-	@echo "  make pack FMT=int8                - packed layers vs each job alone (regression.py --action pack)"
-	@echo "  make multi FMT=bf16 [COPIES=2]    - TB_sienna's copies mode: sienna_top at COPIES copies (regression.py --action multi)"
-	@echo "  make idle-fault SET_PORT=0|1      - a put on the unused contract must fire a_idle_contract (regression.py --action idle-fault)"
-	@echo "  make coef-fault SET_PORT=0|1      - one word off in a lane's coefficient image must fail the image check (regression.py --action coef-fault)"
-	@echo "  make add-lanes                    - add_lanes on the true function of the ADD (int8 residual ADD)"
-	@echo "  make rq-lanes                     - requant_lanes on the true function of the requantize (int8)"
-	@echo "  make regression [MODEL_DIR=<d>]   - SIENNA's tests (pipeline, model, pack, gemm, tflite, residual) at N = 8, 16, 32, 64 x every tile size x fp32, bf16, int8, then one table (long: make -jN, N for your memory)"
-	@echo "  make regression SMALL=1           - The same at N = 8 and 16 only; FMT=<f> narrows either to one format"
-	@echo "  make regression/<point>           - One point, e.g. regression/bf16/N8_T2/pipeline (regression.py --action points lists them)"
-	@echo "  make regression-summary           - The table of the results in REG_DIR (default testbenches/results/regression)"
-	@echo "                                      SystolicMesh, GPNAE and ArithmeticLibrary each run their own: make -C <repo> regression"
-	@echo "  PYTHON=<venv>/bin/python          - Interpreter for these (tflite and model need the tflite package)"
-	@echo ""
-	@echo "Utility Targets:"
-	@echo "  make wave              - View waveforms (requires prior TRACE=vcd|fst run)"
-	@echo "  make gen-matmul        - Generate matmul stimulus in FMT (N=16 default); build it with GEN_PKG=0"
-	@echo "  make gen-conv          - Generate conv stimulus in FMT   (N=16 default); build it with GEN_PKG=0"
-	@echo "  make clean             - Remove all simulation artifacts"
-	@echo "  make clean-all         - Clean all including subprojects"
-	@echo ""
-	@echo "Disk usage note:"
-	@echo "  TRACE=0   (default) → no waveform written; Verilator dir stays small."
-	@echo "  TRACE=fst           → compact waveform, recommended for this project."
-	@echo "  TRACE=vcd           → can be very large for complex designs."
-	@echo ""
-	@echo "Current Configuration:"
-	@echo "  FMT        : $(FMT)  (N=$(N) TILE=$(TILE) LANES=$(LANES) COLLAPSE_K=$(COLLAPSE_K) TEST=$(PKG_TEST))"
-	@echo "  TOP_MODULE : $(TOP_MODULE)  TB_MODE: $(TB_MODE) (MODE $(TB_MODE_NUM))"
-	@echo "  TESTBENCH  : $(TESTBENCH)"
-	@echo "  TRACE      : $(TRACE)"
-	@echo ""
-	@echo "Design Files:"
-	@echo "  Systolic Mesh : $(words $(SM_FILES)) files  |  SM Lib: $(words $(SM_LIB_FILES)) files"
-	@echo "  GPNAE         : $(words $(GPNAE_FILES)) files"
-	@echo "  Maxpool       : $(words $(MAXPOOL_FILES)) files"
-	@echo "  Dropout       : $(words $(DROPOUT_FILES)) files"
-	@echo "  Total         : $(words $(DESIGN_FILES)) files"
+	@echo "  make help-debug                   - targets for debugging a failing or slow run"
+
+help-debug:
+	@echo "=== SIENNA: debugging a run ==="
+	@echo "  make pkg [TEST=<name>]            - write testbenches/test_config_pkg.sv and one test's stimulus for FMT, N, TILE (GEN_PKG=0 builds the one on disk)"
+	@echo "  make gen-matmul | gen-conv        - write a matmul or conv stimulus by hand, then build it with GEN_PKG=0"
+	@echo "  make sim                          - rerun the last TB_sienna build on new stimulus, no rebuild; refuses a build of other inputs or flags"
+	@echo "  make build-key                    - print the key make sim compares with the build's"
+	@echo "  make debug                        - build with GDB back-traces"
+	@echo "  make perf                         - build with Verilator's profiling (where the simulator spends its time)"
+	@echo "  COLLAPSE_K=1|0                    - the mesh mode for verilator, debug and sim (default 1)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vector generation convenience targets
@@ -474,23 +419,6 @@ endif
 # The key make sim compares with the build's (BUILD_KEY), printed.
 build-key:
 	@$(if $(filter vcs,$(SIM)),$(VCS_BUILD_KEY),$(BUILD_KEY))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sub-module targets
-# ─────────────────────────────────────────────────────────────────────────────
-# The mesh TB takes its format from SystolicMesh's FMT (its define) and its sizes and mesh mode as -G overrides.
-# SM_CHECKS=0: without the model checks (aril-fpu, aril-narrow, model-tests); SystolicMesh's own make regression covers every N, tile size and format.
-SM_CHECKS ?= 1
-sm-verilator:
-	@echo "=== Systolic Mesh only: FMT=$(FMT) N=$(N) TILE=$(TILE) COLLAPSE_K=$(COLLAPSE_K) ==="
-	$(MAKE) -C SystolicMesh mesh-regression MATRIX_SIZE=$(N) SIM=$(SIM) \
-		REGRESSION_OPTS="--format $(FMT) --collapse-k $(COLLAPSE_K) --tiles $(TILE)$(if $(filter 0,$(SM_CHECKS)), --no-checks)"
-
-# GPNAE's lane gate at one tier of its coefficient memory: the RTL's words against the true function at that tier's tolerance.
-GPNAE_TIER ?= 0
-gpnae-verilator:
-	@echo "=== GPNAE only: FMT=$(FMT), tier $(GPNAE_TIER) ==="
-	cd GPNAE && $(PYTHON) regression.py --format $(FMT) --run gate --tier $(GPNAE_TIER) --sim $(SIM)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VCS
@@ -749,6 +677,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help verilator vcs sm-verilator gpnae-verilator \
+.PHONY: default help help-debug verilator vcs \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

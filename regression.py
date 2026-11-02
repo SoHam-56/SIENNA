@@ -4464,7 +4464,7 @@ def test_parse_time_rejections():
         assert "COLLAPSE_K=0 reaches" not in r.stderr, (t, r.stderr)
     r = make_n("lint", "COLLAPSE_K=2")
     assert r.returncode != 0 and "Invalid COLLAPSE_K=2" in r.stderr, r.stderr
-    for t in ("help", "sm-verilator"):  # the only targets collapse-k 0 is meaningful for, or harmless in
+    for t in ("help",):  # the one target collapse-k 0 is harmless in
         r = make_n(t, "COLLAPSE_K=0")
         assert r.returncode == 0, (t, r.stderr)
 
@@ -4653,8 +4653,8 @@ def test_point_commands():
     for args in (("lint", "GEN_PKG=0"), ("-C", "SystolicMesh", "lint"), ("-C", "GPNAE", "verilator")):  # every Verilator build of this tree takes SIM_THREADS
         out = make_n(*args, "SIM_THREADS=3").stdout
         assert "--threads 3" in out and "--threads 8" not in out, (args, out[:300])
-    r = make_n("sm-verilator", "FMT=bf16", "N=32", "TILE=8")  # the mesh alone, for one N, as before
-    assert r.returncode == 0 and "mesh-regression MATRIX_SIZE=32" in r.stdout and "--tiles 8" in r.stdout, r.stdout[-300:]
+    for t in ("sm-verilator", "gpnae-verilator"):  # no sub-block runs from SIENNA: each submodule runs its own regression
+        assert make_n(t).returncode != 0, t
 
 
 @selftest
@@ -4950,7 +4950,12 @@ def test_regression_target():
     r = make_n("gemm", "COLLAPSE_K=0", "FMT=fp32", "PYTHON=py")
     assert r.returncode == 0 and "--collapse-k 0" in r.stdout, r.stdout + r.stderr
     h = subprocess.run(["make", "-s", "help"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
-    assert "make sim " in h and "make build-key " in h and "sienna_ck0" not in open(os.path.join(ROOT, "Makefile")).read(), h[-300:]
+    hd = subprocess.run(["make", "-s", "help-debug"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True).stdout
+    assert "make sim " in hd and "make build-key " in hd and "sienna_ck0" not in open(os.path.join(ROOT, "Makefile")).read(), hd[-300:]
+    for t in ("regression SMALL=1", "regression/<point>", "make model ", "make verilator ", "make vcs ", "make wave ", "make lint ", "make clean ", "make help-debug "):
+        assert t in h, (t, h[-300:])  # make help lists only the public targets and points to help-debug
+    for t in ("make pipeline", "make gemm", "make pack ", "make coef-fault", "make check-fmt", "make perf-analysis", "sm-verilator"):
+        assert t not in h, (t, h[-300:])
     with tempfile.TemporaryDirectory() as d:  # a relative MODEL_DIR reaches the points absolute: they run in a private copy
         rel = os.path.relpath(d, ROOT)
         lines = recipe("regression", "SMALL=1", f"MODEL_DIR={rel}")
@@ -4959,14 +4964,6 @@ def test_regression_target():
     r = subprocess.run(["make", "-s", "-n", "regression", py], cwd=ROOT, env=env, capture_output=True, text=True)
     names = [x.split("--name ")[1].split()[0] for x in r.stdout.splitlines() if "--action point " in x]
     assert r.returncode == 0 and sorted(names) == sorted(SPEC.points(False, list(FORMATS))), (r.stderr[-200:], len(names))
-
-
-@selftest
-def test_gpnae_target_tier():
-    r = make_n("gpnae-verilator", "FMT=bf16", "PYTHON=py")
-    assert r.returncode == 0 and "py regression.py --format bf16 --run gate --tier 0" in r.stdout, r.stdout + r.stderr
-    r = make_n("gpnae-verilator", "FMT=bf16", "GPNAE_TIER=2", "PYTHON=py")
-    assert r.returncode == 0 and "--tier 2" in r.stdout, r.stdout + r.stderr
 
 
 @selftest
@@ -6166,9 +6163,8 @@ def test_vcs_commands():
                        (("vcs", "GEN_PKG=0", "TB_MODE=layer"), ("-top TB_sienna", "-pvalue+TB_sienna.MODE=1", "VCS/TB_sienna_layer_sim.build_key.txt")),
                        (("sim", "GEN_PKG=0", "SIM=vcs"), ("VCS/TB_sienna_pipeline_sim.build_key.txt", "cd " + os.path.join(ROOT, "VCS") + " && ./TB_sienna_pipeline_sim")),
                        (("add-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_add_lanes", "+define+FMT_INT8", "VCS/add_lanes/sim  +vcs+dumpvarsoff")),
-                       (("rq-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_requant_lanes", "VCS/rq_lanes/sim")),
-                       (("sm-verilator", "SIM=vcs"), ("mesh-regression MATRIX_SIZE=16 SIM=vcs",)),
-                       (("gpnae-verilator", "SIM=vcs", "PYTHON=python3"), ("--run gate --tier 0 --sim vcs",))):
+                       (("rq-lanes", "SIM=vcs", "PYTHON=python3"), ("-top TB_requant_lanes", "VCS/rq_lanes/sim"))):
+
         r = run(*args)
         assert r.returncode == 0, (args, r.stderr[-300:])
         for w in want:

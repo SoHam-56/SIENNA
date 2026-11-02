@@ -2499,7 +2499,11 @@ def bert_main(argv=None):
         util = macs / (sets * a.n ** 3) if sets else 0
         log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (golden {', '.join(words[t] for t in ref_top)}); end to end max|hw-golden|/max|golden|: "
             f"hidden states {dh:.2e}, pooled {dp:.2e} (tanh lane, tier {a.tier}), MLM logits {dl:.2e}; diag: {diag} words off the bit-exact model over all jobs")
+        part = lambda f: sum(st["cycles"] for st in stats if f(st["tag"]))
+        enc, head = part(lambda t: ".L" in t), part(lambda t: t.endswith("pool") or ".mlm." in t)
         log(f"  {len(stats)} GEMM jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {time.time() - t0:.0f} s")
+        log(f"  of which the encoder's {layers} layers {enc} cycles ({enc / 950e3:.3f} ms); the pooler and the MLM head on the [MASK] row {head} cycles "
+            f"(one-row jobs, the vocabulary projection {part(lambda t: t.endswith('mlm.dec'))})")
         for k, v in (("sets", sets), ("cycles", cyc), ("macs", macs), ("jobs", len(stats))):
             total[k] += v
     log(f"\nreport {report}")

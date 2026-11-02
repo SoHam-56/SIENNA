@@ -21,3 +21,6 @@ Not in this directory:
   (the ad01 model's input, benchmark/reference_submissions/anomaly_detection/datasets/dcase01/): byte-identical copies are in
   MLCommons Tiny at the commit above (Apache 2.0). They are not committed here; fetch_inputs.sh downloads both into this directory
   (git-ignored) and checks each sha256. Without them the kws and ad01 models are skipped.
+
+## lstm_ecg5000.npz
+Trained here by `regression.py --action lstm-model` on ECG5000 (UCR time-series archive, Chen et al. 2015; fetched by models/fetch_ecg5000.sh, not committed). Weights under this directory's license.

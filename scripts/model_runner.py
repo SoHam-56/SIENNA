@@ -2005,10 +2005,14 @@ def check_layer(sim, job, y, fmt, fault=None):
 
 
 def judge(name, desc, fmt, stats, r):
-    """The gate on one inference: hardware (each layer bit-exact, and within LAYER_BOUND of float64) and task (top-1, or ad01's score) against the float model.
-    A REPORTED (model, format) moves only its float checks (bound, task) to reported; a bit-exact failure always gates."""
+    """The gate on one inference: hardware (each layer bit-exact, and within its bound of float64: layer_bound) and task (top-1, or ad01's score) against the float model.
+    A REPORTED (model, format) moves only its float checks (bound, task) to reported; a bit-exact failure always gates. With the lanes at tier 1 or 2 the task
+    check is reported, not gated (the tiers trade accuracy for time), while every layer must still meet its tier's bound."""
     rep = (name, fmt) in REPORTED
     why = " (reported, not gated: a known limit in model_runner.REPORTED)"
+    tier = max((s.get("tier", 0) for s in stats), default=0)
+    if tier and not rep:  # the lanes' 5% and 10% tiers trade accuracy for time: a class that flips there is the measurement, not a failure
+        rep, why = True, f" (reported, not gated: the lanes ran at tier {tier})"
     hw, bad, task, reported = [], set(), [], []
     for s in stats:
         L, e = f"L{s['layer']:02d}", s["exact"]
@@ -2019,7 +2023,7 @@ def judge(name, desc, fmt, stats, r):
         b = layer_bound(fmt, s.get("act", "linear"), s.get("tier", 0))
         if not s["err"] <= b:  # NaN fails too
             m = f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the {fmt} bound {b:g}"
-            if rep:
+            if rep and not tier:  # a layer outside its tier's own bound is a hardware failure at every tier
                 reported.append(m + why)
             else:
                 hw.append(m)

@@ -5586,6 +5586,17 @@ def test_bert_main_reference_only():
         assert "CPU golden (float64): [MASK] ->" in out and "BERT GATE: not run" in out, out
 
 
+@selftest
+def test_packable_blocks():
+    j = lambda K, C, act="relu", **e: {"terms": [(np.zeros((4, K), np.float32), np.zeros((K, C), np.float32))], "bias": None, "act": act, "shape": (4, C), **e}
+    assert mr.packable(j(27, 16), 64) == 32 and mr.packable(j(8, 16), 64) == 16 and mr.packable(j(2, 1), 8) == 2  # the smallest power of two >= max(K, C, 2)
+    assert mr.packable(j(33, 16), 64) == 0 and mr.packable(j(16, 33), 64) == 0 and mr.packable(j(8, 16), 16) == 0  # wider or deeper than N / 2
+    assert mr.packable(j(8, 8, pool=True), 64) == 0 and mr.packable(j(8, 8, act="relu6"), 64) == 0  # pooling jobs and activations the lanes lack
+    r = j(8, 8)
+    r["terms"].append((np.zeros((4, 8), np.float32), np.eye(8, dtype=np.float32)))
+    assert mr.packable(r, 64) == 0  # a residual (two terms)
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")

@@ -5,12 +5,12 @@
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
 #   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite;
 #                       BERT: load_safetensors, wordpiece, bert_tokens, layernorm, gelu, bert_forward (the encoder as GEMM jobs and host ops)
-#   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
+#   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck, packable
 #   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
 #   7. Runtime          run_checked, execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
-#   8. CLI              model_main, tflite_main, tflite_pack_main, bert_main, main
+#   8. CLI              model_main, model_pack_main, tflite_main, tflite_pack_main, bert_main, main
 
 import argparse
 from dataclasses import dataclass
@@ -1208,6 +1208,18 @@ def unpack(Y: np.ndarray, recipe: list) -> list:
     return [[Y[r0:r0 + m, c0:c0 + cc] for r0, m in spans] for c0, cc, spans in recipe]
 
 
+def packable(job, N) -> int:
+    """The block width a job needs in a packed set (the smallest power of two >= max(K, C, 2)), or 0 when it cannot pack: more than one product term,
+    a residual or pooling job, or deeper or wider than N / 2 (a packed job is one block of one pass: sienna-packing, decision 4)."""
+    if len(job["terms"]) != 1 or job.get("pool") or job["act"] not in ACT_CODES:
+        return 0
+    K, C = job["terms"][0][1].shape
+    b = 2
+    while b < max(K, C):
+        b *= 2
+    return b if b <= N // 2 else 0
+
+
 def pack_precheck(pk, cfg, shape, N, lanes, tag="layer"):
     """Refuses a packed layer the layer contract cannot run: in silicon (no assertions) it would compute it silently wrong."""
     M, C, rt = shape
@@ -1983,8 +1995,9 @@ def _true_act(y, act):
     raise ValueError(act)
 
 
-def execute(model, x, sim=None, log=None, fault=None):
-    """Runs the graph. With sim, compute ops run on the RTL, each checked bit for bit (check_layer), and outputs feed the next layer; otherwise float64 reference."""
+def execute(model, x, sim=None, log=None, fault=None, jobs=None):
+    """Runs the graph. With sim, compute ops run on the RTL, each checked bit for bit (check_layer), and outputs feed the next layer; otherwise float64 reference.
+    jobs, a list, collects (layer index, kind, job) for every compute op as lowered on this input."""
     ops, consts = model["ops"], model["consts"]
     t = dict(consts)
     t[model["input"]] = x.astype(np.float32)
@@ -2015,6 +2028,8 @@ def execute(model, x, sim=None, log=None, fault=None):
             t[out] = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)  # host
             continue
         job = fuse_add(op, producers, t, consts, consumers) if kind == "ADD" else lower_op(op, t, consts)
+        if jobs is not None:
+            jobs.append((li, kind, job))
         y, st = run_checked(job, sim, f"L{li:02d}", fault if fault and fault.get("layer") == f"L{li:02d}" else None)
         stats.append(dict(st, layer=li, kind=kind))
         if log:
@@ -2502,6 +2517,106 @@ def bert_main(argv=None):
         sys.exit(1)
 
 
+def model_pack_main(argv=None):
+    """Layers of different models in one packed set (sienna-packing case b) on the layer contract, with the activations a real inference gives them.
+    Every layer of the chosen models is lowered on its first input; those that fit a block (packable) are first-fit grouped into sets of N / b blocks,
+    run packed and each alone on the RTL. Golden: the layer on the CPU in float64 (job_reference). Reported: each model's packable share of its
+    multiply-accumulates, and per group the cycles packed against the sum alone, plus whether the packed outputs equal the lone run's words."""
+    ap = argparse.ArgumentParser(description=model_pack_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="model")
+    ap.add_argument("--pack", action="store_true")
+    ap.add_argument("--models", default="resnet8,ad01,kws,vww")
+    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=("fp32", "bf16"))
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "models"))
+    ap.add_argument("--no-sim", action="store_true", help="only list what packs at this N")
+    a = ap.parse_args(argv)
+    os.makedirs(a.work, exist_ok=True)
+    report = os.path.join(a.work, f"model_pack_N{a.n}_T{a.tile_size}_{a.fmt_name}.log")
+    rep = open(report, "w")
+
+    def log(s):
+        print(s, flush=True)
+        rep.write(s + "\n")
+        rep.flush()
+
+    N = a.n
+    log(f"MODEL PACKING: layers of {a.models} that fit a block at N = {N} (depth and width <= N / 2 = {N // 2}, one pass), {a.fmt_name} T={a.tile_size} lanes={a.lanes}")
+    cands = []
+    for name in a.models.split(","):
+        miss, supply = missing_inputs(name, a.model_dir)
+        if miss:
+            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({supply})")
+            continue
+        model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
+        (x, _, desc), = model_inputs(name, a.model_dir, 1, 7)[0][:1]
+        jobs = []
+        execute(model, x, jobs=jobs)
+        total = sum(macs_of(j) for _, _, j in jobs)
+        fit = [(li, kind, j, packable(j, N)) for li, kind, j in jobs if packable(j, N)]
+        share = sum(macs_of(j) for _, _, j, _ in fit) / total if total else 0
+        log(f"  {name} on {desc}: {len(fit)} of {len(jobs)} layers pack, {100 * share:.1f}% of its {total} MACs: "
+            + ", ".join(f"L{li:02d} {kind} {j['terms'][0][0].shape[0]}x{j['terms'][0][1].shape[0]}x{j['terms'][0][1].shape[1]} {j['act']} b={b}" for li, kind, j, b in fit))
+        cands += [(name, li, j, b) for li, kind, j, b in fit]
+    if not cands:
+        log(f"MODEL PACKING: nothing packs at N = {N}")
+        return
+    groups = []  # first fit, widest blocks first: a group takes N / b jobs of block <= b
+    for c in sorted(cands, key=lambda c: -c[3]):
+        for g in groups:
+            if len(g) < N // g[0][3]:
+                g.append(c)
+                break
+        else:
+            groups.append([c])
+    log(f"  {len(cands)} packable layers in {len(groups)} packed sets")
+    if a.no_sim:
+        log("MODEL PACKING: not run (--no-sim)")
+        return
+    sim = RtlLayer(N, a.lanes, a.work, a.fmt_name, a.tile_size)
+    t0 = time.time()
+    sim.build()
+    log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
+    bound = LAYER_BOUND[a.fmt_name]
+    fails, tot_p, tot_a = [], 0, 0
+    for gi, g in enumerate(groups):
+        models = [{"W": j["terms"][0][1], "bias": j["bias"], "act": j["act"], "inputs": [j["terms"][0][0]]} for _, _, j, _ in g]
+        job, recipe = pack_jobs(models, N, int8=False)
+        b = N >> job["pack"]["shift"]
+        Y, st = run_checked(job, sim, f"mp{gi}")
+        cyc_p = st["cycles"]
+        tot_p += cyc_p
+        names = ", ".join(f"{n}.L{li:02d}" for n, li, _, _ in g)
+        log(f"\n== set {gi}: {names}; b = {b}, {len(g)} of {N // b} blocks, {job['shape'][0]} rows: {st['sets']} sets, {cyc_p} cycles packed")
+        cyc_a = 0
+        for (name, li, j, _), outs in zip(g, unpack(Y, recipe)):
+            yp = np.vstack(outs)
+            ya, sa = run_checked(j, sim, f"mp{gi}.{name}.L{li:02d}")
+            cyc_a += sa["cycles"]
+            ref = job_reference(dict(j, terms=[(op_round(X, a.fmt_name), op_round(W, a.fmt_name)) for X, W in j["terms"]],
+                                     bias=None if j["bias"] is None else op_round(j["bias"], a.fmt_name)))[1]
+            err = float(np.max(np.abs(yp.astype(np.float64) - ref))) / (float(np.max(np.abs(ref))) or 1.0)
+            same = int(np.sum(fmt_bits(yp, a.fmt_name) != fmt_bits(ya, a.fmt_name)))
+            if not err <= bound:
+                fails.append(f"FAIL output set {gi} {name} L{li:02d}: packed output max|hw-golden|/max|golden| {err:.2e} above {bound:g}")
+            if same:
+                fails.append(f"FAIL interference set {gi} {name} L{li:02d}: {same} of {yp.size} packed words differ from the layer run alone")
+            log(f"    {name} L{li:02d} {str(tuple(j['shape'])):<20} alone {sa['sets']:5d} sets {sa['cycles']:7d} cycles; packed block vs CPU golden {err:.2e}, "
+                f"{same} words differ from alone")
+        tot_a += cyc_a
+        log(f"  set {gi}: {cyc_a} cycles alone (sum) vs {cyc_p} packed: {cyc_a / cyc_p:.2f}x")
+    for m in fails:
+        log(m)
+    log(f"\nreport {report}")
+    log(f"MODEL PACKING: {'PASS' if not fails else 'FAIL'}  {a.fmt_name} N={N} T={a.tile_size} lanes={a.lanes}: {len(cands)} layers in {len(groups)} packed sets, "
+        f"{tot_a} cycles alone vs {tot_p} packed ({tot_a / tot_p:.2f}x); {len(fails)} failures (outputs against the CPU golden, bound {bound:g}; packed = alone word for word)")
+    if fails:
+        sys.exit(1)
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--action", choices=ACTIONS, default="model")
@@ -2510,9 +2625,7 @@ def main():
     if a.action == "bert":
         bert_main(rest)
     elif a.action == "model":
-        if a.pack:
-            pre.error("--pack belongs to --action tflite")
-        model_main(rest)
+        (model_pack_main if a.pack else model_main)(rest)
     else:
         (tflite_pack_main if a.pack else tflite_main)(rest)
 

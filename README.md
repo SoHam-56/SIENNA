@@ -76,6 +76,7 @@ int8 versions of these four models do not run yet: in int8 the host stack runs s
 | fp32, N = 16, 32 lanes | 231,296 cycles, 243 µs | 249,026 cycles | 480,322 cycles, 506 µs | ≤ 3.7 × 10⁻⁶ | same as golden, 3 of 3 |
 | bf16, N = 16, 32 lanes | 231,296 cycles, 243 µs | 248,484 cycles | 479,780 cycles, 505 µs | ≤ 1.7 × 10⁻² | same as golden, 3 of 3 |
 | fp32, N = 64, 128 lanes | 18,560 cycles, 19.5 µs | 63,375 cycles | 81,935 cycles, 86 µs | ≤ 3.7 × 10⁻⁶ | same as golden, 3 of 3 |
+| bf16, N = 64, 128 lanes | 18,480 cycles, 19.5 µs | 63,064 cycles | 81,544 cycles, 86 µs | ≤ 1.7 × 10⁻² | same as golden, 3 of 3 |
 
 The encoder's 58.7 M multiply-accumulates take 19.5 µs at N = 64 (6.0 TFLOPS at the assumed 950 MHz, 77% of the mesh's multiply slots); the 128 × 128 attention products fit the mesh exactly. The head is slow for a different reason: it works on one row (the [MASK] token), so the 30,522-wide vocabulary projection fills 1 of N rows of every set and takes three quarters of the run; a host that batches the masked rows of many sentences, or keeps the vocabulary projection on the CPU, avoids it. The pooler's tanh is within the 1% tier's bound (0.49% of the largest output in fp32). BERT-Tiny itself is a weak model: it predicts "france" for "the capital of france is [MASK]", and so does the Hugging Face reference.
 

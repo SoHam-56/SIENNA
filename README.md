@@ -124,6 +124,8 @@ Small jobs of 2 output columns each, run one at a time and packed into shared se
 
 A packed layer takes the same cycles as one of its jobs alone whenever the mesh or the host sets the pace, so the speedup reaches the number of jobs. With fp32 and bf16 tanh the activation lanes take longer on a packed set than on one job's set, so the speedup is lower. N = 8 to 64 in every format is in [`docs/perf_final.txt`](docs/perf_final.txt).
 
+**Real layers of different models in one set** (`make model-pack N=64 LANES=128`, fp32, T = 4; each layer carries the activations a real inference gave it, and its packed outputs equal the layer run alone word for word). A packed job must fit one block of one pass, so its depth and width are at most N / 2. The MLPerf Tiny models are mostly 64 to 128 channels wide, so at N = 64 only their stem layers qualify: ResNet-8's first convolution (3.5% of its multiply-accumulates) and MobileNet's first four (22.4%); one layer at N = 32 and none at N = 16. Packed two to a set, ResNet-8 L00 with MobileNet L00 takes 2,569 cycles against 3,858 one after the other (1.50×: the shorter layer's rows idle beside the longer one's), and MobileNet L04 with L06 841 against 1,682 (2.00×); over the five layers 5,979 cycles against 8,109 (1.36×). Packing pays for workloads of small jobs, as in the table above; a mid-size layer gains nothing from it, with or without multi-pass packed sets, because it already fills its tiles.
+
 ### Compared with other accelerators
 
 **Matrix engine.** Multiply-accumulates per cycle do not depend on the clock, so they compare designs fairly. Most edge accelerators are integer-only; SIENNA builds in fp32, bf16 or int8 from the same source, one format per build.

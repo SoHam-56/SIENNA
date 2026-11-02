@@ -89,8 +89,9 @@ The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `ma
 | N = 16, 32 lanes | 1% | 947,069 cycles | 15.6 µs | 64 of 64 | 1.3 × 10⁻² |
 | N = 16, 32 lanes | 5% | 735,437 cycles | 12.1 µs | 64 of 64 | 2.1 × 10⁻¹ |
 | N = 16, 32 lanes | 10% | 673,391 cycles | 11.1 µs | 64 of 64 | 1.2 |
+| N = 64, 128 lanes | 1% | 328,982 cycles | 5.4 µs | 64 of 64 | 1.3 × 10⁻² |
 
-The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%, yet the class decision survives on every one of the 64 heartbeats; a larger batch is being measured. The golden itself gets 60 of the 64 right.
+The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). At N = 64 each step's jobs are one or two sets whose rows the 64 heartbeats fill, so a step takes 2,348 cycles and the lanes set the pace; the time per heartbeat falls to 5.4 µs, and a batch of 64 or more is what keeps the mesh busy on a recurrent model. The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%, yet the class decision survives on every one of the 64 heartbeats; a larger batch is being measured. The golden itself gets 60 of the 64 right.
 
 **How a set is timed.** The rest of this section measures the engine rather than a model. A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 

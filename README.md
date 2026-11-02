@@ -6,8 +6,8 @@ SIENNA multiplies matrices on a streaming systolic mesh, applies SELU, sigmoid o
 
 | | |
 |---|---|
-| **7.43 TFLOPS** sustained | 64 × 64 mesh streaming matrix multiplies at 95.5% of peak, in fp32, bf16 and int8 |
-| **14 µs** per ResNet-8 inference | CIFAR-10 image on the 64 × 64 mesh, every multiply-accumulate on the RTL |
+| **71,531 ResNet-8 inferences/s** | 14.0 µs each on the 64 × 64 mesh, every multiply-accumulate on the RTL; 118,483/s for DS-CNN, 25,491/s for MobileNet |
+| **7.43 TFLOPS** on the matrix multiply | 64 × 64 mesh streaming sets at 95.5% of the mesh's peak, in fp32, bf16 and int8 — the engine's ceiling, not an inference rate |
 | **within 1% or one output step** of the exact functions | SELU, sigmoid and tanh on every activation lane at the 1% tier, in every format, at N = 8 to 64 (measured worst: fp32 0.50%, bf16 0.77%, int8 SELU 0.69%; int8 sigmoid and tanh within one output step) |
 | **58× fewer cycles** per activation | than the published TYTAN engine it grew from (747 → 12.8 cycles for tanh on one fp32 lane) |
 | **up to 32× faster** on small layers | by packing many small matrix multiplies into one (32 jobs on the 64 × 64 mesh) |
@@ -41,14 +41,40 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 >
 > SIENNA's throughput, latency, bandwidth, model and packing figures below were measured on 2026-10-31 and 2026-11-01 on today's RTL, at every N and tile size, in the default mesh mode and in collapse-k 0 except the builds listed under Verification. Bandwidths are derived from the measured cycles and the bytes the testbench counted on each link. Comparisons with earlier trees use those trees' own measurements, and the other accelerators' figures are their published ones.
 
-**How a set is timed.** A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
+**What it does per inference.** SIENNA is an inference accelerator, so the figures that matter are inference latency and rate; the matrix-multiply numbers further down are the engine's ceiling, not what a model achieves. On the 64 × 64 mesh in fp32 it runs **71,531 ResNet-8 inferences a second** (14.0 µs each), 118,483 DS-CNN, 25,491 MobileNet and 154,083 autoencoder inferences of 40 slices each.
+
+### Inference: MLPerf Tiny models
+
+The host only reshapes tensors and applies softmax. Both sizes run on the layer engine at T = 2 (32 lanes at N = 16, 128 at N = 64), in fp32:
+
+| Model | Task | MACs | Latency, N = 16 | Latency, N = 64 | Inferences/s, N = 64 | Throughput, N = 64 | Host bandwidth at N = 64, in / out |
+|---|---|---|---|---|---|---|---|
+| ResNet-8 | image classification (CIFAR-10) | 12.5 M | 54.1 µs | 14.0 µs | 71,531 | 1.79 TFLOPS | 245 / 70 GB/s |
+| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 8.4 µs | 118,483 | 623 GFLOPS | 251 / 39 GB/s |
+| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 39.2 µs | 25,491 | 382 GFLOPS | 303 / 83 GB/s |
+| Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs | 6.5 µs | 154,083 | 3.26 TFLOPS | 344 / 68 GB/s |
+
+The bandwidth counts the words the host streamed for every layer (inputs and weights) and the result tiles it read back, over the inference's time. bf16 halves it, at the same latency within 1%. Larger tiles take longer: ResNet-8 at N = 64 takes 14.2 µs at T = 4, 14.7 µs at T = 8 and 21.0 µs at T = 16. The collapse-k 0 mesh takes the same or fewer cycles, at most 11% fewer (ResNet-8 at N = 8, T = 4, bf16).
+
+**Accuracy against the floating-point model**, over every model point that ran (69 of 72: N = 8 to 64, every tile size and both mesh modes, all but the three collapse-k 0 builds under Verification; 3 inferences per model per point, 4 for the autoencoder). The layer error is the largest difference from an exact float64 calculation on the same inputs, as a share of that layer's largest output; rounding a single number to bf16 can be off by up to 0.39%:
+
+| Model | fp32: agreement | bf16: agreement | bf16: largest layer error |
+|---|---|---|---|
+| ResNet-8 | same class in 102 of 102 inferences | same class in 105 of 105 | 0.34% || 71,531 
+| DS-CNN | same class in 102 of 102 | same class in 105 of 105 | 0.33% || 118,483 
+| MobileNet | same class in 102 of 102 | same class in 105 of 105 | 0.38% || 25,491 
+| Autoencoder | anomaly score within 0.002% in 136 of 136 | within 0.23% in 140 of 140 | 0.33% || 154,083 
+
+int8 versions of these four models do not run yet: in int8 the host stack runs single quantized layers and residual blocks imported from TFLite or ONNX (the `tflite` and `residual` points), not whole MLPerf Tiny models.
+
+**How a set is timed.** The rest of this section measures the engine rather than a model. A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 
 | N = 16, fp32, ReLU set, T = 4 | Cycles | Time |
 |---|---|---|
 | First result (latency) | 99 | 104 ns |
 | Each further set while streaming (throughput) | 19 | 20 ns |
 
-### Throughput while streaming sets
+### The matrix multiply alone, while streaming sets
 
 Measured by `regression.py`'s performance analysis, 24 sets per run; the FLOPS count the matrix multiply only (2N³ per set). Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
 
@@ -84,30 +110,6 @@ The tanh sets return less because they are pooled (2 × 2, padding 1) before the
 **Mesh mode.** The mesh can also split each product's depth across N / T smaller arrays and add their partial sums (collapse-k 0). In every configuration measured that way (N = 8 to 64, every tile size and format, except the builds listed under Verification) it gives the same cycles per set, because the activation lanes or the host set the pace, and a first result up to 57 cycles sooner (int8, N = 64, T = 2: 156 → 99 cycles; at N = 8, T = 4 it is 1 cycle later).
 
 Against the tree before the restructure (main up to 9fa414e), at N = 64 (T = 2) the activation lanes take 33% fewer cycles per set for SELU and 58% fewer for tanh in fp32 (670 → 449, 1 060 → 449), 44% and 60% fewer in bf16 (540 → 301, 759 → 301), and 2% and 12% fewer in int8 (329 → 323, 367 → 323). At N = 8 and 16 (T = 2): fp32 SELU and tanh take 12% to 34% fewer cycles, bf16 42% to 52% fewer, int8 2% to 16% fewer, and fp32 sigmoid 16% fewer at N = 8 (141 → 119) and 47% fewer at N = 16 (272 → 144). bf16 sigmoid is compared with the Phase 2 tree instead, because the base tree's bf16 sigmoid failed the 1% gate: it takes 0.54 times that tree's cycles at N = 8 (299 → 160) and 0.30 times at N = 16 (580 → 173). At N = 16, T = 16 the mesh sets the pace (256 cycles in every format and activation); there bf16 tanh takes 3.4% more than the Phase 2 tree (256 against 248) and 1.9% more than the base tree (256 against 251). The earlier sweeps did not measure sigmoid at N = 32 or 64.
-
-### MLPerf Tiny models
-
-Every multiply-accumulate runs on the RTL; the host only reshapes tensors and applies softmax. Both sizes run on the layer engine at T = 2 (32 lanes at N = 16, 128 at N = 64), in fp32:
-
-| Model | Task | MACs | Latency, N = 16 | Latency, N = 64 | Throughput, N = 64 | Host bandwidth at N = 64, in / out |
-|---|---|---|---|---|---|---|
-| ResNet-8 | image classification (CIFAR-10) | 12.5 M | 54.1 µs | 14.0 µs | 1.79 TFLOPS | 245 / 70 GB/s |
-| DS-CNN | keyword spotting | 2.6 M | 31.4 µs | 8.4 µs | 623 GFLOPS | 251 / 39 GB/s |
-| MobileNet | visual wake words (96 × 96) | 7.5 M | 102.7 µs | 39.2 µs | 382 GFLOPS | 303 / 83 GB/s |
-| Autoencoder | anomaly detection, 40 slices | 10.6 M | 53.6 µs | 6.5 µs | 3.26 TFLOPS | 344 / 68 GB/s |
-
-The bandwidth counts the words the host streamed for every layer (inputs and weights) and the result tiles it read back, over the inference's time. bf16 halves it, at the same latency within 1%. Larger tiles take longer: ResNet-8 at N = 64 takes 14.2 µs at T = 4, 14.7 µs at T = 8 and 21.0 µs at T = 16. The collapse-k 0 mesh takes the same or fewer cycles, at most 11% fewer (ResNet-8 at N = 8, T = 4, bf16).
-
-**Accuracy against the floating-point model**, over every model point that ran (69 of 72: N = 8 to 64, every tile size and both mesh modes, all but the three collapse-k 0 builds under Verification; 3 inferences per model per point, 4 for the autoencoder). The layer error is the largest difference from an exact float64 calculation on the same inputs, as a share of that layer's largest output; rounding a single number to bf16 can be off by up to 0.39%:
-
-| Model | fp32: agreement | bf16: agreement | bf16: largest layer error |
-|---|---|---|---|
-| ResNet-8 | same class in 102 of 102 inferences | same class in 105 of 105 | 0.34% |
-| DS-CNN | same class in 102 of 102 | same class in 105 of 105 | 0.33% |
-| MobileNet | same class in 102 of 102 | same class in 105 of 105 | 0.38% |
-| Autoencoder | anomaly score within 0.002% in 136 of 136 | within 0.23% in 140 of 140 | 0.33% |
-
-int8 versions of these four models do not run yet: in int8 the host stack runs single quantized layers and residual blocks imported from TFLite or ONNX (the `tflite` and `residual` points), not whole MLPerf Tiny models.
 
 ### Packing small layers
 

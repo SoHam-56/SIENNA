@@ -82,16 +82,16 @@ The encoder's 58.7 M multiply-accumulates take 19.5 µs at N = 64 (6.0 TFLOPS at
 
 ### Inference: a recurrent network through the activation lanes (ECG5000 LSTM)
 
-The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `make lstm` runs a model that cannot: an LSTM of 32 units over 140-sample heartbeats from the ECG5000 set (five classes; trained here with `make lstm-model`, 92.9% test accuracy in TensorFlow). Every step of the recurrence is three jobs through the lanes behind the mesh: the input, forget and output gates (sigmoid) and the candidate (tanh) as products of [xₜ, hₜ₋₁] against the stacked kernels, and the cell state's tanh as a product with a scaled identity; the Hadamard products and the cell update run on the host in float64, and the classifier is one linear job. A batch of heartbeats fills the rows of every job. The golden is the same model on the CPU in float64 (it agrees with Keras to 1.9 × 10⁻⁶), and the gate requires the same top-1 class as the golden for every heartbeat at the 1% tier. 64 heartbeats, fp32, T = 4:
+The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `make lstm` runs a model that cannot: an LSTM of 32 units over 140-sample heartbeats from the ECG5000 set (five classes; trained here with `make lstm-model`, 92.9% test accuracy in TensorFlow). Every step of the recurrence is three jobs through the lanes behind the mesh: the input, forget and output gates (sigmoid) and the candidate (tanh) as products of [xₜ, hₜ₋₁] against the stacked kernels, and the cell state's tanh as a product with a scaled identity; the Hadamard products and the cell update run on the host in float64, and the classifier is one linear job. A batch of heartbeats fills the rows of every job. The golden is the same model on the CPU in float64 (it agrees with Keras to 1.9 × 10⁻⁶), and the gate requires the same top-1 class as the golden for every heartbeat at the 1% tier (at the looser tiers the disagreements are reported). fp32, T = 4:
 
-| Build | Lane tier | Per batch of 64 | Per heartbeat | Top-1 vs golden | Final hidden state vs golden |
-|---|---|---|---|---|---|
-| N = 16, 32 lanes | 1% | 947,069 cycles | 15.6 µs | 64 of 64 | 1.3 × 10⁻² |
-| N = 16, 32 lanes | 5% | 735,437 cycles | 12.1 µs | 64 of 64 | 2.1 × 10⁻¹ |
-| N = 16, 32 lanes | 10% | 673,391 cycles | 11.1 µs | 64 of 64 | 1.2 |
-| N = 64, 128 lanes | 1% | 328,982 cycles | 5.4 µs | 64 of 64 | 1.3 × 10⁻² |
+| Build | Lane tier | Per batch of 512 (64 at N = 64) | Per heartbeat | Top-1 vs golden | Right (golden 469) | Final hidden state vs golden |
+|---|---|---|---|---|---|---|
+| N = 16, 32 lanes | 1% | 7,133,725 cycles | 14.7 µs | 512 of 512 | 469 | 1.6 × 10⁻² |
+| N = 16, 32 lanes | 5% | 5,439,173 cycles | 11.2 µs | 509 of 512 | 470 | 2.4 × 10⁻¹ |
+| N = 16, 32 lanes | 10% | 4,943,402 cycles | 10.2 µs | 504 of 512 | 471 | 1.5 |
+| N = 64, 128 lanes | 1% | 328,982 cycles | 5.4 µs | 64 of 64 | 60 (golden 60) | 1.3 × 10⁻² |
 
-The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). At N = 64 each step's jobs are one or two sets whose rows the 64 heartbeats fill, so a step takes 2,348 cycles and the lanes set the pace; the time per heartbeat falls to 5.4 µs, and a batch of 64 or more is what keeps the mesh busy on a recurrent model. The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%, yet the class decision survives on every one of the 64 heartbeats; a larger batch is being measured. The golden itself gets 60 of the 64 right.
+The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%; the class decision changes on 3 of 512 heartbeats at 5% and 8 at 10%, and the accuracy against the labels stays within two heartbeats of the golden's. At N = 64 each step's jobs are one or two sets whose rows the heartbeats fill, so a step takes 2,348 cycles and the lanes set the pace; the time per heartbeat falls to 5.4 µs, and a batch of 64 or more is what keeps the mesh busy on a recurrent model.
 
 **How a set is timed.** The rest of this section measures the engine rather than a model. A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 

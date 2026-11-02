@@ -80,9 +80,23 @@ int8 versions of these four models do not run yet: in int8 the host stack runs s
 
 The encoder's 58.7 M multiply-accumulates take 19.5 µs at N = 64 (6.0 TFLOPS at the assumed 950 MHz, 77% of the mesh's multiply slots); the 128 × 128 attention products fit the mesh exactly. The head is slow for a different reason: it works on one row (the [MASK] token), so the 30,522-wide vocabulary projection fills 1 of N rows of every set and takes three quarters of the run; a host that batches the masked rows of many sentences, or keeps the vocabulary projection on the CPU, avoids it. The pooler's tanh is within the 1% tier's bound (0.49% of the largest output in fp32). BERT-Tiny itself is a weak model: it predicts "france" for "the capital of france is [MASK]", and so does the Hugging Face reference.
 
+### Inference: a self-normalizing network through the activation lanes (SELU CIFAR-10 convnet)
+
+The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `make model MODELS=selu TIER=t` runs one that does not: a self-normalizing convnet (Klambauer et al.: SELU after every layer but the logits, no batch normalization; conv 3 × 3 32, 64, 64 with 2 × 2 max pooling, then 128 and 10 units; 8.1 M multiply-accumulates; trained here with `make selu-model`, 78.6% CIFAR-10 test accuracy). The convolutions and dense layers run on the layer engine with SELU on the lanes at the chosen tier; the 2 × 2 pooling and softmax run on the host (the hardware's pooling is of a set's N × N result, not of an image). Golden: the model on the CPU in float64; the gate requires the same class as the golden on every image at the 1% tier and every layer within its tier's bound. 100 CIFAR-10 test images (the MLPerf Tiny perf-sample indices), T = 4:
+
+| Build | Lane tier | Per image | Same class as golden | Right (golden 78) | Largest layer error |
+|---|---|---|---|---|---|
+| fp32, N = 16, 32 lanes | 1% | 62,759 cycles, 66 µs | 100 of 100 | 78 | within 1% |
+| fp32, N = 16, 32 lanes | 5% | 52,115 cycles, 55 µs | 99 of 100 | 79 | within 5% |
+| fp32, N = 16, 32 lanes | 10% | 52,115 cycles, 55 µs | 99 of 100 | 79 | within 10% |
+| bf16, N = 16, 32 lanes | 1% | 48,553 cycles, 51 µs | 100 of 100 | 78 | within 1% |
+| fp32, N = 64, 128 lanes | 1% | 14,011 cycles, 14.7 µs | 3 of 3 | | within 1% |
+
+The 5% and 10% tiers take the same time, because SELU's shorter polynomials need the same number of lane rounds at both. The one image whose class changes at those tiers is a near tie that the golden gets wrong and the hardware right, so the accuracy against the labels is unchanged. At N = 64 the lanes set the pace: the first convolution (1,024 pixel rows, 32 channels) takes 7,478 of the 14,011 cycles, against 2,358 for the second with five times the multiply-accumulates, which is why this 8.1 M-MAC network takes as long as the 12.5 M-MAC ReLU ResNet-8 (14.0 µs).
+
 ### Inference: a recurrent network through the activation lanes (ECG5000 LSTM)
 
-The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `make lstm` runs a model that cannot: an LSTM of 32 units over 140-sample heartbeats from the ECG5000 set (five classes; trained here with `make lstm-model`, 92.9% test accuracy in TensorFlow). Every step of the recurrence is three jobs through the lanes behind the mesh: the input, forget and output gates (sigmoid) and the candidate (tanh) as products of [xₜ, hₜ₋₁] against the stacked kernels, and the cell state's tanh as a product with a scaled identity; the Hadamard products and the cell update run on the host in float64, and the classifier is one linear job. A batch of heartbeats fills the rows of every job. The golden is the same model on the CPU in float64 (it agrees with Keras to 1.9 × 10⁻⁶), and the gate requires the same top-1 class as the golden for every heartbeat at the 1% tier (at the looser tiers the disagreements are reported). fp32, T = 4:
+`make lstm` runs a model whose every step goes through the lanes: an LSTM of 32 units over 140-sample heartbeats from the ECG5000 set (five classes; trained here with `make lstm-model`, 92.9% test accuracy in TensorFlow). Every step of the recurrence is three jobs through the lanes behind the mesh: the input, forget and output gates (sigmoid) and the candidate (tanh) as products of [xₜ, hₜ₋₁] against the stacked kernels, and the cell state's tanh as a product with a scaled identity; the Hadamard products and the cell update run on the host in float64, and the classifier is one linear job. A batch of heartbeats fills the rows of every job. The golden is the same model on the CPU in float64 (it agrees with Keras to 1.9 × 10⁻⁶), and the gate requires the same top-1 class as the golden for every heartbeat at the 1% tier (at the looser tiers the disagreements are reported). fp32, T = 4:
 
 | Build | Lane tier | Per batch of 512 (64 at N = 64) | Per heartbeat | Top-1 vs golden | Right (golden 469) | Final hidden state vs golden |
 |---|---|---|---|---|---|---|
@@ -256,6 +270,8 @@ make regression                             # every test at N = 8 to 64 (days on
 make regression/bf16/N8_T2/pipeline         # one point of the regression
 make model FMT=bf16 [MODEL_DIR=<dir>]       # the four MLPerf Tiny models on the RTL (fp32 or bf16)
 models/fetch_bert_tiny.sh && make bert      # BERT-Tiny's encoder on the RTL (fp32 or bf16; BERT_SEQ=, BERT_TIER=)
+make model MODELS=selu TIER=1               # the SELU CIFAR-10 convnet with the lanes at the 1% (0), 5% (1) or 10% (2) tier
+make lstm TIER=0 LSTM_BATCH=64              # the ECG5000 LSTM, gates and tanh on the lanes each step
 make model-pack N=64 LANES=128              # layers of different MLPerf Tiny models in one packed set
 make verilator FMT=bf16 N=16 TILE=4 TRACE=fst   # one simulation with a waveform (vcs: the same on Synopsys VCS)
 make wave                                   # open that waveform

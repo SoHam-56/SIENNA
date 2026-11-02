@@ -16,6 +16,8 @@ runs on the login node (pure Python, no simulation). Charts are inline SVG from 
 (no matplotlib on this system). build_report.py and `g4_table.py` import SIENNA's `regression.py` (`PIPELINE_TESTS`,
 the perf section's `events()`; was perf_analysis.py). Check the render with a headless Chrome screenshot before telling Soham.
 
+**Since 2026-11-01** the report is built by `python3 /proj/work/spramanik/sienna_jobs/report/final_report.py <SIENNA>/docs/perf_final.txt <sienna_report>/sienna_report_2026-10-10.html <sienna_report>/sienna_report.html`: today's state (throughput, latency, bandwidth, MLPerf models, activation lanes, packing) parsed from `docs/perf_final.txt`, the changes since 2026-10-10 and the coverage, then the 2026-10-10 report verbatim as history (its run data was deleted, so build_report.py can no longer rebuild it). PDF: `google-chrome --headless=new --no-pdf-header-footer --print-to-pdf=sienna_report.pdf file://.../sienna_report.html`.
+
 ## Sections (Soham's order, 2026-09-28)
 
 | # | Section | Data |

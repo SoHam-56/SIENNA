@@ -3,13 +3,13 @@
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
-#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite;
+#   2. Frontend         load_tflite, load_npz_model, load_model, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite;
 #                       BERT: load_safetensors, wordpiece, bert_tokens, layernorm, gelu, bert_forward (the encoder as GEMM jobs and host ops)
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck, packable
 #   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
-#   7. Runtime          run_checked, execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
+#   7. Runtime          run_checked, maxpool2d, execute, macs_of; the model gate: check_layer, judge, layer_bound, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
 #   8. CLI              model_main, model_pack_main, tflite_main, tflite_pack_main, bert_main, main
 
 import argparse
@@ -709,6 +709,54 @@ def load_tflite(path: str) -> dict:
         ops.append(d)
     shapes = {i: tuple(g.Tensors(i).ShapeAsNumpy()) for i in range(g.TensorsLength()) if g.Tensors(i).ShapeLength()}
     return {"ops": ops, "consts": consts, "shapes": shapes, "input": g.Inputs(0), "output": g.Outputs(0)}
+
+
+def load_npz_model(path: str) -> dict:
+    """A small convolutional classifier saved as .npz by regression.py --action selu-model, in load_tflite's graph form: its `layers` field names
+    the ops in order (conv: 3 x 3 SAME stride 1; pool: 2 x 2 max, stride 2; fc; softmax), each conv or fc with its weights (HWIO or in x out),
+    bias and activation; the input is raw 0..255 NHWC like resnet8's (the 1/255 is folded into the first weights)."""
+    z = np.load(path, allow_pickle=False)
+    layers = [str(x) for x in z["layers"]]
+    shape = tuple(int(v) for v in z["input_shape"])
+    ops, consts, shapes, t = [], {}, {0: shape}, 0  # tensor 0 is the input; each op makes tensor t + 1
+    for i, spec in enumerate(layers):
+        kind, _, name = spec.partition(":")
+        o = {"inputs": [t], "outputs": [t + 1], "act": "linear"}
+        if kind in ("conv", "fc"):
+            w, b = z[name + "_w"].astype(np.float32), z[name + "_b"].astype(np.float32)
+            o["act"] = str(z[name + "_act"])
+            if kind == "conv":
+                consts[100 + 2 * i] = w.transpose(3, 0, 1, 2).copy()  # HWIO -> TFLite's Cout x kh x kw x Cin
+                o.update(kind="CONV_2D", same=True, stride=(1, 1))
+                shape = (1, shape[1], shape[2], w.shape[3])
+            else:
+                consts[100 + 2 * i] = w.T.copy()  # in x out -> TFLite's Dout x Din
+                o["kind"] = "FULLY_CONNECTED"
+                shape = (1, w.shape[1])
+            consts[101 + 2 * i] = b
+            o["inputs"] += [100 + 2 * i, 101 + 2 * i]
+        elif kind == "pool":
+            o.update(kind="MAX_POOL_2D", filter=(2, 2), stride=(2, 2))
+            shape = (1, shape[1] // 2, shape[2] // 2, shape[3])
+        elif kind == "softmax":
+            o["kind"] = "SOFTMAX"
+        else:
+            raise ValueError(f"{path}: layer {spec!r}")
+        if kind == "fc" and len(shapes[t]) == 4:  # flatten before the first fc, as Keras's Flatten on NHWC
+            flat = (1, int(np.prod(shapes[t][1:])))
+            ops.append({"kind": "RESHAPE", "inputs": [t], "outputs": [t + 1], "act": "linear"})
+            shapes[t + 1] = flat
+            t += 1
+            o["inputs"][0], o["outputs"][0] = t, t + 1
+        ops.append(o)
+        shapes[t + 1] = shape
+        t += 1
+    return {"ops": ops, "consts": consts, "shapes": shapes, "input": 0, "output": t, "meta": {k: z[k] for k in z.files if k.startswith("meta_")}}
+
+
+def load_model(path: str) -> dict:
+    """A model file in load_tflite's graph form: .tflite through load_tflite, .npz through load_npz_model."""
+    return load_npz_model(path) if path.endswith(".npz") else load_tflite(path)
 
 
 def _same_pad(n, k, s):
@@ -1851,7 +1899,13 @@ LAYER_BOUND = {  # max|hw-ref|/max|ref| per layer against float64 on the same op
     "fp32": 1e-4,  # also regression.py's gemm bound; measured worst 3.29e-05 over 187 layers (mg_fp32c), 3x margin
     "bf16": 0.02,  # fp32 sums: measured worst 3.77e-03 (vww L04, ba3_models_N16_bf16), about half a bf16 ulp of the largest output (2^-8 = 3.9e-03 is the RNE limit), 5x margin; bf16 sums were 3.35e-02 to 1.83 in every model, so they fail it
 }
-CLASSIFIERS = ("resnet8", "kws", "vww")  # top-1 must equal the float reference's in every format
+CLASSIFIERS = ("resnet8", "kws", "vww", "selu")  # top-1 must equal the float reference's in every format
+CIFAR_MODELS = ("resnet8", "selu")  # take CIFAR-10 test images (--ref-accuracy, perf-sample indices)
+
+
+def layer_bound(fmt: str, act: str, tier: int = 0) -> float:
+    """A layer's bound against float64: the format's, or for a lane activation (SELU, sigmoid, tanh) its tier's tolerance if that is looser."""
+    return LAYER_BOUND[fmt] if act in ("relu", "linear") else max(LAYER_BOUND[fmt], gpnae_model.TIER_TOL[tier])
 SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 with fp32 sums measured 2.24e-03 (ba3_models_N16_bf16, 4.5x margin)
 REPORTED = set()  # (model, format) known limits: float checks shown as FAIL, not counted; bit-exact still gates; ad01 bf16 left it once bf16 summed in fp32
 
@@ -1914,8 +1968,9 @@ def judge(name, desc, fmt, stats, r):
             hw.append(f"FAIL hardware {name} [{desc}] {L}: {e['differ']} of {e['words']} words differ from the bit-exact model; "
                       f"first at index {e['index']} (row {e['row']}, col {e['col']}): expected {e['expected']} got {e['got']}")
             bad.add(L)
-        if not s["err"] <= LAYER_BOUND[fmt]:  # NaN fails too
-            m = f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the {fmt} bound {LAYER_BOUND[fmt]:g}"
+        b = layer_bound(fmt, s.get("act", "linear"), s.get("tier", 0))
+        if not s["err"] <= b:  # NaN fails too
+            m = f"FAIL hardware {name} [{desc}] {L}: max|hw-ref|/max|ref| {s['err']:.2e} above the {fmt} bound {b:g}"
             if rep:
                 reported.append(m + why)
             else:
@@ -1995,9 +2050,20 @@ def _true_act(y, act):
     raise ValueError(act)
 
 
-def execute(model, x, sim=None, log=None, fault=None, jobs=None):
+def maxpool2d(x, f, st):
+    """Max pooling of an NHWC tensor (VALID, as Keras's MaxPooling2D default) in float64."""
+    _, H, W, C = x.shape
+    oh, ow = (H - f[0]) // st[0] + 1, (W - f[1]) // st[1] + 1
+    out = np.full((1, oh, ow, C), -np.inf)
+    for i in range(f[0]):
+        for j in range(f[1]):
+            out = np.maximum(out, x[:, i : i + st[0] * oh : st[0], j : j + st[1] * ow : st[1], :].astype(np.float64))
+    return out
+
+
+def execute(model, x, sim=None, log=None, fault=None, jobs=None, tier=0):
     """Runs the graph. With sim, compute ops run on the RTL, each checked bit for bit (check_layer), and outputs feed the next layer; otherwise float64 reference.
-    jobs, a list, collects (layer index, kind, job) for every compute op as lowered on this input."""
+    jobs, a list, collects (layer index, kind, job) for every compute op as lowered on this input; tier is the lanes' accuracy tier for SELU, sigmoid and tanh layers."""
     ops, consts = model["ops"], model["consts"]
     t = dict(consts)
     t[model["input"]] = x.astype(np.float32)
@@ -2027,11 +2093,16 @@ def execute(model, x, sim=None, log=None, fault=None, jobs=None):
             e = np.exp(v - v.max(axis=-1, keepdims=True))
             t[out] = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)  # host
             continue
+        if kind == "MAX_POOL_2D":
+            t[out] = maxpool2d(t[op["inputs"][0]], op["filter"], op["stride"]).astype(np.float32)  # host: a conv output's spatial pool is not a set's 2D pool
+            continue
         job = fuse_add(op, producers, t, consts, consumers) if kind == "ADD" else lower_op(op, t, consts)
+        if job["act"] not in ("relu", "linear"):
+            job["tier"] = tier
         if jobs is not None:
             jobs.append((li, kind, job))
         y, st = run_checked(job, sim, f"L{li:02d}", fault if fault and fault.get("layer") == f"L{li:02d}" else None)
-        stats.append(dict(st, layer=li, kind=kind))
+        stats.append(dict(st, layer=li, kind=kind, act=job["act"], tier=tier))
         if log:
             rec = st["exact"]
             ex = "" if rec is None else f"  bit-exact {rec['differ']}/{rec['words']} differ"
@@ -2075,7 +2146,7 @@ def kws_mfcc(wav_path):
 def model_inputs(name, mdir, count, seed):
     """Real inputs where MLPerf Tiny ships them; otherwise seeded synthetic inputs, flagged as such."""
     rng = np.random.RandomState(seed)
-    if name == "resnet8":
+    if name in CIFAR_MODELS:
         x, y = cifar_test(os.path.join(mdir, "data"))
         idx = np.load(os.path.join(mdir, "perf_samples_idxs.npy"))[:count]
         return [(x[i : i + 1], int(y[i]), f"cifar10_test[{i}]") for i in idx], "CIFAR-10 test images (MLPerf Tiny perf-sample indices)"
@@ -2099,6 +2170,7 @@ MODELS = {
     "ad01": "ad01_fp32.tflite",
     "kws": "kws_ref_model_float32.tflite",
     "vww": "vww_96_float.tflite",
+    "selu": "selu_cifar10.npz",  # the SELU convnet regression.py --action selu-model trains (not an MLPerf Tiny model; make model's default list leaves it out)
 }
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
 ACTIONS = ("model", "tflite", "bert")
@@ -2110,6 +2182,7 @@ MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to fetc
     "ad01": (("normal_id_01_00000000_hist_librosa.bin",), "run models/fetch_inputs.sh"),
     "kws": (("marvin_617de221_0.wav",), "run models/fetch_inputs.sh"),
     "vww": ((), ""),
+    "selu": (("data/cifar-10-batches-py/test_batch", "perf_samples_idxs.npy"), "run models/fetch_cifar10.sh, and regression.py --action selu-model models/"),
 }
 
 
@@ -2141,6 +2214,7 @@ def model_main(argv=None):
     ap.add_argument("--fault", default=None, help="TEST ONLY, to prove the gate fails: word:MODEL:LAYER:INDEX[:BIT] (flip a hardware output bit), "
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
+    ap.add_argument("--tier", type=int, choices=(0, 1, 2), default=0, help="the activation lanes' accuracy tier for SELU, sigmoid and tanh layers: 1%%, 5%%, 10%%")
     a = ap.parse_args(argv)
     if a.engine == "sets" and a.collapse_k == 0:
         ap.error("--engine sets builds collapse-k 1 (TB_sienna (sets)); use --engine layer")
@@ -2176,7 +2250,7 @@ def model_main(argv=None):
         log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
     sim_fmt = getattr(sim, "fmt_name", "fp32")
     engine = "emulator" if a.emulate else f"engine {a.engine}"
-    how = ("no bit-exact model: emulator" if isinstance(sim, Emulator) else "bit-exact") + f", {sim_fmt} bound {LAYER_BOUND[sim_fmt]:g}"
+    how = ("no bit-exact model: emulator" if isinstance(sim, Emulator) else "bit-exact") + f", {sim_fmt} bound {LAYER_BOUND[sim_fmt]:g}, lane layers tier {a.tier} ({gpnae_model.TIER_TOL[a.tier]:g})"
     tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": [],
              "runs": {}, "rep_seen": set(), "rep_failed": set()}
     results = {}
@@ -2191,8 +2265,8 @@ def model_main(argv=None):
         log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
         return
     for name in models:
-        model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
-        if name == "resnet8" and a.ref_accuracy:
+        model = load_model(os.path.join(a.model_dir, MODELS[name]))
+        if name in CIFAR_MODELS and a.ref_accuracy:
             x, y = cifar_test(os.path.join(a.model_dir, "data"))
             hits = sum(int(np.argmax(execute(model, x[i : i + 1])[0]) == y[i]) for i in range(a.ref_accuracy))
             log(f"{name}: float64 reference top-1 on the first {a.ref_accuracy} CIFAR-10 test images: {hits}/{a.ref_accuracy} = {100 * hits / a.ref_accuracy:.1f}%")
@@ -2208,7 +2282,7 @@ def model_main(argv=None):
             c0, s0, w0, t0 = sim.cycles, sim.sets, getattr(sim, "words", 0), time.time()
             log(f"  inference on {desc}")
             f_here = fault if fault and fault["model"] == name and ii == 0 else None  # a test-only fault hits the model's first inference
-            hw, stats = execute(model, x, sim, log, f_here)
+            hw, stats = execute(model, x, sim, log, f_here, tier=a.tier)
             if f_here and f_here["kind"] == "top1":  # TEST ONLY: the hardware's top two outputs swapped
                 hw = np.array(hw, np.float32)
                 o = np.argsort(hw.ravel())[::-1][:2]
@@ -2258,7 +2332,7 @@ def model_main(argv=None):
     for m in tally["hw"] + tally["task"] + extra + tally["reported"] + notes:
         log(m)
     rep_names = ", ".join(f"{m} {f}" for m, f in sorted(tally["rep_failed"]))
-    log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} {engine}: {len(tally['runs'])} of {len(models)} models ran, "
+    log(f"MODEL GATE: {'PASS' if ok else 'FAIL'}  {sim_fmt} N={a.n} T={a.tile_size} lanes={a.lanes} tier={a.tier} {engine}: {len(tally['runs'])} of {len(models)} models ran, "
         f"{tally['inferences']} inferences; hardware: {tally['bad_layers']} of {tally['layers']} layers fail ({how}); "
         f"task: {tally['bad_inferences']} of {tally['inferences']} inferences fail; other failures: {len(extra)}; "
         f"reported, not gated: {len(tally['reported'])}{' (' + rep_names + ')' if rep_names else ''}"

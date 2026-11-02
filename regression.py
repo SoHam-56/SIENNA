@@ -69,7 +69,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna (pipeline)'s accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "coef-fault", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "selu-model", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "coef-fault", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -3600,6 +3600,75 @@ def pack_models_main(argv=None) -> None:
               f"y [{ys.min()}, {ys.max()}] w_scales {p['w_scales'].size}")
 
 
+# ── selu-model: a self-normalizing CIFAR-10 convnet for the activation lanes ──
+
+SELU_LAYERS = ["conv:c1", "pool", "conv:c2", "pool", "conv:c3", "pool", "fc:f1", "fc:f2", "softmax"]  # model_runner.load_npz_model's order
+SELU_WIDTHS = {"c1": 32, "c2": 64, "c3": 64, "f1": 128, "f2": 10}
+
+
+def selu_npz(weights: dict, acts: dict, meta: dict) -> dict:
+    """The arrays load_npz_model reads: layers, input_shape, <name>_w / _b / _act, meta_*; the first conv's weights carry the 1/255 of the input scaling."""
+    out = {"layers": np.array(SELU_LAYERS), "input_shape": np.array([1, 32, 32, 3])}
+    for name, (w, b) in weights.items():
+        out[name + "_w"], out[name + "_b"], out[name + "_act"] = np.asarray(w, np.float32), np.asarray(b, np.float32), np.array(acts[name])
+    out["c1_w"] = out["c1_w"] / np.float32(255.0)
+    out.update({"meta_" + k: np.array(v) for k, v in meta.items()})
+    return out
+
+
+def selu_model_main(argv=None) -> None:
+    """Trains a small SELU convnet (Klambauer et al.: SELU, lecun_normal, alpha dropout; no batch norm) on CIFAR-10 and saves it as
+    <out>/selu_cifar10.npz for make model (--models selu): conv 3x3 32 - pool - conv 3x3 64 - pool - conv 3x3 64 - pool - fc 128 - fc 10, SELU
+    everywhere but the logits. The training set is models/data (fetch_cifar10.sh train); the test accuracy is stored as meta_test_top1."""
+    ap = argparse.ArgumentParser(description=selu_model_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="selu-model")
+    ap.add_argument("out", help="output directory (make model's MODEL_DIR, e.g. models/)")
+    ap.add_argument("--data", default=os.path.join(ROOT, "models", "data", "cifar-10-batches-py"))
+    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--seed", type=int, default=1)
+    a = ap.parse_args(argv)
+    _tf_imports()
+    import pickle
+    tf.keras.utils.set_random_seed(a.seed)
+    load = lambda f: pickle.load(open(os.path.join(a.data, f), "rb"), encoding="bytes")
+    tr = [load(f"data_batch_{i}") for i in range(1, 6)]
+    x_tr = np.concatenate([d[b"data"] for d in tr]).reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1).astype(np.float32) / 255.0
+    y_tr = np.concatenate([d[b"labels"] for d in tr])
+    te = load("test_batch")
+    x_te = te[b"data"].reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1).astype(np.float32) / 255.0
+    y_te = np.array(te[b"labels"])
+    L = tf.keras.layers
+    conv = lambda n, c: L.Conv2D(c, 3, padding="same", activation="selu", kernel_initializer="lecun_normal", name=n)
+    model = tf.keras.Sequential([L.Input((32, 32, 3)), conv("c1", SELU_WIDTHS["c1"]), L.MaxPooling2D(2), conv("c2", SELU_WIDTHS["c2"]), L.MaxPooling2D(2),
+                                 conv("c3", SELU_WIDTHS["c3"]), L.MaxPooling2D(2), L.Flatten(),
+                                 L.Dense(SELU_WIDTHS["f1"], activation="selu", kernel_initializer="lecun_normal", name="f1"), L.AlphaDropout(0.05),
+                                 L.Dense(SELU_WIDTHS["f2"], kernel_initializer="lecun_normal", name="f2")])
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+    aug = tf.keras.Sequential([L.RandomFlip("horizontal"), L.RandomTranslation(0.1, 0.1)])
+    ds = tf.data.Dataset.from_tensor_slices((x_tr, y_tr)).shuffle(50000, seed=a.seed).batch(128).map(lambda x, y: (aug(x, training=True), y)).prefetch(2)
+    t0 = time.time()
+    model.fit(ds, epochs=a.epochs, validation_data=(x_te, y_te), verbose=2)
+    loss, acc = model.evaluate(x_te, y_te, verbose=0)
+    weights = {n: model.get_layer(n).get_weights() for n in SELU_WIDTHS}
+    acts = {n: "selu" for n in SELU_WIDTHS}
+    acts["f2"] = "linear"
+    os.makedirs(a.out, exist_ok=True)
+    path = os.path.join(a.out, "selu_cifar10.npz")
+    np.savez(path, **selu_npz(weights, acts, {"test_top1": acc, "epochs": a.epochs, "seed": a.seed, "train_s": time.time() - t0}))
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import model_runner as mr_  # noqa: the saved graph must reproduce Keras on raw 0..255 inputs
+    g = mr_.load_model(path)
+    k = model.predict(x_te[:64], verbose=0)
+    ours = np.vstack([mr_.execute(g, x_te[i : i + 1] * 255.0)[0] for i in range(64)])
+    soft = np.exp(k - k.max(1, keepdims=True))
+    soft /= soft.sum(1, keepdims=True)
+    d = float(np.max(np.abs(ours - soft)))
+    print(f"selu-model: test top-1 {100 * acc:.2f}% after {a.epochs} epochs ({time.time() - t0:.0f} s); saved {path}; "
+          f"load_npz_model's graph vs Keras on 64 test images: max |softmax diff| {d:.2e} {'OK' if d < 1e-4 else 'MISMATCH'}")
+    if d >= 1e-4:
+        sys.exit(1)
+
+
 # ── gpnae-tflite (was gpnae_int8_tflite.py) ──────────────────────────────────
 
 GPTFL_OPS = (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic"))  # (truth.py function, GPNAE control word, TFLite op)
@@ -4822,7 +4891,7 @@ def test_model_points_skip_without_models():
         assert SPEC.skipped("fp32/N8_T2/model", o(d)) is None
         assert mr.missing_inputs("vww", d) == ([], "") and mr.missing_inputs("kws", d)[0] == ["kws_ref_model_float32.tflite", "marvin_617de221_0.wav"]
     shipped = os.path.join(ROOT, "models")
-    assert all(os.path.isfile(os.path.join(shipped, m)) for m in mr.MODELS.values()) and SPEC.skipped("fp32/N8_T2/model", o(shipped)) is None
+    assert all(os.path.isfile(os.path.join(shipped, mr.MODELS[m])) for m in ("resnet8", "ad01", "kws", "vww")) and SPEC.skipped("fp32/N8_T2/model", o(shipped)) is None  # the trained selu net ships once made
     assert mr.missing_inputs("resnet8", shipped)[1] == "run models/fetch_cifar10.sh" or not mr.missing_inputs("resnet8", shipped)[0]
     r = subprocess.run(["make", "-s", "-n", "model", "PYTHON=py"], cwd=ROOT, env=MAKE_ENV, capture_output=True, text=True)
     assert f"--model-dir {shipped} " in r.stdout and "/proj/" not in r.stdout.replace(ROOT, "<root>"), r.stdout[-300:]
@@ -5595,6 +5664,46 @@ def test_packable_blocks():
     r = j(8, 8)
     r["terms"].append((np.zeros((4, 8), np.float32), np.eye(8, dtype=np.float32)))
     assert mr.packable(r, 64) == 0  # a residual (two terms)
+
+
+@selftest
+def test_npz_model_graph():
+    rng = np.random.default_rng(5)  # a toy SELU convnet through load_npz_model and execute equals the same net written out plainly
+    widths = {"c1": 4, "c2": 5, "c3": 6, "f1": 7, "f2": 3}
+    w = {"c1": (rng.standard_normal((3, 3, 3, 4)), rng.standard_normal(4)), "c2": (rng.standard_normal((3, 3, 4, 5)), rng.standard_normal(5)),
+         "c3": (rng.standard_normal((3, 3, 5, 6)), rng.standard_normal(6)), "f1": (rng.standard_normal((4 * 4 * 6, 7)), rng.standard_normal(7)),
+         "f2": (rng.standard_normal((7, 3)), rng.standard_normal(3))}
+    acts = {n: "selu" for n in widths}
+    acts["f2"] = "linear"
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "m.npz")
+        np.savez(path, **selu_npz(w, acts, {"test_top1": 0.5}))
+        g = mr.load_npz_model(path)
+        assert [o["kind"] for o in g["ops"]] == ["CONV_2D", "MAX_POOL_2D", "CONV_2D", "MAX_POOL_2D", "CONV_2D", "MAX_POOL_2D", "RESHAPE", "FULLY_CONNECTED", "FULLY_CONNECTED", "SOFTMAX"]
+        assert float(g["meta"]["meta_test_top1"]) == 0.5
+        x = rng.uniform(0, 255, (1, 32, 32, 3)).astype(np.float32)
+        y, stats = mr.execute(g, x)
+        selu = lambda v: 1.0507009873554805 * np.where(v > 0, v, 1.6732632423543772 * (np.exp(np.minimum(v, 0)) - 1))
+        conv = lambda v, W, b: selu(sum(np.pad(v, ((1, 1), (1, 1), (0, 0)))[i : i + v.shape[0], j : j + v.shape[1]] @ W[i, j] for i in range(3) for j in range(3)) + b)
+        pool = lambda v: np.max(v.reshape(v.shape[0] // 2, 2, v.shape[1] // 2, 2, -1), axis=(1, 3))
+        h = x[0].astype(np.float64) / 255.0
+        for n in ("c1", "c2", "c3"):
+            W, b = w[n]
+            h = pool(conv(h, W, b))
+        h = selu(h.reshape(-1) @ w["f1"][0] + w["f1"][1]) @ w["f2"][0] + w["f2"][1]
+        e = np.exp(h - h.max())
+        assert np.max(np.abs(y.ravel() - e / e.sum())) < 1e-5, np.max(np.abs(y.ravel() - e / e.sum()))
+        assert all(s["act"] == "selu" and s["tier"] == 2 for s in mr.execute(g, x, tier=2)[1][:-1])  # the tier reaches every lane layer, not the linear logits
+        assert mr.execute(g, x, tier=2)[1][-1]["act"] == "linear"
+
+
+@selftest
+def test_maxpool_and_layer_bound():
+    x = np.arange(2 * 4 * 4 * 1, dtype=np.float32).reshape(1, 4, 4, 2)  # a 2 x 2 stride-2 max of NHWC keeps the bottom-right of each window here
+    p = mr.maxpool2d(x, (2, 2), (2, 2))
+    assert p.shape == (1, 2, 2, 2) and p[0, 0, 0, 0] == x[0, 1, 1, 0] and p[0, 1, 1, 1] == x[0, 3, 3, 1]
+    assert mr.layer_bound("fp32", "relu") == mr.LAYER_BOUND["fp32"] and mr.layer_bound("fp32", "selu", 0) == gpnae_model.TIER_TOL[0]
+    assert mr.layer_bound("bf16", "tanh", 2) == gpnae_model.TIER_TOL[2] and mr.layer_bound("bf16", "linear", 2) == mr.LAYER_BOUND["bf16"]
 
 
 # ── tool: perf section (was test_perf_analysis.py) ──
@@ -6701,7 +6810,7 @@ def multi_main(argv) -> None:
     sys.exit(1 if bad else 0)
 
 
-MAINS = {"idle-fault": idle_fault_main, "coef-fault": coef_fault_main, "multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main,
+MAINS = {"idle-fault": idle_fault_main, "coef-fault": coef_fault_main, "multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main, "selu-model": selu_model_main,
          "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          "summary": summary_main, **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point")}}  # each parses its own options (regression.py --action A --help)
 

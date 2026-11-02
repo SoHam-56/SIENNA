@@ -16,6 +16,9 @@ PYTHON ?= python3
 MODEL_DIR ?= $(PRJ_DIR)/models
 # Inferences per model in make model; make regression runs 3.
 MODEL_COUNT ?= 1
+# The models make model runs (names in model_runner.MODELS); selu is the SELU convnet make selu-model trains, and TIER its lanes' accuracy tier (0: 1%, 1: 5%, 2: 10%).
+MODELS ?= resnet8,ad01,kws,vww
+TIER ?= 0
 # make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
 SMALL ?= 0
 QUICK ?= 0
@@ -293,6 +296,7 @@ help:
 	@echo "  make regression                   - every test at N = 8 to 64 (use make -jN; see the README for memory)"
 	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
 	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32 or bf16)"
+	@echo "  make model MODELS=selu TIER=1     - the SELU CIFAR-10 convnet (make selu-model trains it) with the lanes at tier 0, 1 or 2"
 	@echo "  make bert [BERT_SEQ=128 BERT_TIER=0] - BERT-Tiny's encoder on the RTL (fp32 or bf16; models/fetch_bert_tiny.sh first)"
 	@echo "  make model-pack N=64 LANES=128    - layers of different MLPerf Tiny models in one packed set (fp32 or bf16)"
 	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
@@ -549,7 +553,14 @@ model:
 		--lanes $(LANES) \
 		--format $(FMT) \
 		--collapse-k $(COLLAPSE_K) \
-		--count $(MODEL_COUNT)
+		--count $(MODEL_COUNT) \
+		--models $(MODELS) \
+		--tier $(TIER)
+
+# Trains the SELU CIFAR-10 convnet (TensorFlow; models/fetch_cifar10.sh train first) and saves MODEL_DIR/selu_cifar10.npz for make model MODELS=selu.
+selu-model:
+	$(PYTHON) regression.py --action selu-model $(MODEL_DIR) --epochs $(SELU_EPOCHS)
+SELU_EPOCHS ?= 30
 
 # Layers of different MLPerf Tiny models in one packed set, with a real inference's activations (fp32 or bf16); N = 64 needs LANES=64 or 128.
 model-pack:
@@ -705,6 +716,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help help-debug verilator vcs bert model-pack \
+.PHONY: default help help-debug verilator vcs bert model-pack selu-model \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

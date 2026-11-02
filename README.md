@@ -80,6 +80,18 @@ int8 versions of these four models do not run yet: in int8 the host stack runs s
 
 The encoder's 58.7 M multiply-accumulates take 19.5 µs at N = 64 (6.0 TFLOPS at the assumed 950 MHz, 77% of the mesh's multiply slots); the 128 × 128 attention products fit the mesh exactly. The head is slow for a different reason: it works on one row (the [MASK] token), so the 30,522-wide vocabulary projection fills 1 of N rows of every set and takes three quarters of the run; a host that batches the masked rows of many sentences, or keeps the vocabulary projection on the CPU, avoids it. The pooler's tanh is within the 1% tier's bound (0.49% of the largest output in fp32). BERT-Tiny itself is a weak model: it predicts "france" for "the capital of france is [MASK]", and so does the Hugging Face reference.
 
+### Inference: a recurrent network through the activation lanes (ECG5000 LSTM)
+
+The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `make lstm` runs a model that cannot: an LSTM of 32 units over 140-sample heartbeats from the ECG5000 set (five classes; trained here with `make lstm-model`, 92.9% test accuracy in TensorFlow). Every step of the recurrence is three jobs through the lanes behind the mesh: the input, forget and output gates (sigmoid) and the candidate (tanh) as products of [xₜ, hₜ₋₁] against the stacked kernels, and the cell state's tanh as a product with a scaled identity; the Hadamard products and the cell update run on the host in float64, and the classifier is one linear job. A batch of heartbeats fills the rows of every job. The golden is the same model on the CPU in float64 (it agrees with Keras to 1.9 × 10⁻⁶), and the gate requires the same top-1 class as the golden for every heartbeat at the 1% tier. 64 heartbeats, fp32, T = 4:
+
+| Build | Lane tier | Per batch of 64 | Per heartbeat | Top-1 vs golden | Final hidden state vs golden |
+|---|---|---|---|---|---|
+| N = 16, 32 lanes | 1% | 947,069 cycles | 15.6 µs | 64 of 64 | 1.3 × 10⁻² |
+| N = 16, 32 lanes | 5% | 735,437 cycles | 12.1 µs | 64 of 64 | 2.1 × 10⁻¹ |
+| N = 16, 32 lanes | 10% | 673,391 cycles | 11.1 µs | 64 of 64 | 1.2 |
+
+The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%, yet the class decision survives on every one of the 64 heartbeats; a larger batch is being measured. The golden itself gets 60 of the 64 right.
+
 **How a set is timed.** The rest of this section measures the engine rather than a model. A set is one N × N by N × N matrix multiply (2N³ operations) followed by its activation, pooling and dropout. The testbench counts cycles from the host's start to the set's completion signal:
 
 | N = 16, fp32, ReLU set, T = 4 | Cycles | Time |

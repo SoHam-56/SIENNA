@@ -69,7 +69,7 @@ from matmul_tests import _ref_matmul, pow2_tile_sizes, write_mem
 
 RESULTS_DIR = os.path.join(ROOT, "testbenches", "results", "pipeline")
 ACCUM_ZERO_PASSES = 4  # TB_sienna (pipeline)'s accumulate pass: partial sets of zeros before the summed group
-ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "selu-model", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "coef-fault", "selftest", "points", "point", "summary")
+ACTIONS = ("regression", "gen", "pkg", "analyze", "pack", "gemm", "residual", "perf", "oracle", "pack-models", "selu-model", "lstm-model", "gpnae-tflite", "rq-vectors", "add-vectors", "multi", "idle-fault", "coef-fault", "selftest", "points", "point", "summary")
 
 # ── ANSI Colors ──────────────────────────────────────────────────────────────
 _G = "\033[92m"
@@ -3669,6 +3669,49 @@ def selu_model_main(argv=None) -> None:
         sys.exit(1)
 
 
+# ── lstm-model: an LSTM classifier of ECG5000 heartbeats for the sigmoid and tanh lanes ──
+
+def lstm_model_main(argv=None) -> None:
+    """Trains a Keras LSTM (units tanh / sigmoid, as model_runner.lstm_forward computes it) then a dense classifier on ECG5000's 500 training
+    heartbeats (140 samples, 5 classes) and saves <out>/lstm_ecg5000.npz for model_runner --action lstm; the test accuracy on the 4500 test heartbeats is
+    stored as meta_test_top1, and the saved weights are checked against Keras through model_runner.lstm_forward on 64 test heartbeats."""
+    ap = argparse.ArgumentParser(description=lstm_model_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="lstm-model")
+    ap.add_argument("out", help="output directory (models/)")
+    ap.add_argument("--data", default=os.path.join(ROOT, "models", "ecg5000"))
+    ap.add_argument("--units", type=int, default=32)
+    ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--seed", type=int, default=1)
+    a = ap.parse_args(argv)
+    _tf_imports()
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import model_runner as mr_
+    tf.keras.utils.set_random_seed(a.seed)
+    x_tr, y_tr = mr_.ecg5000(os.path.join(a.data, "ECG5000_TRAIN.txt"))
+    x_te, y_te = mr_.ecg5000(os.path.join(a.data, "ECG5000_TEST.txt"))
+    L = tf.keras.layers
+    model = tf.keras.Sequential([L.Input((x_tr.shape[1], 1)), L.LSTM(a.units, name="lstm"), L.Dense(5, name="fc")])
+    model.compile(optimizer=tf.keras.optimizers.Adam(3e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+    t0 = time.time()
+    model.fit(x_tr, y_tr, batch_size=32, epochs=a.epochs, validation_data=(x_te, y_te), verbose=2)
+    _, acc = model.evaluate(x_te, y_te, verbose=0)
+    W, U, b = model.get_layer("lstm").get_weights()
+    fw, fb = model.get_layer("fc").get_weights()
+    os.makedirs(a.out, exist_ok=True)
+    path = os.path.join(a.out, "lstm_ecg5000.npz")
+    np.savez(path, lstm_W=W.astype(np.float32), lstm_U=U.astype(np.float32), lstm_b=b.astype(np.float32), fc_w=fw.astype(np.float32), fc_b=fb.astype(np.float32),
+             meta_test_top1=np.array(acc), meta_epochs=np.array(a.epochs), meta_seed=np.array(a.seed), meta_train_s=np.array(time.time() - t0))
+    w = mr_.load_lstm_npz(path)
+    run = lambda job, tag: (mr_.job_reference(job)[0] if job["act"] == "linear" else mr_._true_act(mr_.job_reference(job)[0], job["act"])).astype(np.float32)
+    ours = mr_.lstm_forward(w, x_te[:64], run)["logits"]
+    k = model.predict(x_te[:64], verbose=0)
+    d = float(np.max(np.abs(ours - k)))
+    print(f"lstm-model: test top-1 {100 * acc:.2f}% after {a.epochs} epochs ({time.time() - t0:.0f} s); saved {path}; "
+          f"lstm_forward vs Keras on 64 test heartbeats: max |logit diff| {d:.2e} {'OK' if d < 1e-3 else 'MISMATCH'}")
+    if d >= 1e-3:
+        sys.exit(1)
+
+
 # ── gpnae-tflite (was gpnae_int8_tflite.py) ──────────────────────────────────
 
 GPTFL_OPS = (("tanh", 3, "tanh"), ("sigmoid", 2, "logistic"))  # (truth.py function, GPNAE control word, TFLite op)
@@ -5707,6 +5750,38 @@ def test_maxpool_and_layer_bound():
     assert mr.layer_bound("bf16", "tanh", 2) == gpnae_model.TIER_TOL[2] and mr.layer_bound("bf16", "linear", 2) == mr.LAYER_BOUND["bf16"]
 
 
+@selftest
+def test_lstm_forward_matches_plain_cell():
+    rng = np.random.default_rng(9)  # the three-job lowering (gates / candidate / scaled-identity cell tanh) against the Keras cell written out plainly
+    u, F, B, T = 4, 1, 3, 5
+    w = {"lstm_W": rng.standard_normal((F, 4 * u)).astype(np.float32), "lstm_U": rng.standard_normal((u, 4 * u)).astype(np.float32),
+         "lstm_b": rng.standard_normal(4 * u).astype(np.float32), "fc_w": rng.standard_normal((u, 2)).astype(np.float32), "fc_b": rng.standard_normal(2).astype(np.float32)}
+    X = rng.standard_normal((B, T, F)).astype(np.float32)
+    tags = []
+
+    def run(job, tag):
+        tags.append((tag, job["act"], tuple(job["shape"])))
+        y = mr.job_reference(job)[0]
+        return (mr._true_act(y, job["act"]) if job["act"] != "linear" else y).astype(np.float32)
+
+    out = mr.lstm_forward(w, X, run, tier=1)
+    sig = lambda v: 1 / (1 + np.exp(-v))
+    h = c = np.zeros((B, u))
+    for t in range(T):
+        z = X[:, t, :].astype(np.float64) @ w["lstm_W"] + h @ w["lstm_U"] + w["lstm_b"]
+        i, f, g, o = (z[:, k * u : (k + 1) * u] for k in range(4))  # Keras order i, f, c, o
+        c = sig(f) * c + sig(i) * np.tanh(g)
+        h = sig(o) * np.tanh(c)
+    logits = h @ w["fc_w"] + w["fc_b"]
+    assert np.max(np.abs(out["logits"] - logits)) < 1e-4 and np.max(np.abs(out["h"] - h)) < 1e-5, np.max(np.abs(out["logits"] - logits))
+    assert [t[0] for t in tags[:3]] == ["t000.gates", "t000.cand", "t000.cell"] and tags[-1][0] == "fc" and len(tags) == 3 * T + 1
+    assert tags[0][1:] == ("sigmoid", (B, 3 * u)) and tags[1][1:] == ("tanh", (B, u)) and tags[2][1:] == ("tanh", (B, u)) and tags[-1][1] == "linear"
+    with tempfile.TemporaryDirectory() as d:  # the ECG5000 text form: label first, 1-based
+        open(os.path.join(d, "e.txt"), "w").write("   2.0000000e+00  -1.1e-01   2.5e+00\n   1.0000000e+00   3.0e-01  -4.0e-01\n")
+        x, y = mr.ecg5000(os.path.join(d, "e.txt"))
+        assert x.shape == (2, 2, 1) and y.tolist() == [1, 0] and abs(float(x[0, 1, 0]) - 2.5) < 1e-6
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")
@@ -6811,7 +6886,7 @@ def multi_main(argv) -> None:
     sys.exit(1 if bad else 0)
 
 
-MAINS = {"idle-fault": idle_fault_main, "coef-fault": coef_fault_main, "multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main, "selu-model": selu_model_main,
+MAINS = {"idle-fault": idle_fault_main, "coef-fault": coef_fault_main, "multi": multi_main, "pack": pack_main, "gemm": gemm_main, "residual": residual_main, "perf": perf_main, "oracle": oracle_main, "pack-models": pack_models_main, "selu-model": selu_model_main, "lstm-model": lstm_model_main,
          "gpnae-tflite": gpnae_tflite_main, "rq-vectors": rq_vectors_main, "add-vectors": add_vectors_main, "selftest": selftest_main,
          "summary": summary_main, **{x: (lambda argv, x=x: regress.main(SPEC, ["--action", x, *argv])) for x in ("points", "point")}}  # each parses its own options (regression.py --action A --help)
 

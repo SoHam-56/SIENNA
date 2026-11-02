@@ -297,6 +297,7 @@ help:
 	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
 	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32 or bf16)"
 	@echo "  make model MODELS=selu TIER=1     - the SELU CIFAR-10 convnet (make selu-model trains it) with the lanes at tier 0, 1 or 2"
+	@echo "  make lstm TIER=0 [LSTM_BATCH=64]  - the ECG5000 LSTM classifier (make lstm-model trains it): gates and tanh on the lanes each step"
 	@echo "  make bert [BERT_SEQ=128 BERT_TIER=0] - BERT-Tiny's encoder on the RTL (fp32 or bf16; models/fetch_bert_tiny.sh first)"
 	@echo "  make model-pack N=64 LANES=128    - layers of different MLPerf Tiny models in one packed set (fp32 or bf16)"
 	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
@@ -562,6 +563,16 @@ selu-model:
 	$(PYTHON) regression.py --action selu-model $(MODEL_DIR) --epochs $(SELU_EPOCHS)
 SELU_EPOCHS ?= 30
 
+# Trains the ECG5000 LSTM classifier (TensorFlow; models/fetch_ecg5000.sh first) and saves MODEL_DIR/lstm_ecg5000.npz; make lstm runs it on the RTL.
+lstm-model:
+	$(PYTHON) regression.py --action lstm-model $(MODEL_DIR) --epochs $(LSTM_EPOCHS)
+LSTM_EPOCHS ?= 60
+LSTM_BATCH ?= 64
+lstm:
+	@[ -f "$(MODEL_DIR)/lstm_ecg5000.npz" ] || { echo "ERROR: make lstm needs $(MODEL_DIR)/lstm_ecg5000.npz (make lstm-model)"; exit 1; }
+	$(PYTHON) scripts/model_runner.py --action lstm --model $(MODEL_DIR)/lstm_ecg5000.npz --data $(MODEL_DIR)/ecg5000/ECG5000_TEST.txt \
+		--n $(N) --tile-size $(TILE) --lanes $(LANES) --format $(FMT) --collapse-k $(COLLAPSE_K) --tier $(TIER) --batch $(LSTM_BATCH)
+
 # Layers of different MLPerf Tiny models in one packed set, with a real inference's activations (fp32 or bf16); N = 64 needs LANES=64 or 128.
 model-pack:
 	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model-pack needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
@@ -716,6 +727,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help help-debug verilator vcs bert model-pack selu-model \
+.PHONY: default help help-debug verilator vcs bert model-pack selu-model lstm-model lstm \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

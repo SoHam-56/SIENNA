@@ -5,12 +5,13 @@
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
 #   2. Frontend         load_tflite, load_npz_model, load_model, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite;
 #                       BERT: load_safetensors, wordpiece, bert_tokens, layernorm, gelu, bert_forward (the encoder as GEMM jobs and host ops)
+#                       LSTM: load_lstm_npz, lstm_forward (the cell as three lane jobs per step and host elementwise ops), ecg5000
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck, packable
 #   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
 #   7. Runtime          run_checked, maxpool2d, execute, macs_of; the model gate: check_layer, judge, layer_bound, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
-#   8. CLI              model_main, model_pack_main, tflite_main, tflite_pack_main, bert_main, main
+#   8. CLI              model_main, model_pack_main, tflite_main, tflite_pack_main, bert_main, lstm_main, main
 
 import argparse
 from dataclasses import dataclass
@@ -1094,6 +1095,53 @@ def bert_forward(w: dict, ids, mask, run, heads: int, mask_id: int = None, tier:
     return out
 
 
+# ── LSTM (recurrent): weights, and the cell as GEMM jobs per time step ─────────
+
+LSTM_GATES = ("i", "f", "c", "o")  # Keras's column order in the kernel, recurrent kernel and bias: input, forget, candidate, output, units wide each
+
+
+def load_lstm_npz(path: str) -> dict:
+    """The arrays regression.py --action lstm-model saves: lstm_W (features x 4u), lstm_U (u x 4u), lstm_b (4u), fc_w (u x classes), fc_b, meta_*."""
+    z = np.load(path, allow_pickle=False)
+    return {k: z[k] for k in z.files}
+
+
+def lstm_forward(w: dict, X, run, tier: int = 0, hidden=None) -> dict:
+    """A Keras LSTM layer (tanh candidate and output, sigmoid gates) then a dense classifier on a batch X (B x T x F), every matrix product through
+    run(job, tag) -> float32: per step one sigmoid job for the i, f, o gates and one tanh job for the candidate, both on [x_t, h_{t-1}] against the
+    stacked kernel and recurrent kernel, then the cell state's tanh as a product with a scaled identity (c / 2 times 2 I, exact in float) through a tanh
+    job, since the lanes sit behind the mesh; the Hadamard products and the cell update run on the host in float64. hidden, a list, collects h_t."""
+    W, U, b = w["lstm_W"].astype(np.float32), w["lstm_U"].astype(np.float32), w["lstm_b"].astype(np.float32)
+    u = U.shape[0]
+    B, T, F = X.shape
+    col = {g: slice(k * u, (k + 1) * u) for k, g in enumerate(LSTM_GATES)}
+    ifo = np.concatenate([np.arange(u) + col[g].start for g in ("i", "f", "o")])
+    WU = np.vstack([W, U])  # [x_t, h_{t-1}] against [W; U]
+    W_ifo, b_ifo, W_c, b_c = WU[:, ifo].copy(), b[ifo].copy(), WU[:, col["c"]].copy(), b[col["c"]].copy()
+    eye2 = (2.0 * np.eye(u, dtype=np.float32))
+    h = np.zeros((B, u), np.float64)
+    c = np.zeros((B, u), np.float64)
+    for t in range(T):
+        inp = np.hstack([X[:, t, :], h]).astype(np.float32)
+        g = run({"terms": [(inp, W_ifo)], "bias": b_ifo, "act": "sigmoid", "shape": (B, 3 * u), "tier": tier}, f"t{t:03d}.gates").astype(np.float64)
+        cand = run({"terms": [(inp, W_c)], "bias": b_c, "act": "tanh", "shape": (B, u), "tier": tier}, f"t{t:03d}.cand").astype(np.float64)
+        i, f, o = g[:, :u], g[:, u : 2 * u], g[:, 2 * u :]
+        c = f * c + i * cand
+        tc = run({"terms": [((c / 2.0).astype(np.float32), eye2)], "bias": None, "act": "tanh", "shape": (B, u), "tier": tier}, f"t{t:03d}.cell").astype(np.float64)
+        h = o * tc
+        if hidden is not None:
+            hidden.append(h.copy())
+    logits = run({"terms": [(h.astype(np.float32), w["fc_w"].astype(np.float32))], "bias": w["fc_b"].astype(np.float32), "act": "linear",
+                  "shape": (B, w["fc_w"].shape[1]), "tier": 0}, "fc")
+    return {"logits": logits, "h": h, "c": c}
+
+
+def ecg5000(path: str) -> tuple:
+    """(X as B x 140 x 1 float32, labels 0..4) of a UCR ECG5000 text file (label then 140 samples per line)."""
+    d = np.loadtxt(path)
+    return d[:, 1:, None].astype(np.float32), d[:, 0].astype(np.int64) - 1
+
+
 # ── 3. Middle end: jobs become N x N sets or a layer's streams; packing ───────
 
 HW_BIAS = True  # the mesh adds the bias; False lowers it as a ones column and an extra depth row
@@ -2173,7 +2221,7 @@ MODELS = {
     "selu": "selu_cifar10.npz",  # the SELU convnet regression.py --action selu-model trains (not an MLPerf Tiny model; make model's default list leaves it out)
 }
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
-ACTIONS = ("model", "tflite", "bert")
+ACTIONS = ("model", "tflite", "bert", "lstm")
 BERT_DIR = os.path.join(ROOT, "models", "bert_tiny")  # models/fetch_bert_tiny.sh
 
 
@@ -2697,6 +2745,106 @@ def model_pack_main(argv=None):
         sys.exit(1)
 
 
+def lstm_main(argv=None):
+    """An LSTM classifier of ECG5000 heartbeats (regression.py --action lstm-model trains it) on the layer contract: per time step the gates' sigmoid
+    and the candidate's tanh are lane jobs on [x_t, h_{t-1}], the cell state's tanh a scaled-identity lane job, the classifier a linear job; the
+    Hadamard products and cell update run on the host in float64. Golden: the same model on the CPU in float64. Gate: every job within its tier's bound
+    of float64 on its operands, and at tier 0 the same top-1 class as the golden for every heartbeat; at tiers 1 and 2 the agreement is reported."""
+    ap = argparse.ArgumentParser(description=lstm_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="lstm")
+    ap.add_argument("--model", default=os.path.join(ROOT, "models", "lstm_ecg5000.npz"))
+    ap.add_argument("--data", default=os.path.join(ROOT, "models", "ecg5000", "ECG5000_TEST.txt"))
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=("fp32", "bf16"))
+    ap.add_argument("--tier", type=int, default=0, choices=(0, 1, 2), help="the lanes' accuracy tier for the gates, candidate and cell tanh")
+    ap.add_argument("--batch", type=int, default=64, help="heartbeats classified together (the rows of every step's jobs)")
+    ap.add_argument("--seed", type=int, default=7, help="which test heartbeats: a seeded draw over the test file")
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "lstm"))
+    ap.add_argument("--no-sim", action="store_true", help="float reference only")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1)
+    a = ap.parse_args(argv)
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
+    os.makedirs(a.work, exist_ok=True)
+    report = os.path.join(a.work, f"lstm_report_N{a.n}_T{a.tile_size}_{a.fmt_name}_tier{a.tier}.log")
+    rep = open(report, "w")
+
+    def log(s):
+        print(s, flush=True)
+        rep.write(s + "\n")
+        rep.flush()
+
+    w = load_lstm_npz(a.model)
+    X, y = ecg5000(a.data)
+    idx = np.random.RandomState(a.seed).choice(len(X), a.batch, replace=False)
+    X, y = X[idx], y[idx]
+    u, T = w["lstm_U"].shape[0], X.shape[1]
+    log(f"LSTM {os.path.basename(a.model)}: {u} units over {T} steps, {w['fc_w'].shape[1]} classes (trained test top-1 {100 * float(w['meta_test_top1']):.1f}%); "
+        f"{a.batch} test heartbeats (seed {a.seed}); {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} tier {a.tier}")
+    log("golden: the model on the CPU in float64; hardware run: the gates (sigmoid), candidate (tanh) and cell tanh on the lanes behind the mesh each step, the classifier as a linear job; "
+        "Hadamard products and the cell update on the host")
+    ref_run = lambda job, tag: (job_reference(job)[0] if job["act"] == "linear" else _true_act(job_reference(job)[0], job["act"])).astype(np.float32)
+    ref = lstm_forward(w, X, ref_run, a.tier)
+    ref_top = np.argmax(ref["logits"], axis=1)
+    log(f"  CPU golden: top-1 right on {int(np.sum(ref_top == y))} of {a.batch} heartbeats")
+    if a.no_sim:
+        log("LSTM GATE: not run (--no-sim: float reference only)")
+        return
+    sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
+    t0 = time.time()
+    sim.build()
+    log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
+    stats, fails = [], []
+
+    def run(job, tag):
+        yv, st = run_checked(job, sim, tag)
+        st = dict(st, act=job["act"])
+        stats.append(st)
+        b = layer_bound(a.fmt_name, job["act"], job.get("tier", 0))
+        if not st["err"] <= b:
+            fails.append(f"FAIL job {tag}: max|hw-ref|/max|ref| {st['err']:.2e} above {b:g}")
+        if tag.startswith("t000.") or tag == "fc":  # the first step's three jobs and the classifier in full; the rest summed below
+            rec = st["exact"]
+            log(f"    {tag:<10} {str(tuple(job['shape'])):<10} K {job['terms'][0][1].shape[0]:3d} {job['act']:<7} sets {st['sets']:4d}  cycles {st['cycles']:6d}  "
+                f"MACs {st['macs']:8d}  job err {st['err']:.2e}  diag: {rec['differ']}/{rec['words']} words off the bit-exact model")
+        return yv
+
+    c0, s0, t0 = sim.cycles, sim.sets, time.time()
+    hw = lstm_forward(w, X, run, a.tier)
+    cyc, sets = sim.cycles - c0, sim.sets - s0
+    hw_top = np.argmax(hw["logits"], axis=1)
+    agree = int(np.sum(hw_top == ref_top))
+    kinds = {}
+    for st in stats:
+        k = st["tag"].split(".")[-1] if "." in st["tag"] else st["tag"]
+        d = kinds.setdefault(k, [0, 0, 0.0])
+        d[0] += st["cycles"]
+        d[1] += 1
+        d[2] = max(d[2], st["err"])
+    for k, (cy, n, e) in kinds.items():
+        log(f"  {k:<6} {n:4d} jobs {cy:8d} cycles  worst job err {e:.2e}")
+    dl = float(np.max(np.abs(hw["logits"].astype(np.float64) - ref["logits"]))) / (float(np.max(np.abs(ref["logits"]))) or 1.0)
+    dh = float(np.max(np.abs(hw["h"] - ref["h"]))) / (float(np.max(np.abs(ref["h"]))) or 1.0)
+    macs = sum(st["macs"] for st in stats)
+    log(f"  result: hardware top-1 agrees with the CPU golden on {agree} of {a.batch} heartbeats (right on {int(np.sum(hw_top == y))}, golden {int(np.sum(ref_top == y))}); "
+        f"final hidden state max|hw-golden|/max|golden| {dh:.2e}, logits {dl:.2e}")
+    log(f"  {len(stats)} jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed) for {a.batch} heartbeats = {cyc / a.batch / 950e3 * 1e3:.2f} us each  "
+        f"{macs} MACs  MAC-slot use {100 * macs / (sets * a.n ** 3):.1f}%  wall {time.time() - t0:.0f} s")
+    if a.tier == 0 and agree != a.batch:
+        fails.append(f"FAIL task: top-1 differs from the CPU golden on {a.batch - agree} of {a.batch} heartbeats at tier 0")
+    elif agree != a.batch:
+        log(f"  reported, not gated: top-1 differs from the golden on {a.batch - agree} heartbeats at tier {a.tier}")
+    for m in fails:
+        log(m)
+    log(f"\nreport {report}")
+    log(f"LSTM GATE: {'PASS' if not fails else 'FAIL'}  {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} tier={a.tier} batch={a.batch}: {len(stats)} jobs, {sets} sets, "
+        f"{cyc} cycles; top-1 agreement {agree}/{a.batch}; {len(fails)} failures")
+    if fails:
+        sys.exit(1)
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--action", choices=ACTIONS, default="model")
@@ -2704,6 +2852,8 @@ def main():
     a, rest = pre.parse_known_args()
     if a.action == "bert":
         bert_main(rest)
+    elif a.action == "lstm":
+        lstm_main(rest)
     elif a.action == "model":
         (model_pack_main if a.pack else model_main)(rest)
     else:

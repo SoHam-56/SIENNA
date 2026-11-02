@@ -294,6 +294,7 @@ help:
 	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
 	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32 or bf16)"
 	@echo "  make bert [BERT_SEQ=128 BERT_TIER=0] - BERT-Tiny's encoder on the RTL (fp32 or bf16; models/fetch_bert_tiny.sh first)"
+	@echo "  make model-pack N=64 LANES=128    - layers of different MLPerf Tiny models in one packed set (fp32 or bf16)"
 	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
 	@echo "  make vcs                          - the same on Synopsys VCS; SIM=vcs runs make regression on VCS (README: Running with VCS)"
 	@echo "  make wave                         - open the last waveform"
@@ -550,6 +551,16 @@ model:
 		--collapse-k $(COLLAPSE_K) \
 		--count $(MODEL_COUNT)
 
+# Layers of different MLPerf Tiny models in one packed set, with a real inference's activations (fp32 or bf16); N = 64 needs LANES=64 or 128.
+model-pack:
+	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model-pack needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
+	$(PYTHON) scripts/model_runner.py --action model --pack \
+		--model-dir $(MODEL_DIR) \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--format $(FMT)
+
 # BERT-Tiny's encoder on the layer contract (fp32 or bf16): models/bert_tiny from models/fetch_bert_tiny.sh, or BERT_DIR=<d>.
 BERT_DIR ?= $(PRJ_DIR)/models/bert_tiny
 BERT_SEQ ?= 128
@@ -694,6 +705,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help help-debug verilator vcs bert \
+.PHONY: default help help-debug verilator vcs bert model-pack \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

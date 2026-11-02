@@ -20,3 +20,5 @@ models/data/
 models/marvin_617de221_0.wav
 models/normal_id_01_00000000_hist_librosa.bin
 models/*.part
+# BERT-Tiny (Apache 2.0, google/bert_uncased_L-2_H-128_A-2), downloaded by models/fetch_bert_tiny.sh
+models/bert_tiny/

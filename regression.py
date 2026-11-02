@@ -5455,6 +5455,137 @@ def test_gate_verdict():
     assert ok and "can be dropped" in notes[0], notes
 
 
+# ── tool: the BERT frontend (model_runner's load_safetensors, wordpiece, bert_tokens, bert_forward) ──
+
+@selftest
+def test_safetensors_roundtrip():
+    with tempfile.TemporaryDirectory() as d:  # a two-tensor file in the format's layout reads back exactly; a non-F32 tensor is refused
+        a, b = np.arange(6, dtype="<f4").reshape(2, 3), np.array([1.5, -2.0], "<f4")
+        hdr = {"a": {"dtype": "F32", "shape": [2, 3], "data_offsets": [0, 24]}, "b": {"dtype": "F32", "shape": [2], "data_offsets": [24, 32]},
+               "__metadata__": {"format": "pt"}}
+        h = json.dumps(hdr).encode()
+        f = os.path.join(d, "m.safetensors")
+        open(f, "wb").write(struct.pack("<Q", len(h)) + h + a.tobytes() + b.tobytes())
+        t = mr.load_safetensors(f)
+        assert set(t) == {"a", "b"} and np.array_equal(t["a"], a) and np.array_equal(t["b"], b) and t["a"].dtype == np.float32
+        hdr["b"]["dtype"] = "BF16"
+        h = json.dumps(hdr).encode()
+        open(f, "wb").write(struct.pack("<Q", len(h)) + h + a.tobytes() + b.tobytes())
+        try:
+            mr.load_safetensors(f)
+            assert False, "a BF16 tensor was read as F32"
+        except ValueError as e:
+            assert "BF16" in str(e)
+
+
+@selftest
+def test_wordpiece_and_tokens():
+    vocab = {t: i for i, t in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "play", "##ing", "##s", ".", ",", "un", "##wanted"])}
+    assert mr.wordpiece("The playing plays [MASK].", vocab) == ["the", "play", "##ing", "play", "##s", "[MASK]", "."]  # case, pieces, [MASK] whole, '.' split
+    assert mr.wordpiece("unwanted, xyz", vocab) == ["un", "##wanted", ",", "[UNK]"]  # longest match first; no piece -> [UNK]
+    assert mr.wordpiece("thé", vocab) == ["the"]  # accents stripped
+    ids, mask = mr.bert_tokens("the play .", vocab, 8)
+    assert ids.tolist() == [2, 5, 6, 9, 3, 0, 0, 0] and mask.tolist() == [1, 1, 1, 1, 1, 0, 0, 0]
+    try:
+        mr.bert_tokens("the play .", vocab, 4)
+        assert False, "5 tokens fit a sequence of 4"
+    except ValueError:
+        pass
+
+
+def _bert_direct(w, ids, mask, heads):
+    """BERT's encoder written out plainly in float64 (einsum per head), independent of bert_forward's job lowering: (hidden, pooled, logits of [MASK] rows)."""
+    ln = mr.layernorm
+    E = w["bert.embeddings.word_embeddings.weight"].astype(np.float64)
+    d = E.shape[1]
+    hd = d // heads
+    H = ln(E[ids] + w["bert.embeddings.position_embeddings.weight"][: len(ids)] + w["bert.embeddings.token_type_embeddings.weight"][0],
+           w["bert.embeddings.LayerNorm.weight"], w["bert.embeddings.LayerNorm.bias"])
+    lin = lambda X, n: X @ w[n + ".weight"].astype(np.float64).T + w[n + ".bias"]
+    for l in range(sum(1 for k in w if k.endswith("attention.self.query.weight"))):
+        p = f"bert.encoder.layer.{l}."
+        Q, K, V = (lin(H, p + f"attention.self.{x}").reshape(len(ids), heads, hd) for x in ("query", "key", "value"))
+        S = np.einsum("qhd,khd->hqk", Q, K) / np.sqrt(hd) + np.where(mask > 0, 0.0, -1e4)[None, None, :]
+        P = np.exp(S - S.max(-1, keepdims=True))
+        P /= P.sum(-1, keepdims=True)
+        C = np.einsum("hqk,khd->qhd", P, V).reshape(len(ids), d)
+        H = ln(lin(C, p + "attention.output.dense") + H, w[p + "attention.output.LayerNorm.weight"], w[p + "attention.output.LayerNorm.bias"])
+        H = ln(lin(mr.gelu(lin(H, p + "intermediate.dense")), p + "output.dense") + H, w[p + "output.LayerNorm.weight"], w[p + "output.LayerNorm.bias"])
+    pooled = np.tanh(lin(H[:1], "bert.pooler.dense"))
+    rows = np.flatnonzero(ids == 4)
+    T = ln(mr.gelu(lin(H[rows], "cls.predictions.transform.dense")), w["cls.predictions.transform.LayerNorm.weight"], w["cls.predictions.transform.LayerNorm.bias"])
+    return H, pooled, T @ E.T + w["cls.predictions.bias"]
+
+
+def _bert_toy(rng, d=8, heads=2, ffn=16, vocab=20, layers=2, seq=6):
+    """Random BERT weights in the checkpoint's names and shapes."""
+    r = lambda *s: rng.standard_normal(s).astype(np.float32) * 0.5
+    w = {"bert.embeddings.word_embeddings.weight": r(vocab, d), "bert.embeddings.position_embeddings.weight": r(seq, d),
+         "bert.embeddings.token_type_embeddings.weight": r(2, d), "bert.embeddings.LayerNorm.weight": 1 + r(d), "bert.embeddings.LayerNorm.bias": r(d),
+         "bert.pooler.dense.weight": r(d, d), "bert.pooler.dense.bias": r(d), "cls.predictions.bias": r(vocab),
+         "cls.predictions.transform.dense.weight": r(d, d), "cls.predictions.transform.dense.bias": r(d),
+         "cls.predictions.transform.LayerNorm.weight": 1 + r(d), "cls.predictions.transform.LayerNorm.bias": r(d)}
+    for l in range(layers):
+        p = f"bert.encoder.layer.{l}."
+        for x in ("query", "key", "value"):
+            w[p + f"attention.self.{x}.weight"], w[p + f"attention.self.{x}.bias"] = r(d, d), r(d)
+        w[p + "attention.output.dense.weight"], w[p + "attention.output.dense.bias"] = r(d, d), r(d)
+        w[p + "attention.output.LayerNorm.weight"], w[p + "attention.output.LayerNorm.bias"] = 1 + r(d), r(d)
+        w[p + "intermediate.dense.weight"], w[p + "intermediate.dense.bias"] = r(ffn, d), r(ffn)
+        w[p + "output.dense.weight"], w[p + "output.dense.bias"] = r(d, ffn), r(d)
+        w[p + "output.LayerNorm.weight"], w[p + "output.LayerNorm.bias"] = 1 + r(d), r(d)
+    return w
+
+
+@selftest
+def test_bert_forward_matches_direct():
+    rng = np.random.default_rng(11)  # the job lowering (one QKV product, per-head QK^T with the scale in K, PV, fp32 hand-offs) against the plain float64 encoder
+    w = _bert_toy(rng)
+    ids, mask = np.array([2, 7, 4, 9, 3, 0]), np.array([1, 1, 1, 1, 1, 0])
+    tags = []
+
+    def run(job, tag):  # the float64 reference backend, as bert_main's --no-sim; records every job
+        y = mr.job_reference(job)[0]
+        tags.append((tag, job["act"], tuple(job["shape"]), job["terms"][0][1].shape[0]))
+        return (mr._true_act(y, job["act"]) if job["act"] != "linear" else y).astype(np.float32)
+
+    out = mr.bert_forward(w, ids, mask, run, 2, mask_id=4, tier=1)
+    H, pooled, logits = _bert_direct(w, ids, mask, 2)
+    assert np.max(np.abs(out["hidden"] - H)) < 2e-5 and np.max(np.abs(out["pooled"] - pooled)) < 2e-5 and np.max(np.abs(out["logits"] - logits)) < 2e-4, \
+        (np.max(np.abs(out["hidden"] - H)), np.max(np.abs(out["pooled"] - pooled)), np.max(np.abs(out["logits"] - logits)))
+    assert out["mask_rows"].tolist() == [2] and out["layers"] == 2
+    names = [t[0] for t in tags]
+    assert names == ["L0.qkv", "L0.h0.qk", "L0.h0.pv", "L0.h1.qk", "L0.h1.pv", "L0.out", "L0.ffn1", "L0.ffn2",
+                     "L1.qkv", "L1.h0.qk", "L1.h0.pv", "L1.h1.qk", "L1.h1.pv", "L1.out", "L1.ffn1", "L1.ffn2", "pool", "mlm.xf", "mlm.dec"], names
+    by = {t[0]: t for t in tags}
+    assert by["L0.qkv"][2:] == ((6, 24), 8) and by["L0.h0.qk"][2:] == ((6, 6), 4) and by["L0.h0.pv"][2:] == ((6, 4), 6)  # shapes: 3d wide, L x L over hd, L x hd over L
+    assert by["L0.ffn1"][2:] == ((6, 16), 8) and by["mlm.dec"][2:] == ((1, 20), 8) and by["pool"][1] == "tanh" and all(t[1] == "linear" for t in tags if t[0] != "pool")
+    # every attention row of a padded query still sums to one over the unpadded keys: the mask reaches the softmax
+    out2 = mr.bert_forward(w, ids, np.ones(6, np.int64), run, 2, mask_id=4)
+    assert np.max(np.abs(out2["hidden"] - out["hidden"])) > 1e-3
+
+
+@selftest
+def test_bert_main_reference_only():
+    with tempfile.TemporaryDirectory() as d:  # --no-sim on a toy checkpoint: loads, tokenizes, reports the [MASK] prediction, no gate
+        w = _bert_toy(np.random.default_rng(3), seq=16)
+        hdr, blobs, off = {}, [], 0
+        for k, v in w.items():
+            hdr[k] = {"dtype": "F32", "shape": list(v.shape), "data_offsets": [off, off + v.nbytes]}
+            blobs.append(v.astype("<f4").tobytes())
+            off += v.nbytes
+        h = json.dumps(hdr).encode()
+        open(os.path.join(d, "model.safetensors"), "wb").write(struct.pack("<Q", len(h)) + h + b"".join(blobs))
+        json.dump({"num_attention_heads": 2, "num_hidden_layers": 2, "hidden_size": 8, "intermediate_size": 16, "vocab_size": 20}, open(os.path.join(d, "config.json"), "w"))
+        open(os.path.join(d, "vocab.txt"), "w").write("\n".join(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "play", "##ing", "##s", ".", ",", "un", "##wanted"]
+                                                                 + [f"w{i}" for i in range(7)]) + "\n")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mr.bert_main(["--bert-dir", d, "--no-sim", "--seq", "16", "--text", "the plays [MASK] .", "--work", os.path.join(d, "work")])
+        out = buf.getvalue()
+        assert "float64 reference: [MASK] ->" in out and "BERT GATE: not run" in out, out
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")

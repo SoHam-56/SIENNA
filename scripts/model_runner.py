@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers)."""
+"""SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers; --action bert: BERT-Tiny's encoder, every matrix product on the pipeline, softmax, LayerNorm and GELU on the host)."""
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
-#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite
+#   2. Frontend         load_tflite, lower_op, fuse_add, im2col, job_reference; int8 TFLite layers: load_int8_graph, load_layer, job_of, add_record_of_tflite;
+#                       BERT: load_safetensors, wordpiece, bert_tokens, layernorm, gelu, bert_forward (the encoder as GEMM jobs and host ops)
 #   3. Middle end       tile_job (sets), format_layer and layer_epilogue (a layer's streams), pack_jobs, unpack, pack_precheck
 #   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
-#   7. Runtime          execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
-#   8. CLI              model_main, tflite_main, tflite_pack_main, main
+#   7. Runtime          run_checked, execute, macs_of; the model gate: check_layer, judge, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
+#   8. CLI              model_main, tflite_main, tflite_pack_main, bert_main, main
 
 import argparse
 from dataclasses import dataclass
@@ -18,9 +19,11 @@ import json
 import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
+import unicodedata
 
 import numpy as np
 
@@ -899,6 +902,148 @@ def job_of(layer: dict, x: np.ndarray, saved, name: str = "") -> tuple:
     if max(abs(a - int(saved[k])) for a, k in zip((rec.lo, rec.hi), ("act_min", "act_max"))) > 1:  # rounding may move a bound one code
         raise ValueError(f"clamp ({rec.lo}, {rec.hi}) is not the npz's ({int(saved['act_min'])}, {int(saved['act_max'])}): the model and the npz do not belong together")
     return job_of_record(rec, x)
+
+
+# ── BERT (encoder-only Transformer): weights, tokens, and the encoder as GEMM jobs ─
+
+def load_safetensors(path: str) -> dict:
+    """Every F32 tensor of a .safetensors file by name (8-byte little-endian header length, JSON header, raw little-endian data)."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        data = f.read()
+    out = {}
+    for name, t in header.items():
+        if name == "__metadata__":
+            continue
+        if t["dtype"] != "F32":
+            raise ValueError(f"{path}: {name} is {t['dtype']}; only F32 tensors are read")
+        a, b = t["data_offsets"]
+        out[name] = np.frombuffer(data[a:b], dtype="<f4").reshape(t["shape"]).astype(np.float32)
+    return out
+
+
+def _basic(w: str, words: list) -> None:
+    """BERT's basic tokenizer on one whitespace-delimited word: lower case, accents stripped, each punctuation character its own word."""
+    w = "".join(c for c in unicodedata.normalize("NFD", w.lower()) if unicodedata.category(c) != "Mn")
+    cur = ""
+    for c in w:
+        if unicodedata.category(c).startswith("P") or (33 <= ord(c) <= 47) or (58 <= ord(c) <= 64) or (91 <= ord(c) <= 96) or (123 <= ord(c) <= 126):
+            words += [cur] if cur else []
+            words.append(c)
+            cur = ""
+        else:
+            cur += c
+    words += [cur] if cur else []
+
+
+def wordpiece(text: str, vocab: dict, unk: str = "[UNK]", max_chars: int = 100) -> list:
+    """BERT's uncased basic tokenizer (lower case, accents stripped, punctuation split off, [MASK]-like special tokens whole wherever they stand)
+    then greedy longest-match WordPiece ('##' continuations; a word with no piece is unk)."""
+    specials = sorted((t for t in vocab if re.fullmatch(r"\[[A-Z]+\]", t)), key=len, reverse=True)
+    words = []
+    for seg in re.split("(" + "|".join(map(re.escape, specials)) + ")", text) if specials else [text]:
+        if seg in vocab:
+            words.append(seg)
+            continue
+        for w in seg.split():
+            _basic(w, words)
+    toks = []
+    for w in words:
+        if w in vocab:
+            toks.append(w)
+            continue
+        if len(w) > max_chars:
+            toks.append(unk)
+            continue
+        i, pieces = 0, []
+        while i < len(w):
+            j = len(w)
+            while j > i and ("##" if i else "") + w[i:j] not in vocab:
+                j -= 1
+            if j == i:
+                pieces = [unk]
+                break
+            pieces.append(("##" if i else "") + w[i:j])
+            i = j
+        toks += pieces
+    return toks
+
+
+def bert_tokens(text: str, vocab: dict, seq: int) -> tuple:
+    """(ids, mask) of one sentence as BERT takes it: [CLS] pieces [SEP], zero-padded to seq; refuses a sentence longer than seq."""
+    toks = ["[CLS]"] + wordpiece(text, vocab) + ["[SEP]"]
+    if len(toks) > seq:
+        raise ValueError(f"{len(toks)} tokens; --seq {seq} holds fewer")
+    ids = np.zeros(seq, np.int64)
+    ids[: len(toks)] = [vocab[t] for t in toks]
+    mask = np.zeros(seq, np.int64)
+    mask[: len(toks)] = 1
+    return ids, mask
+
+
+def layernorm(x, g, b, eps=1e-12):
+    """BERT's LayerNorm over the last axis, in float64."""
+    x = np.asarray(x, np.float64)
+    m = x.mean(axis=-1, keepdims=True)
+    v = ((x - m) ** 2).mean(axis=-1, keepdims=True)
+    return (x - m) / np.sqrt(v + eps) * g.astype(np.float64) + b.astype(np.float64)
+
+
+def gelu(x):
+    """BERT's exact GELU, x Phi(x), in float64 (no erf in numpy: Abramowitz-Stegun 7.1.26 is 1.5e-7 off; math.erf is exact, applied elementwise)."""
+    x = np.asarray(x, np.float64)
+    return 0.5 * x * (1.0 + np.vectorize(math.erf)(x / math.sqrt(2.0)))
+
+
+def bert_forward(w: dict, ids, mask, run, heads: int, mask_id: int = None, tier: int = 0, seq_prefix: str = "") -> dict:
+    """BERT's encoder (Google's bert_uncased checkpoints) on token ids: every matrix product through run(job, tag) -> float32 outputs, the host does
+    the embedding lookup, softmax, LayerNorm, GELU and the residual adds in float64. Returns the hidden states, the pooler's tanh output (a GPNAE
+    tanh job at tier) and the masked-language-model logits of the [MASK] positions (the vocabulary projection on those rows only)."""
+    E = w["bert.embeddings.word_embeddings.weight"]
+    d = E.shape[1]
+    L = len(ids)
+    hd = d // heads
+
+    def lin(X, name, act="linear", tag="", t=0):  # torch Linear y = x W^T + b as a job with W^T, the lane at tier t
+        W = w[name + ".weight"].T.copy()
+        return run({"terms": [(np.asarray(X, np.float32), W)], "bias": w[name + ".bias"], "act": act, "shape": (X.shape[0], W.shape[1]), "tier": t}, tag)
+
+    H = E[ids] + w["bert.embeddings.position_embeddings.weight"][:L] + w["bert.embeddings.token_type_embeddings.weight"][0]
+    H = layernorm(H, w["bert.embeddings.LayerNorm.weight"], w["bert.embeddings.LayerNorm.bias"]).astype(np.float32)
+    neg = np.where(mask > 0, 0.0, -1e4)[None, :]  # padding never attended to
+    n = 0
+    while f"bert.encoder.layer.{n}.attention.self.query.weight" in w:
+        n += 1
+    for l in range(n):
+        p = f"bert.encoder.layer.{l}."
+        Wqkv = np.hstack([w[p + f"attention.self.{x}.weight"].T for x in ("query", "key", "value")]).copy()  # one 3d-wide product
+        bqkv = np.concatenate([w[p + f"attention.self.{x}.bias"] for x in ("query", "key", "value")])
+        QKV = run({"terms": [(H, Wqkv)], "bias": bqkv, "act": "linear", "shape": (L, 3 * d), "tier": 0}, f"{seq_prefix}L{l}.qkv")
+        ctx = []
+        for h in range(heads):
+            Q, K, V = (QKV[:, i * d + h * hd : i * d + (h + 1) * hd] for i in range(3))
+            S = run({"terms": [(Q, (K.T / math.sqrt(hd)).astype(np.float32))], "bias": None, "act": "linear", "shape": (L, L), "tier": 0}, f"{seq_prefix}L{l}.h{h}.qk")
+            S = S.astype(np.float64) + neg
+            P = np.exp(S - S.max(axis=-1, keepdims=True))
+            P = (P / P.sum(axis=-1, keepdims=True)).astype(np.float32)
+            ctx.append(run({"terms": [(P, V.copy())], "bias": None, "act": "linear", "shape": (L, hd), "tier": 0}, f"{seq_prefix}L{l}.h{h}.pv"))
+        A = lin(np.hstack(ctx), p + "attention.output.dense", tag=f"{seq_prefix}L{l}.out")
+        H = layernorm(A.astype(np.float64) + H, w[p + "attention.output.LayerNorm.weight"], w[p + "attention.output.LayerNorm.bias"]).astype(np.float32)
+        F = gelu(lin(H, p + "intermediate.dense", tag=f"{seq_prefix}L{l}.ffn1")).astype(np.float32)
+        O = lin(F, p + "output.dense", tag=f"{seq_prefix}L{l}.ffn2")
+        H = layernorm(O.astype(np.float64) + H, w[p + "output.LayerNorm.weight"], w[p + "output.LayerNorm.bias"]).astype(np.float32)
+    out = {"hidden": H, "layers": n, "heads": heads}
+    if "bert.pooler.dense.weight" in w:
+        out["pooled"] = lin(H[:1], "bert.pooler.dense", act="tanh", tag=f"{seq_prefix}pool", t=tier)
+    rows = np.flatnonzero(ids == mask_id) if mask_id is not None else np.zeros(0, np.int64)
+    if rows.size and "cls.predictions.transform.dense.weight" in w:
+        T = gelu(lin(H[rows], "cls.predictions.transform.dense", tag=f"{seq_prefix}mlm.xf"))
+        T = layernorm(T, w["cls.predictions.transform.LayerNorm.weight"], w["cls.predictions.transform.LayerNorm.bias"]).astype(np.float32)
+        out["logits"] = run({"terms": [(T, E.T.copy())], "bias": w["cls.predictions.bias"], "act": "linear", "shape": (rows.size, E.shape[0]), "tier": 0},
+                            f"{seq_prefix}mlm.dec")
+        out["mask_rows"] = rows
+    return out
 
 
 # ── 3. Middle end: jobs become N x N sets or a layer's streams; packing ───────
@@ -1799,6 +1944,45 @@ def gate_verdict(tally, models, fault=None) -> tuple:
     return not tally["hw"] and not tally["task"] and not extra, extra, notes
 
 
+def run_checked(job, sim, tag, fault=None):
+    """One job on sim (None: the float64 reference), judged as the model gate judges a layer -> (float32 outputs, stat): the hardware's words against
+    the backend's bit-exact model (check_layer), its error against float64 on the operands it took (a narrow format's operands are rounded first), and
+    apart, against the unrounded float64 (err_vs_float)."""
+    _, ref_float = job_reference(job)
+    fmt = getattr(sim, "fmt_name", "fp32")
+    if fmt != "fp32":  # the hardware takes rounded operands; judge it on those, and report the format's own cost apart
+        job = dict(job, terms=[(op_round(X, fmt), op_round(W, fmt)) for X, W in job["terms"]],
+                   bias=None if job["bias"] is None else op_round(job["bias"], fmt))
+    _, ref = job_reference(job)
+    if job["act"] not in ("relu", "linear"):  # job_reference knows the bypass activations; the lanes' functions in float64 here
+        ref = _true_act(ref, job["act"])
+        ref_float = _true_act(ref_float, job["act"])
+    if sim is None:
+        y, n, cyc = ref.astype(np.float32), 0, 0
+    else:
+        y, n, cyc = sim.run_job(job, tag)
+    rec = None
+    if sim is not None:
+        y, rec = check_layer(sim, job, y, fmt, fault)
+    scale = float(np.max(np.abs(ref))) or 1.0
+    err = float(np.max(np.abs(y.astype(np.float64) - ref))) / scale
+    err_fmt = float(np.max(np.abs(y.astype(np.float64) - ref_float))) / (float(np.max(np.abs(ref_float))) or 1.0)
+    return y, {"tag": tag, "sets": n, "cycles": cyc, "macs": macs_of(job), "passes": len(job["terms"]), "shape": list(job["shape"]),
+               "err": err, "err_vs_float": err_fmt, "exact": rec}
+
+
+def _true_act(y, act):
+    """A lane function on float64 values (the true function, not the lane's polynomial): SELU, sigmoid, tanh."""
+    y = np.asarray(y, np.float64)
+    if act == "tanh":
+        return np.tanh(y)
+    if act == "sigmoid":
+        return 1.0 / (1.0 + np.exp(-y))
+    if act == "selu":
+        return 1.0507009873554805 * np.where(y > 0, y, 1.6732632423543772 * (np.exp(np.minimum(y, 0)) - 1.0))
+    raise ValueError(act)
+
+
 def execute(model, x, sim=None, log=None, fault=None):
     """Runs the graph. With sim, compute ops run on the RTL, each checked bit for bit (check_layer), and outputs feed the next layer; otherwise float64 reference."""
     ops, consts = model["ops"], model["consts"]
@@ -1831,28 +2015,12 @@ def execute(model, x, sim=None, log=None, fault=None):
             t[out] = (e / e.sum(axis=-1, keepdims=True)).astype(np.float32)  # host
             continue
         job = fuse_add(op, producers, t, consts, consumers) if kind == "ADD" else lower_op(op, t, consts)
-        _, ref_float = job_reference(job)
-        fmt = getattr(sim, "fmt_name", "fp32")
-        if fmt != "fp32":  # the hardware takes rounded operands; judge it on those, and report the format's own cost apart
-            job = dict(job, terms=[(op_round(X, fmt), op_round(W, fmt)) for X, W in job["terms"]],
-                       bias=None if job["bias"] is None else op_round(job["bias"], fmt))
-        _, ref = job_reference(job)
-        if sim is None:
-            y = ref.astype(np.float32)
-            n = cyc = 0
-        else:
-            y, n, cyc = sim.run_job(job, f"L{li:02d}")
-        rec = None
-        if sim is not None:
-            y, rec = check_layer(sim, job, y, fmt, fault if fault and fault.get("layer") == f"L{li:02d}" else None)
-        scale = float(np.max(np.abs(ref))) or 1.0
-        err = float(np.max(np.abs(y.astype(np.float64) - ref))) / scale
-        err_fmt = float(np.max(np.abs(y.astype(np.float64) - ref_float))) / (float(np.max(np.abs(ref_float))) or 1.0)
-        stats.append({"layer": li, "kind": kind, "sets": n, "cycles": cyc, "macs": macs_of(job),
-                      "passes": len(job["terms"]), "shape": list(job["shape"]), "err": err, "err_vs_float": err_fmt, "exact": rec})
+        y, st = run_checked(job, sim, f"L{li:02d}", fault if fault and fault.get("layer") == f"L{li:02d}" else None)
+        stats.append(dict(st, layer=li, kind=kind))
         if log:
+            rec = st["exact"]
             ex = "" if rec is None else f"  bit-exact {rec['differ']}/{rec['words']} differ"
-            log(f"    L{li:02d} {kind:<18} {str(job['shape']):<18} sets {n:6d}  cycles {cyc:8d}  MACs {stats[-1]['macs']:9d}  max err/max|ref| {err:.2e}{ex}")
+            log(f"    L{li:02d} {kind:<18} {str(job['shape']):<18} sets {st['sets']:6d}  cycles {st['cycles']:8d}  MACs {st['macs']:9d}  max err/max|ref| {st['err']:.2e}{ex}")
         t[out] = y.reshape(job["shape"]).astype(np.float32)
     return t[model["output"]], stats
 
@@ -1918,7 +2086,8 @@ MODELS = {
     "vww": "vww_96_float.tflite",
 }
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
-ACTIONS = ("model", "tflite")
+ACTIONS = ("model", "tflite", "bert")
+BERT_DIR = os.path.join(ROOT, "models", "bert_tiny")  # models/fetch_bert_tiny.sh
 
 
 MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to fetch one that is missing (models/NOTICE: sources and licenses)
@@ -1938,7 +2107,7 @@ def missing_inputs(name, mdir):
 
 def model_main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs")
+    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs; bert: BERT-Tiny")
     ap.add_argument("--models", default="resnet8,ad01,kws,vww")
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
@@ -2222,12 +2391,124 @@ def tflite_pack_main(argv=None):
     sys.exit(1 if bad else 0)
 
 
+BERT_TEXTS = (  # masked sentences and the token the float model should put first; the task gate compares the hardware's top-1 with the float reference's
+    "the capital of france is [MASK] .",
+    "the quick brown fox jumps over the lazy [MASK] .",
+    "she plays the [MASK] in an orchestra .",
+)
+
+
+def bert_main(argv=None):
+    """BERT-Tiny (google/bert_uncased_L-2_H-128_A-2) on the layer contract: every matrix product (Q K V, Q K^T per head, P V, the output and FFN
+    layers, the pooler as a tanh lane job at --tier, the MLM head on the [MASK] rows) is a GEMM job on the RTL and gated bit for bit against the
+    backend's exact model; softmax, LayerNorm, GELU, the embedding lookup and the residual adds run on the host in float64. The task gate is
+    the top-1 masked token against the float64 reference."""
+    ap = argparse.ArgumentParser(description=bert_main.__doc__)
+    ap.add_argument("--action", choices=ACTIONS, default="bert")
+    ap.add_argument("--bert-dir", default=BERT_DIR, help="config.json, model.safetensors and vocab.txt (models/fetch_bert_tiny.sh)")
+    ap.add_argument("--n", type=int, default=16)
+    ap.add_argument("--tile-size", type=int, default=4)
+    ap.add_argument("--lanes", type=int, default=32)
+    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=("fp32", "bf16"))
+    ap.add_argument("--seq", type=int, default=128, help="tokens per sentence after padding (the attention products are seq x seq)")
+    ap.add_argument("--tier", type=int, default=0, choices=(0, 1, 2), help="the pooler's tanh lane tier: 1%%, 5%%, 10%%")
+    ap.add_argument("--text", action="append", help="a masked sentence (repeatable); default: three built in")
+    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "bert"))
+    ap.add_argument("--no-sim", action="store_true", help="float reference only")
+    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1)
+    a = ap.parse_args(argv)
+    global COLLAPSE_K
+    COLLAPSE_K = a.collapse_k
+    os.makedirs(a.work, exist_ok=True)
+    report = os.path.join(a.work, f"bert_report_N{a.n}_T{a.tile_size}_{a.fmt_name}.log")
+    rep = open(report, "w")
+
+    def log(s):
+        print(s, flush=True)
+        rep.write(s + "\n")
+        rep.flush()
+
+    cfg = json.load(open(os.path.join(a.bert_dir, "config.json")))
+    w = load_safetensors(os.path.join(a.bert_dir, "model.safetensors"))
+    vocab = {t.rstrip("\n"): i for i, t in enumerate(open(os.path.join(a.bert_dir, "vocab.txt"), encoding="utf-8"))}
+    words = {i: t for t, i in vocab.items()}
+    heads, layers = cfg["num_attention_heads"], cfg["num_hidden_layers"]
+    log(f"BERT {os.path.basename(os.path.normpath(a.bert_dir))}: {layers} layers, d = {cfg['hidden_size']}, {heads} heads, FFN {cfg['intermediate_size']}, "
+        f"vocab {cfg['vocab_size']}; seq {a.seq}; {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} collapse-k {COLLAPSE_K}; pooler tanh at tier {a.tier}")
+    log("host (float64): embeddings, softmax, LayerNorm, GELU, residual adds; RTL: every matrix product, the pooler's tanh")
+    sim = None
+    if not a.no_sim:
+        sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
+        t0 = time.time()
+        sim.build()
+        log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
+    bound = LAYER_BOUND[a.fmt_name]
+    lane_tol = gpnae_model.TIER_TOL[a.tier]
+    hw_fail, task_fail, total = [], [], {"sets": 0, "cycles": 0, "macs": 0, "jobs": 0}
+    for si, text in enumerate(a.text or BERT_TEXTS):
+        ids, mask = bert_tokens(text, vocab, a.seq)
+        ref = bert_forward(w, ids, mask, lambda job, tag: job_reference(job)[0].astype(np.float32) if job["act"] == "linear"
+                           else _true_act(job_reference(job)[0], job["act"]).astype(np.float32), heads, vocab["[MASK]"], a.tier)
+        log(f"\n== sentence {si}: {text!r} ({int(mask.sum())} tokens)")
+        ref_top = [int(np.argmax(r)) for r in ref["logits"]]
+        log(f"  float64 reference: [MASK] -> {', '.join(words[t] for t in ref_top)}")
+        if sim is None:
+            continue
+        stats = []
+
+        def run(job, tag):
+            y, st = run_checked(job, sim, f"s{si}.{tag}")
+            stats.append(dict(st, act=job["act"], tier=job.get("tier", 0)))
+            rec = st["exact"]
+            ex = "" if rec is None else f"  bit-exact {rec['differ']}/{rec['words']} differ"
+            log(f"    {tag:<12} {str(tuple(job['shape'])):<14} K {job['terms'][0][1].shape[0]:5d} {job['act']:<7} sets {st['sets']:5d}  cycles {st['cycles']:7d}  "
+                f"MACs {st['macs']:9d}  max err/max|ref| {st['err']:.2e}{ex}")
+            return y
+
+        c0, s0, t0 = sim.cycles, sim.sets, time.time()
+        hw = bert_forward(w, ids, mask, run, heads, vocab["[MASK]"], a.tier)
+        cyc, sets = sim.cycles - c0, sim.sets - s0
+        macs = sum(st["macs"] for st in stats)
+        hw_top = [int(np.argmax(r)) for r in hw["logits"]]
+        for st in stats:
+            b = lane_tol if st["act"] not in ("relu", "linear") else bound
+            if st["exact"] and st["exact"]["differ"]:
+                hw_fail.append(f"FAIL hardware sentence {si} {st['tag']}: {st['exact']['differ']} of {st['exact']['words']} words differ from the bit-exact model")
+            if not st["err"] <= b:
+                hw_fail.append(f"FAIL hardware sentence {si} {st['tag']}: max|hw-ref|/max|ref| {st['err']:.2e} above {b:g}")
+        if hw_top != ref_top:
+            task_fail.append(f"FAIL task sentence {si}: hardware's [MASK] -> {', '.join(words[t] for t in hw_top)}, the float reference's {', '.join(words[t] for t in ref_top)}")
+        dh = float(np.max(np.abs(hw["hidden"].astype(np.float64) - ref["hidden"]))) / float(np.max(np.abs(ref["hidden"])))
+        dp = float(np.max(np.abs(hw["pooled"].astype(np.float64) - ref["pooled"]))) / float(np.max(np.abs(ref["pooled"])))
+        util = macs / (sets * a.n ** 3) if sets else 0
+        log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (ref {', '.join(words[t] for t in ref_top)}); hidden states max|hw-ref|/max|ref| {dh:.2e}, "
+            f"pooled {dp:.2e} (tanh lane, tier {a.tier})")
+        log(f"  {len(stats)} GEMM jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {time.time() - t0:.0f} s")
+        for k, v in (("sets", sets), ("cycles", cyc), ("macs", macs), ("jobs", len(stats))):
+            total[k] += v
+    log(f"\nreport {report}")
+    if sim is None:
+        log("BERT GATE: not run (--no-sim: float reference only)")
+        return
+    for m in hw_fail + task_fail:
+        log(m)
+    n_s = len(a.text or BERT_TEXTS)
+    ok = not hw_fail and not task_fail and total["jobs"] > 0
+    log(f"BERT GATE: {'PASS' if ok else 'FAIL'}  {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} seq={a.seq} tier={a.tier}: {n_s} sentences, {total['jobs']} GEMM jobs, "
+        f"{total['sets']} sets, {total['cycles']} cycles, {total['macs']} MACs; hardware: {len(hw_fail)} failures (bit-exact, {a.fmt_name} bound {bound:g}, "
+        f"lane tier bound {lane_tol:g}); task: {len(task_fail)} of {n_s} sentences fail")
+    if not ok:
+        sys.exit(1)
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--action", choices=ACTIONS, default="model")
     pre.add_argument("--pack", action="store_true")
     a, rest = pre.parse_known_args()
-    if a.action == "model":
+    if a.action == "bert":
+        bert_main(rest)
+    elif a.action == "model":
         if a.pack:
             pre.error("--pack belongs to --action tflite")
         model_main(rest)

@@ -293,6 +293,7 @@ help:
 	@echo "  make regression                   - every test at N = 8 to 64 (use make -jN; see the README for memory)"
 	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
 	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32 or bf16)"
+	@echo "  make bert [BERT_SEQ=128 BERT_TIER=0] - BERT-Tiny's encoder on the RTL (fp32 or bf16; models/fetch_bert_tiny.sh first)"
 	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
 	@echo "  make vcs                          - the same on Synopsys VCS; SIM=vcs runs make regression on VCS (README: Running with VCS)"
 	@echo "  make wave                         - open the last waveform"
@@ -549,6 +550,22 @@ model:
 		--collapse-k $(COLLAPSE_K) \
 		--count $(MODEL_COUNT)
 
+# BERT-Tiny's encoder on the layer contract (fp32 or bf16): models/bert_tiny from models/fetch_bert_tiny.sh, or BERT_DIR=<d>.
+BERT_DIR ?= $(PRJ_DIR)/models/bert_tiny
+BERT_SEQ ?= 128
+BERT_TIER ?= 0
+bert:
+	@[ -f "$(BERT_DIR)/model.safetensors" ] || { echo "ERROR: make bert needs $(BERT_DIR)/model.safetensors (run models/fetch_bert_tiny.sh, or BERT_DIR=<d>)"; exit 1; }
+	$(PYTHON) scripts/model_runner.py --action bert \
+		--bert-dir $(BERT_DIR) \
+		--n $(N) \
+		--tile-size $(TILE) \
+		--lanes $(LANES) \
+		--format $(FMT) \
+		--collapse-k $(COLLAPSE_K) \
+		--seq $(BERT_SEQ) \
+		--tier $(BERT_TIER)
+
 # GEMM shape sweep on sienna_top's layer contract, built at N, TILE and LANES.
 gemm:
 	$(PYTHON) regression.py --action gemm \
@@ -677,6 +694,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help help-debug verilator vcs \
+.PHONY: default help help-debug verilator vcs bert \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

@@ -1065,3 +1065,49 @@ int8   64 tanh      4   16  2048       10606     169696     11.16    178.63   16
 int8   64 tanh      2   32  2048       10606     339392     11.16    357.25   32.00x     0 PASS
 (* = the signed-zero case: rows of zeros in every job.)
 
+
+5. WORKLOADS BEYOND MLPERF TINY (2026-11-02; branch workloads; every GEMM on the layer engine, T = 4; golden = the model on the CPU in float64) =====
+Labels: cycles MEASURED per unit (a 128-token sentence, an image, a heartbeat, or a packed set); us DERIVED at 950 MHz; MACs are the model's own per unit;
+        slot% = MACs / (sets x N^3), DERIVED (the share of set slots holding real multiply-accumulates); agree = units whose class or token equals the
+        CPU golden's; tier = the activation lanes' accuracy tier (0: 1%, 1: 5%, 2: 10%). Host ops: BERT softmax, LayerNorm, GELU, embeddings, residual
+        adds; SELU net 2x2 max pool and softmax; LSTM Hadamard products and the cell update. Runs: sienna_jobs/runs/bert2_*, selu_*, lstm_*, mpack_*.
+--- BERT-Tiny (google/bert_uncased_L-2_H-128_A-2, 2 layers, d = 128, 2 heads, FFN 512; 3 masked sentences of 128 tokens; make bert) ------------
+fmt     N  lanes tier part       cycles/unit     us    MACs/unit   slot%  agree  hidden err  verdict
+fp32   16     32    0 encoder        231296   243.5    58720256   100.0    -     -           PASS
+fp32   16     32    0 whole          480322   505.6    62659840    51.5   3/3   3.67e-06    PASS
+bf16   16     32    0 encoder        231296   243.5    58720256   100.0    -     -           PASS
+bf16   16     32    0 whole          479780   505.0    62659840    51.5   3/3   1.68e-02    PASS
+fp32   64    128    0 encoder         18560    19.5    58720256   100.0    -     -           PASS
+fp32   64    128    0 whole           81935    86.2    62659840    20.2   3/3   3.67e-06    PASS
+bf16   64    128    0 encoder         18480    19.5    58720256   100.0    -     -           PASS
+bf16   64    128    0 whole           81544    85.8    62659840    20.2   3/3   1.68e-02    PASS
+(whole = encoder + pooler (a tanh lane job) + the masked-language-model head on the [MASK] row, whose 30,522-wide vocabulary projection is a one-row job:
+ 61,730 cycles at N = 64. hidden err = max |hw - golden| / max |golden| on the final hidden states, worst sentence.)
+--- SELU CIFAR-10 convnet (conv 32-64-64 3x3 + pool, fc 128, fc 10; SELU on the lanes everywhere but the logits; 78.6% test top-1; make model MODELS=selu) ---
+fmt     N  lanes tier images  cycles/unit     us    MACs/unit   slot%  agree    right  golden right  verdict
+fp32   16     32    0    100       62759    66.1     8094976    78.9  100/100     78      78        PASS
+fp32   16     32    1    100       52115    54.9     8094976    78.9   99/100     79      78        PASS (top-1 change reported, not gated, at tier 1)
+fp32   16     32    2    100       52115    54.9     8094976    78.9   99/100     79      78        PASS (reported at tier 2)
+bf16   16     32    0    100       48553    51.1     8094976    78.9  100/100     78      78        PASS
+fp32   64    128    0      3       14011    14.7     8094976    39.1    3/3        -       -        PASS
+(fp32 SELU at tiers 1 and 2 is one degree-2 piece at both, so the lanes take the same rounds and every layer's cycles are identical. At N = 64 the first
+ convolution, 1,024 rows x 32 channels through the lanes, takes 7,478 of the 14,011 cycles.)
+--- ECG5000 LSTM (32 units over 140 steps, 5 classes; gates sigmoid, candidate and cell tanh on the lanes each step; 92.9% test top-1; make lstm) -------
+fmt     N  lanes tier batch  cycles/batch  us/heartbeat  MACs/batch  slot%  agree    right  golden right  hidden err  verdict
+fp32   16     32    0    512      7133725      14.67    305152000    59.4  512/512    469     469        1.57e-02    PASS
+fp32   16     32    1    512      5439173      11.18    305152000    59.4  509/512    470     469        2.37e-01    PASS (reported at tier 1)
+fp32   16     32    2    512      4943402      10.16    305152000    59.4  504/512    471     469        1.46e+00    PASS (reported at tier 2)
+fp32   16     32    0     64       947069      15.58     38144000    59.4   64/64      60      60        1.33e-02    PASS
+fp32   16     32    1     64       735437      12.10     38144000    59.4   64/64      60      60        2.09e-01    PASS
+fp32   16     32    2     64       673391      11.08     38144000    59.4   64/64      60      60        1.16e+00    PASS
+fp32   64    128    0     64       328982       5.41     38144000    25.9   64/64      60      60        1.33e-02    PASS
+bf16   64    128    0     64       280831       4.62     38144000    25.9   64/64      60      60        1.68e-01    PASS
+(a step is three lane jobs: at N = 16 6,763 cycles at tier 0 and 4,728 at tier 2; at N = 64 2,348 cycles, the lanes pacing one or two sets. hidden err is
+ the final hidden state's max |hw - golden| / max |golden|: the recurrence accumulates the tier's error, yet the class survives on all but 3 (5%) and 8 (10%) of 512.)
+--- Real layers of different models in one packed set (make model-pack N=64 LANES=128, fp32; each layer with a real inference's activations) -----------
+set  layers                       b  blocks  rows  sets  cycles packed  cycles alone (sum)  speedup  words differ from alone  verdict
+0    resnet8.L00 + vww.L00       32   2/2    2304    36          2569               3858    1.50x        0                   PASS
+1    vww.L04 + vww.L06           32   2/2     576     9           841               1682    2.00x        0                   PASS
+2    vww.L02                     16   1/4    2304    36          2569               2569    1.00x        0                   PASS
+(a packed job is one block of one pass, depth and width <= N / 2: of the four MLPerf Tiny models only these five stem layers qualify at N = 64 (resnet8 3.5%,
+ vww 22.4% of their MACs); none at N = 16, one at N = 32. Set 1 packs two layers of one model: two of its inferences in flight.)

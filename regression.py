@@ -5782,6 +5782,19 @@ def test_lstm_forward_matches_plain_cell():
         assert x.shape == (2, 2, 1) and y.tolist() == [1, 0] and abs(float(x[0, 1, 0]) - 2.5) < 1e-6
 
 
+@selftest
+def test_tie_within_bound():
+    r = np.array([[1.0, 0.99995, -5.0], [1.0, 0.5, -5.0], [2.0, 2.0, 0.0]])  # a 5e-5 gap is a tie in fp32 (bound 1e-4 x 5) but not a 0.5 gap; equal is a tie
+    assert mr.tie_within_bound(r, "fp32").tolist() == [True, False, True] and mr.tie_within_bound(r, "bf16").tolist() == [True, False, True]
+    assert mr.tie_within_bound(np.array([[1.0, 0.95, -5.0]]), "bf16").tolist() == [True] and mr.tie_within_bound(np.array([[1.0, 0.95, -5.0]]), "fp32").tolist() == [False]
+    stats = [{"layer": 0, "kind": "FULLY_CONNECTED", "exact": {"differ": 0, "words": 4}, "err": 1e-6, "act": "linear", "tier": 0}]
+    tie = {"hw_top": 1, "ref_top": 0, "ref_out": [1.0, 0.99995, -5.0]}
+    g = mr.judge("resnet8", "x", "fp32", stats, tie)
+    assert not g["task"] and g["reported"] and "within the fp32 bound" in g["reported"][0]
+    g = mr.judge("resnet8", "x", "fp32", stats, dict(tie, ref_out=[1.0, 0.5, -5.0]))
+    assert g["task"] and not g["reported"]
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")

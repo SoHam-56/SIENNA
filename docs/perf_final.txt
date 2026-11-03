@@ -1100,6 +1100,7 @@ fp32   16     32    2    512      4943402      10.16    305152000    59.4  504/5
 fp32   16     32    0     64       947069      15.58     38144000    59.4   64/64      60      60        1.33e-02    PASS
 fp32   16     32    1     64       735437      12.10     38144000    59.4   64/64      60      60        2.09e-01    PASS
 fp32   16     32    2     64       673391      11.08     38144000    59.4   64/64      60      60        1.16e+00    PASS
+bf16   16     32    0    512      5127765      10.54    305152000    59.4  511/512    469     469        1.66e-01    PASS (the one change is a tie: golden margin 0.24% of max |logit|, under the bf16 bound)
 fp32   64    128    0     64       328982       5.41     38144000    25.9   64/64      60      60        1.33e-02    PASS
 bf16   64    128    0     64       280831       4.62     38144000    25.9   64/64      60      60        1.68e-01    PASS
 (a step is three lane jobs: at N = 16 6,763 cycles at tier 0 and 4,728 at tier 2; at N = 64 2,348 cycles, the lanes pacing one or two sets. hidden err is

@@ -90,7 +90,7 @@ The MLPerf Tiny models are ReLU networks, which bypass the activation lanes. `ma
 | fp32, N = 16, 32 lanes | 5% | 52,115 cycles, 55 µs | 99 of 100 | 79 | within 5% |
 | fp32, N = 16, 32 lanes | 10% | 52,115 cycles, 55 µs | 99 of 100 | 79 | within 10% |
 | bf16, N = 16, 32 lanes | 1% | 48,553 cycles, 51 µs | 100 of 100 | 78 | within 1% |
-| fp32, N = 64, 128 lanes | 1% | 14,011 cycles, 14.7 µs | 3 of 3 | | within 1% |
+| fp32, N = 64, 128 lanes | 1% | 14,011 cycles, 14.7 µs | 100 of 100 | 78 | within 1% |
 
 The 5% and 10% tiers take the same time because, in fp32, SELU's 5% and 10% coefficient sets are both one polynomial piece of degree 2 (the 1% set is degree 6; `gpnae_model.default_mem`), so the lanes run the same number of multiply-add rounds at both tiers and every layer's cycle count is identical. The LSTM's tiers differ because sigmoid and tanh drop to degree 1 at 10%. For scale, the published TYTAN engine measured 747 cycles per tanh output (its SELU series is shorter, so take this as an estimate): the first convolution's 32,768 outputs on 128 such lanes would take about 191,000 cycles for that layer alone, against the 7,478 cycles SIENNA's lanes take for it and 14,011 for the whole network. The one image whose class changes at those tiers is a near tie that the golden gets wrong and the hardware right, so the accuracy against the labels is unchanged. At N = 64 the lanes set the pace: the first convolution (1,024 pixel rows, 32 channels) takes 7,478 of the 14,011 cycles, against 2,358 for the second with five times the multiply-accumulates, which is why this 8.1 M-MAC network takes as long as the 12.5 M-MAC ReLU ResNet-8 (14.0 µs).
 

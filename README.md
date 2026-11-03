@@ -104,6 +104,7 @@ The 5% and 10% tiers take the same time because, in fp32, SELU's 5% and 10% coef
 | N = 16, 32 lanes | 5% | 5,439,173 cycles | 11.2 µs | 509 of 512 | 470 | 2.4 × 10⁻¹ |
 | N = 16, 32 lanes | 10% | 4,943,402 cycles | 10.2 µs | 504 of 512 | 471 | 1.5 |
 | N = 64, 128 lanes | 1% | 328,982 cycles | 5.4 µs | 64 of 64 | 60 (golden 60) | 1.3 × 10⁻² |
+| N = 64, 128 lanes, bf16 | 1% | 280,831 cycles | 4.6 µs | 64 of 64 | 60 (golden 60) | 1.7 × 10⁻¹ |
 
 The looser tiers run the lanes' shorter polynomials, which is where the time goes (at N = 16 a step's three jobs take 6,763 cycles at 1% and 4,728 at 10%). The hidden state drifts over the 140 steps as the tier loosens, by 2% of its largest value at the 1% tier and more than its largest value at 10%; the class decision changes on 3 of 512 heartbeats at 5% and 8 at 10%, and the accuracy against the labels stays within two heartbeats of the golden's. At N = 64 each step's jobs are one or two sets whose rows the heartbeats fill, so a step takes 2,348 cycles and the lanes set the pace; the time per heartbeat falls to 5.4 µs, and a batch of 64 or more is what keeps the mesh busy on a recurrent model.
 

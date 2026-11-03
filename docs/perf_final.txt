@@ -1090,8 +1090,14 @@ fp32   16     32    1    100       52115    54.9     8094976    78.9   99/100   
 fp32   16     32    2    100       52115    54.9     8094976    78.9   99/100     79      78        PASS (reported at tier 2)
 bf16   16     32    0    100       48553    51.1     8094976    78.9  100/100     78      78        PASS
 fp32   64    128    0    100       14011    14.7     8094976    39.1  100/100     78      78        PASS
-(fp32 SELU at tiers 1 and 2 is one degree-2 piece at both, so the lanes take the same rounds and every layer's cycles are identical. At N = 64 the first
- convolution, 1,024 rows x 32 channels through the lanes, takes 7,478 of the 14,011 cycles.)
+bf16   16     32    1    100       47374    49.9     8094976    78.9   99/100     79      78        PASS (reported at tier 1)
+bf16   16     32    2    100       47374    49.9     8094976    78.9   99/100     79      78        PASS (reported at tier 2)
+bf16   64    128    0    100       10775    11.3     8094976    39.1  100/100     78      78        PASS
+fp32   64    128    1    100       11195    11.8     8094976    39.1   99/100     79      78        PASS (reported at tier 1)
+fp32   64    128    2    100       11195    11.8     8094976    39.1   99/100     79      78        PASS (reported at tier 2)
+(fp32 SELU at tiers 1 and 2 is one degree-2 piece at both, and bf16's are degree-1 pieces at both, so the lanes take the same rounds and every layer's
+ cycles are identical. At N = 64 the first convolution, 1,024 rows x 32 channels through the lanes, takes 7,478 of the 14,011 cycles. The one image whose
+ class changes at the looser tiers is the same near tie in every build, which the golden gets wrong and the hardware right.)
 --- ECG5000 LSTM (32 units over 140 steps, 5 classes; gates sigmoid, candidate and cell tanh on the lanes each step; 92.9% test top-1; make lstm) -------
 fmt     N  lanes tier batch  cycles/batch  us/heartbeat  MACs/batch  slot%  agree    right  golden right  hidden err  verdict
 fp32   16     32    0    512      7133725      14.67    305152000    59.4  512/512    469     469        1.57e-02    PASS
@@ -1103,12 +1109,27 @@ fp32   16     32    2     64       673391      11.08     38144000    59.4   64/6
 bf16   16     32    0    512      5127765      10.54    305152000    59.4  511/512    469     469        1.66e-01    PASS (the one change is a tie: golden margin 0.24% of max |logit|, under the bf16 bound)
 fp32   64    128    0     64       328982       5.41     38144000    25.9   64/64      60      60        1.33e-02    PASS
 bf16   64    128    0     64       280831       4.62     38144000    25.9   64/64      60      60        1.68e-01    PASS
+bf16   16     32    1    512      4523406       9.30    305152000    59.4  508/512    470     469        5.51e-01    PASS (reported at tier 1; one of the four a tie)
+bf16   16     32    2    512      4054884       8.34    305152000    59.4  495/512    461     469        1.94e+00    PASS (reported at tier 2: bf16 + 10% diverges, 8 classes lost)
+fp32   64    128    1     64       278442       4.58     38144000    25.9   64/64      60      60        2.09e-01    PASS
+fp32   64    128    2     64       266896       4.39     38144000    25.9   64/64      60      60        1.16e+00    PASS
 (a step is three lane jobs: at N = 16 6,763 cycles at tier 0 and 4,728 at tier 2; at N = 64 2,348 cycles, the lanes pacing one or two sets. hidden err is
- the final hidden state's max |hw - golden| / max |golden|: the recurrence accumulates the tier's error, yet the class survives on all but 3 (5%) and 8 (10%) of 512.)
+ the final hidden state's max |hw - golden| / max |golden|: the recurrence accumulates the tier's error; in fp32 the class survives on all but 3 (5%) and 8
+ (10%) of 512, in bf16 on all but 4 (5%), but bf16 with the 10% tier drifts past the model (17 of 512 change, 8 lost against the labels): the two
+ approximations compound over 140 steps. BERT's pooler at tiers 1 and 2: 3.4% and 7.3% from the exact tanh, the [MASK] tokens unchanged.)
 --- Real layers of different models in one packed set (make model-pack N=64 LANES=128, fp32; each layer with a real inference's activations) -----------
 set  layers                       b  blocks  rows  sets  cycles packed  cycles alone (sum)  speedup  words differ from alone  verdict
 0    resnet8.L00 + vww.L00       32   2/2    2304    36          2569               3858    1.50x        0                   PASS
 1    vww.L04 + vww.L06           32   2/2     576     9           841               1682    2.00x        0                   PASS
 2    vww.L02                     16   1/4    2304    36          2569               2569    1.00x        0                   PASS
 (a packed job is one block of one pass, depth and width <= N / 2: of the four MLPerf Tiny models only these five stem layers qualify at N = 64 (resnet8 3.5%,
- vww 22.4% of their MACs); none at N = 16, one at N = 32. Set 1 packs two layers of one model: two of its inferences in flight.)
+ vww 22.4% of their MACs); none at N = 16, one at N = 32. Set 1 packs two layers of one model: two of its inferences in flight. bf16 (run mpack_n64_bf16):
+ 2564 / 836 / 2564 cycles packed against 3848 / 1672 / 2564 alone, 1.36x over the five, 0 words differ.)
+--- N = 64 collapse-k 0, T = 2 (2026-11-03, runs s5_r3_*; 4 compile jobs; the points the 2026-10-26 sweep estimated past the 2 GB link limit) ---------
+point                    node       MaxRSS    wall      outcome
+fp32/N64_T2/gemm-ck0     768 GB     465 GB    11.6 h    link failed: relocation truncated to fit (crt1.o, libc_nonshared, main in vm_classes_63.o)
+fp32/N64_T2/model-ck0    768 GB     465 GB    12.3 h    same link failure
+bf16/N64_T2/gemm-ck0     512 GB     274 GB     7.2 h    same link failure (main in vm_classes_62.o)
+bf16/N64_T2/model-ck0    512 GB     274 GB     7.0 h    same link failure
+(now OBSERVED, not estimated: the fp32 and bf16 T = 2 layer-engine builds at N = 64 compile (465 and 274 GB resident) and fail at the same 2 GB link
+ as fp32 T = 4 did; binary sizes still unrecorded (the build directories are deleted by the farm wrapper). NOT RUN stands for these points.)

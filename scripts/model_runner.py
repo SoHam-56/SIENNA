@@ -2589,9 +2589,7 @@ def model_int8_run(a, models, sim, log, results, js) -> bool:
         log(f"\n== {name} ({MODELS_INT8[name]}, int8), inputs: {source}; input scale {float(model['in_tensor']['scale'][0]):.6g} zero point {int(model['in_tensor']['zp'][0])}")
         runs = []
         for x, label, desc in inputs:
-            q = quantize_input(x, model["in_tensor"])
-            if name == "ad01" and q.shape[0] > 1:
-                continue  # the slices run one at a time: the interpreter takes one row
+            q = quantize_input(x, model["in_tensor"])  # the autoencoder's 40-slice batch is one inference of 40 rows, as in float; the interpreter takes them one by one
             gold = tflite_run(path, q)
             c0, s0, t0 = (sim.cycles, sim.sets, time.time()) if sim else (0, 0, time.time())
             log(f"  inference on {desc}")

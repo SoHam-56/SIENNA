@@ -1095,6 +1095,8 @@ bf16   16     32    2    100       47374    49.9     8094976    78.9   99/100   
 bf16   64    128    0    100       10775    11.3     8094976    39.1  100/100     78      78        PASS
 fp32   64    128    1    100       11195    11.8     8094976    39.1   99/100     79      78        PASS (reported at tier 1)
 fp32   64    128    2    100       11195    11.8     8094976    39.1   99/100     79      78        PASS (reported at tier 2)
+bf16   64    128    1    100       10167    10.7     8094976    39.1   99/100     79      78        PASS (reported at tier 1)
+bf16   64    128    2    100       10167    10.7     8094976    39.1   99/100     79      78        PASS (reported at tier 2)
 (fp32 SELU at tiers 1 and 2 is one degree-2 piece at both, and bf16's are degree-1 pieces at both, so the lanes take the same rounds and every layer's
  cycles are identical. At N = 64 the first convolution, 1,024 rows x 32 channels through the lanes, takes 7,478 of the 14,011 cycles. The one image whose
  class changes at the looser tiers is the same near tie in every build, which the golden gets wrong and the hardware right.)
@@ -1113,6 +1115,8 @@ bf16   16     32    1    512      4523406       9.30    305152000    59.4  508/5
 bf16   16     32    2    512      4054884       8.34    305152000    59.4  495/512    461     469        1.94e+00    PASS (reported at tier 2: bf16 + 10% diverges, 8 classes lost)
 fp32   64    128    1     64       278442       4.58     38144000    25.9   64/64      60      60        2.09e-01    PASS
 fp32   64    128    2     64       266896       4.39     38144000    25.9   64/64      60      60        1.16e+00    PASS
+bf16   64    128    1     64       254191       4.18     38144000    25.9   64/64      60      60        5.24e-01    PASS
+bf16   64    128    2     64       243997       4.01     38144000    25.9   63/64      59      60        1.97e+00    PASS (reported at tier 2: the same bf16 + 10% drift, heartbeat 36 lost)
 (a step is three lane jobs: at N = 16 6,763 cycles at tier 0 and 4,728 at tier 2; at N = 64 2,348 cycles, the lanes pacing one or two sets. hidden err is
  the final hidden state's max |hw - golden| / max |golden|: the recurrence accumulates the tier's error; in fp32 the class survives on all but 3 (5%) and 8
  (10%) of 512, in bf16 on all but 4 (5%), but bf16 with the 10% tier drifts past the model (17 of 512 change, 8 lost against the labels): the two

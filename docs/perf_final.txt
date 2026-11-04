@@ -757,6 +757,23 @@ bf16   0  64  64 Autoencoder     116172   122.29   0.173    1.12    0.22     9.1
 int8 MLPerf Tiny models: not run. model_runner refuses --format int8 for the float MLPerf models ('the int8 MLPerf models are sub-project 2b');
 the int8 TFLite layers (tflite and tflite-ck0 points) are SIENNA's int8 model coverage today. NEEDS_DECISION.
 
+--- int8: the MLCommons int8 models end to end (make model FMT=int8, T = 4; 2026-11-04, runs int8b_*; golden = the TFLite interpreter's reference kernels on the same input codes) ---
+Gate: every stage of every layer on the true function of its exact int32 sum (requantize, residual ADD, lanes), and the end of the pipeline against the
+interpreter: a classifier's top-1, the autoencoder's anomaly score within 5% (measured worst 2.43e-2 over 40 slices, mean 0.81%). codes = output codes that
+differ from the interpreter, reported: int8Requantizer rounds half up where TFLite double-rounds, so one-step differences propagate. int8 TOPS = 2 x MACs / time.
+fmt   ck   N   T model        inferences   lat cyc       us    TOPS   MACs      agree    codes differ   gate
+int8   1  16   4 ResNet-8          20        52041    54.78   0.434   12501632   20/20    47/200       PASS
+int8   1  16   4 DS-CNN             3        29205    30.74   0.164    2656768    3/3      2/36        PASS
+int8   1  16   4 MobileNet          3        97189   102.30   0.139    7489664    3/3      0/6         PASS
+int8   1  16   4 Autoencoder/slice 40        17545    18.47   0.027     264192   40/40  7900/25600     PASS (score |d|/golden max 2.43e-2)
+int8   1  64   4 ResNet-8           3        14030    14.77   1.609   12501632    3/3      9/30        PASS
+int8   1  64   4 DS-CNN             3         7685     8.09   0.624    2656768    3/3      2/36        PASS
+int8   1  64   4 MobileNet          3        36754    38.69   0.368    7489664    3/3      0/6         PASS
+int8   1  64   4 Autoencoder/slice  3         6139     6.46   0.078     264192    3/3    617/1920      PASS
+(the inputs are the float runs' (CIFAR-10 test images, the MLPerf clip, the dcase slices, synthetic MobileNet images), quantized with each model's input
+ scale and zero point. Cycles equal the fp32 runs' at T = 2 within 1.5%: int8 changes the words' width, not the sets' pace. DS-CNN's and MobileNet's
+ depthwise layers run in the layer engine's kk form with block-diagonal int8 taps.)
+
 4. PACKING ===========================================================================================================================================
 --- Packing: N / b jobs of b output columns each, packed into one N x N layer against each job alone (T = 4) ---------------
 cycles MEASURED on TB_sienna (layer); us DERIVED at 950 MHz; mism = packed outputs that differ from the job alone, bit for bit (the gate: 0).

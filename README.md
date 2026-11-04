@@ -65,7 +65,16 @@ The bandwidth counts the words the host streamed for every layer (inputs and wei
 | MobileNet | same class in 102 of 102 | same class in 105 of 105 | 0.38% || 25,491 
 | Autoencoder | anomaly score within 0.002% in 136 of 136 | within 0.23% in 140 of 140 | 0.33% || 154,083 
 
-int8 versions of these four models do not run yet: in int8 the host stack runs single quantized layers and residual blocks imported from TFLite or ONNX (the `tflite` and `residual` points), not whole MLPerf Tiny models.
+**int8, end to end** (`make model FMT=int8`, since 2026-11-04): the four MLCommons int8 models run whole on the layer engine, every convolution, depthwise convolution, dense layer and residual block as int8 jobs with per-channel requantize, average pooling and softmax on the host in the int8 domain. The golden is the TFLite interpreter's reference kernels on the same input codes; the gate holds every stage of every layer to the true function of its exact int32 sum and the end of the pipeline to the interpreter's answer. T = 4:
+
+| Model | Latency, N = 16 | Latency, N = 64 | Same answer as the interpreter | Output codes that differ (reported) |
+|---|---|---|---|---|
+| ResNet-8 | 54.8 µs | 14.8 µs | top-1 on 20 of 20 (N = 16), 3 of 3 (N = 64) | 47 of 200, 9 of 30 |
+| DS-CNN | 30.7 µs | 8.1 µs | top-1 on 3 of 3, 3 of 3 | 2 of 36, 2 of 36 |
+| MobileNet | 102.3 µs | 38.7 µs | top-1 on 3 of 3, 3 of 3 | 0 of 6, 0 of 6 |
+| Autoencoder, per slice | 18.5 µs | 6.5 µs | anomaly score within 2.4% on 40 of 40 slices (mean 0.8%) | 7,900 of 25,600 |
+
+The cycles equal the fp32 runs' within 1.5%: int8 narrows the words, it does not change the sets' pace. The differing output codes are one-step differences from the requantizer's rounding (half up, where TFLite double-rounds), which the true-function gate accepts and which propagate through ten layers in the autoencoder; they never change a class.
 
 ### Inference: a Transformer encoder (BERT-Tiny)
 

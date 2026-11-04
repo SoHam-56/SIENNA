@@ -757,23 +757,139 @@ bf16   0  64  64 Autoencoder     116172   122.29   0.173    1.12    0.22     9.1
 int8 MLPerf Tiny models: not run. model_runner refuses --format int8 for the float MLPerf models ('the int8 MLPerf models are sub-project 2b');
 the int8 TFLite layers (tflite and tflite-ck0 points) are SIENNA's int8 model coverage today. NEEDS_DECISION.
 
---- int8: the MLCommons int8 models end to end (make model FMT=int8, T = 4; 2026-11-04, runs int8b_*; golden = the TFLite interpreter's reference kernels on the same input codes) ---
+--- int8: the MLCommons int8 models end to end (make model FMT=int8; 2026-11-04, runs int8b_* at T = 4 and int8m_* at every other N and T, and collapse-k 0 at N = 8, 16; golden = the TFLite interpreter's reference kernels on the same input codes) ---
 Gate: every stage of every layer on the true function of its exact int32 sum (requantize, residual ADD, lanes), and the end of the pipeline against the
 interpreter: a classifier's top-1, the autoencoder's anomaly score within 5% (measured worst 2.43e-2 over 40 slices, mean 0.81%). codes = output codes that
 differ from the interpreter, reported: int8Requantizer rounds half up where TFLite double-rounds, so one-step differences propagate. int8 TOPS = 2 x MACs / time.
 fmt   ck   N   T model        inferences   lat cyc       us    TOPS   MACs      agree    codes differ   gate
-int8   1  16   4 ResNet-8          20        52041    54.78   0.434   12501632   20/20    47/200       PASS
-int8   1  16   4 DS-CNN             3        29205    30.74   0.164    2656768    3/3      2/36        PASS
-int8   1  16   4 MobileNet          3        97189   102.30   0.139    7489664    3/3      0/6         PASS
-int8   1  16   4 Autoencoder/slice 40        17545    18.47   0.027     264192   40/40  7900/25600     PASS (score |d|/golden max 2.43e-2)
-int8   1  16   4 Autoencoder        1        50920    53.60   0.394   10567680    1/1   7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-3)
-int8   1  64   4 ResNet-8           3        14030    14.77   1.609   12501632    3/3      9/30        PASS
-int8   1  64   4 DS-CNN             3         7685     8.09   0.624    2656768    3/3      2/36        PASS
-int8   1  64   4 MobileNet          3        36754    38.69   0.368    7489664    3/3      0/6         PASS
-int8   1  64   4 Autoencoder/slice  3         6139     6.46   0.078     264192    3/3    617/1920      PASS
-int8   1  64   4 Autoencoder        1         6139     6.46   3.272   10567680    1/1   7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-3)
-(the inputs are the float runs' (CIFAR-10 test images, the MLPerf clip, the dcase slices, synthetic MobileNet images), quantized with each model's input
- scale and zero point. Cycles equal the fp32 runs' at T = 2 within 1.5%: int8 changes the words' width, not the sets' pace. DS-CNN's and MobileNet's
+int8   1   8   2 ResNet-8           3       200940   211.52   0.118   12501632     3/3        9/30     PASS
+int8   1   8   2 DS-CNN             3        75410    79.38   0.067    2656768     3/3        2/36     PASS
+int8   1   8   2 MobileNet          3       230109   242.22   0.062    7489664     3/3         0/6     PASS
+int8   1   8   2 Autoencoder/slice  3        33653    35.42   0.015     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1   8   2 Autoencoder        1       165664   174.38   0.121   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1   8   4 ResNet-8           3       226738   238.67   0.105   12501632     3/3        9/30     PASS
+int8   1   8   4 DS-CNN             3        84929    89.40   0.059    2656768     3/3        2/36     PASS
+int8   1   8   4 MobileNet          3       263159   277.01   0.054    7489664     3/3         0/6     PASS
+int8   1   8   4 Autoencoder/slice  3        37848    39.84   0.013     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1   8   4 Autoencoder        1       187003   196.85   0.107   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1   8   8 ResNet-8           3       345246   363.42   0.069   12501632     3/3        9/30     PASS
+int8   1   8   8 DS-CNN             3       122911   129.38   0.041    2656768     3/3        2/36     PASS
+int8   1   8   8 MobileNet          3       423787   446.09   0.034    7489664     3/3         0/6     PASS
+int8   1   8   8 Autoencoder/slice  3        55562    58.49   0.009     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1   8   8 Autoencoder        1       273581   287.98   0.073   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  16   2 ResNet-8           3        51861    54.59   0.458   12501632     3/3        9/30     PASS
+int8   1  16   2 DS-CNN             3        29025    30.55   0.174    2656768     3/3        2/36     PASS
+int8   1  16   2 MobileNet          3        96685   101.77   0.147    7489664     3/3         0/6     PASS
+int8   1  16   2 Autoencoder/slice  3        17365    18.28   0.029     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  16   2 Autoencoder        1        50740    53.41   0.396   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  16   4 ResNet-8          20        52041    54.78   0.456   12501632   20/20      47/200     PASS
+int8   1  16   4 DS-CNN             3        29205    30.74   0.173    2656768     3/3        2/36     PASS
+int8   1  16   4 MobileNet          3        97189   102.30   0.146    7489664     3/3         0/6     PASS
+int8   1  16   4 Autoencoder/slice 40        17545    18.47   0.029     264192   40/40  7900/25600     PASS (score |d|/golden max 2.43e-02)
+int8   1  16   4 Autoencoder        1        50920    53.60   0.394   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  16   8 ResNet-8           3        61877    65.13   0.384   12501632     3/3        9/30     PASS
+int8   1  16   8 DS-CNN             3        31953    33.63   0.158    2656768     3/3        2/36     PASS
+int8   1  16   8 MobileNet          3       122193   128.62   0.116    7489664     3/3         0/6     PASS
+int8   1  16   8 Autoencoder/slice  3        19400    20.42   0.026     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  16   8 Autoencoder        1        55702    58.63   0.360   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  16  16 ResNet-8           3       137295   144.52   0.173   12501632     3/3        9/30     PASS
+int8   1  16  16 DS-CNN             3        76515    80.54   0.066    2656768     3/3        2/36     PASS
+int8   1  16  16 MobileNet          3       302915   318.86   0.047    7489664     3/3         0/6     PASS
+int8   1  16  16 Autoencoder/slice  3        35570    37.44   0.014     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  16  16 Autoencoder        1       101424   106.76   0.198   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  32   2 ResNet-8           3        22059    23.22   1.077   12501632     3/3        9/30     PASS
+int8   1  32   2 DS-CNN             3        13425    14.13   0.376    2656768     3/3        2/36     PASS
+int8   1  32   2 MobileNet          3        56229    59.19   0.253    7489664     3/3         0/6     PASS
+int8   1  32   2 Autoencoder/slice  3         9770    10.28   0.051     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  32   2 Autoencoder        1        18544    19.52   1.083   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  32   4 ResNet-8           3        22239    23.41   1.068   12501632     3/3        9/30     PASS
+int8   1  32   4 DS-CNN             3        13605    14.32   0.371    2656768     3/3        2/36     PASS
+int8   1  32   4 MobileNet          3        56733    59.72   0.251    7489664     3/3         0/6     PASS
+int8   1  32   4 Autoencoder/slice  3         9950    10.47   0.050     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  32   4 Autoencoder        1        18724    19.71   1.072   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  32   8 ResNet-8           3        24271    25.55   0.979   12501632     3/3        9/30     PASS
+int8   1  32   8 DS-CNN             3        14205    14.95   0.355    2656768     3/3        2/36     PASS
+int8   1  32   8 MobileNet          3        63593    66.94   0.224    7489664     3/3         0/6     PASS
+int8   1  32   8 Autoencoder/slice  3        10634    11.19   0.047     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  32   8 Autoencoder        1        19520    20.55   1.029   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  32  16 ResNet-8           3        50553    53.21   0.470   12501632     3/3        9/30     PASS
+int8   1  32  16 DS-CNN             3        23365    24.59   0.216    2656768     3/3        2/36     PASS
+int8   1  32  16 MobileNet          3       127443   134.15   0.112    7489664     3/3         0/6     PASS
+int8   1  32  16 Autoencoder/slice  3        18160    19.12   0.028     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  32  16 Autoencoder        1        33694    35.47   0.596   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  32  32 ResNet-8           3       187380   197.24   0.127   12501632     3/3        9/30     PASS
+int8   1  32  32 DS-CNN             3        79289    83.46   0.064    2656768     3/3        2/36     PASS
+int8   1  32  32 MobileNet          3       468443   493.10   0.030    7489664     3/3         0/6     PASS
+int8   1  32  32 Autoencoder/slice  3        60113    63.28   0.008     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  32  32 Autoencoder        1       116627   122.77   0.172   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64   2 ResNet-8           3        13850    14.58   1.715   12501632     3/3        9/30     PASS
+int8   1  64   2 DS-CNN             3         7505     7.90   0.673    2656768     3/3        2/36     PASS
+int8   1  64   2 MobileNet          3        36250    38.16   0.393    7489664     3/3         0/6     PASS
+int8   1  64   2 Autoencoder/slice  3         5959     6.27   0.084     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64   2 Autoencoder        1         5959     6.27   3.369   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64   4 ResNet-8           3        14030    14.77   1.693   12501632     3/3        9/30     PASS
+int8   1  64   4 DS-CNN             3         7685     8.09   0.657    2656768     3/3        2/36     PASS
+int8   1  64   4 MobileNet          3        36754    38.69   0.387    7489664     3/3         0/6     PASS
+int8   1  64   4 Autoencoder/slice  3         6139     6.46   0.082     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64   4 Autoencoder        1         6139     6.46   3.271   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64   8 ResNet-8           3        14630    15.40   1.624   12501632     3/3        9/30     PASS
+int8   1  64   8 DS-CNN             3         8285     8.72   0.609    2656768     3/3        2/36     PASS
+int8   1  64   8 MobileNet          3        38434    40.46   0.370    7489664     3/3         0/6     PASS
+int8   1  64   8 Autoencoder/slice  3         6739     7.09   0.074     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64   8 Autoencoder        1         6739     7.09   2.979   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64  16 ResNet-8           3        26390    27.78   0.900   12501632     3/3        9/30     PASS
+int8   1  64  16 DS-CNN             3        11405    12.01   0.443    2656768     3/3        2/36     PASS
+int8   1  64  16 MobileNet          3        67961    71.54   0.209    7489664     3/3         0/6     PASS
+int8   1  64  16 Autoencoder/slice  3        10995    11.57   0.046     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64  16 Autoencoder        1        10995    11.57   1.826   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64  32 ResNet-8           3        91980    96.82   0.258   12501632     3/3        9/30     PASS
+int8   1  64  32 DS-CNN             3        25229    26.56   0.200    2656768     3/3        2/36     PASS
+int8   1  64  32 MobileNet          3       214211   225.49   0.066    7489664     3/3         0/6     PASS
+int8   1  64  32 Autoencoder/slice  3        31834    33.51   0.016     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64  32 Autoencoder        1        31834    33.51   0.631   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   1  64  64 ResNet-8           3       354764   373.44   0.067   12501632     3/3        9/30     PASS
+int8   1  64  64 DS-CNN             3        85581    90.09   0.059    2656768     3/3        2/36     PASS
+int8   1  64  64 MobileNet          3       815637   858.57   0.017    7489664     3/3         0/6     PASS
+int8   1  64  64 Autoencoder/slice  3       116012   122.12   0.004     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   1  64  64 Autoencoder        1       116012   122.12   0.173   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0   8   2 ResNet-8           3       200900   211.47   0.118   12501632     3/3        9/30     PASS
+int8   0   8   2 DS-CNN             3        75370    79.34   0.067    2656768     3/3        2/36     PASS
+int8   0   8   2 MobileNet          3       229997   242.10   0.062    7489664     3/3         0/6     PASS
+int8   0   8   2 Autoencoder/slice  3        33613    35.38   0.015     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0   8   2 Autoencoder        1       165624   174.34   0.121   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0   8   4 ResNet-8           3       202112   212.75   0.118   12501632     3/3        9/30     PASS
+int8   0   8   4 DS-CNN             3        75560    79.54   0.067    2656768     3/3        2/36     PASS
+int8   0   8   4 MobileNet          3       235129   247.50   0.061    7489664     3/3         0/6     PASS
+int8   0   8   4 Autoencoder/slice  3        33908    35.69   0.015     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0   8   4 Autoencoder        1       166446   175.21   0.121   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0   8   8 ResNet-8           3       345246   363.42   0.069   12501632     3/3        9/30     PASS
+int8   0   8   8 DS-CNN             3       122911   129.38   0.041    2656768     3/3        2/36     PASS
+int8   0   8   8 MobileNet          3       423787   446.09   0.034    7489664     3/3         0/6     PASS
+int8   0   8   8 Autoencoder/slice  3        55562    58.49   0.009     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0   8   8 Autoencoder        1       273581   287.98   0.073   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0  16   2 ResNet-8           3        51751    54.47   0.459   12501632     3/3        9/30     PASS
+int8   0  16   2 DS-CNN             3        28915    30.44   0.175    2656768     3/3        2/36     PASS
+int8   0  16   2 MobileNet          3        96377   101.45   0.148    7489664     3/3         0/6     PASS
+int8   0  16   2 Autoencoder/slice  3        17255    18.16   0.029     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0  16   2 Autoencoder        1        50630    53.29   0.397   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0  16   4 ResNet-8           3        51941    54.67   0.457   12501632     3/3        9/30     PASS
+int8   0  16   4 DS-CNN             3        29105    30.64   0.173    2656768     3/3        2/36     PASS
+int8   0  16   4 MobileNet          3        96909   102.01   0.147    7489664     3/3         0/6     PASS
+int8   0  16   4 Autoencoder/slice  3        17445    18.36   0.029     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0  16   4 Autoencoder        1        50820    53.49   0.395   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0  16   8 ResNet-8           3        58873    61.97   0.403   12501632     3/3        9/30     PASS
+int8   0  16   8 DS-CNN             3        30231    31.82   0.167    2656768     3/3        2/36     PASS
+int8   0  16   8 MobileNet          3       116913   123.07   0.122    7489664     3/3         0/6     PASS
+int8   0  16   8 Autoencoder/slice  3        18404    19.37   0.027     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0  16   8 Autoencoder        1        52554    55.32   0.382   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+int8   0  16  16 ResNet-8           3       137295   144.52   0.173   12501632     3/3        9/30     PASS
+int8   0  16  16 DS-CNN             3        76515    80.54   0.066    2656768     3/3        2/36     PASS
+int8   0  16  16 MobileNet          3       302915   318.86   0.047    7489664     3/3         0/6     PASS
+int8   0  16  16 Autoencoder/slice  3        35570    37.44   0.014     264192     3/3    617/1920     PASS (score |d|/golden max 1.65e-02)
+int8   0  16  16 Autoencoder        1       101424   106.76   0.198   10567680     1/1  7900/25600     PASS (the 40 slices as one inference: score |d|/golden 2.05e-03)
+(every configuration: 3 inferences per classifier, 3 slices and the 40-slice batch for the autoencoder, all PASS; the T = 4 rows at N = 16 and 64 come from the 20-image
+ and 40-slice runs. The inputs are the float runs' (CIFAR-10 test images, the MLPerf clip, the dcase slices, synthetic MobileNet images), quantized with each model's
+ input scale and zero point. Cycles equal the fp32 runs' at the same N and T within 1.5%: int8 changes the words' width, not the sets' pace. DS-CNN's and MobileNet's
  depthwise layers run in the layer engine's kk form with block-diagonal int8 taps.)
 
 4. PACKING ===========================================================================================================================================

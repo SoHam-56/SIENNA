@@ -2474,6 +2474,14 @@ def model_main(argv=None):
         log(f"TEST ONLY: --fault {a.fault} (a run without it is unchanged; a fault that is never applied fails the gate)")
     sim_fmt = getattr(sim, "fmt_name", "fp32")
     engine = "emulator" if a.emulate else f"engine {a.engine}"
+    results = {}
+    models, skipped = a.models.split(","), []
+    if a.fmt_name == "int8":  # the int8 models: their own loader, executor and gate (model_int8_run)
+        ok = model_int8_run(a, models, sim, log, results, js)
+        log(f"\nreport {report}\nresults {js}")
+        if not ok:
+            sys.exit(1)
+        return
     how = ("no bit-exact model: emulator" if isinstance(sim, Emulator) else "bit-exact") + f", {sim_fmt} bound {LAYER_BOUND[sim_fmt]:g}, lane layers tier {a.tier} ({gpnae_model.TIER_TOL[a.tier]:g})"
     tally = {"layers": 0, "bad_layers": 0, "inferences": 0, "bad_inferences": 0, "hw": [], "task": [], "reported": [],
              "runs": {}, "rep_seen": set(), "rep_failed": set()}
@@ -2487,12 +2495,6 @@ def model_main(argv=None):
             skipped.append(name)
     if not models:
         log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
-        return
-    if a.fmt_name == "int8":
-        ok = model_int8_run(a, models, sim, log, results, js)
-        log(f"\nreport {report}\nresults {js}")
-        if not ok:
-            sys.exit(1)
         return
     for name in models:
         model = load_model(os.path.join(a.model_dir, MODELS[name]))

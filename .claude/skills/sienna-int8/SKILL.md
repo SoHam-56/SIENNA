@@ -13,7 +13,7 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 deferred to one final sweep after check-in (Soham 2026-09-29). 2b: its pre-synthesis RTL part (the residual ADD and the
 int8 sigmoid ladder, skill `sienna-int8-residual`) implemented and verified 2026-10-18 on branch `int8_residual` at
 N = 8 and 16 at every tile size (gate G4, run rs2_g4); N = 32 and 64 run in the final sweep. The rest of 2b (model
-lowering of the ADD, average pooling, depthwise, softmax) is not started.**
+lowering of the ADD, average pooling, depthwise, softmax) landed 2026-11-04 on branch `workloads` (commits fed0e3a, e9e3962, 05f71d4, eb6bc64): `make model FMT=int8` runs the four MLCommons int8 models whole (`load_int8_graph(whole=True)`, `execute_int8`, `model_int8_run`; depthwise as the layer engine's kk form with block-diagonal int8 taps; golden = the TFLite interpreter's reference kernels, gate = every stage on the true function + the interpreter's top-1 / anomaly score within `SCORE_BOUND['int8']` = 5%); all PASS at N = 16 and 64 (docs/perf_final.txt section 3, int8 rows).**
 Gate reports, verbatim in the `sienna-report` skill's `history/`:
 - 2026-10-01 rerun after the requantize split and the Taylor capture fix (farm runs `sp_*`, not in `history/`): G1
   `sp_g1` PASS, G2 `sp_g2` bit-exact, SIENNA int8 37/37 at N = 16 and 32 (both mesh modes, random power-up at N = 16),

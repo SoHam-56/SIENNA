@@ -4654,9 +4654,9 @@ def test_regression_points():
     assert small[1:3] == full[1:3] == ["add-lanes", "rq-lanes"] and not set(UNIT_POINTS) & set(small[3:])  # int8's unit benches: once
     assert small[3:8] == full[3:8] == [DEFAULT_POINT, *FAULT_POINTS, *COEF_FAULT_POINTS] and [p for p in small if p.endswith(MULTI_KIND)] == [f"{f}/N8_T2/{MULTI_KIND}" for f in FORMATS]
     extra = 1 + 2 + 2 + 3  # the default point, the two idle faults, the two coefficient-image faults and pipeline-multi per format
-    assert len(small) == len(set(small)) == 1 + 2 + 7 * 28 + extra == 207 and len(full) == len(set(full)) == 1 + 2 + 18 * 12 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 449, (len(small), len(full))
-    layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["gemm-ck0", "tflite-ck0"]}
-    for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "pack", "gemm", "tflite"])):
+    assert len(small) == len(set(small)) == 1 + 2 + 7 * 30 + extra == 221 and len(full) == len(set(full)) == 1 + 2 + 18 * 14 + 7 * 9 + 11 * 3 + 18 * 6 + 18 + extra == 485, (len(small), len(full))
+    layer_ck0 = {"fp32": ["model-ck0", "gemm-ck0"], "bf16": ["model-ck0", "gemm-ck0"], "int8": ["model-ck0", "gemm-ck0", "tflite-ck0"]}
+    for f, kinds in (("fp32", ["pipeline", "model", "pack", "gemm"]), ("bf16", ["pipeline", "model", "pack", "gemm"]), ("int8", ["pipeline", "model", "pack", "gemm", "tflite"])):
         for n, t in sweep(full):  # back-to-back and the layer contract's collapse-k 0 at every N, the pipeline's collapse-k 0 at N = 8 and 16; packing needs collapse-k 1
             want = kinds[:1] + (["pipeline-ck0", "pipeline-b2b", "pipeline-ck0-b2b"] if n <= 16 else ["pipeline-b2b"]) + kinds[1:] + layer_ck0[f] + (["residual"] if f == "int8" else [])
             assert [p.rsplit("/", 1)[1] for p in full if p.startswith(f"{f}/N{n}_T{t}/") and not p.endswith(MULTI_KIND)] == want, (f, n, t)
@@ -4680,9 +4680,9 @@ def test_regression_points():
     assert SPEC.verdict("coef-fault-sp1", "[FAIL] COEF IMAGE reset: lane 0 word 7 (load address 7) holds 1, the image has 0\nCOEF FAULT: CAUGHT (SET_PORT 1)\n", 0) == "PASS"
     assert SPEC.verdict("coef-fault-sp0", "COEF FAULT: SURVIVED (SET_PORT 0)\n", 1).startswith("FAIL")
     assert [SPEC.parse(p)["lanes"] for p in ("fp32/N32_T8/pipeline", "fp32/N64_T8/pipeline", "fp32/N8_T2/model")] == [32, 128, 32]
-    for bad in ("fp32/N8_T16/pipeline", "int8/N8_T2/model", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
+    for bad in ("fp32/N8_T16/pipeline", "fp32/N16_T4/tflite", "fp16/N8_T2/pack", "fp32/N8_T2/selftest", "fp32/pipeline",
                 "fp32/N12_T4/pack", "fp32/N8_T2/mesh", "fp32/gpnae-verilator", "fp32/aril-fpu", "fp32/N32_T8/pipeline-ck0",
-                "fp32/N8_T2/pack-ck0", "int8/N8_T2/model-ck0", "fp32/N8_T2/tflite-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
+                "fp32/N8_T2/pack-ck0", "fp32/N8_T2/tflite-ck0", "fp32/N32_T8/pipeline-ck0-b2b", "bf16/N64_T8/pipeline-ck0-b2b",
                 "fp32/N8_T2/pack-b2b", "fp32/N8_T2/pipeline-b2b-ck0", "fp32/N8_T2/residual", "bf16/N16_T4/residual"):
         try:
             SPEC.parse(bad)
@@ -5043,7 +5043,7 @@ def test_regression_target():
         assert lines[-1].split("--formats ")[1].split()[0] == ("int8" if "FMT=int8" in args else "fp32,bf16,int8"), lines[-1]
     small = [x.split("--name ")[1].split()[0] for x in recipe("regression", "SMALL=1", "MODEL_DIR=/m") if "--action point " in x]
     assert [p for p in small if p.endswith("-ck0")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
-                                                       for k in ["pipeline-ck0"] + (["gemm-ck0", "tflite-ck0"] if f == "int8" else ["model-ck0", "gemm-ck0"])]
+                                                       for k in ["pipeline-ck0"] + (["model-ck0", "gemm-ck0", "tflite-ck0"] if f == "int8" else ["model-ck0", "gemm-ck0"])]
     assert [p for p in small if p.endswith("-b2b")] == [f"{f}/N{n}_T{t}/{k}" for f in FORMATS for n in (8, 16) for t in pow2_tile_sizes(n)
                                                        for k in ("pipeline-b2b", "pipeline-ck0-b2b")]
     full = [x.split("--name ")[1].split()[0] for x in recipe("regression", "MODEL_DIR=/m") if "--action point " in x]
@@ -6708,9 +6708,9 @@ class SiennaSpec(regress.Spec):
 
     @staticmethod
     def _offered(f, n, k):
-        """model in fp32 and bf16, tflite (-ck0 too) and residual in int8, the pipeline's -ck0 kinds at CK0_SIZES, LAYER_CK0 at every N, the -b2b kinds at B2B_SIZES."""
+        """model in every format (int8 since 2026-11-04: the MLCommons int8 models), tflite (-ck0 too) and residual in int8, the pipeline's -ck0 kinds at CK0_SIZES, LAYER_CK0 at every N, the -b2b kinds at B2B_SIZES."""
         b = k.removesuffix("-ck0")
-        return ((b != "model" or f != "int8") and (b != "tflite" or f == "int8") and (k != "residual" or f == "int8")
+        return ((b != "tflite" or f == "int8") and (k != "residual" or f == "int8")
                 and ("-ck0" not in k or k in LAYER_CK0 or n in CK0_SIZES)
                 and (not k.endswith("-b2b") or n in B2B_SIZES))
 
@@ -6730,7 +6730,7 @@ class SiennaSpec(regress.Spec):
         if n not in regress.SIZES or t not in pow2_tile_sizes(n):
             raise ValueError(f"{name}: N is 8, 16, 32 or 64 and the tile size a power-of-2 divisor of N")
         if not self._offered(f, n, k):
-            raise ValueError(f"{name}: model runs in fp32 and bf16, tflite and residual in int8, the pipeline's -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
+            raise ValueError(f"{name}: tflite and residual run in int8, the pipeline's -ck0 kinds at N = {', '.join(map(str, CK0_SIZES))}"
                              f" and the -b2b kinds at N = {', '.join(map(str, B2B_SIZES))}")
         return {"fmt": f, "n": n, "tile": t, "lanes": reg_lanes(n), "kind": k, "ck": 0 if "-ck0" in k else 1, "b2b": k.endswith("-b2b")}
 
@@ -6854,7 +6854,8 @@ class SiennaSpec(regress.Spec):
         if name in ("selftest", DEFAULT_POINT) or name in UNIT_POINTS or name in FAULT_POINTS or name in COEF_FAULT_POINTS or self.parse(name)["kind"].removesuffix("-ck0") != "model":
             return None
         d = getattr(opts, "model_dir", "")
-        if not d or not os.path.isdir(d) or not any(os.path.isfile(os.path.join(d, m)) for m in mr.MODELS.values()):
+        files = (mr.MODELS_INT8 if self.parse(name)["fmt"] == "int8" else mr.MODELS).values()
+        if not d or not os.path.isdir(d) or not any(os.path.isfile(os.path.join(d, m)) for m in files):
             return "no MODEL_DIR" + (f" ({d} holds no model)" if d else "")
         return None
 

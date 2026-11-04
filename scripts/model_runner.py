@@ -2543,7 +2543,7 @@ def tflite_pack_main(argv=None):
     sys.exit(1 if bad else 0)
 
 
-BERT_BOUND = {"fp32": 1e-4, "bf16": 5e-2}  # end to end, max|hw-golden|/max|golden| on the hidden states, pooled output and MLM logits; bf16 PROVISIONAL until measured
+BERT_BOUND = {"fp32": 1e-4, "bf16": 5e-2}  # end to end, max|hw-golden|/max|golden| on the hidden states, pooled output and MLM logits: fp32 measured 3.7e-6 (27x margin); bf16 measured 1.7e-2 on the hidden states and 2.9e-2 on the pooled tanh at N = 16 and 64 (1.7x margin)
 BERT_TEXTS = (  # masked sentences and the token the float model should put first; the task gate compares the hardware's top-1 with the float reference's
     "the capital of france is [MASK] .",
     "the quick brown fox jumps over the lazy [MASK] .",

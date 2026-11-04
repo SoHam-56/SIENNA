@@ -73,6 +73,7 @@ The bandwidth counts the words the host streamed for every layer (inputs and wei
 | DS-CNN | 30.7 µs | 8.1 µs | top-1 on 3 of 3, 3 of 3 | 2 of 36, 2 of 36 |
 | MobileNet | 102.3 µs | 38.7 µs | top-1 on 3 of 3, 3 of 3 | 0 of 6, 0 of 6 |
 | Autoencoder, per slice | 18.5 µs | 6.5 µs | anomaly score within 2.4% on 40 of 40 slices (mean 0.8%) | 7,900 of 25,600 |
+| Autoencoder, 40 slices as one inference | 53.6 µs | 6.5 µs | anomaly score within 0.2% | 7,900 of 25,600 |
 
 The cycles equal the fp32 runs' within 1.5%: int8 narrows the words, it does not change the sets' pace. The differing output codes are one-step differences from the requantizer's rounding (half up, where TFLite double-rounds), which the true-function gate accepts and which propagate through ten layers in the autoencoder; they never change a class.
 

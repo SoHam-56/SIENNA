@@ -41,7 +41,7 @@ Work moves through SIENNA in *sets*: one N × N matrix multiplied by another, th
 >
 > SIENNA's throughput, latency, bandwidth, model and packing figures below were measured on 2026-10-31 and 2026-11-01 on today's RTL, at every N and tile size, in the default mesh mode and in collapse-k 0 except the builds listed under Verification. Bandwidths are derived from the measured cycles and the bytes the testbench counted on each link. Comparisons with earlier trees use those trees' own measurements, and the other accelerators' figures are their published ones.
 
-**What it does per inference.** SIENNA is an inference accelerator, so the figures that matter are inference latency and rate; the matrix-multiply numbers further down are the engine's ceiling, not what a model achieves. On the 64 × 64 mesh in fp32 it runs **71,531 ResNet-8 inferences a second** (14.0 µs each), 118,483 DS-CNN, 25,491 MobileNet and 154,083 autoencoder inferences of 40 slices each.
+**What it does per inference.** SIENNA is an inference accelerator, so the figures that matter are inference latency and rate; the per-set numbers further down time the whole pipeline on streamed sets, and their ReLU rows are the engine's ceiling, not what a model achieves. On the 64 × 64 mesh in fp32 it runs **71,531 ResNet-8 inferences a second** (14.0 µs each), 118,483 DS-CNN, 25,491 MobileNet and 154,083 autoencoder inferences of 40 slices each.
 
 ### Inference: MLPerf Tiny models
 
@@ -126,9 +126,9 @@ The looser tiers run the lanes' shorter polynomials, which is where the time goe
 | First result (latency) | 99 | 104 ns |
 | Each further set while streaming (throughput) | 19 | 20 ns |
 
-### The matrix multiply alone, while streaming sets
+### The whole pipeline per set, while streaming sets
 
-Measured by `regression.py`'s performance analysis, 24 sets per run; the FLOPS count the matrix multiply only (2N³ per set). Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
+Measured by `regression.py`'s performance analysis, 24 sets per run: the time per set is the interval between finished sets at the pipeline's output, after the mesh, the activation lanes, pooling and dropout, so the activated rows are the whole pipeline's throughput, not the mesh's. The operations counted are the matrix multiply's 2N³ per set, because the activation, pooling and dropout add no multiply-accumulates; a ReLU set is the engine's ceiling, a SELU, sigmoid or tanh set is what a model with that activation gets. Each cell gives fp32 · bf16 · int8, in GFLOPS at N = 16 and TFLOPS at N = 32 and 64 (GOPS and TOPS for int8):
 
 | Activation | N = 16 (GFLOPS) | N = 32 (TFLOPS) | N = 64 (TFLOPS) |
 |---|---|---|---|

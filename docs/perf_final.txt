@@ -5,7 +5,8 @@ Clock: 950 MHz ASSUMED (the frequency the published TYTAN engine reached); no ti
 Source: make perf-analysis (regression.py --action perf) for ReLU no pool, SELU, sigmoid and tanh, 24 streamed sets each, every N and power-of-2
         tile size, fp32 / bf16 / int8, collapse-k 1 and 0; N >= 32 built at -O0; lanes 32 up to N = 32, 128 at N = 64.
 Labels: cps = cycles per set, MEASURED (mean of the last 12 output intervals); lat = first-output latency in cycles, MEASURED; us/set and lat us DERIVED;
-        TFLOPS (TOPS in int8) = 2 N^3 / cps x 950e6 / 1e12, DERIVED (matmul only); %peak against N^2 MACs x 2 per cycle, DERIVED.
+        TFLOPS (TOPS in int8) = 2 N^3 / cps x 950e6 / 1e12, DERIVED: the whole pipeline's throughput (cps is timed at the output, after the lanes, pooling and
+        dropout) in the matmul's operations, since the activation adds none; %peak against N^2 MACs x 2 per cycle, DERIVED.
         in / out B/set = bytes per set on SIENNA's external links, counted on the first pass's 24 sets: host puts (one per set, the sideband of
         $bits(set_side_t)), the west and north row words the TB queued, the bias row on puts that carry one (stimulus knobs), weight-cache fills
         (none in these configs) and coefficient loads (none: the pipeline keeps the reset image), and the output words the TB received; each count

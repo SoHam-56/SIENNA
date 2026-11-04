@@ -440,8 +440,8 @@ def conv2d_acc(x_q, w_q, b_q, in_zp, folded=False) -> np.ndarray:
 class LayerRecord:
     """The neutral int8 conv / fully connected layer every importer produces: symmetric int8 weights, an int32 bias in units of
     s_in s_w[c], each output channel's real scale S[c] = s_in s_w[c] / s_out, the zero points and the fused activation's clamp."""
-    kind: str  # "conv" or "fc"
-    w_q: np.ndarray  # int8 codes: conv (cout, kh, kw, cin), fc (cout, cin)
+    kind: str  # "conv", "dw" (depthwise) or "fc"
+    w_q: np.ndarray  # int8 codes: conv (cout, kh, kw, cin), dw (c, kh, kw, 1), fc (cout, cin)
     b_q: np.ndarray  # int32 bias per output channel, zeros where the layer has none
     scale: np.ndarray  # S[c], float64
     zp_in: int
@@ -504,12 +504,14 @@ def record_of_tflite(layer: dict, name: str = "") -> LayerRecord:
     inp, flt, b, out = layer["input"], layer["filter"], layer["bias"], layer["output"]
     _symmetric(flt["zp"], name)
     w = flt["data"].astype(np.int64)
+    kind = {"CONV_2D": "conv", "FULLY_CONNECTED": "fc", "DEPTHWISE_CONV_2D": "dw"}[layer["kind"]]
+    if kind == "dw":  # TFLite's 1 x kh x kw x C filter as (C, kh, kw, 1): one tap set per channel
+        w = w.reshape(w.shape[1], w.shape[2], w.shape[3]).transpose(2, 0, 1)[:, :, :, None]
     cout = w.shape[0]
-    kind = "conv" if layer["kind"] == "CONV_2D" else "fc"
     bq = np.zeros(cout, np.int64) if b is None or b["data"] is None else b["data"].astype(np.int64)
     lo, hi = layer["act_range"]
     stride, pads = (1, 1), (0, 0, 0, 0)
-    if kind == "conv":
+    if kind in ("conv", "dw"):
         if layer.get("stride") is None or layer.get("same") is None:
             raise ValueError(f"layer {name or '(unnamed)'}: stride and padding are missing from the conv layer")
         stride = tuple(int(v) for v in layer["stride"])
@@ -615,6 +617,14 @@ def job_of_record(rec: LayerRecord, x) -> tuple:
         X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
         W = w.reshape(cout, -1).T  # OHWI filters: depth in (ky, kx, c) order, as im2col lays it out
         shape = (len(x), oh, ow, cout)
+    elif rec.kind == "dw":  # depthwise: depth in (c, ky, kx) order, a block-diagonal weight (channel c's taps feed only output c), the layer engine's kk form
+        kk = w.shape[1] * w.shape[2]
+        cols = [im2col(np.asarray(xi, np.float32), w.shape[1], w.shape[2], rec.stride, rec.pads, channel_major=True, pad_value=float(rec.zp_in)) for xi in x]
+        X, (oh, ow) = np.vstack([c for c, _ in cols]), cols[0][1]
+        W = np.zeros((cout * kk, cout), np.int64)
+        for c in range(cout):
+            W[c * kk : (c + 1) * kk, c] = w[c].reshape(kk)
+        shape = (len(x), oh, ow, cout)
     else:
         W = w.T
         X = np.asarray(x, np.float32).reshape(-1, W.shape[0])
@@ -622,7 +632,10 @@ def job_of_record(rec: LayerRecord, x) -> tuple:
     hw_bias = wrap32(np.asarray(rec.b_q, np.int64) - rec.zp_in * W.sum(axis=0))
     req = dict(mult=mult, shift=shift, zp=rec.zp_out, amin=rec.lo, amax=rec.hi, mx=0, shx=0, mout=0, shout=0, zout=0,
                ratio=[float(v) for v in rec.scale])
-    return {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape, "req": req}, shape
+    job = {"terms": [(X.astype(np.float32), W.astype(np.float32))], "bias": hw_bias, "act": "linear", "shape": shape, "req": req}
+    if rec.kind == "dw":
+        job["kk"] = w.shape[1] * w.shape[2]
+    return job, shape
 
 
 
@@ -2274,14 +2287,12 @@ def execute_int8(model: dict, q, sim=None, log=None, tier: int = 0) -> tuple:
             if not math.isclose(float(op["input"]["scale"][0]), float(op["output"]["scale"][0])) or int(op["input"]["zp"][0]) != int(op["output"]["zp"][0]):
                 raise ValueError(f"{tag}: average pooling with a changed quantization is not supported")
             t[out] = avgpool_int8(t[op["inputs"][0]], op["filter"], op["stride"], op["same"], *op["act_range"])
-        elif kind == "DEPTHWISE_CONV_2D":
-            raise ValueError(f"{tag}: DEPTHWISE_CONV_2D is not lowered in int8 yet (the float path has it)")
-        elif kind in ("CONV_2D", "FULLY_CONNECTED"):
+        elif kind in ("CONV_2D", "DEPTHWISE_CONV_2D", "FULLY_CONNECTED"):
             if out in deferred:
                 continue
             rec = record_of_tflite(op, tag)
             x = t[op["inputs"][0]]
-            job, shape = job_of_record(rec, [x[0]] if rec.kind == "conv" else x.reshape(-1, rec.w_q.shape[1]))
+            job, shape = job_of_record(rec, [x[0]] if rec.kind != "fc" else x.reshape(-1, rec.w_q.shape[1]))
             t[out] = run(job, tag, shape)
         elif kind == "ADD":
             conv_t = next(i for i in op["inputs"] if i in deferred)
@@ -2572,9 +2583,6 @@ def model_int8_run(a, models, sim, log, results, js) -> bool:
             log(f"skipped: model {name}: {MODELS_INT8[name]} not in {a.model_dir} (models/NOTICE: MLCommons Tiny)")
             continue
         model = load_int8_graph(path, whole=True)
-        if any(op["kind"] == "DEPTHWISE_CONV_2D" for op in model["ops"]):
-            log(f"skipped: model {name}: DEPTHWISE_CONV_2D is not lowered in int8 yet")
-            continue
         inputs, source = model_inputs(name, a.model_dir, a.count, 7)
         log(f"\n== {name} ({MODELS_INT8[name]}, int8), inputs: {source}; input scale {float(model['in_tensor']['scale'][0]):.6g} zero point {int(model['in_tensor']['zp'][0])}")
         runs = []

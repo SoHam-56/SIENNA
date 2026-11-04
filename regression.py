@@ -5830,6 +5830,27 @@ def test_execute_int8_graph():
     assert mr.avgpool_int8(np.array([[[[1], [2]], [[2], [2]]]], np.int64), (2, 2), (2, 2), False, -128, 127)[0, 0, 0, 0] == 2  # 7 / 4 rounds half away: 2
 
 
+@selftest
+def test_int8_depthwise_record():
+    rng = np.random.default_rng(6)  # the int8 depthwise lowering (block-diagonal taps, channel-major patches, kk) equals a direct per-channel convolution
+    C, H, W = 5, 6, 7
+    w = rng.integers(-127, 128, (1, 3, 3, C)).astype(np.int8)
+    b = rng.integers(-300, 300, C).astype(np.int32)
+    x = rng.integers(-128, 128, (1, H, W, C)).astype(np.int64)
+    tensor = lambda i, shape, scale, zp, data=None: dict(index=i, type=9, shape=tuple(shape), data=data, scale=np.array(scale, np.float32), zp=np.array([zp], np.int64))
+    op = dict(kind="DEPTHWISE_CONV_2D", inputs=[0, 1, 2], input=tensor(0, (1, H, W, C), [0.1], 7), filter=dict(tensor(1, (1, 3, 3, C), [0.01 * (c + 1) for c in range(C)], 0, w), zp=np.zeros(1, np.int64)),
+              bias=tensor(2, (C,), [1.0], 0, b), output=tensor(3, (1, H, W, C), [0.2], -9), fused="relu", same=True, stride=(1, 1), act_range=ipu.activation_clamp("relu", 0.2, -9))
+    rec = mr.record_of_tflite(op, "dw")
+    assert rec.kind == "dw" and rec.w_q.shape == (C, 3, 3, 1) and rec.pads == (1, 1, 1, 1)
+    job, shape = mr.job_of_record(rec, [x[0]])
+    assert shape == (1, H, W, C) and job["kk"] == 9 and job["terms"][0][1].shape == (C * 9, C)
+    acc = mr.layer_truth(job, np.zeros((H * W, C), np.int64))[2].reshape(H, W, C)
+    xp = np.pad(x[0] - 7, ((1, 1), (1, 1), (0, 0)))  # the direct convolution on zero-point-centred inputs, as TFLite defines it
+    direct = np.stack([sum(xp[i : i + H, j : j + W, c] * int(w[0, i, j, c]) for i in range(3) for j in range(3)) + int(b[c]) for c in range(C)], axis=-1)
+    assert np.array_equal(acc, direct), np.max(np.abs(acc - direct))
+    assert mr.macs_of(job) == H * W * C * 9
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")

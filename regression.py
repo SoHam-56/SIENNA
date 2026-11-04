@@ -5795,6 +5795,41 @@ def test_tie_within_bound():
     assert g["task"] and not g["reported"]
 
 
+def _toy_int8_graph(rng):
+    """A two-layer int8 classifier in load_int8_graph(whole=True)'s form: fc 6 -> 5 (ReLU) -> fc 5 -> 3, reshape, softmax; tensors 0 (input) .. 6."""
+    def tensor(i, shape, scale, zp, data=None):
+        return dict(index=i, type=9 if data is None or data.dtype == np.int8 else 2, shape=tuple(shape), data=data, scale=np.array([scale], np.float32), zp=np.array([zp], np.int64))
+    w1 = rng.integers(-127, 128, (5, 6)).astype(np.int8); b1 = rng.integers(-500, 500, 5).astype(np.int32)
+    w2 = rng.integers(-127, 128, (3, 5)).astype(np.int8); b2 = rng.integers(-500, 500, 3).astype(np.int32)
+    fc = lambda k, i_in, i_w, i_b, i_out, w, b, s_in, z_in, s_w, s_out, z_out, fused: dict(
+        kind="FULLY_CONNECTED", inputs=[i_in, i_w, i_b], input=tensor(i_in, (1, w.shape[1]), s_in, z_in), filter=dict(tensor(i_w, w.shape, 1.0, 0, w), scale=np.array(s_w, np.float32), zp=np.zeros(1, np.int64)),
+        bias=tensor(i_b, (w.shape[0],), 1.0, 0, b), output=tensor(i_out, (1, w.shape[0]), s_out, z_out), fused=fused, act_range=ipu.activation_clamp(fused, s_out, z_out))
+    ops = [fc(0, 0, 1, 2, 3, w1, b1, 0.05, -3, [0.01, 0.02, 0.03, 0.04, 0.05], 0.1, -20, "relu"),
+           fc(1, 3, 4, 5, 6, w2, b2, 0.1, -20, [0.02, 0.03, 0.04], 0.2, 5, "none"),
+           dict(kind="RESHAPE", inputs=[6], input=tensor(6, (1, 3), 0.2, 5), output=tensor(7, (1, 3), 0.2, 5), fused="none"),
+           dict(kind="SOFTMAX", inputs=[7], input=tensor(7, (1, 3), 0.2, 5), output=tensor(8, (1, 3), 1 / 256, -128), fused="none")]
+    return {"ops": ops, "input": 0, "output": 8, "in_tensor": tensor(0, (1, 6), 0.05, -3), "out_tensor": tensor(8, (1, 3), 1 / 256, -128)}
+
+
+@selftest
+def test_execute_int8_graph():
+    rng = np.random.default_rng(4)  # the whole-graph int8 executor on the bit-exact model equals the layers computed one by one with the int8 reference
+    g = _toy_int8_graph(rng)
+    q = rng.integers(-128, 128, (1, 6)).astype(np.int64)
+    y, stats = mr.execute_int8(g, q)
+    rec1, rec2 = mr.record_of_tflite(g["ops"][0], "a"), mr.record_of_tflite(g["ops"][1], "b")
+    j1, _ = mr.job_of_record(rec1, q.reshape(1, 6))
+    h = mr.layer_truth(j1, np.zeros((1, 5), np.int64))[1]
+    j2, _ = mr.job_of_record(rec2, h.reshape(1, 5))
+    logits = mr.layer_truth(j2, np.zeros((1, 3), np.int64))[1]
+    assert np.array_equal(y, mr.softmax_int8(logits, g["ops"][3]["input"], g["ops"][3]["output"])) and y.shape == (1, 3) and y.min() >= -128
+    assert [st["tag"] for st in stats] == ["L00", "L01"] and stats[0]["macs"] == 30 and stats[1]["macs"] == 15  # int8 counts every weight code
+    assert mr.quantize_input(np.array([[0.0, 0.05, -1e9]]), g["in_tensor"]).tolist() == [[-3, -2, -128]]
+    p = mr.avgpool_int8(np.array([[[[3], [4]], [[-5], [-6]]]], np.int64), (2, 2), (2, 2), False, -128, 127)
+    assert p.shape == (1, 1, 1, 1) and p[0, 0, 0, 0] == -1  # (3 + 4 - 5 - 6) / 4 = -1
+    assert mr.avgpool_int8(np.array([[[[1], [2]], [[2], [2]]]], np.int64), (2, 2), (2, 2), False, -128, 127)[0, 0, 0, 0] == 2  # 7 / 4 rounds half away: 2
+
+
 # ── tool: perf section (was test_perf_analysis.py) ──
 
 PERF_FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testbenches", "perf_fixtures")

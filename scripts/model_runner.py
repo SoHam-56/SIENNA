@@ -10,8 +10,8 @@
 #   4. Device protocol  write_layer and read_outputs (TB_sienna (layer)'s layer and result files), write_sets (TB_sienna (sets)'s set file)
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
-#   7. Runtime          run_checked, maxpool2d, execute, macs_of; the model gate: check_layer, judge, layer_bound, tie_within_bound, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
-#   8. CLI              model_main, model_pack_main, tflite_main, tflite_pack_main, bert_main, lstm_main, main
+#   7. Runtime          run_checked, maxpool2d, execute, execute_int8 (quantize_input, avgpool_int8, softmax_int8, tflite_run), macs_of; the model gate: check_layer, judge, layer_bound, tie_within_bound, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
+#   8. CLI              model_main (model_int8_run for FMT=int8), model_pack_main, tflite_main, tflite_pack_main, bert_main, lstm_main, main
 
 import argparse
 from dataclasses import dataclass
@@ -863,8 +863,10 @@ def check_int8_add(op: dict, where: str) -> None:
         raise ValueError(f"{where}: per-axis scales or zero points are not supported; the ADD takes one per tensor")
 
 
-def load_int8_graph(path: str) -> dict:
-    """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD ops in order with their tensors (and indices), fused kinds and clamps."""
+def load_int8_graph(path: str, whole: bool = False) -> dict:
+    """An int8 .tflite's CONV_2D, FULLY_CONNECTED and ADD ops in order with their tensors (and indices), fused kinds and clamps. With whole, the
+    other ops of a whole classifier too (DEPTHWISE_CONV_2D, AVERAGE_POOL_2D, RESHAPE, SOFTMAX, each with its tensors) and the graph's input and
+    output tensors, for execute_int8."""
     import tflite
     from tflite.ActivationFunctionType import ActivationFunctionType as AF
     from tflite.BuiltinOperator import BuiltinOperator as BO
@@ -872,6 +874,8 @@ def load_int8_graph(path: str) -> dict:
     names = {v: k for k, v in BO.__dict__.items() if not k.startswith("_")}
     acts = {AF.NONE: "none", AF.RELU: "relu", AF.RELU6: "relu6", AF.RELU_N1_TO_1: "relu_n1_to_1"}  # ipu.activation_clamp's kinds
     opts = {"CONV_2D": tflite.Conv2DOptions, "FULLY_CONNECTED": tflite.FullyConnectedOptions, "ADD": tflite.AddOptions}
+    if whole:
+        opts.update({"DEPTHWISE_CONV_2D": tflite.DepthwiseConv2DOptions, "AVERAGE_POOL_2D": tflite.Pool2DOptions, "RESHAPE": None, "SOFTMAX": None})
     m = tflite.Model.GetRootAsModel(open(path, "rb").read(), 0)
     g = m.Subgraphs(0)
 
@@ -894,9 +898,21 @@ def load_int8_graph(path: str) -> dict:
         c = m.OperatorCodes(op.OpcodeIndex())
         kind = names[max(c.BuiltinCode(), c.DeprecatedBuiltinCode())]
         if kind not in opts:
-            raise ValueError(f"{path}: operator {k} is {kind}; the int8 importer takes CONV_2D, FULLY_CONNECTED and ADD")
+            raise ValueError(f"{path}: operator {k} is {kind}; the int8 importer takes CONV_2D, FULLY_CONNECTED and ADD" + (", DEPTHWISE_CONV_2D, AVERAGE_POOL_2D, RESHAPE and SOFTMAX" if whole else ""))
         ins = [op.Inputs(j) for j in range(op.InputsLength())]
         out = tensor(op.Outputs(0))
+        if kind in ("RESHAPE", "SOFTMAX"):
+            ops.append(dict(kind=kind, inputs=ins[:1], input=tensor(ins[0]), output=out, fused="none"))
+            continue
+        if kind == "AVERAGE_POOL_2D":
+            opt = opts[kind]()
+            t = op.BuiltinOptions()
+            opt.Init(t.Bytes, t.Pos)
+            fa = opt.FusedActivationFunction()
+            d = dict(kind=kind, inputs=ins[:1], input=tensor(ins[0]), output=out, filter=(opt.FilterHeight(), opt.FilterWidth()), stride=(opt.StrideH(), opt.StrideW()),
+                     same=opt.Padding() == 0, fused=acts[fa], act_range=ipu.activation_clamp(acts[fa], float(out["scale"][0]), int(out["zp"][0])))
+            ops.append(d)
+            continue
         if kind == "ADD":
             d = dict(kind=kind, inputs=ins[:2], a=tensor(ins[0]), b=tensor(ins[1]), output=out)
             check_int8_add(d, f"{path}: operator {k} ADD")
@@ -911,17 +927,21 @@ def load_int8_graph(path: str) -> dict:
         opt = opts[kind]()
         t = op.BuiltinOptions()
         opt.Init(t.Bytes, t.Pos)
-        if kind == "CONV_2D":
+        if kind in ("CONV_2D", "DEPTHWISE_CONV_2D"):
             if opt.DilationHFactor() != 1 or opt.DilationWFactor() != 1:
                 raise ValueError(f"{path}: dilation is not supported")
             d.update(same=opt.Padding() == 0, stride=(opt.StrideH(), opt.StrideW()))
+            if kind == "DEPTHWISE_CONV_2D" and opt.DepthMultiplier() != 1:
+                raise ValueError(f"{path}: depth multiplier {opt.DepthMultiplier()} is not supported")
+        if kind != "ADD":
+            d["inputs"] = ins
         fa = opt.FusedActivationFunction()
         if fa not in acts:
             raise ValueError(f"{path}: fused activation {fa} is not supported")
         d["fused"] = acts[fa]
         d["act_range"] = ipu.activation_clamp(acts[fa], float(out["scale"][0]), int(out["zp"][0]))
         ops.append(d)
-    return {"ops": ops, "input": g.Inputs(0), "output": g.Outputs(0)}
+    return {"ops": ops, "input": g.Inputs(0), "output": g.Outputs(0), "in_tensor": tensor(g.Inputs(0)), "out_tensor": tensor(g.Outputs(0))}
 
 
 def load_layer(path: str) -> dict:
@@ -1938,7 +1958,10 @@ def macs_of(job):
     for X, W in job["terms"]:
         if W.shape[0] == W.shape[1] and np.array_equal(W, np.eye(W.shape[0], dtype=W.dtype)):
             continue
-        n += X.shape[0] * np.count_nonzero(W)
+        if job.get("req") is not None:  # int8: a zero weight code is data (a small weight quantized away), not structure
+            n += X.shape[0] * (W.shape[0] if job.get("kk") else W.size)
+        else:
+            n += X.shape[0] * np.count_nonzero(W)
     return int(n)
 
 
@@ -1962,7 +1985,8 @@ def tie_within_bound(ref_logits, fmt: str) -> np.ndarray:
 def layer_bound(fmt: str, act: str, tier: int = 0) -> float:
     """A layer's bound against float64: the format's, or for a lane activation (SELU, sigmoid, tanh) its tier's tolerance if that is looser."""
     return LAYER_BOUND[fmt] if act in ("relu", "linear") else max(LAYER_BOUND[fmt], gpnae_model.TIER_TOL[tier])
-SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2}  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 with fp32 sums measured 2.24e-03 (ba3_models_N16_bf16, 4.5x margin)
+SCORE_BOUND = {"fp32": 1e-3, "bf16": 1e-2,  # ad01 score |hw-ref|/ref vs the float model: fp32 measured 1.85e-05 (54x margin); bf16 with fp32 sums measured 2.24e-03 (ba3_models_N16_bf16, 4.5x margin)
+               "int8": 5e-2}  # against the TFLite interpreter's score: its requantize double-rounds where int8Requantizer rounds half up, so about 40% of the output codes differ by one step after ten layers; measured 1.65e-2 on two slices (2026-11-04)
 REPORTED = set()  # (model, format) known limits: float checks shown as FAIL, not counted; bit-exact still gates; ad01 bf16 left it once bf16 summed in fp32
 
 
@@ -2174,6 +2198,126 @@ def execute(model, x, sim=None, log=None, fault=None, jobs=None, tier=0):
     return t[model["output"]], stats
 
 
+def quantize_input(x, t: dict) -> np.ndarray:
+    """Float input x as the int8 model's input tensor t takes it: round(x / scale) + zero point, clamped to int8."""
+    return np.clip(np.rint(np.asarray(x, np.float64) / float(t["scale"][0])) + int(t["zp"][0]), -128, 127).astype(np.int64)
+
+
+def avgpool_int8(x, f, st, same, lo, hi) -> np.ndarray:
+    """TFLite's int8 AVERAGE_POOL_2D on NHWC codes: the window sum divided by its count, rounded half away from zero, clamped (input and output share
+    scale and zero point, which TFLite requires)."""
+    _, H, W, C = x.shape
+    if same:
+        raise ValueError("SAME-padded average pooling is not supported (the MLPerf Tiny models pool VALID)")
+    oh, ow = (H - f[0]) // st[0] + 1, (W - f[1]) // st[1] + 1
+    out = np.zeros((1, oh, ow, C), np.int64)
+    n = f[0] * f[1]
+    for i in range(oh):
+        for j in range(ow):
+            acc = x[0, i * st[0] : i * st[0] + f[0], j * st[1] : j * st[1] + f[1], :].astype(np.int64).sum(axis=(0, 1))
+            out[0, i, j] = np.where(acc >= 0, (acc + n // 2) // n, -((-acc + n // 2) // n))
+    return np.clip(out, lo, hi)
+
+
+def softmax_int8(q, t_in: dict, t_out: dict) -> np.ndarray:
+    """Softmax of dequantized int8 codes, requantized to the output tensor (TFLite: scale 1/256, zero point -128), in float64 on the host."""
+    v = (np.asarray(q, np.float64) - int(t_in["zp"][0])) * float(t_in["scale"][0])
+    e = np.exp(v - v.max(axis=-1, keepdims=True))
+    p = e / e.sum(axis=-1, keepdims=True)
+    return np.clip(np.rint(p / float(t_out["scale"][0])) + int(t_out["zp"][0]), -128, 127).astype(np.int64)
+
+
+def execute_int8(model: dict, q, sim=None, log=None, tier: int = 0) -> tuple:
+    """Runs an int8 classifier (load_int8_graph(whole=True)) on input codes q: every CONV_2D and FULLY_CONNECTED is an int8 layer job on sim (None: the
+    bit-exact model), a conv that feeds only an ADD runs as that ADD's residual job (job_of_add_record), average pooling, reshape and softmax run on
+    the host in the int8 domain. Returns (output codes, stats): per job its sets, cycles, MACs and every stage gate on the true function."""
+    ops = model["ops"]
+    t = {model["input"]: np.asarray(q, np.int64)}
+    consumers = {}
+    for op in ops:
+        for i in op["inputs"]:
+            consumers[i] = consumers.get(i, 0) + 1
+    producer = {op["output"]["index"]: op for op in ops}
+    deferred = set()  # convs that feed only an ADD, with no fused activation: computed inside the ADD's residual job
+    for op in ops:
+        if op["kind"] == "ADD":
+            for i in op["inputs"]:
+                p = producer.get(i)
+                if p is not None and p["kind"] in ("CONV_2D", "FULLY_CONNECTED") and p["fused"] == "none" and consumers[i] == 1 and i not in deferred:
+                    deferred.add(i)
+                    break
+    stats = []
+
+    def run(job, tag, shape):
+        if sim is None:
+            Y = int8_residual_exact(*_residual_args(job)) if job.get("add") is not None else layer_truth(job, np.zeros(job["shape"], np.int64))[1]
+            n = cyc = 0
+            gates = []
+        else:
+            Y, n, cyc = sim.run_job(job, tag)
+            gates = layer_stage_gates(job, Y, sim.last_stages, sim.N)
+        st = {"tag": tag, "sets": n, "cycles": cyc, "macs": macs_of(job), "shape": list(shape), "gates": gates, "bad": [g for g, r in gates if not r.ok]}
+        stats.append(st)
+        if log:
+            line = "; ".join(f"{g} {'PASS' if r.ok else 'FAIL'}" for g, r in gates) or "golden"
+            log(f"    {tag:<6} {job.get('add') is not None and 'CONV+ADD' or 'LAYER':<9} {str(tuple(shape)):<18} sets {n:6d}  cycles {cyc:8d}  MACs {st['macs']:9d}  {line}")
+        return np.asarray(Y, np.int64).reshape(shape)
+
+    for li, op in enumerate(ops):
+        kind, out = op["kind"], op["output"]["index"]
+        tag = f"L{li:02d}"
+        if kind == "RESHAPE":
+            t[out] = t[op["inputs"][0]].reshape(op["output"]["shape"])
+        elif kind == "SOFTMAX":
+            t[out] = softmax_int8(t[op["inputs"][0]], op["input"], op["output"])
+        elif kind == "AVERAGE_POOL_2D":
+            if not math.isclose(float(op["input"]["scale"][0]), float(op["output"]["scale"][0])) or int(op["input"]["zp"][0]) != int(op["output"]["zp"][0]):
+                raise ValueError(f"{tag}: average pooling with a changed quantization is not supported")
+            t[out] = avgpool_int8(t[op["inputs"][0]], op["filter"], op["stride"], op["same"], *op["act_range"])
+        elif kind == "DEPTHWISE_CONV_2D":
+            raise ValueError(f"{tag}: DEPTHWISE_CONV_2D is not lowered in int8 yet (the float path has it)")
+        elif kind in ("CONV_2D", "FULLY_CONNECTED"):
+            if out in deferred:
+                continue
+            rec = record_of_tflite(op, tag)
+            x = t[op["inputs"][0]]
+            job, shape = job_of_record(rec, [x[0]] if rec.kind == "conv" else x.reshape(-1, rec.w_q.shape[1]))
+            t[out] = run(job, tag, shape)
+        elif kind == "ADD":
+            conv_t = next(i for i in op["inputs"] if i in deferred)
+            other = next(i for i in op["inputs"] if i != conv_t)
+            p = producer[conv_t]
+            rec = record_of_tflite(p, f"L{ops.index(p):02d}")
+            x = t[p["inputs"][0]]
+            job, shape = job_of_add_record(rec, add_record_of_tflite(op, conv_t, tag), [x[0]] if rec.kind == "conv" else x.reshape(-1, rec.w_q.shape[1]), t[other])
+            t[out] = run(job, f"{tag}+L{ops.index(p):02d}", shape)
+        else:
+            raise ValueError(f"{tag}: {kind}")
+    return t[model["output"]], stats
+
+
+def _residual_args(job) -> tuple:
+    """int8_residual_exact's arguments from a residual job (job_of_add_record): the conv's codes and words, the residual codes, the ADD and lane words."""
+    (X, W), (R, _) = job["terms"]
+    return (np.asarray(X, np.int64), np.asarray(W, np.int64), np.asarray(job["bias"], np.int64), job["req"], np.asarray(R, np.int64), job["add"], job["lane"], job["act"])
+
+
+def tflite_run(path: str, q) -> np.ndarray:
+    """The TFLite interpreter (reference kernels) on int8 input codes q, one row at a time: the CPU golden of an int8 model."""
+    import tensorflow as tf  # lazily: model_runner imports without TensorFlow
+    it = tf.lite.Interpreter(model_path=path, experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_REF)
+    it.allocate_tensors()
+    i, o = it.get_input_details()[0], it.get_output_details()[0]
+    q = np.asarray(q, np.int8)
+    rows = q.reshape((-1,) + tuple(i["shape"][1:]))
+    outs = []
+    for r in rows:
+        it.set_tensor(i["index"], r[None])
+        it.invoke()
+        outs.append(it.get_tensor(o["index"]).astype(np.int64))
+    return np.concatenate(outs)
+
+
 # ── 8. CLI: --action model (default), --action tflite [--pack] ───────────────
 
 def cifar_test(data_dir):
@@ -2228,6 +2372,12 @@ def model_inputs(name, mdir, count, seed):
     raise ValueError(name)
 
 
+MODELS_INT8 = {  # MLCommons Tiny's int8 models (models/NOTICE), run by make model FMT=int8
+    "resnet8": "pretrainedResnet_quant.tflite",
+    "ad01": "ad01_int8.tflite",
+    "kws": "kws_ref_model.tflite",
+    "vww": "vww_96_int8.tflite",
+}
 MODELS = {
     "resnet8": "pretrainedResnet.tflite",
     "ad01": "ad01_fp32.tflite",
@@ -2283,8 +2433,8 @@ def model_main(argv=None):
         ap.error("--engine sets builds collapse-k 1 (TB_sienna (sets)); use --engine layer")
     global COLLAPSE_K
     COLLAPSE_K = a.collapse_k
-    if a.fmt_name == "int8":
-        ap.error("the int8 MLPerf models are sub-project 2b; single-layer TFLite int8 models run with --action tflite")
+    if a.fmt_name == "int8" and (a.emulate or a.engine == "sets" or a.fault):
+        ap.error("--format int8 runs on the layer engine without --emulate or --fault")
     if a.fmt_name != "fp32" and (a.emulate or a.engine == "sets"):
         ap.error(f"--format {a.fmt_name}: --engine sets and --emulate build and judge fp32 only; use --engine layer")
     os.makedirs(a.work, exist_ok=True)
@@ -2326,6 +2476,12 @@ def model_main(argv=None):
             skipped.append(name)
     if not models:
         log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
+        return
+    if a.fmt_name == "int8":
+        ok = model_int8_run(a, models, sim, log, results, js)
+        log(f"\nreport {report}\nresults {js}")
+        if not ok:
+            sys.exit(1)
         return
     for name in models:
         model = load_model(os.path.join(a.model_dir, MODELS[name]))
@@ -2402,6 +2558,69 @@ def model_main(argv=None):
         + (f"; skipped (inputs absent): {', '.join(skipped)}" if skipped else ""))
     if not ok:
         sys.exit(1)
+
+
+def model_int8_run(a, models, sim, log, results, js) -> bool:
+    """The int8 MLPerf Tiny models end to end on sim (make model FMT=int8). Golden: the TFLite interpreter's reference kernels on the same input codes
+    (the model on the CPU). Gate per inference: every stage of every layer on the true function (layer_stage_gates) and the end of the pipeline against
+    the golden: a classifier's top-1, the autoencoder's anomaly score within SCORE_BOUND; code-level agreement with the interpreter is reported."""
+    bad_hw = bad_task = n_inf = n_layers = 0
+    ran = []
+    for name in models:
+        path = os.path.join(a.model_dir, MODELS_INT8[name])
+        if not os.path.isfile(path):
+            log(f"skipped: model {name}: {MODELS_INT8[name]} not in {a.model_dir} (models/NOTICE: MLCommons Tiny)")
+            continue
+        model = load_int8_graph(path, whole=True)
+        if any(op["kind"] == "DEPTHWISE_CONV_2D" for op in model["ops"]):
+            log(f"skipped: model {name}: DEPTHWISE_CONV_2D is not lowered in int8 yet")
+            continue
+        inputs, source = model_inputs(name, a.model_dir, a.count, 7)
+        log(f"\n== {name} ({MODELS_INT8[name]}, int8), inputs: {source}; input scale {float(model['in_tensor']['scale'][0]):.6g} zero point {int(model['in_tensor']['zp'][0])}")
+        runs = []
+        for x, label, desc in inputs:
+            q = quantize_input(x, model["in_tensor"])
+            if name == "ad01" and q.shape[0] > 1:
+                continue  # the slices run one at a time: the interpreter takes one row
+            gold = tflite_run(path, q)
+            c0, s0, t0 = (sim.cycles, sim.sets, time.time()) if sim else (0, 0, time.time())
+            log(f"  inference on {desc}")
+            hw, stats = execute_int8(model, q, sim, log, a.tier)
+            cyc, sets = (sim.cycles - c0, sim.sets - s0) if sim else (0, 0)
+            bad = [f"{st['tag']} ({g})" for st in stats for g in st["bad"]]
+            differ = int(np.sum(hw.ravel() != gold.ravel()))
+            r = {"input": desc, "label": label, "cycles": cyc, "sets": sets, "macs": sum(st["macs"] for st in stats), "layers": len(stats), "bad_stages": bad,
+                 "differ_from_interpreter": differ, "words": int(hw.size), "wall_s": time.time() - t0}
+            if name == "ad01":
+                deq = lambda c, tt: (np.asarray(c, np.float64) - int(tt["zp"][0])) * float(tt["scale"][0])
+                xin = deq(q, model["in_tensor"])
+                sh, sg = float(np.mean((xin - deq(hw, model["out_tensor"])) ** 2)), float(np.mean((xin - deq(gold, model["out_tensor"])) ** 2))
+                rel = abs(sh - sg) / sg if sg else 0.0
+                task_ok = rel <= SCORE_BOUND["int8"]
+                r.update(score_hw=sh, score_golden=sg, score_rel=rel)
+                line = f"anomaly score hw {sh:.6f} golden {sg:.6f} |d|/golden {rel:.2e}"
+            else:
+                ht, gt = int(np.argmax(hw.ravel())), int(np.argmax(gold.ravel()))
+                task_ok = ht == gt
+                r.update(hw_top=ht, golden_top=gt)
+                line = f"top-1 hw {ht} golden {gt} label {label}"
+            r["task_ok"], r["hw_ok"] = task_ok, not bad
+            log(f"  result: {line}; {differ} of {hw.size} output codes differ from the interpreter (reported); {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  "
+                f"{sets} sets  {r['macs']} MACs  wall {r['wall_s']:.0f} s")
+            log(f"  gate: hardware {'PASS' if not bad else 'FAIL ' + ', '.join(bad)} ({len(stats)} layers, every stage on the true function)  task {'PASS' if task_ok else 'FAIL'}")
+            bad_hw += int(bool(bad))
+            bad_task += int(not task_ok)
+            n_inf += 1
+            n_layers += len(stats)
+            runs.append(r)
+        results.setdefault(name, {})["runs"] = runs
+        results[name]["source"] = source
+        ran.append(name)
+        json.dump(results, open(js, "w"), indent=1, default=list)
+    ok = n_inf > 0 and not bad_hw and not bad_task
+    log(f"\nMODEL GATE: {'PASS' if ok else 'FAIL'}  int8 N={a.n} T={a.tile_size} lanes={a.lanes} tier={a.tier} engine layer: {len(ran)} of {len(models)} models ran ({', '.join(ran)}), "
+        f"{n_inf} inferences, {n_layers} layers; hardware: {bad_hw} inferences with a failing stage; task: {bad_task} of {n_inf} fail against the interpreter")
+    return ok
 
 
 def tflite_main(argv=None):

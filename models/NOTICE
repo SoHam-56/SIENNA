@@ -27,3 +27,14 @@ Trained here by `regression.py --action lstm-model` on ECG5000 (UCR time-series 
 
 ## selu_cifar10.npz
 Trained here by `regression.py --action selu-model` on CIFAR-10 (Krizhevsky 2009; fetched by models/fetch_cifar10.sh train, not committed): a self-normalizing convnet (Klambauer et al. 2017), 78.6% test top-1. Weights under this directory's license.
+
+## The int8 MLPerf Tiny models (make model FMT=int8)
+MLCommons Tiny at the commit above (Apache 2.0), unmodified; sha256 as fetched 2026-11-03:
+  ad01_int8.tflite              benchmark/training/anomaly_detection/trained_models/ad01_int8.tflite
+  pretrainedResnet_quant.tflite benchmark/training/image_classification/trained_models/pretrainedResnet_quant.tflite
+  kws_ref_model.tflite          benchmark/training/keyword_spotting/trained_models/kws_ref_model.tflite
+  vww_96_int8.tflite            benchmark/training/visual_wake_words/trained_models/vww_96_int8.tflite
+87cf24194ef93d1d9b11a591d805526b98008e351655d29883c825c9c106ba24    ad01_int8.tflite
+3c002613d1b2475eb51dd78dfb85a546c8ae658dee71cf6ade43b022fe205415    pretrainedResnet_quant.tflite
+aeea436800704fce17b17292e4412630ad856e9d777c044c64ef748a880bd0ae    kws_ref_model.tflite
+597a384c8c2c8a1276f04702f25013b7838f2f814f1ca7c174d295b73e3d6b7b    vww_96_int8.tflite

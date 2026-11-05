@@ -1207,7 +1207,7 @@ Labels: cycles MEASURED per unit (a 128-token sentence, an image, a heartbeat, o
         slot% = MACs / (sets x N^3), DERIVED (the share of set slots holding real multiply-accumulates); agree = units whose class or token equals the
         CPU golden's; tier = the activation lanes' accuracy tier (0: 1%, 1: 5%, 2: 10%). Host ops: BERT softmax, LayerNorm, GELU, embeddings, residual
         adds; SELU net 2x2 max pool and softmax; LSTM Hadamard products and the cell update. Runs: sienna_jobs/runs/bert2_*, selu_*, lstm_*, mpack_*.
---- BERT-Tiny (google/bert_uncased_L-2_H-128_A-2, 2 layers, d = 128, 2 heads, FFN 512; 3 masked sentences of 128 tokens; make bert) ------------
+--- BERT-Tiny (google/bert_uncased_L-2_H-128_A-2, 2 layers, d = 128, 2 heads, FFN 512; 3 masked sentences of 128 tokens; make model MODELS=bert) ------------
 fmt     N  lanes tier part       cycles/unit     us    MACs/unit   slot%  agree  hidden err  verdict
 fp32   16     32    0 encoder        231296   243.5    58720256   100.0    -     -           PASS
 fp32   16     32    0 whole          480322   505.6    62659840    51.5   3/3   3.67e-06    PASS
@@ -1236,7 +1236,7 @@ bf16   64    128    2    100       10167    10.7     8094976    39.1   99/100   
 (fp32 SELU at tiers 1 and 2 is one degree-2 piece at both, and bf16's are degree-1 pieces at both, so the lanes take the same rounds and every layer's
  cycles are identical. At N = 64 the first convolution, 1,024 rows x 32 channels through the lanes, takes 7,478 of the 14,011 cycles. The one image whose
  class changes at the looser tiers is the same near tie in every build, which the golden gets wrong and the hardware right.)
---- ECG5000 LSTM (32 units over 140 steps, 5 classes; gates sigmoid, candidate and cell tanh on the lanes each step; 92.9% test top-1; make lstm) -------
+--- ECG5000 LSTM (32 units over 140 steps, 5 classes; gates sigmoid, candidate and cell tanh on the lanes each step; 92.9% test top-1; make model MODELS=lstm) -------
 fmt     N  lanes tier batch  cycles/batch  us/heartbeat  MACs/batch  slot%  agree    right  golden right  hidden err  verdict
 fp32   16     32    0    512      7133725      14.67    305152000    59.4  512/512    469     469        1.57e-02    PASS
 fp32   16     32    1    512      5439173      11.18    305152000    59.4  509/512    470     469        2.37e-01    PASS (reported at tier 1)
@@ -1257,7 +1257,7 @@ bf16   64    128    2     64       243997       4.01     38144000    25.9   63/6
  the final hidden state's max |hw - golden| / max |golden|: the recurrence accumulates the tier's error; in fp32 the class survives on all but 3 (5%) and 8
  (10%) of 512, in bf16 on all but 4 (5%), but bf16 with the 10% tier drifts past the model (17 of 512 change, 8 lost against the labels): the two
  approximations compound over 140 steps. BERT's pooler at tiers 1 and 2: 3.4% and 7.3% from the exact tanh, the [MASK] tokens unchanged.)
---- Real layers of different models in one packed set (make model-pack N=64 LANES=128, fp32; each layer with a real inference's activations) -----------
+--- Real layers of different models in one packed set (make pack N=64 LANES=128, its real-layer part, fp32; each layer with a real inference's activations) -----------
 set  layers                       b  blocks  rows  sets  cycles packed  cycles alone (sum)  speedup  words differ from alone  verdict
 0    resnet8.L00 + vww.L00       32   2/2    2304    36          2569               3858    1.50x        0                   PASS
 1    vww.L04 + vww.L06           32   2/2     576     9           841               1682    2.00x        0                   PASS

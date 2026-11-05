@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: float models end to end, every multiply-accumulate on the pipeline, host only reshapes and softmax; --action tflite: the int8 TFLite layers; --action bert: BERT-Tiny's encoder, every matrix product on the pipeline, softmax, LayerNorm and GELU on the host)."""
+"""SIENNA's host software stack: lowers TFLite models to the RTL's layer and set protocol and runs them on a backend (--action model, the default: models end to end, every matrix product on the pipeline, with the host doing only what the hardware has no unit for: reshapes, softmax, LayerNorm, GELU, max pooling of images, the LSTM's Hadamard products; --action tflite: the int8 TFLite layers)."""
 
 # Contents, in the order a driver / compiler is layered (sections call each other through these names; 1-4 are what a driver needs):
 #   1. Numerics         op_round, fmt_bits, quant_act, quant_weights, fold_bias, requant_params, requantize, encode_scales, int8_layer_exact, add_words, qadd_codes, exact_sum, exact_layer; layer_scales, fc_acc, conv2d_acc
@@ -11,7 +11,7 @@
 #   5. Device build     write_build_pkg (test_config_pkg.sv), write_sv_package, _config_items, SETS_IN_FLIGHT, COLLAPSE_K
 #   6. Backends         RtlLayer (TB_sienna (layer)), RtlSets (TB_sienna (sets)), Emulator (numpy)
 #   7. Runtime          run_checked, maxpool2d, execute, execute_int8 (quantize_input, avgpool_int8, softmax_int8, tflite_run), macs_of; the model gate: check_layer, judge, layer_bound, tie_within_bound, gate_verdict, the bounds (LAYER_BOUND, SCORE_BOUND, REPORTED), test-only faults
-#   8. CLI              model_main (model_int8_run for FMT=int8), model_pack_main, tflite_main, tflite_pack_main, bert_main, lstm_main, main
+#   8. CLI              model_main (model_int8_run for FMT=int8; bert_run and lstm_run for those model names; tally_add), model_pack_run / model_pack_main (make pack's real layers), tflite_main, tflite_pack_main, main
 
 import argparse
 from dataclasses import dataclass
@@ -2389,15 +2389,18 @@ MODELS_INT8 = {  # MLCommons Tiny's int8 models (models/NOTICE), run by make mod
     "kws": "kws_ref_model.tflite",
     "vww": "vww_96_int8.tflite",
 }
-MODELS = {
+MODELS = {  # make model's names; bert and lstm are not TFLite models: model_main runs them through bert_run and lstm_run
     "resnet8": "pretrainedResnet.tflite",
     "ad01": "ad01_fp32.tflite",
     "kws": "kws_ref_model_float32.tflite",
     "vww": "vww_96_float.tflite",
-    "selu": "selu_cifar10.npz",  # the SELU convnet regression.py --action selu-model trains (not an MLPerf Tiny model; make model's default list leaves it out)
+    "selu": "selu_cifar10.npz",  # the SELU convnet regression.py --action selu-model trains
+    "bert": "bert_tiny/model.safetensors",  # BERT-Tiny (models/fetch_bert_tiny.sh)
+    "lstm": "lstm_ecg5000.npz",  # the ECG5000 LSTM regression.py --action lstm-model trains
 }
+MLPERF_MODELS = ("resnet8", "ad01", "kws", "vww")
 MODEL_DIR = os.path.join(ROOT, "testbenches", "tflite_int8")
-ACTIONS = ("model", "tflite", "bert", "lstm")
+ACTIONS = ("model", "tflite")
 BERT_DIR = os.path.join(ROOT, "models", "bert_tiny")  # models/fetch_bert_tiny.sh
 
 
@@ -2407,6 +2410,8 @@ MODEL_INPUTS = {  # each model's input files beside its .tflite, and how to fetc
     "kws": (("marvin_617de221_0.wav",), "run models/fetch_inputs.sh"),
     "vww": ((), ""),
     "selu": (("data/cifar-10-batches-py/test_batch", "perf_samples_idxs.npy"), "run models/fetch_cifar10.sh, and regression.py --action selu-model models/"),
+    "bert": (("bert_tiny/vocab.txt", "bert_tiny/config.json"), "run models/fetch_bert_tiny.sh"),
+    "lstm": (("ecg5000/ECG5000_TEST.txt",), "run models/fetch_ecg5000.sh, and regression.py --action lstm-model models/"),
 }
 
 
@@ -2419,7 +2424,7 @@ def missing_inputs(name, mdir):
 
 def model_main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: float models end to end (this CLI); tflite: the int8 TFLite runs; bert: BERT-Tiny")
+    ap.add_argument("--action", choices=ACTIONS, default="model", help="model: models end to end (this CLI; --models names them: the MLPerf Tiny four, selu, bert, lstm); tflite: the int8 TFLite layers")
     ap.add_argument("--models", default="resnet8,ad01,kws,vww")
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--count", type=int, default=1, help="inferences per model on the RTL")
@@ -2439,6 +2444,8 @@ def model_main(argv=None):
                     "shared:... (flip it in the exact model too), top1:MODEL (swap the top two outputs); first inference of MODEL")
     ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1, help="the mesh's COLLAPSE_K the layer engine builds and the golden follows")
     ap.add_argument("--tier", type=int, choices=(0, 1, 2), default=0, help="the activation lanes' accuracy tier for SELU, sigmoid and tanh layers: 1%%, 5%%, 10%%")
+    ap.add_argument("--bert-seq", type=int, default=128, help="bert: tokens per sentence after padding (--count sentences of BERT_TEXTS)")
+    ap.add_argument("--lstm-batch", type=int, default=64, help="lstm: heartbeats classified together in the one inference (a seeded draw over the test file)")
     a = ap.parse_args(argv)
     if a.engine == "sets" and a.collapse_k == 0:
         ap.error("--engine sets builds collapse-k 1 (TB_sienna (sets)); use --engine layer")
@@ -2497,6 +2504,12 @@ def model_main(argv=None):
         log(f"MODEL GATE: SKIPPED (no model has its files in {a.model_dir})")
         return
     for name in models:
+        if name in ("bert", "lstm"):  # their own forward passes and gates; the same tally and MODEL GATE
+            runs, source = (bert_run if name == "bert" else lstm_run)(a, sim, log, tally)
+            results.setdefault(name, {})["runs"] = runs
+            results[name]["source"] = source
+            json.dump(results, open(js, "w"), indent=1, default=list)
+            continue
         model = load_model(os.path.join(a.model_dir, MODELS[name]))
         if name in CIFAR_MODELS and a.ref_accuracy:
             x, y = cifar_test(os.path.join(a.model_dir, "data"))
@@ -2541,17 +2554,7 @@ def model_main(argv=None):
             log(f"  gate: hardware {verdict_word(g, 'hw')} ({len(stats)} layers, {how})  task {verdict_word(g, 'task')} ({g['task_line']})")
             for m in g["hw"] + g["task"] + g["reported"]:
                 log(f"    {m}")
-            tally["layers"] += len(stats)
-            tally["bad_layers"] += len(g["bad_layers"])
-            tally["inferences"] += 1
-            tally["bad_inferences"] += int(bool(g["task"]))
-            tally["runs"][name] = tally["runs"].get(name, 0) + 1
-            if g["rep_key"]:
-                tally["rep_seen"].add(g["rep_key"])
-                if g["reported"]:
-                    tally["rep_failed"].add(g["rep_key"])
-            for k in ("hw", "task", "reported"):
-                tally[k] += g[k]
+            tally_add(tally, name, g, len(stats))
         results.setdefault(name, {})["runs"] = runs
         results[name]["source"] = source
         json.dump(results, open(js, "w"), indent=1, default=list)
@@ -2573,6 +2576,21 @@ def model_main(argv=None):
         sys.exit(1)
 
 
+def tally_add(tally: dict, name: str, g: dict, layers: int) -> None:
+    """One inference's gate into the run's tally (judge's keys: hw, task, reported, bad_layers, rep_key)."""
+    tally["layers"] += layers
+    tally["bad_layers"] += len(g["bad_layers"])
+    tally["inferences"] += 1
+    tally["bad_inferences"] += int(bool(g["task"]))
+    tally["runs"][name] = tally["runs"].get(name, 0) + 1
+    if g.get("rep_key"):
+        tally["rep_seen"].add(g["rep_key"])
+        if g["reported"]:
+            tally["rep_failed"].add(g["rep_key"])
+    for k in ("hw", "task", "reported"):
+        tally[k] += g[k]
+
+
 def model_int8_run(a, models, sim, log, results, js) -> bool:
     """The int8 MLPerf Tiny models end to end on sim (make model FMT=int8). Golden: the TFLite interpreter's reference kernels on the same input codes
     (the model on the CPU). Gate per inference: every stage of every layer on the true function (layer_stage_gates) and the end of the pipeline against
@@ -2580,6 +2598,9 @@ def model_int8_run(a, models, sim, log, results, js) -> bool:
     bad_hw = bad_task = n_inf = n_layers = 0
     ran = []
     for name in models:
+        if name not in MODELS_INT8:
+            log(f"skipped: model {name}: no int8 form (the MLCommons int8 models are {', '.join(MODELS_INT8)})")
+            continue
         path = os.path.join(a.model_dir, MODELS_INT8[name])
         if not os.path.isfile(path):
             log(f"skipped: model {name}: {MODELS_INT8[name]} not in {a.model_dir} (models/NOTICE: MLCommons Tiny)")
@@ -2778,63 +2799,35 @@ BERT_TEXTS = (  # masked sentences and the token the float model should put firs
 )
 
 
-def bert_main(argv=None):
-    """BERT-Tiny (google/bert_uncased_L-2_H-128_A-2) on the layer contract. The golden is the model run on the CPU in float64 (bert_forward with a
-    numpy backend; it agrees with the Hugging Face implementation to 1.3e-7). The hardware run puts every matrix product (Q K V, Q K^T per head, P V,
-    the output and FFN layers, the pooler as a tanh lane job at --tier, the MLM head on the [MASK] rows) through the RTL and does softmax, LayerNorm,
-    GELU, the embedding lookup and the residual adds on the host in float64. The gate compares the end of the pipeline with the golden for the same
-    input: the final hidden states, the pooled output and the MLM logits within BERT_BOUND, and the same top-1 masked token. Per job, the layer gate's
-    comparison with the backend's bit-exact model is printed as a diagnostic only."""
-    ap = argparse.ArgumentParser(description=bert_main.__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="bert")
-    ap.add_argument("--bert-dir", default=BERT_DIR, help="config.json, model.safetensors and vocab.txt (models/fetch_bert_tiny.sh)")
-    ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--tile-size", type=int, default=4)
-    ap.add_argument("--lanes", type=int, default=32)
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=("fp32", "bf16"))
-    ap.add_argument("--seq", type=int, default=128, help="tokens per sentence after padding (the attention products are seq x seq)")
-    ap.add_argument("--tier", type=int, default=0, choices=(0, 1, 2), help="the pooler's tanh lane tier: 1%%, 5%%, 10%%")
-    ap.add_argument("--text", action="append", help="a masked sentence (repeatable); default: three built in")
-    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "bert"))
-    ap.add_argument("--no-sim", action="store_true", help="float reference only")
-    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1)
-    a = ap.parse_args(argv)
-    global COLLAPSE_K
-    COLLAPSE_K = a.collapse_k
-    os.makedirs(a.work, exist_ok=True)
-    report = os.path.join(a.work, f"bert_report_N{a.n}_T{a.tile_size}_{a.fmt_name}.log")
-    rep = open(report, "w")
-
-    def log(s):
-        print(s, flush=True)
-        rep.write(s + "\n")
-        rep.flush()
-
-    cfg = json.load(open(os.path.join(a.bert_dir, "config.json")))
-    w = load_safetensors(os.path.join(a.bert_dir, "model.safetensors"))
-    vocab = {t.rstrip("\n"): i for i, t in enumerate(open(os.path.join(a.bert_dir, "vocab.txt"), encoding="utf-8"))}
+def bert_run(a, sim, log, tally) -> tuple:
+    """BERT-Tiny (google/bert_uncased_L-2_H-128_A-2, MODELS['bert'] under --model-dir) as a model of make model: --count masked sentences of BERT_TEXTS,
+    --bert-seq tokens each. The golden is the model run on the CPU in float64 (bert_forward with a numpy backend; it agrees with the Hugging Face
+    implementation to 1.3e-7). The hardware run puts every matrix product (Q K V, Q K^T per head, P V, the output and FFN layers, the pooler as a tanh
+    lane job at --tier, the MLM head on the [MASK] rows) through the RTL and does softmax, LayerNorm, GELU, the embedding lookup and the residual adds
+    on the host in float64. Gate per sentence, into the tally: the final hidden states, the pooled output and the MLM logits within BERT_BOUND (hardware),
+    and the same top-1 masked token (task); the layer gate's bit-exact comparison is a diagnostic. Returns (runs, source)."""
+    d = os.path.join(a.model_dir, "bert_tiny")
+    cfg = json.load(open(os.path.join(d, "config.json")))
+    w = load_safetensors(os.path.join(d, "model.safetensors"))
+    vocab = {t.rstrip("\n"): i for i, t in enumerate(open(os.path.join(d, "vocab.txt"), encoding="utf-8"))}
     words = {i: t for t, i in vocab.items()}
     heads, layers = cfg["num_attention_heads"], cfg["num_hidden_layers"]
-    log(f"BERT {os.path.basename(os.path.normpath(a.bert_dir))}: {layers} layers, d = {cfg['hidden_size']}, {heads} heads, FFN {cfg['intermediate_size']}, "
-        f"vocab {cfg['vocab_size']}; seq {a.seq}; {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} collapse-k {COLLAPSE_K}; pooler tanh at tier {a.tier}")
-    log("golden: the model on the CPU in float64; hardware run: every matrix product and the pooler's tanh on the RTL, embeddings, softmax, LayerNorm, GELU and residual adds on the host")
-    sim = None
-    if not a.no_sim:
-        sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
-        t0 = time.time()
-        sim.build()
-        log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
-    bound = BERT_BOUND[a.fmt_name]
-    lane_tol = gpnae_model.TIER_TOL[a.tier]
-    hw_fail, task_fail, total = [], [], {"sets": 0, "cycles": 0, "macs": 0, "jobs": 0}
-    for si, text in enumerate(a.text or BERT_TEXTS):
-        ids, mask = bert_tokens(text, vocab, a.seq)
-        ref = bert_forward(w, ids, mask, lambda job, tag: job_reference(job)[0].astype(np.float32) if job["act"] == "linear"
-                           else _true_act(job_reference(job)[0], job["act"]).astype(np.float32), heads, vocab["[MASK]"], a.tier)
-        log(f"\n== sentence {si}: {text!r} ({int(mask.sum())} tokens)")
+    fmt = getattr(sim, "fmt_name", "fp32")
+    texts = BERT_TEXTS[: a.count]
+    source = f"{len(texts)} masked sentences of {a.bert_seq} tokens (BERT_TEXTS); golden: the model on the CPU in float64"
+    log(f"\n== bert (bert_tiny: {layers} layers, d = {cfg['hidden_size']}, {heads} heads, FFN {cfg['intermediate_size']}, vocab {cfg['vocab_size']}), inputs: {source}")
+    log("  hardware run: every matrix product and the pooler's tanh on the RTL; embeddings, softmax, LayerNorm, GELU and residual adds on the host")
+    bound, lane_tol = BERT_BOUND[fmt], gpnae_model.TIER_TOL[a.tier]
+    ref_run = lambda job, tag: (job_reference(job)[0] if job["act"] == "linear" else _true_act(job_reference(job)[0], job["act"])).astype(np.float32)
+    runs = []
+    for si, text in enumerate(texts):
+        ids, mask = bert_tokens(text, vocab, a.bert_seq)
+        ref = bert_forward(w, ids, mask, ref_run, heads, vocab["[MASK]"], a.tier)
         ref_top = [int(np.argmax(r)) for r in ref["logits"]]
-        log(f"  CPU golden (float64): [MASK] -> {', '.join(words[t] for t in ref_top)}")
+        desc = f"sentence {si}: {text!r} ({int(mask.sum())} tokens)"
+        log(f"  inference on {desc}; CPU golden: [MASK] -> {', '.join(words[t] for t in ref_top)}")
         if sim is None:
+            runs.append({"input": desc, "ref_top": ref_top})
             continue
         stats = []
 
@@ -2842,9 +2835,8 @@ def bert_main(argv=None):
             y, st = run_checked(job, sim, f"s{si}.{tag}")
             stats.append(dict(st, act=job["act"], tier=job.get("tier", 0)))
             rec = st["exact"]
-            ex = "" if rec is None else f"  diag: {rec['differ']}/{rec['words']} words off the bit-exact model"
             log(f"    {tag:<12} {str(tuple(job['shape'])):<14} K {job['terms'][0][1].shape[0]:5d} {job['act']:<7} sets {st['sets']:5d}  cycles {st['cycles']:7d}  "
-                f"MACs {st['macs']:9d}  job err {st['err']:.2e}{ex}")
+                f"MACs {st['macs']:9d}  job err {st['err']:.2e}" + ("" if rec is None else f"  diag: {rec['differ']}/{rec['words']} words off the bit-exact model"))
             return y
 
         c0, s0, t0 = sim.cycles, sim.sets, time.time()
@@ -2852,44 +2844,105 @@ def bert_main(argv=None):
         cyc, sets = sim.cycles - c0, sim.sets - s0
         macs = sum(st["macs"] for st in stats)
         hw_top = [int(np.argmax(r)) for r in hw["logits"]]
-        diag = sum(st["exact"]["differ"] for st in stats if st["exact"])
         rel = lambda k: float(np.max(np.abs(hw[k].astype(np.float64) - ref[k]))) / (float(np.max(np.abs(ref[k]))) or 1.0)
         dh, dp, dl = rel("hidden"), rel("pooled"), rel("logits")
-        for what, v, b in (("hidden states", dh, bound), ("pooled output (tanh lane)", dp, max(bound, lane_tol)), ("MLM logits", dl, bound)):
-            if not v <= b:
-                hw_fail.append(f"FAIL output sentence {si}: {what} max|hw-golden|/max|golden| {v:.2e} above {b:g}")
+        g = {"hw": [], "task": [], "reported": [], "bad_layers": [], "rep_key": None, "task_line": f"[MASK] -> {', '.join(words[t] for t in hw_top)}, golden {', '.join(words[t] for t in ref_top)}"}
+        for what, v, b_ in (("hidden states", dh, bound), ("pooled output (tanh lane)", dp, max(bound, lane_tol)), ("MLM logits", dl, bound)):
+            if not v <= b_:
+                g["hw"].append(f"FAIL hardware bert [{desc}]: {what} max|hw-golden|/max|golden| {v:.2e} above {b_:g}")
+                g["bad_layers"].append(what)
         if hw_top != ref_top:
-            task_fail.append(f"FAIL task sentence {si}: hardware's [MASK] -> {', '.join(words[t] for t in hw_top)}, the CPU golden's {', '.join(words[t] for t in ref_top)}")
-        util = macs / (sets * a.n ** 3) if sets else 0
-        log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (golden {', '.join(words[t] for t in ref_top)}); end to end max|hw-golden|/max|golden|: "
-            f"hidden states {dh:.2e}, pooled {dp:.2e} (tanh lane, tier {a.tier}), MLM logits {dl:.2e}; diag: {diag} words off the bit-exact model over all jobs")
+            g["task"].append(f"FAIL task bert [{desc}]: {g['task_line']}")
         part = lambda f: sum(st["cycles"] for st in stats if f(st["tag"]))
-        enc, head = part(lambda t: ".L" in t), part(lambda t: t.endswith("pool") or ".mlm." in t)
-        log(f"  {len(stats)} GEMM jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed)  {macs} MACs  MAC-slot use {100 * util:.1f}%  wall {time.time() - t0:.0f} s")
-        log(f"  of which the encoder's {layers} layers {enc} cycles ({enc / 950e3:.3f} ms); the pooler and the MLM head on the [MASK] row {head} cycles "
-            f"(one-row jobs, the vocabulary projection {part(lambda t: t.endswith('mlm.dec'))})")
-        for k, v in (("sets", sets), ("cycles", cyc), ("macs", macs), ("jobs", len(stats))):
-            total[k] += v
-    log(f"\nreport {report}")
+        enc = part(lambda t: ".L" in t)
+        r = {"input": desc, "ref_top": ref_top, "hw_top": hw_top, "cycles": cyc, "encoder_cycles": enc, "sets": sets, "macs": macs, "layers": stats, "wall_s": time.time() - t0,
+             "hidden_err": dh, "pooled_err": dp, "logits_err": dl, "gate": g}
+        log(f"  result: [MASK] -> {', '.join(words[t] for t in hw_top)} (golden {', '.join(words[t] for t in ref_top)}); end to end max|hw-golden|/max|golden|: hidden states {dh:.2e}, "
+            f"pooled {dp:.2e} (tanh lane, tier {a.tier}), MLM logits {dl:.2e}  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed), the encoder's {layers} layers {enc} of them  "
+            f"{sets} sets  {macs} MACs  wall {r['wall_s']:.0f} s")
+        log(f"  gate: hardware {'PASS' if not g['hw'] else 'FAIL'} ({len(stats)} GEMM jobs; outputs against the CPU golden, {fmt} bound {bound:g}, pooled {max(bound, lane_tol):g})  task {'PASS' if not g['task'] else 'FAIL'} ({g['task_line']})")
+        for m in g["hw"] + g["task"]:
+            log(f"    {m}")
+        tally_add(tally, "bert", g, len(stats))
+        runs.append(r)
+    return runs, source
+
+
+def model_pack_run(sim, model_dir: str, fmt: str, log, models: str = "resnet8,ad01,kws,vww", N: int = None) -> int:
+    """Layers of different models in one packed set (sienna-packing case b) on sim, with the activations a real inference gives them: every layer of the
+    models is lowered on its first input, those that fit a block (packable) are first-fit grouped into sets of N / b blocks, run packed and each alone.
+    Golden: the layer on the CPU in float64 (job_reference); the packed words must also equal the lone run's. Logs each model's packable share of its
+    multiply-accumulates and per set the cycles packed against the sum alone. Returns the number of failures (0 passes). With sim None, lists what packs."""
+    N = N or sim.N
+    log(f"MODEL PACKING: layers of {models} that fit a block at N = {N} (depth and width <= N / 2 = {N // 2}, one pass), {fmt}")
+    cands = []
+    for name in models.split(","):
+        miss, supply = missing_inputs(name, model_dir)
+        if miss:
+            log(f"  skipped: model {name}: {', '.join(miss)} not in {model_dir} ({supply})")
+            continue
+        model = load_tflite(os.path.join(model_dir, MODELS[name]))
+        (x, _, desc), = model_inputs(name, model_dir, 1, 7)[0][:1]
+        jobs = []
+        execute(model, x, jobs=jobs)
+        total = sum(macs_of(j) for _, _, j in jobs)
+        fit = [(li, kind, j, packable(j, N)) for li, kind, j in jobs if packable(j, N)]
+        share = sum(macs_of(j) for _, _, j, _ in fit) / total if total else 0
+        log(f"  {name} on {desc}: {len(fit)} of {len(jobs)} layers pack, {100 * share:.1f}% of its {total} MACs: "
+            + ", ".join(f"L{li:02d} {kind} {j['terms'][0][0].shape[0]}x{j['terms'][0][1].shape[0]}x{j['terms'][0][1].shape[1]} {j['act']} b={b}" for li, kind, j, b in fit))
+        cands += [(name, li, j, b) for li, kind, j, b in fit]
+    if not cands:
+        log(f"MODEL PACKING: nothing packs at N = {N}")
+        return 0
+    groups = []  # first fit, widest blocks first: a group takes N / b jobs of block <= b
+    for c in sorted(cands, key=lambda c: -c[3]):
+        for g in groups:
+            if len(g) < N // g[0][3]:
+                g.append(c)
+                break
+        else:
+            groups.append([c])
+    log(f"  {len(cands)} packable layers in {len(groups)} packed sets")
     if sim is None:
-        log("BERT GATE: not run (--no-sim: float reference only)")
-        return
-    for m in hw_fail + task_fail:
+        log("MODEL PACKING: not run (no simulator)")
+        return 0
+    bound = LAYER_BOUND[fmt]
+    fails, tot_p, tot_a = [], 0, 0
+    for gi, g in enumerate(groups):
+        ms = [{"W": j["terms"][0][1], "bias": j["bias"], "act": j["act"], "inputs": [j["terms"][0][0]]} for _, _, j, _ in g]
+        job, recipe = pack_jobs(ms, N, int8=False)
+        b = N >> job["pack"]["shift"]
+        Y, st = run_checked(job, sim, f"mp{gi}")
+        cyc_p = st["cycles"]
+        tot_p += cyc_p
+        names = ", ".join(f"{n}.L{li:02d}" for n, li, _, _ in g)
+        same = len({n for n, _, _, _ in g}) < len(g)
+        log(f"== set {gi}: {names}; b = {b}, {len(g)} of {N // b} blocks, {job['shape'][0]} rows: {st['sets']} sets, {cyc_p} cycles packed"
+            + (" (layers of one model side by side: two of its inferences in flight, not one)" if same else ""))
+        cyc_a = 0
+        for (name, li, j, _), outs in zip(g, unpack(Y, recipe)):
+            yp = np.vstack(outs)
+            ya, sa = run_checked(j, sim, f"mp{gi}.{name}.L{li:02d}")
+            cyc_a += sa["cycles"]
+            ref = job_reference(dict(j, terms=[(op_round(X, fmt), op_round(W, fmt)) for X, W in j["terms"]], bias=None if j["bias"] is None else op_round(j["bias"], fmt)))[1]
+            err = float(np.max(np.abs(yp.astype(np.float64) - ref))) / (float(np.max(np.abs(ref))) or 1.0)
+            diff = int(np.sum(fmt_bits(yp, fmt) != fmt_bits(ya, fmt)))
+            if not err <= bound:
+                fails.append(f"FAIL output set {gi} {name} L{li:02d}: packed output max|hw-golden|/max|golden| {err:.2e} above {bound:g}")
+            if diff:
+                fails.append(f"FAIL interference set {gi} {name} L{li:02d}: {diff} of {yp.size} packed words differ from the layer run alone")
+            log(f"    {name} L{li:02d} {str(tuple(j['shape'])):<20} alone {sa['sets']:5d} sets {sa['cycles']:7d} cycles; packed block vs CPU golden {err:.2e}, {diff} words differ from alone")
+        tot_a += cyc_a
+        log(f"  set {gi}: {cyc_a} cycles alone (sum) vs {cyc_p} packed: {cyc_a / cyc_p:.2f}x")
+    for m in fails:
         log(m)
-    n_s = len(a.text or BERT_TEXTS)
-    ok = not hw_fail and not task_fail and total["jobs"] > 0
-    log(f"BERT GATE: {'PASS' if ok else 'FAIL'}  {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} seq={a.seq} tier={a.tier}: {n_s} sentences, {total['jobs']} GEMM jobs, "
-        f"{total['sets']} sets, {total['cycles']} cycles, {total['macs']} MACs; outputs against the CPU golden: {len(hw_fail)} failures ({a.fmt_name} bound {bound:g}, "
-        f"pooled {max(bound, lane_tol):g}); task: {len(task_fail)} of {n_s} sentences fail")
-    if not ok:
-        sys.exit(1)
+    log(f"MODEL PACKING: {'PASS' if not fails else 'FAIL'}  {fmt} N={N}: {len(cands)} layers in {len(groups)} packed sets, {tot_a} cycles alone vs {tot_p} packed ({tot_a / tot_p:.2f}x); "
+        f"{len(fails)} failures (outputs against the CPU golden, bound {bound:g}; packed = alone word for word)")
+    return len(fails)
 
 
 def model_pack_main(argv=None):
-    """Layers of different models in one packed set (sienna-packing case b) on the layer contract, with the activations a real inference gives them.
-    Every layer of the chosen models is lowered on its first input; those that fit a block (packable) are first-fit grouped into sets of N / b blocks,
-    run packed and each alone on the RTL. Golden: the layer on the CPU in float64 (job_reference). Reported: each model's packable share of its
-    multiply-accumulates, and per group the cycles packed against the sum alone, plus whether the packed outputs equal the lone run's words."""
+    """make pack's real-layer part on its own: model_pack_run on a fresh layer-engine build (python model_runner.py --action model --pack)."""
     ap = argparse.ArgumentParser(description=model_pack_main.__doc__)
     ap.add_argument("--action", choices=ACTIONS, default="model")
     ap.add_argument("--pack", action="store_true")
@@ -2903,150 +2956,53 @@ def model_pack_main(argv=None):
     ap.add_argument("--no-sim", action="store_true", help="only list what packs at this N")
     a = ap.parse_args(argv)
     os.makedirs(a.work, exist_ok=True)
-    report = os.path.join(a.work, f"model_pack_N{a.n}_T{a.tile_size}_{a.fmt_name}.log")
-    rep = open(report, "w")
+    rep = open(os.path.join(a.work, f"model_pack_N{a.n}_T{a.tile_size}_{a.fmt_name}.log"), "w")
 
     def log(s):
         print(s, flush=True)
         rep.write(s + "\n")
         rep.flush()
 
-    N = a.n
-    log(f"MODEL PACKING: layers of {a.models} that fit a block at N = {N} (depth and width <= N / 2 = {N // 2}, one pass), {a.fmt_name} T={a.tile_size} lanes={a.lanes}")
-    cands = []
-    for name in a.models.split(","):
-        miss, supply = missing_inputs(name, a.model_dir)
-        if miss:
-            log(f"skipped: model {name}: {', '.join(miss)} not in {a.model_dir} ({supply})")
-            continue
-        model = load_tflite(os.path.join(a.model_dir, MODELS[name]))
-        (x, _, desc), = model_inputs(name, a.model_dir, 1, 7)[0][:1]
-        jobs = []
-        execute(model, x, jobs=jobs)
-        total = sum(macs_of(j) for _, _, j in jobs)
-        fit = [(li, kind, j, packable(j, N)) for li, kind, j in jobs if packable(j, N)]
-        share = sum(macs_of(j) for _, _, j, _ in fit) / total if total else 0
-        log(f"  {name} on {desc}: {len(fit)} of {len(jobs)} layers pack, {100 * share:.1f}% of its {total} MACs: "
-            + ", ".join(f"L{li:02d} {kind} {j['terms'][0][0].shape[0]}x{j['terms'][0][1].shape[0]}x{j['terms'][0][1].shape[1]} {j['act']} b={b}" for li, kind, j, b in fit))
-        cands += [(name, li, j, b) for li, kind, j, b in fit]
-    if not cands:
-        log(f"MODEL PACKING: nothing packs at N = {N}")
-        return
-    groups = []  # first fit, widest blocks first: a group takes N / b jobs of block <= b
-    for c in sorted(cands, key=lambda c: -c[3]):
-        for g in groups:
-            if len(g) < N // g[0][3]:
-                g.append(c)
-                break
-        else:
-            groups.append([c])
-    log(f"  {len(cands)} packable layers in {len(groups)} packed sets")
-    if a.no_sim:
-        log("MODEL PACKING: not run (--no-sim)")
-        return
-    sim = RtlLayer(N, a.lanes, a.work, a.fmt_name, a.tile_size)
-    t0 = time.time()
-    sim.build()
-    log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
-    bound = LAYER_BOUND[a.fmt_name]
-    fails, tot_p, tot_a = [], 0, 0
-    for gi, g in enumerate(groups):
-        models = [{"W": j["terms"][0][1], "bias": j["bias"], "act": j["act"], "inputs": [j["terms"][0][0]]} for _, _, j, _ in g]
-        job, recipe = pack_jobs(models, N, int8=False)
-        b = N >> job["pack"]["shift"]
-        Y, st = run_checked(job, sim, f"mp{gi}")
-        cyc_p = st["cycles"]
-        tot_p += cyc_p
-        names = ", ".join(f"{n}.L{li:02d}" for n, li, _, _ in g)
-        same = len({n for n, _, _, _ in g}) < len(g)
-        log(f"\n== set {gi}: {names}; b = {b}, {len(g)} of {N // b} blocks, {job['shape'][0]} rows: {st['sets']} sets, {cyc_p} cycles packed"
-            + (" (layers of one model side by side: two of its inferences in flight, not one)" if same else ""))
-        cyc_a = 0
-        for (name, li, j, _), outs in zip(g, unpack(Y, recipe)):
-            yp = np.vstack(outs)
-            ya, sa = run_checked(j, sim, f"mp{gi}.{name}.L{li:02d}")
-            cyc_a += sa["cycles"]
-            ref = job_reference(dict(j, terms=[(op_round(X, a.fmt_name), op_round(W, a.fmt_name)) for X, W in j["terms"]],
-                                     bias=None if j["bias"] is None else op_round(j["bias"], a.fmt_name)))[1]
-            err = float(np.max(np.abs(yp.astype(np.float64) - ref))) / (float(np.max(np.abs(ref))) or 1.0)
-            same = int(np.sum(fmt_bits(yp, a.fmt_name) != fmt_bits(ya, a.fmt_name)))
-            if not err <= bound:
-                fails.append(f"FAIL output set {gi} {name} L{li:02d}: packed output max|hw-golden|/max|golden| {err:.2e} above {bound:g}")
-            if same:
-                fails.append(f"FAIL interference set {gi} {name} L{li:02d}: {same} of {yp.size} packed words differ from the layer run alone")
-            log(f"    {name} L{li:02d} {str(tuple(j['shape'])):<20} alone {sa['sets']:5d} sets {sa['cycles']:7d} cycles; packed block vs CPU golden {err:.2e}, "
-                f"{same} words differ from alone")
-        tot_a += cyc_a
-        log(f"  set {gi}: {cyc_a} cycles alone (sum) vs {cyc_p} packed: {cyc_a / cyc_p:.2f}x")
-    for m in fails:
-        log(m)
-    log(f"\nreport {report}")
-    log(f"MODEL PACKING: {'PASS' if not fails else 'FAIL'}  {a.fmt_name} N={N} T={a.tile_size} lanes={a.lanes}: {len(cands)} layers in {len(groups)} packed sets, "
-        f"{tot_a} cycles alone vs {tot_p} packed ({tot_a / tot_p:.2f}x); {len(fails)} failures (outputs against the CPU golden, bound {bound:g}; packed = alone word for word)")
-    if fails:
+    sim = None
+    if not a.no_sim:
+        sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
+        sim.build()
+    if model_pack_run(sim, a.model_dir, a.fmt_name, log, a.models, a.n):
         sys.exit(1)
 
-
-def lstm_main(argv=None):
-    """An LSTM classifier of ECG5000 heartbeats (regression.py --action lstm-model trains it) on the layer contract: per time step the gates' sigmoid
-    and the candidate's tanh are lane jobs on [x_t, h_{t-1}], the cell state's tanh a scaled-identity lane job, the classifier a linear job; the
-    Hadamard products and cell update run on the host in float64. Golden: the same model on the CPU in float64. Gate: every job within its tier's bound
-    of float64 on its operands, and at tier 0 the same top-1 class as the golden for every heartbeat; at tiers 1 and 2 the agreement is reported."""
-    ap = argparse.ArgumentParser(description=lstm_main.__doc__)
-    ap.add_argument("--action", choices=ACTIONS, default="lstm")
-    ap.add_argument("--model", default=os.path.join(ROOT, "models", "lstm_ecg5000.npz"))
-    ap.add_argument("--data", default=os.path.join(ROOT, "models", "ecg5000", "ECG5000_TEST.txt"))
-    ap.add_argument("--n", type=int, default=16)
-    ap.add_argument("--tile-size", type=int, default=4)
-    ap.add_argument("--lanes", type=int, default=32)
-    ap.add_argument("--format", dest="fmt_name", default="fp32", choices=("fp32", "bf16"))
-    ap.add_argument("--tier", type=int, default=0, choices=(0, 1, 2), help="the lanes' accuracy tier for the gates, candidate and cell tanh")
-    ap.add_argument("--batch", type=int, default=64, help="heartbeats classified together (the rows of every step's jobs)")
-    ap.add_argument("--seed", type=int, default=7, help="which test heartbeats: a seeded draw over the test file")
-    ap.add_argument("--work", default=os.path.join(ROOT, "testbenches", "results", "lstm"))
-    ap.add_argument("--no-sim", action="store_true", help="float reference only")
-    ap.add_argument("--collapse-k", type=int, choices=(0, 1), default=1)
-    a = ap.parse_args(argv)
-    global COLLAPSE_K
-    COLLAPSE_K = a.collapse_k
-    os.makedirs(a.work, exist_ok=True)
-    report = os.path.join(a.work, f"lstm_report_N{a.n}_T{a.tile_size}_{a.fmt_name}_tier{a.tier}.log")
-    rep = open(report, "w")
-
-    def log(s):
-        print(s, flush=True)
-        rep.write(s + "\n")
-        rep.flush()
-
-    w = load_lstm_npz(a.model)
-    X, y = ecg5000(a.data)
-    idx = np.random.RandomState(a.seed).choice(len(X), a.batch, replace=False)
+def lstm_run(a, sim, log, tally) -> tuple:
+    """The ECG5000 LSTM classifier (MODELS['lstm'] under --model-dir, trained by regression.py --action lstm-model) as a model of make model: one
+    inference of --lstm-batch heartbeats (a seeded draw over the test file). Per time step the gates' sigmoid and the candidate's tanh are lane jobs on
+    [x_t, h_{t-1}], the cell state's tanh a scaled-identity lane job, the classifier a linear job; the Hadamard products and cell update run on the host
+    in float64. Golden: the same model on the CPU in float64. Gate, into the tally: every job within its tier's bound (hardware), and the same top-1
+    class as the golden for every heartbeat whose golden top two logits the format's bound can tell apart (task) at tier 0; at tiers 1 and 2 the
+    disagreements are reported. Returns (runs, source)."""
+    w = load_lstm_npz(os.path.join(a.model_dir, MODELS["lstm"]))
+    X, y = ecg5000(os.path.join(a.model_dir, "ecg5000", "ECG5000_TEST.txt"))
+    idx = np.random.RandomState(7).choice(len(X), a.lstm_batch, replace=False)
     X, y = X[idx], y[idx]
     u, T = w["lstm_U"].shape[0], X.shape[1]
-    log(f"LSTM {os.path.basename(a.model)}: {u} units over {T} steps, {w['fc_w'].shape[1]} classes (trained test top-1 {100 * float(w['meta_test_top1']):.1f}%); "
-        f"{a.batch} test heartbeats (seed {a.seed}); {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} tier {a.tier}")
-    log("golden: the model on the CPU in float64; hardware run: the gates (sigmoid), candidate (tanh) and cell tanh on the lanes behind the mesh each step, the classifier as a linear job; "
-        "Hadamard products and the cell update on the host")
+    fmt = getattr(sim, "fmt_name", "fp32")
+    source = f"{a.lstm_batch} ECG5000 test heartbeats (seed 7) as one inference; golden: the model on the CPU in float64"
+    log(f"\n== lstm (lstm_ecg5000: {u} units over {T} steps, {w['fc_w'].shape[1]} classes, trained test top-1 {100 * float(w['meta_test_top1']):.1f}%), inputs: {source}")
+    log("  hardware run: the gates (sigmoid), candidate (tanh) and cell tanh on the lanes behind the mesh each step, the classifier as a linear job; Hadamard products and the cell update on the host")
     ref_run = lambda job, tag: (job_reference(job)[0] if job["act"] == "linear" else _true_act(job_reference(job)[0], job["act"])).astype(np.float32)
     ref = lstm_forward(w, X, ref_run, a.tier)
     ref_top = np.argmax(ref["logits"], axis=1)
-    log(f"  CPU golden: top-1 right on {int(np.sum(ref_top == y))} of {a.batch} heartbeats")
-    if a.no_sim:
-        log("LSTM GATE: not run (--no-sim: float reference only)")
-        return
-    sim = RtlLayer(a.n, a.lanes, a.work, a.fmt_name, a.tile_size)
-    t0 = time.time()
-    sim.build()
-    log(f"built TB_sienna (layer) in {time.time() - t0:.0f} s")
-    stats, fails = [], []
+    desc = f"{a.lstm_batch} heartbeats"
+    log(f"  inference on {desc}; CPU golden: top-1 right on {int(np.sum(ref_top == y))} of {a.lstm_batch}")
+    if sim is None:
+        return [{"input": desc, "ref_right": int(np.sum(ref_top == y))}], source
+    stats, g = [], {"hw": [], "task": [], "reported": [], "bad_layers": [], "rep_key": None, "task_line": ""}
 
     def run(job, tag):
         yv, st = run_checked(job, sim, tag)
         st = dict(st, act=job["act"])
         stats.append(st)
-        b = layer_bound(a.fmt_name, job["act"], job.get("tier", 0))
-        if not st["err"] <= b:
-            fails.append(f"FAIL job {tag}: max|hw-ref|/max|ref| {st['err']:.2e} above {b:g}")
+        b_ = layer_bound(fmt, job["act"], job.get("tier", 0))
+        if not st["err"] <= b_:
+            g["hw"].append(f"FAIL hardware lstm [{desc}] {tag}: max|hw-ref|/max|ref| {st['err']:.2e} above {b_:g}")
+            g["bad_layers"].append(tag)
         if tag.startswith("t000.") or tag == "fc":  # the first step's three jobs and the classifier in full; the rest summed below
             rec = st["exact"]
             log(f"    {tag:<10} {str(tuple(job['shape'])):<10} K {job['terms'][0][1].shape[0]:3d} {job['act']:<7} sets {st['sets']:4d}  cycles {st['cycles']:6d}  "
@@ -3061,37 +3017,34 @@ def lstm_main(argv=None):
     kinds = {}
     for st in stats:
         k = st["tag"].split(".")[-1] if "." in st["tag"] else st["tag"]
-        d = kinds.setdefault(k, [0, 0, 0.0])
-        d[0] += st["cycles"]
-        d[1] += 1
-        d[2] = max(d[2], st["err"])
+        dd = kinds.setdefault(k, [0, 0, 0.0])
+        dd[0] += st["cycles"]; dd[1] += 1; dd[2] = max(dd[2], st["err"])
     for k, (cy, n, e) in kinds.items():
-        log(f"  {k:<6} {n:4d} jobs {cy:8d} cycles  worst job err {e:.2e}")
+        log(f"    {k:<6} {n:4d} jobs {cy:8d} cycles  worst job err {e:.2e}")
     dl = float(np.max(np.abs(hw["logits"].astype(np.float64) - ref["logits"]))) / (float(np.max(np.abs(ref["logits"]))) or 1.0)
     dh = float(np.max(np.abs(hw["h"] - ref["h"]))) / (float(np.max(np.abs(ref["h"]))) or 1.0)
     macs = sum(st["macs"] for st in stats)
-    log(f"  result: hardware top-1 agrees with the CPU golden on {agree} of {a.batch} heartbeats (right on {int(np.sum(hw_top == y))}, golden {int(np.sum(ref_top == y))}); "
-        f"final hidden state max|hw-golden|/max|golden| {dh:.2e}, logits {dl:.2e}")
-    log(f"  {len(stats)} jobs  {sets} sets  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed) for {a.batch} heartbeats = {cyc / a.batch / 950e3 * 1e3:.2f} us each  "
-        f"{macs} MACs  MAC-slot use {100 * macs / (sets * a.n ** 3):.1f}%  wall {time.time() - t0:.0f} s")
     diff = np.flatnonzero(hw_top != ref_top)
-    tie = tie_within_bound(ref["logits"], a.fmt_name)
+    tie = tie_within_bound(ref["logits"], fmt)
     for i in diff:
         s_ = np.sort(ref["logits"][i].astype(np.float64))
-        log(f"  heartbeat {i}: hardware class {hw_top[i]}, golden {ref_top[i]} (label {y[i]}); the golden's top two logits differ by {s_[-1] - s_[-2]:.4f}"
+        log(f"    heartbeat {i}: hardware class {hw_top[i]}, golden {ref_top[i]} (label {y[i]}); the golden's top two logits differ by {s_[-1] - s_[-2]:.4f}"
             f" = {(s_[-1] - s_[-2]) / float(np.max(np.abs(ref['logits']))):.4f} of max |logit|" + (" (a tie within the format's bound)" if tie[i] else ""))
     gated = [i for i in diff if not tie[i]]
+    g["task_line"] = f"top-1 agrees with the golden on {agree} of {a.lstm_batch} heartbeats (right on {int(np.sum(hw_top == y))}, golden {int(np.sum(ref_top == y))})"
     if a.tier == 0 and gated:
-        fails.append(f"FAIL task: top-1 differs from the CPU golden on {len(gated)} of {a.batch} heartbeats at tier 0 beyond a tie within the {a.fmt_name} bound")
+        g["task"].append(f"FAIL task lstm [{desc}]: top-1 differs from the CPU golden on {len(gated)} heartbeats beyond a tie within the {fmt} bound")
     elif diff.size:
-        log(f"  reported, not gated: top-1 differs from the golden on {diff.size} heartbeats" + (f" at tier {a.tier}" if a.tier else f", each a tie within the {a.fmt_name} bound"))
-    for m in fails:
-        log(m)
-    log(f"\nreport {report}")
-    log(f"LSTM GATE: {'PASS' if not fails else 'FAIL'}  {a.fmt_name} N={a.n} T={a.tile_size} lanes={a.lanes} tier={a.tier} batch={a.batch}: {len(stats)} jobs, {sets} sets, "
-        f"{cyc} cycles; top-1 agreement {agree}/{a.batch}; {len(fails)} failures")
-    if fails:
-        sys.exit(1)
+        g["reported"].append(f"lstm [{desc}]: top-1 differs from the golden on {diff.size} heartbeats" + (f" (reported, not gated: the lanes ran at tier {a.tier})" if a.tier else f" (reported, not gated: each a tie within the {fmt} bound)"))
+    r = {"input": desc, "cycles": cyc, "sets": sets, "macs": macs, "layers": stats, "agree": agree, "hw_right": int(np.sum(hw_top == y)), "ref_right": int(np.sum(ref_top == y)),
+         "hidden_err": dh, "logits_err": dl, "wall_s": time.time() - t0, "gate": g}
+    log(f"  result: {g['task_line']}; final hidden state max|hw-golden|/max|golden| {dh:.2e}, logits {dl:.2e}  {cyc} cycles = {cyc / 950e3:.3f} ms @950 MHz (assumed) "
+        f"= {cyc / a.lstm_batch / 950:.2f} us per heartbeat  {sets} sets  {macs} MACs  wall {r['wall_s']:.0f} s")
+    log(f"  gate: hardware {'PASS' if not g['hw'] else 'FAIL'} ({len(stats)} jobs, each within its tier's bound)  task {'PASS' if not g['task'] else 'FAIL'} ({g['task_line']})")
+    for m in g["hw"] + g["task"] + g["reported"]:
+        log(f"    {m}")
+    tally_add(tally, "lstm", g, len(stats))
+    return [r], source
 
 
 def main():
@@ -3099,11 +3052,7 @@ def main():
     pre.add_argument("--action", choices=ACTIONS, default="model")
     pre.add_argument("--pack", action="store_true")
     a, rest = pre.parse_known_args()
-    if a.action == "bert":
-        bert_main(rest)
-    elif a.action == "lstm":
-        lstm_main(rest)
-    elif a.action == "model":
+    if a.action == "model":
         (model_pack_main if a.pack else model_main)(rest)
     else:
         (tflite_pack_main if a.pack else tflite_main)(rest)

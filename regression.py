@@ -2112,6 +2112,7 @@ def pack_main(argv=None):
     ap.add_argument("--rows", type=int, nargs="+", default=[2], help="row tiles per packed layer; several run in turn")
     ap.add_argument("--format", dest="fmt", default="int8", choices=sorted(mr.FORMATS))
     ap.add_argument("--act", choices=sorted(set(ACTS)), help="every entry holds this activation (a same-activation cycle sweep); default the mixed table")
+    ap.add_argument("--model-dir", default="", help="the MLPerf Tiny models: at N >= 32 in fp32 or bf16 their packable layers run packed and alone (model_runner.model_pack_run)")
     a = ap.parse_args(argv)
     a.acts = [a.act] * 8 if a.act else ACTS
     work = os.path.join(ROOT, "testbenches", "results", "pack")
@@ -2127,6 +2128,8 @@ def pack_main(argv=None):
         if a.fmt != "int8":
             bad += run_case(a, sim, a.n, 2, a.rows[0], 990, log, zero_rows=True)  # Review Focus 3: signed zeros
         bad += run_models(a, sim, log)
+        if a.n >= 32 and a.fmt != "int8" and a.model_dir and os.path.isdir(a.model_dir):  # real layers of different models in one set (nothing packs below N = 32)
+            bad += mr.model_pack_run(sim, a.model_dir, a.fmt, log)
     tail = f"PACK REGRESSION {'PASS' if bad == 0 else 'FAIL'}: {bad} mismatching outputs"
     print(tail, flush=True)
     log.write(tail + "\n")
@@ -4639,7 +4642,7 @@ def test_default_point():
 @selftest
 def test_pack_target():
     r = make_n("pack", "FMT=bf16", "N=32", "TILE=8", "LANES=64", "PYTHON=py")
-    assert r.returncode == 0 and r.stdout.split() == "py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64".split(), r.stdout + r.stderr
+    assert r.returncode == 0 and r.stdout.split() == f"py regression.py --action pack --format bf16 --n 32 --tile 8 --lanes 64 --model-dir {ROOT}/models".split(), r.stdout + r.stderr
     r = make_n("pack", "FMT=fp16")
     assert r.returncode != 0 and "FMT=fp16: not one of" in r.stderr, r.stderr
 
@@ -5679,8 +5682,9 @@ def test_bert_forward_matches_direct():
 
 
 @selftest
-def test_bert_main_reference_only():
-    with tempfile.TemporaryDirectory() as d:  # --no-sim on a toy checkpoint: loads, tokenizes, reports the [MASK] prediction, no gate
+def test_bert_as_a_model_reference_only():
+    with tempfile.TemporaryDirectory() as d:  # make model MODELS=bert --no-sim on a toy checkpoint under <model-dir>/bert_tiny: loads, tokenizes, reports the [MASK] prediction
+        os.makedirs(os.path.join(d, "bert_tiny"))
         w = _bert_toy(np.random.default_rng(3), seq=16)
         hdr, blobs, off = {}, [], 0
         for k, v in w.items():
@@ -5688,15 +5692,16 @@ def test_bert_main_reference_only():
             blobs.append(v.astype("<f4").tobytes())
             off += v.nbytes
         h = json.dumps(hdr).encode()
-        open(os.path.join(d, "model.safetensors"), "wb").write(struct.pack("<Q", len(h)) + h + b"".join(blobs))
-        json.dump({"num_attention_heads": 2, "num_hidden_layers": 2, "hidden_size": 8, "intermediate_size": 16, "vocab_size": 20}, open(os.path.join(d, "config.json"), "w"))
-        open(os.path.join(d, "vocab.txt"), "w").write("\n".join(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "play", "##ing", "##s", ".", ",", "un", "##wanted"]
-                                                                 + [f"w{i}" for i in range(7)]) + "\n")
+        open(os.path.join(d, "bert_tiny", "model.safetensors"), "wb").write(struct.pack("<Q", len(h)) + h + b"".join(blobs))
+        json.dump({"num_attention_heads": 2, "num_hidden_layers": 2, "hidden_size": 8, "intermediate_size": 16, "vocab_size": 20}, open(os.path.join(d, "bert_tiny", "config.json"), "w"))
+        open(os.path.join(d, "bert_tiny", "vocab.txt"), "w").write("\n".join(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "play", "##ing", "##s", ".", ",", "un", "##wanted"]
+                                                                              + [f"w{i}" for i in range(7)]) + "\n")
+        assert mr.missing_inputs("bert", d)[0] == [] and mr.missing_inputs("lstm", d)[0] == ["lstm_ecg5000.npz", "ecg5000/ECG5000_TEST.txt"]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            mr.bert_main(["--bert-dir", d, "--no-sim", "--seq", "16", "--text", "the plays [MASK] .", "--work", os.path.join(d, "work")])
+            mr.model_main(["--models", "bert", "--model-dir", d, "--no-sim", "--bert-seq", "16", "--count", "1", "--work", os.path.join(d, "work")])
         out = buf.getvalue()
-        assert "CPU golden (float64): [MASK] ->" in out and "BERT GATE: not run" in out, out
+        assert "== bert (bert_tiny: 2 layers" in out and "CPU golden: [MASK] ->" in out and "MODEL GATE: not run" in out, out
 
 
 @selftest

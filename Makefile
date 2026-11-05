@@ -16,9 +16,13 @@ PYTHON ?= python3
 MODEL_DIR ?= $(PRJ_DIR)/models
 # Inferences per model in make model; make regression runs 3.
 MODEL_COUNT ?= 1
-# The models make model runs (names in model_runner.MODELS); selu is the SELU convnet make selu-model trains, and TIER its lanes' accuracy tier (0: 1%, 1: 5%, 2: 10%).
-MODELS ?= resnet8,ad01,kws,vww
+# The models make model runs (names in model_runner.MODELS): the four MLPerf Tiny models, selu (the SELU convnet make selu-model trains), bert (BERT-Tiny,
+# models/fetch_bert_tiny.sh) and lstm (the ECG5000 LSTM make lstm-model trains); a model whose files are absent is skipped by name. TIER is the lanes'
+# accuracy tier (0: 1%, 1: 5%, 2: 10%); BERT_SEQ the tokens per sentence, LSTM_BATCH the heartbeats per inference. FMT=int8 runs the MLCommons int8 models.
+MODELS ?= resnet8,ad01,kws,vww,selu,bert,lstm
 TIER ?= 0
+BERT_SEQ ?= 128
+LSTM_BATCH ?= 64
 # make regression: SMALL=1 runs N = 8 and 16 only; REG_DIR holds one result (.log, .json) per point and the table.
 SMALL ?= 0
 QUICK ?= 0
@@ -295,11 +299,8 @@ help:
 	@echo "  make regression SMALL=1           - every test at N = 8 and 16 (FMT=<f> narrows it to one format)"
 	@echo "  make regression                   - every test at N = 8 to 64 (use make -jN; see the README for memory)"
 	@echo "  make regression/<point>           - one point, e.g. regression/bf16/N8_T2/pipeline (python3 regression.py --action points lists them)"
-	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the four MLPerf Tiny models on the RTL (fp32, bf16; FMT=int8 runs the MLCommons int8 models)"
-	@echo "  make model MODELS=selu TIER=1     - the SELU CIFAR-10 convnet with the lanes at tier 0, 1 or 2 (make selu-model trains it: TensorFlow)"
-	@echo "  make lstm TIER=0 [LSTM_BATCH=64]  - the ECG5000 LSTM classifier: gates and tanh on the lanes each step (make lstm-model trains it)"
-	@echo "  make bert [BERT_SEQ=128 BERT_TIER=0] - BERT-Tiny's encoder on the RTL (fp32 or bf16; models/fetch_bert_tiny.sh first)"
-	@echo "  make model-pack N=64 LANES=128    - layers of different MLPerf Tiny models in one packed set (fp32 or bf16)"
+	@echo "  make model FMT=bf16 [MODEL_DIR=d] - the models end to end on the RTL: the four MLPerf Tiny models, the SELU convnet, BERT-Tiny, the ECG5000 LSTM"
+	@echo "       MODELS=a,b,.. TIER=0|1|2       (fp32, bf16; FMT=int8 runs the MLCommons int8 models; BERT_SEQ=, LSTM_BATCH=; make selu-model and lstm-model train the two)"
 	@echo "  make verilator [TRACE=fst|vcd]    - one simulation of TB_sienna at FMT, N, TILE, LANES"
 	@echo "  make vcs                          - the same on Synopsys VCS; SIM=vcs runs make regression on VCS (README: Running with VCS)"
 	@echo "  make wave                         - open the last waveform"
@@ -555,6 +556,8 @@ model:
 		--format $(FMT) \
 		--collapse-k $(COLLAPSE_K) \
 		--count $(MODEL_COUNT) \
+		--bert-seq $(BERT_SEQ) \
+		--lstm-batch $(LSTM_BATCH) \
 		--models $(MODELS) \
 		--tier $(TIER)
 
@@ -567,37 +570,6 @@ SELU_EPOCHS ?= 30
 lstm-model:
 	$(PYTHON) regression.py --action lstm-model $(MODEL_DIR) --epochs $(LSTM_EPOCHS)
 LSTM_EPOCHS ?= 60
-LSTM_BATCH ?= 64
-lstm:
-	@[ -f "$(MODEL_DIR)/lstm_ecg5000.npz" ] || { echo "ERROR: make lstm needs $(MODEL_DIR)/lstm_ecg5000.npz (make lstm-model)"; exit 1; }
-	$(PYTHON) scripts/model_runner.py --action lstm --model $(MODEL_DIR)/lstm_ecg5000.npz --data $(MODEL_DIR)/ecg5000/ECG5000_TEST.txt \
-		--n $(N) --tile-size $(TILE) --lanes $(LANES) --format $(FMT) --collapse-k $(COLLAPSE_K) --tier $(TIER) --batch $(LSTM_BATCH)
-
-# Layers of different MLPerf Tiny models in one packed set, with a real inference's activations (fp32 or bf16); N = 64 needs LANES=64 or 128.
-model-pack:
-	@[ -n "$(MODEL_DIR)" ] || { echo "ERROR: make model-pack needs MODEL_DIR=<directory of the .tflite models> (its default is models/)"; exit 1; }
-	$(PYTHON) scripts/model_runner.py --action model --pack \
-		--model-dir $(MODEL_DIR) \
-		--n $(N) \
-		--tile-size $(TILE) \
-		--lanes $(LANES) \
-		--format $(FMT)
-
-# BERT-Tiny's encoder on the layer contract (fp32 or bf16): models/bert_tiny from models/fetch_bert_tiny.sh, or BERT_DIR=<d>.
-BERT_DIR ?= $(PRJ_DIR)/models/bert_tiny
-BERT_SEQ ?= 128
-BERT_TIER ?= 0
-bert:
-	@[ -f "$(BERT_DIR)/model.safetensors" ] || { echo "ERROR: make bert needs $(BERT_DIR)/model.safetensors (run models/fetch_bert_tiny.sh, or BERT_DIR=<d>)"; exit 1; }
-	$(PYTHON) scripts/model_runner.py --action bert \
-		--bert-dir $(BERT_DIR) \
-		--n $(N) \
-		--tile-size $(TILE) \
-		--lanes $(LANES) \
-		--format $(FMT) \
-		--collapse-k $(COLLAPSE_K) \
-		--seq $(BERT_SEQ) \
-		--tier $(BERT_TIER)
 
 # GEMM shape sweep on sienna_top's layer contract, built at N, TILE and LANES.
 gemm:
@@ -649,7 +621,7 @@ multi:
 
 # Packed layers against each job alone on sienna_top's layer contract (regression.py --action pack), in FMT at N, TILE and LANES.
 pack:
-	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES)
+	$(PYTHON) regression.py --action pack --format $(FMT) --n $(N) --tile $(TILE) --lanes $(LANES) --model-dir $(MODEL_DIR)
 
 # add_lanes on regression.py --action add-vectors: fails unless the log has RESULT: PASSED and no error or failed assertion (patterns bracketed against make's echo), then gates its outputs on the true function
 ADDL_DIR = $(if $(filter vcs,$(SIM)),$(VCS_DIR),$(VERILATOR_DIR))/add_lanes
@@ -727,6 +699,6 @@ clean-all: clean
 	-$(MAKE) -C GPNAE clean 2>/dev/null || true
 	@echo "-- Deep clean complete"
 
-.PHONY: default help help-debug verilator vcs bert model-pack selu-model lstm-model lstm \
+.PHONY: default help help-debug verilator vcs selu-model lstm-model \
         wave lint debug perf list-files check-files clean clean-all \
         gen-matmul gen-conv pipeline pkg pkg-geometry model gemm perf-analysis tflite residual pack multi idle-fault coef-fault check-fmt check-hier add-lanes rq-lanes regression regression-summary sim build-key

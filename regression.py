@@ -2129,7 +2129,8 @@ def pack_main(argv=None):
             bad += run_case(a, sim, a.n, 2, a.rows[0], 990, log, zero_rows=True)  # Review Focus 3: signed zeros
         bad += run_models(a, sim, log)
         if a.n >= 32 and a.fmt != "int8" and a.model_dir and os.path.isdir(a.model_dir):  # real layers of different models in one set (nothing packs below N = 32)
-            bad += mr.model_pack_run(sim, a.model_dir, a.fmt, log)
+            say = lambda line: (print(line, flush=True), log.write(line + "\n"))  # pack_main's log is a file; model_pack_run takes a function
+            bad += mr.model_pack_run(sim, a.model_dir, a.fmt, say)
     tail = f"PACK REGRESSION {'PASS' if bad == 0 else 'FAIL'}: {bad} mismatching outputs"
     print(tail, flush=True)
     log.write(tail + "\n")

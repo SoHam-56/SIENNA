@@ -138,7 +138,7 @@ git -C GPNAE/ArithmeticLibrary remote set-url --push origin git@github.com:SoHam
 git submodule status; for d in . GPNAE SystolicMesh SystolicMesh/ArithmeticLibrary GPNAE/ArithmeticLibrary; do echo "$d: $(git -C $d rev-parse --abbrev-ref HEAD) $(git -C $d rev-parse --short HEAD)"; done
 ```
 
-Expected: every repo on `int8`, at the commits the `bf16` branch pins (SIENNA cf14921 or later, SystolicMesh e6fa73c, GPNAE 41cad2d, AriL d97e270). Push the new branches: AriL first (`git -C SystolicMesh/ArithmeticLibrary push -u origin int8`), then GPNAE and SystolicMesh, then SIENNA; check each.
+Expected: every repo on `int8`, at the commits the `bf16` branch pins (SIENNA 7a13a93 or later, SystolicMesh e6fa73c, GPNAE 41cad2d, AriL d97e270). Push the new branches: AriL first (`git -C SystolicMesh/ArithmeticLibrary push -u origin int8`), then GPNAE and SystolicMesh, then SIENNA; check each.
 
 - [ ] **Step 3: Install TensorFlow into the job venv**
 

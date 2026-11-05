@@ -8,16 +8,16 @@ description: Use when running, changing or extending SIENNA's Python tooling - t
 
 # SIENNA tooling: two scripts
 
-**Status: implemented and verified 2026-10-05 on branch `tooling` (SIENNA only; not pushed), gated tree 7b711bd
-(b396aeb..7b711bd; the commit after it changes only this skill). Final gate `tlf_*` (`sienna_report/tooling_gate.log`):
+**Status: implemented and verified 2026-10-05 on branch `tooling` (SIENNA only; not pushed), gated tree 0dd422e
+(666f660..0dd422e; the commit after it changes only this skill). Final gate `tlf_*` (`sienna_report/tooling_gate.log`):
 all 106 packing-gate configurations identical to `pkf_*`. Follow-ups the same day (Soham: "go with option 2, and do the
-layering now"): model_runner laid out in eight layered sections (2a88978) and `make check` passing in fp32, bf16 and
-int8 at 972464c, bf16 accuracy reported, not gated (see Gate).** Design approved 2026-10-05 (Soham:
+layering now"): model_runner laid out in eight layered sections (c745253) and `make check` passing in fp32, bf16 and
+int8 at b91e5b0, bf16 accuracy reported, not gated (see Gate).** Design approved 2026-10-05 (Soham:
 "keep submodule scripts, delete old ones, go ahead"). Soham asked for exactly two
 Python scripts in SIENNA: one for hardware sanity, one that runs models and stands as the reference host software a
 software team builds its own layer from ("this model runner is supposed to be the compiler").
 
-## Before the move (main b1cfacb)
+## Before the move (main ce45981)
 
 17 tracked Python files at the SIENNA root and one under testbenches/, about 4,700 lines:
 
@@ -206,8 +206,8 @@ driver needs.
 ## As built (2026-10-05)
 
 Commits on `tooling` (SIENNA; the submodules are untouched: SystolicMesh b1a2c31, GPNAE 0d407a7, AriL cb46ced):
-d49a829 (TB_sienna_layer -> TB_sienna (layer)), 3cc5675 (Task 1), 21fbc8f (Task 2), 3217ed7 and 3584a1f (Task 3), ff91381
-(Task 4), fb68726 (comments) and the skill commits. The only tracked Python outside the submodules is `model_runner.py`
+5b8586e (TB_sienna_layer -> TB_sienna (layer)), 095281c (Task 1), 6134b61 (Task 2), bf45754 and 1442233 (Task 3), b0563b8
+(Task 4), b4bb397 (comments) and the skill commits. The only tracked Python outside the submodules is `model_runner.py`
 (1,349 lines) and `regression.py` (3,017 lines); the check is the global-constraints command in the implementation plan.
 The plan ledger (`.superpowers/sdd/implementation-plan-sienna-tooling/progress.md`) has the full record.
 
@@ -243,7 +243,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 
 ### Departures from the design above, each with its reason
 
-1. **model_runner has eight sections, not six** (2a88978, after the plan's tasks): a contents block, then 1 Numerics,
+1. **model_runner has eight sections, not six** (c745253, after the plan's tasks): a contents block, then 1 Numerics,
    2 Frontend, 3 Middle end, 4 Device protocol, 5 Device build, 6 Backends, 7 Runtime (`execute`, `macs_of`), 8 CLI.
    The build package and the graph executor fit none of the six layers. The device protocol is `write_layer` (moved
    out of `RtlLayer.run_job`) and `read_outputs` for TB_sienna (layer), plus `write_sets` for TB_sienna (sets).
@@ -275,7 +275,7 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 9. **`--action all`'s verdict per step** is the exit status plus a scan for `Assertion failed` / `%Error` in the step's
    log; logs go to `testbenches/results/check/`. It follows GPNAE's own contract: the int8 sigmoid accuracy shortfall
    is printed "reported, not gated", so `make check` passes with it (an open int8 item, not a tooling one). In bf16
-   (f10f49d, fixed in 972464c) GPNAE is two steps: `gpnae-verilator` with `GPNAE_MODEL=hw` (bit-exact against the
+   (d78b7db, fixed in b91e5b0) GPNAE is two steps: `gpnae-verilator` with `GPNAE_MODEL=hw` (bit-exact against the
    lane model, gated) and `gpnae-accuracy` (against the functions, in `REPORTED`: shown, not counted). fp32 keeps
    one gated accuracy step because gpnae_model's fp32 negative sigmoid does not match the RTL (`--model hw` fails 9 of
    10 patterns, sigmoid only, as `g11_hw32` did on 2026-09-28; a GPNAE item). The steps run without make check's own
@@ -298,20 +298,20 @@ Log and result file names did not change (`pack_regression_*.log`, `gemm_sweep_N
 Each task compared its flows on the farm with the final packing gate (`pkf_*`): regression words and cycles
 (`int8_cmp_reg.py`), pack, gemm, TFLite and model result lines, the perf report, rq-vectors, the oracle and pack-models
 files; all identical (task reports in the ledger directory). `tl4_check_int8` (`make check FMT=int8 N=16 TILE=4`) passed
-every step. The final gate reran the packing gate's list with prefix `tlf_` on 7b711bd (snapshot from clean tracked trees) and
+every step. The final gate reran the packing gate's list with prefix `tlf_` on 0dd422e (snapshot from clean tracked trees) and
 is recorded in `sienna_report/tooling_gate.log` (a new file beside `packing_gate.log`, which stays the packing record;
 summary by `sienna_jobs/tlf_gate_summary.py`, launcher `sienna_jobs/tlf_msgs/`). 108 of 109 runs pass:
 - All 106 `pkf_` configurations pass and are identical to their `pkf_` run: regression words and cycles at N = 8, 16
   (T = 2-16) and 32 and collapse-k 0, the mesh sweeps, the unit benches, `make pack` at every N / T and format and the
   8 `--act` sweeps, the TFLite single-layer and packed runs, gemm, the four lints, `make model`, `--engine sets` and
   TB_sienna (copies). The only text difference is the int8 pack log's info line naming `model_runner.py --action tflite
-  --pack` instead of `tflite_pack_run.py` (21fbc8f).
+  --pack` instead of `tflite_pack_run.py` (6134b61).
 - `make check` passes in fp32 (6 of 6 steps) and int8 (7 of 7); its regression, pack and tflite match the pkf runs.
-- `make check FMT=bf16` failed at `gpnae-verilator` on 7b711bd: GPNAE's regression gates bf16 accuracy against the
+- `make check FMT=bf16` failed at `gpnae-verilator` on 0dd422e: GPNAE's regression gates bf16 accuracy against the
   exact functions at 6.25% and gets tanh 8.59% worst (sigmoid 7.22%), the open item in `sienna-uniform-format`.
   The lane is bit-exact against its model (`tlf_x_gpnae_bf16_hw`, `--model hw`: 7200 of 7200). Soham chose to report
   it, not gate it (2026-10-05); departure 9 has how.
-- Follow-up gate on 972464c (`tlh_check_*`, `make check N=16 TILE=4`): fp32 6 of 6, bf16 6 of 6 gated with
+- Follow-up gate on b91e5b0 (`tlh_check_*`, `make check N=16 TILE=4`): fp32 6 of 6, bf16 6 of 6 gated with
   `gpnae-accuracy` reported (worst 8.59% against 6.25%, unchanged; bit-exact step 0.0000%), int8 7 of 7. Each run's
   regression words and cycles, pack log and (int8) TFLite lines are identical to the `pkf_` runs.
 - /proj/work was at its quota during the gate, so the run outputs live on `/proj/scratch/spramanik/sienna_tlf`,

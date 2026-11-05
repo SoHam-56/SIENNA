@@ -1,6 +1,6 @@
 SIENNA PERFORMANCE (perf, collapse-k 0, models, packing)                                                                     2026-11-01
 ======================================================================================================================================================
-RTL: SIENNA f2ab4e8 and later (RTL and benches unchanged by the perf tooling), GPNAE 76eeb59, SystolicMesh dbb0e3b, ArithmeticLibrary bc90a93.
+RTL: SIENNA 439f56d and later (RTL and benches unchanged by the perf tooling), GPNAE 76eeb59, SystolicMesh dbb0e3b, ArithmeticLibrary bc90a93.
 Clock: 950 MHz ASSUMED (the frequency the published TYTAN engine reached); no timing run has shown it for SIENNA.
 Source: make perf-analysis (regression.py --action perf) for ReLU no pool, SELU, sigmoid and tanh, 24 streamed sets each, every N and power-of-2
         tile size, fp32 / bf16 / int8, collapse-k 1 and 0; N >= 32 built at -O0; lanes 32 up to N = 32, 128 at N = 64.
@@ -12,7 +12,7 @@ Labels: cps = cycles per set, MEASURED (mean of the last 12 output intervals); l
         (none in these configs) and coefficient loads (none: the pipeline keeps the reset image), and the output words the TB received; each count
         times its link's width from the RTL package. GB/s = bytes per set / (cps / 950 MHz), DERIVED: the sustained bandwidth that keeps the
         measured cycles per set.
-References (collapse-k 1): B = the Phase 2 tree (a81ff7e's RTL, N = 8 and 16 only); base = main up to 9fa414e (at N = 8, 16; earlier sweeps at N = 32 T = 4 and N = 64 T = 2, 4, 8; no sigmoid). bf16 sigmoid is compared with B only (the base
+References (collapse-k 1): B = the Phase 2 tree (ab8ff79's RTL, N = 8 and 16 only); base = main up to 6e99e3a (at N = 8, 16; earlier sweeps at N = 32 T = 4 and N = 64 T = 2, 4, 8; no sigmoid). bf16 sigmoid is compared with B only (the base
         tree's bf16 sigmoid failed the 1% gate). new/B, new/base < 1 = fewer cycles.
 
 1. COLLAPSE-K 1 =====================================================================================================================================

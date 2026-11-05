@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- fp32 and int8 builds: outputs identical to main `c05c332` (words compared with `$J/cr_msgs/task5a/t5_cmp.py` against the merged-tree runs `mc_gate_{fp32,int8}`; mesh results against `crb_sm16_*`, `crb_sm8g_*`), and cycle counts identical.
+- fp32 and int8 builds: outputs identical to main `32fed2b` (words compared with `$J/cr_msgs/task5a/t5_cmp.py` against the merged-tree runs `mc_gate_{fp32,int8}`; mesh results against `crb_sm16_*`, `crb_sm8g_*`), and cycle counts identical.
 - bf16 builds: mesh, host, pack, GEMM and model-layer cycle counts identical to main (fpMulWiden 3 = today's `mul_lat(8,7)`, fp32 adder 5 = `add_lat`, U = 6); activation-limited polynomial-lane streams (tanh, SELU, sigmoid) may move, because `gpnae_tail`'s cycles depend on the values the mesh gives (reworded by Ruling 3, 2026-10-09); outputs change and are checked bit-exactly against the updated models.
 - GPNAE (lanes, `gpnae.sv`, GPNAE math) unchanged; the lanes keep taking `DATA_WIDTH` (bf16) words.
 - Narrowing: round to nearest even; NaN -> the format's canonical qNaN (`fpu.Fmt.qnan`, 7FC0 in bf16); infinity kept; an fp32 input with exponent field 0 (zero or subnormal) -> signed zero; rounding up past the largest finite gives infinity.
@@ -38,8 +38,8 @@
 
 **Files:** none in git. Farm scripts under `$J/cr_msgs/bf16acc/`.
 
-- [ ] Create branch `bf16_accum` in ArithmeticLibrary (SystolicMesh/ArithmeticLibrary and GPNAE/ArithmeticLibrary, the same repo), GPNAE and SystolicMesh, from their current main (AriL 07c6430, GPNAE b1ef12d, SystolicMesh 3fd3ef6). SIENNA's `bf16_accum` exists (spec commit 4772096 on main c05c332).
-- [ ] Baselines on main RTL (launch from the current tree before any change; names `ba0_*`): mesh regression bf16 at N 8 (`$J/cmds/mesh_notrace.sh reg 8 bf16 1 --group matmul`), N 16 (`$J/cmds/mk.sh sm-verilator FMT=bf16 N=16 PYTHON=$J/venv/bin/python`), N 32 T 4; `make gemm FMT=bf16` (full, not QUICK, for the error-vs-K table) and `make gemm FMT=fp32 QUICK=1`; model sweep bf16 N 16 (`$J/cmds/model_sweep.sh 16 4 bf16 32`). fp32/int8 baselines: `mc_gate_{fp32,int8}` (main c05c332), `crb_sm16_*`, `crb_sm8g_*`.
+- [ ] Create branch `bf16_accum` in ArithmeticLibrary (SystolicMesh/ArithmeticLibrary and GPNAE/ArithmeticLibrary, the same repo), GPNAE and SystolicMesh, from their current main (AriL 07c6430, GPNAE b1ef12d, SystolicMesh 3fd3ef6). SIENNA's `bf16_accum` exists (spec commit 5c85902 on main 32fed2b).
+- [ ] Baselines on main RTL (launch from the current tree before any change; names `ba0_*`): mesh regression bf16 at N 8 (`$J/cmds/mesh_notrace.sh reg 8 bf16 1 --group matmul`), N 16 (`$J/cmds/mk.sh sm-verilator FMT=bf16 N=16 PYTHON=$J/venv/bin/python`), N 32 T 4; `make gemm FMT=bf16` (full, not QUICK, for the error-vs-K table) and `make gemm FMT=fp32 QUICK=1`; model sweep bf16 N 16 (`$J/cmds/model_sweep.sh 16 4 bf16 32`). fp32/int8 baselines: `mc_gate_{fp32,int8}` (main 32fed2b), `crb_sm16_*`, `crb_sm8g_*`.
 - [ ] Record in the ledger: the baseline run names, bf16 ad01 anomaly scores (expected about 2.7-2.8x the reference), GEMM bf16 error vs K.
 
 ### Task 1: ArithmeticLibrary: accumulator width split, fpNarrow, fpMulWiden reset, models

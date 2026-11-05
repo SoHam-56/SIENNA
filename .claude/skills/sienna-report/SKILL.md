@@ -22,7 +22,7 @@ the perf section's `events()`; was perf_analysis.py). Check the render with a he
 
 | # | Section | Data |
 |---|---|---|
-| 1 | How SIENNA got here: architecture changes, ready/valid to credits, GPNAE changes, day one against today | `report/journey.json` (curated from `journey.md`); day one measured from `sienna_jobs/dayone_tree` (SIENNA 0eeac7e + build fix e988875), runs `dayone_*` |
+| 1 | How SIENNA got here: architecture changes, ready/valid to credits, GPNAE changes, day one against today | `report/journey.json` (curated from `journey.md`); day one measured from `sienna_jobs/dayone_tree` (SIENNA 0eeac7e + build fix 6bc11a5), runs `dayone_*` |
 | 2 | Regressions: what each level tests; latency and throughput against N and tile size | g4 sweep runs `g4p_N*_T*_{fp32,bf16}` via `sienna_jobs/g4_table.py` |
 | 3 | Real models (MLPerf Tiny) for each N and tile size | runs `ms_N*_T*_{fp32,bf16}` (`cmds/model_sweep.sh`, `model_runner.py --tile-size`) |
 | 3b (2026-11-03) | Workloads beyond MLPerf Tiny: BERT-Tiny, the SELU CIFAR-10 convnet, the ECG5000 LSTM, real layers of different models packed; every tier and format | `docs/perf_final.txt` section 5 (`load_workloads()` in final_report.py; runs `bert2_*`, `selu_*`, `lstm_*`, `mpack_*`, and the `s5_r3_*` link-failure builds) |
@@ -45,7 +45,7 @@ The present-state report (final_report.py) has, beyond these: 5 packing; 6 "What
 - Tables and charts, highlights only; no dumps of every result. One consistent config per chart series.
 - Day-one comparisons use the same tests at the same N and T. Day one ran one set at a time, so its
   cycles per set are load + latency (a lower bound).
-- Accumulate configs: use `g4_table.py`'s values (perf_analysis, now `regression.py --action perf`, before f1cc285 mis-reported them).
+- Accumulate configs: use `g4_table.py`'s values (perf_analysis, now `regression.py --action perf`, before b9e96fa mis-reported them).
 
 ## history/
 

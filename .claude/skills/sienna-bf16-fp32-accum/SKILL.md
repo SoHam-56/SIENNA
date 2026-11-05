@@ -70,7 +70,7 @@ Measurements, each with its run: `sienna_report/bf16_accum_compare.log` (outside
 | ArithmeticLibrary (both clones) | f6a443b `acc_w` 32, `out_w`, `acc_exp_w`/`acc_man_w`, `widen`, `fpNarrow` + TB + `fpu.narrow`, `fpMulWiden` to D-8, `fpu.widen`/`mul_widen`; cce9105 review fixes (two more fpNarrow mutants, `fpu.narrow` masks to 32 bits, fpNarrow lint 0 warnings); a03aa29 `supported()` comment |
 | SystolicMesh | 5503185 TB_PE_pack made non-vacuous (on main's RTL); 9f01605 PE `fpMulWiden` + `fp32Adder`, reducer `fp32Adder` with `fpNarrow` at its write, `OUT_W`, fp32 `bias_i`, `mesh_model`, `stim_format`, new tests, AriL bump; a1bc0de review fixes (`mm_range_edge`, `mm_bias_special` wording, expect guard message, file list, `fp32_of` guard); 473285f AriL bump; 3903e03 README; fd0cc98 the regression runs the model checks first |
 | GPNAE | ddd8429, a812858: ArithmeticLibrary bumps only; lanes unchanged |
-| SIENNA | 9327b61 bias widened in `sienna_layer` and the TBs, `OUT_W` result link in `sienna_top`, width checks, goldens, `bf16_bias_special_linear_nopool`, tooling, bumps; 9e7df01 ad01 bf16 gated (`REPORTED` empty); 0341b75 bf16 layer bound 0.02, bf16 GEMM gated, bias check on the registered capture, `a_bias_widened`; 87d564e bumps (AriL a03aa29 everywhere); 88ef427 TB bias-check strings; 563c9af docs; final-review fixes 3803fec (model-check gate steps, SystolicMesh fd0cc98), d426a95 (`layer_bias_special`), e610ebd (LAYER_BOUND comment), then their docs commit |
+| SIENNA | b3c249b bias widened in `sienna_layer` and the TBs, `OUT_W` result link in `sienna_top`, width checks, goldens, `bf16_bias_special_linear_nopool`, tooling, bumps; 788241c ad01 bf16 gated (`REPORTED` empty); 2fb0b51 bf16 layer bound 0.02, bf16 GEMM gated, bias check on the registered capture, `a_bias_widened`; 1790f36 bumps (AriL a03aa29 everywhere); 461e369 TB bias-check strings; aced040 docs; final-review fixes 9f07cd7 (model-check gate steps, SystolicMesh fd0cc98), 276ae23 (`layer_bias_special`), 544e9b5 (LAYER_BOUND comment), then their docs commit |
 
 ### What was built
 
@@ -96,7 +96,7 @@ As designed, with the three approved decisions: narrow in the mesh at the reduce
 
 - Cycles: as Ruling 3 (the plan's Global Constraint and Task 4 bullet are reworded to match).
 - `sienna_layer`'s check is `$bits(bias_buf[0][0]) == sienna_fmt_pkg::acc_w(EXP_W, MAN_W)`: the plan's `$bits(bias_buf[0]) == ACC_W` was true by construction.
-- fp32 and int8 are compared with main c05c332's merged-tree runs (`mc_gate_*`, `crb_*`), the plan's reference, rather than `stage_credits_v6`.
+- fp32 and int8 are compared with main 32fed2b's merged-tree runs (`mc_gate_*`, `crb_*`), the plan's reference, rather than `stage_credits_v6`.
 - The bf16 GEMM error is gated (0.02), not only reported.
 - Accuracy against the estimates above: ad01's first layer 1.81e-03 to 2.27e-03 (estimate about 0.4%); its anomaly score within 2.24e-03 of the float model's (estimate "a few percent"); GEMM error 2.0e-03 to 3.6e-03 at every K up to 3072.
 

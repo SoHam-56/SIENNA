@@ -7,7 +7,7 @@ description: Use when designing, building or verifying SIENNA's multi-job packin
 
 # SIENNA: multi-job packing
 
-**Status: implemented and verified 2026-10-04 on the packing branch (gated tree SIENNA 8d7a4b2, SystolicMesh b1a2c31; the commit after it changes only this skill) at N = 8-32; N = 64 after check-in.**
+**Status: implemented and verified 2026-10-04 on the packing branch (gated tree SIENNA 1239fa7, SystolicMesh b1a2c31; the commit after it changes only this skill) at N = 8-32; N = 64 after check-in.**
 Spec approved 2026-10-04; "As built" at the end lists every deviation. The design before this work (2026-10-04) is tagged
 `three_formats_v4` in SIENNA and SystolicMesh and `three_formats_v2` in GPNAE.
 
@@ -152,10 +152,10 @@ Script and class names in this section are those of 2026-10-04; the `sienna-tool
 commands (`pack_regression.py` is `regression.py --action pack`, `tflite_pack_run.py` is
 `model_runner.py --action tflite --pack`, LayerSim is `RtlLayer`).
 
-Verified tree: SIENNA `packing` 8d7a4b2, SystolicMesh `packing` b1a2c31 (not pushed; GPNAE and ArithmeticLibrary
+Verified tree: SIENNA `packing` 1239fa7, SystolicMesh `packing` b1a2c31 (not pushed; GPNAE and ArithmeticLibrary
 unchanged). The final gate (`pkf_*`, `packing_gate.log` section 8) ran Task 9's full list on exactly those commits, after
-the final review's fixes; the commit after 8d7a4b2 changes only this skill. Earlier gates: Task 9 on efe2b68 (+ 935221f
-for collapse-k 0, `pkg_*`), Task 10 on 1d2cac8 (`pk10_*`). Run results in `sienna_jobs/runs`.
+the final review's fixes; the commit after 1239fa7 changes only this skill. Earlier gates: Task 9 on 9c95372 (+ db62a91
+for collapse-k 0, `pkg_*`), Task 10 on c1a146c (`pk10_*`). Run results in `sienna_jobs/runs`.
 
 Deviations from the plan, each with its reason (the plan ledger has the full rulings):
 
@@ -191,7 +191,7 @@ Deviations from the plan, each with its reason (the plan ledger has the full rul
 **Gate (all on the farm, N <= 32):** Task 9 launched 94 gate runs, 93 configurations plus `pkg_ck0b_16_int8`, the rerun
 of the one failure (`pkg_ck0_16_int8`, packed tests on collapse-k 0, deviation 11); 93 pass. Not counted there: the 8
 `pkg_perf_*` measurement runs and the 11 audit runs (`pkg_vacprobe`, `pkg_neg_*`). Task 10 added 12 `pk10_*` runs
-(`packing_gate.log` section 7 lists the three lints on one line). The final gate (section 8) is 106 runs on 8d7a4b2 +
+(`packing_gate.log` section 7 lists the three lints on one line). The final gate (section 8) is 106 runs on 1239fa7 +
 b1a2c31, all pass: Task 9's 93 configurations, the 8 perf sweeps, `make model FMT=bf16`, `model_runner --engine sets`
 (TB_sienna (sets)) and TB_sienna (copies) in three formats; each identical to Task 9's baseline and to Task 9's own run,
 the sets-engine and multi runs identical to the three_formats_v4 tree, `make model`'s first inference per model identical

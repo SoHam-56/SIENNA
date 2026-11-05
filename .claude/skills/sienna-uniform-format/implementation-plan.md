@@ -30,7 +30,7 @@
 
 ## Branches and file map
 
-All work continues on the existing `bf16` branches (AriL `bf16` at 7ad20b7, SystolicMesh `bf16` at 934d99b, SIENNA `bf16` at 55f3a8c). GPNAE gets a new `bf16` branch from `main` (f1482f4). The mixed-bf16 operand split already on these branches is reworked in place into one format.
+All work continues on the existing `bf16` branches (AriL `bf16` at 7ad20b7, SystolicMesh `bf16` at 934d99b, SIENNA `bf16` at 7878a24). GPNAE gets a new `bf16` branch from `main` (f1482f4). The mixed-bf16 operand split already on these branches is reworked in place into one format.
 
 | Repo | Create | Modify |
 |---|---|---|

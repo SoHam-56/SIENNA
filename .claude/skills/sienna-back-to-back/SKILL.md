@@ -223,7 +223,7 @@ stage controller processing it, not attached to every data word.
 Ordering is an invariant, not a mechanism: stages are in-order and each holds one
 set, so results emerge in issue order by construction. No reorder buffer.
 
-### Module boundaries as built (credit links, SIENNA branch `credits` at 3d66c57, 2026-10-07)
+### Module boundaries as built (credit links, SIENNA branch `credits` at 39db74d, 2026-10-07)
 
 Every module boundary is now one credit link (`credit_link_if`, from ArithmeticLibrary `src/credit`); no boundary uses ready/valid or valid-only handshakes any more.
 What still travels without its own credit: the row, cache-write and bias buses and `sienna_layer`'s int8 epilogue words, which ride beside a put that holds the credit, and `requant_lanes`' fixed-latency valid pipe inside the activation stage, which cannot stall.

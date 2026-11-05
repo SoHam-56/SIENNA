@@ -13,7 +13,7 @@ description: Use when building or verifying SIENNA's int8 build (sub-project 2 o
 deferred to one final sweep after check-in (Soham 2026-09-29). 2b: its pre-synthesis RTL part (the residual ADD and the
 int8 sigmoid ladder, skill `sienna-int8-residual`) implemented and verified 2026-10-18 on branch `int8_residual` at
 N = 8 and 16 at every tile size (gate G4, run rs2_g4); N = 32 and 64 run in the final sweep. The rest of 2b (model
-lowering of the ADD, average pooling, depthwise, softmax) landed 2026-11-04 on branch `workloads` (commits fed0e3a, e9e3962, 05f71d4, eb6bc64): `make model FMT=int8` runs the four MLCommons int8 models whole (`load_int8_graph(whole=True)`, `execute_int8`, `model_int8_run`; depthwise as the layer engine's kk form with block-diagonal int8 taps; golden = the TFLite interpreter's reference kernels, gate = every stage on the true function + the interpreter's top-1 / anomaly score within `SCORE_BOUND['int8']` = 5%); all PASS at N = 16 and 64 (docs/perf_final.txt section 3, int8 rows).**
+lowering of the ADD, average pooling, depthwise, softmax) landed 2026-11-04 on branch `workloads` (commits 8de9a7b, ecc256f, 757cf36, 5874034): `make model FMT=int8` runs the four MLCommons int8 models whole (`load_int8_graph(whole=True)`, `execute_int8`, `model_int8_run`; depthwise as the layer engine's kk form with block-diagonal int8 taps; golden = the TFLite interpreter's reference kernels, gate = every stage on the true function + the interpreter's top-1 / anomaly score within `SCORE_BOUND['int8']` = 5%); all PASS at N = 16 and 64 (docs/perf_final.txt section 3, int8 rows).**
 Gate reports, verbatim in the `sienna-report` skill's `history/`:
 - 2026-10-01 rerun after the requantize split and the Taylor capture fix (farm runs `sp_*`, not in `history/`): G1
   `sp_g1` PASS, G2 `sp_g2` bit-exact, SIENNA int8 37/37 at N = 16 and 32 (both mesh modes, random power-up at N = 16),
@@ -139,7 +139,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   multipliers and shifts); int8 has 35 tests, the plan's 33 plus `int8_mixed_act_train` and `int8_pad_negative_tanh`.
 - Task 21: the TFLite path uses only the model's own words: the multipliers and shifts from the G0 npz and the model's
   int32 bias tensor (with the -z_in * sum(w) fold), never the regression's `requant_params` or `fold_bias`.
-- Task 22: the performance model counted 3 requantize cycles in an int8 ReLU / linear activation stage; since 9dbced4
+- Task 22: the performance model counted 3 requantize cycles in an int8 ReLU / linear activation stage; since 686d21b
   (5a) it does not (`per_lane + 4` in every format, still 1 above measured), because that set leaves the stage while
   its beats drain. Its GPNAE lane model counted only the Horner rounds, 50-76 cycles per set short in every format;
   5b replaced it (see the activation-model line).
@@ -148,7 +148,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
 - Final fix: int8 ReLU relies on the host clamp. `sienna_top` (its `!IS_INT &&` ReLU bypass) and `gpnae_poly_int8` both
   pass ReLU through unchanged, so the requantize clamp must be `[max(req_min, req_zp), req_max]`. The TFLite flow and
   `regression.py` always set it; a host that leaves `req_min = -128` with a zero point above -128 gets linear output.
-- Final fix: SIENNA commits 1647456, 58171a1, 980bcf7 and 6f329a1 do not build alone (the plan's RTL-first split);
+- Final fix: SIENNA commits d73a6c3, c17573d, 8c132cf and 3c9f41f do not build alone (the plan's RTL-first split);
   skip them when bisecting, and GPNAE 71e9b75 and c35d24b too (SELU fix A split the same way, RTL first).
 - Superseded 2026-10-12 by Task 1.16 (the block-float bullet below; this and the SELU fix A bullet are history): the int8 host lowering (`model_runner`) rejected SELU layers whose input range reaches x = 487.29, where
   lambda * x leaves int32 in 2^-22; the regression's SELU tests print "SELU saturation: k of n lane inputs at
@@ -175,7 +175,7 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   no pooling, `zp_random` and `req_random`) drains a ReLU or linear set into a GPNAE set's fill, and
   `int8_accum2_mixed_bypass_nopool` puts a partial set behind each draining one; both are bit-exact at N = 16 and 32.
   `TB_sienna (pipeline)` fails a pass in which a draining ReLU or linear set still holds the stage while the next set could
-  start (1b4bf1a's RTL at `req_lat()` 3: 3 cycles per set) or a partial set passes during a drain, and prints the
+  start (7d9d9b7's RTL at `req_lat()` 3: 3 cycles per set) or a partial set passes during a drain, and prints the
   overlap-into-lane-set and partial-set-held counts. `sienna_top`'s `a_rq_one_set` (int8, simulation only: a set's first
   beat never enters the requantize pipeline while a beat is in it) is stricter than the real bank-reuse hazard: each beat
   carries its own sideband, so two sets' beats could share the pipeline safely. It holds at `req_lat()` = 4 by
@@ -199,11 +199,11 @@ and bf16 reruns keep snapshotting a clean tree (`snap_launch_tree.sh` with `TREE
   a bank is marked full one cycle later, so at N = 32 the int8 ReLU / linear stage alternates 36 and 37 cycles while it
   waits for pooling to free a bank, 36.5 per set (+1.4% at N = 32; N = 16 stays 19); a third activation bank would
   remove it, Soham's option. The split also costs every int8 GPNAE lane set (tanh, SELU) one cycle per set wherever
-  activation is the bottleneck (lane stage 53 -> 54 at N = 8): G4 (4e3d15a) to final (ff5ecb1), tanh 56 -> 57 at
+  activation is the bottleneck (lane stage 53 -> 54 at N = 8): G4 (19bf4a7) to final (715fe28), tanh 56 -> 57 at
   N = 8, 107 -> 108 at N = 16, 365 -> 366 at N = 32 and 64; SELU 52 -> 54 at N = 8 (+3.8%), 96 -> 97, 327 -> 328
   (perf runs g8p_* against fnp_* / fn64p_*); mesh- and host-bound points and fp32 / bf16 are unchanged. With it, `TB_sienna (pipeline)`'s drain-overlap absence check counts only
   cycles that do not accept the next set (`!g_accept`): the last beat can now leave in the accept cycle, which held
-  nothing; 1b4bf1a's RTL still fails the check.
+  nothing; 7d9d9b7's RTL still fails the check.
 - Taylor lane capture fix (Soham 2026-10-01, GPNAE a3d580c): `gpnae`'s G_CAP read the FIFO head as soon as `empty_o`
   fell, but a word written into an empty FIFO reaches `data_o` 3 edges later, so a held `last_i`, `last_i` on or one
   cycle after the write, and G_NEXT or G_WAIT -> G_CAP after a refill of a drained FIFO captured a stale word. It now

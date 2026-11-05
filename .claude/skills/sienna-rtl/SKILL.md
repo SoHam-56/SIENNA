@@ -200,13 +200,13 @@ Each repo tags its own milestones: the name says what that version contains, the
 
 | Repo | Tag | Commit | Date | What it contains | Was |
 |---|---|---|---|---|---|
-| SIENNA, SystolicMesh | `handshake_tile_v1` | 5fdeaeb, 98b429b | 2026-09-24 | the valid/ready handshake PE tile beside the synchronous one | `legacy_tile_v1` |
-| SIENNA, SystolicMesh | `serial_mesh_v2` | bb998cb, a4cea39 | 2026-09-25 | synchronous tiles only; the mesh takes one set at a time | `serial_mesh_v1` |
-| SIENNA, SystolicMesh | `pipelined_mesh_v3` | 012b013, 407b2bc | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
-| SIENNA, SystolicMesh | `three_formats_v4` | 1a6b081, a32f237 | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
-| SIENNA, SystolicMesh | `job_packing_v5` | 3ff67e9, c569e1f | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
-| SIENNA, SystolicMesh | `stage_credits_v6` | 09c4dc4, 10f6831 | 2026-10-10 | every module boundary on one credit link, output back-pressure, optional register stages; bf16 sums in fp32, gated model runs and model checks, dead code removed (moved from 68625d6, 3fd3ef6) | new |
-| SIENNA, SystolicMesh | `generic_formats_v7` | 42d3d59, ca41794 | 2026-10-26 | one top and a format-generic datapath (fmt_mul/fmt_add pick fp32, bf16 or int8 units); generic affine int8 with residual ADD; programmable table-free activation lanes; uniform repo layout; float PE continuing-pass hazard fixed | new |
+| SIENNA, SystolicMesh | `handshake_tile_v1` | dbf6955, 98b429b | 2026-09-24 | the valid/ready handshake PE tile beside the synchronous one | `legacy_tile_v1` |
+| SIENNA, SystolicMesh | `serial_mesh_v2` | d0973c0, a4cea39 | 2026-09-25 | synchronous tiles only; the mesh takes one set at a time | `serial_mesh_v1` |
+| SIENNA, SystolicMesh | `pipelined_mesh_v3` | 001cdc9, 407b2bc | 2026-09-26 | pipelined mesh, sets back to back; fp32 only | `pre_synthesis_v1` |
+| SIENNA, SystolicMesh | `three_formats_v4` | 500b4b5, a32f237 | 2026-10-04 | one format per build: fp32, bf16 or int8 (TFLite requantize) | `pre_packing_v1` |
+| SIENNA, SystolicMesh | `job_packing_v5` | 602c3d6, c569e1f | 2026-10-07 | several small jobs packed on one mesh; credits only at the entry | new |
+| SIENNA, SystolicMesh | `stage_credits_v6` | 5923942, 10f6831 | 2026-10-10 | every module boundary on one credit link, output back-pressure, optional register stages; bf16 sums in fp32, gated model runs and model checks, dead code removed (moved from 296d7bf, 3fd3ef6) | new |
+| SIENNA, SystolicMesh | `generic_formats_v7` | 5343153, ca41794 | 2026-10-26 | one top and a format-generic datapath (fmt_mul/fmt_add pick fp32, bf16 or int8 units); generic affine int8 with residual ADD; programmable table-free activation lanes; uniform repo layout; float PE continuing-pass hazard fixed | new |
 | GPNAE | `tytan_vdat2025` | 59c0aa6 | 2025-10-29 | the Taylor-series lane as published (VDAT 2025) | same |
 | GPNAE | `poly_lane_v1` | f1482f4 | 2026-09-25 | the fitted-polynomial lane, exact past the fits, ReLU and linear; fp32 | `pre_synthesis_v1` |
 | GPNAE | `three_formats_v2` | 0d407a7 | 2026-10-01 | the polynomial lane in fp32 or bf16, and a separate int8 lane | `pre_packing_v1` |

@@ -7,7 +7,7 @@ description: Use when designing, building or verifying SIENNA's int8 residual AD
 
 # int8 pre-synthesis RTL: residual ADD and the sigmoid ladder (spec; decisions approved by Soham 2026-10-10)
 
-Read from SIENNA main fce13e8 (clean clone `/proj/scratch/spramanik/n8_fix`), GPNAE afd786b, ArithmeticLibrary 1d04a26,
+Read from SIENNA main f884a10 (clean clone `/proj/scratch/spramanik/n8_fix`), GPNAE afd786b, ArithmeticLibrary 1d04a26,
 TensorFlow 2.18.1 in `sienna_jobs/venv`. Nothing was built or simulated. The sigmoid numbers below come from evaluating
 `gpnae_model` (numpy, bit-exact with the RTL per G2) in this investigation, not from RTL runs.
 
@@ -31,7 +31,7 @@ Departures from the spec, each with its reason (plan `implementation-plan.md`, d
 - **P-9** reversed by Task 2.10b: `--action perf` models the residual tests; validated per test against measured cycles (PERF MODEL: PASS, 805 test-points; control `m_perf_sig` fails).
 - **F3** every stage of a residual layer is gated from `TB_sienna (layer)`'s per-stage dumps (the conv's requantize, the identity requantize, hold_mem, the ADD, the lane).
 - **D6 (review row)** the set-level tests, the layer cases and the TFLite blocks run in both mesh modes (collapse-k 1 and 0) and at random power-up.
-- **Changed words against main 9fa414e** (G4, N = 8 and 16, every tile size; per test in the G4 report): fp32 only 3 words in each of 2 mixed tests with tanh at N = 16 (T_TINY, Task 1.16); bf16 words in 22 tests with a sigmoid, tanh or SELU set (134,112 words over 154 test-points) and their cycles in 118 test-points (Decision 5: the fp32 tail and refits); int8 cycles and results identical everywhere, words changed in 238 test-points: the 6 `req_random` tests 157,649 words (redrawn for the new units), 13 sigmoid and SELU tests 14,053 (the ladder, Task 1.16's SELU, rounding), 20 others 1,030, at most 39 in one test-point (round half up at ties). Every changed word passes the true-function gates.
+- **Changed words against main 6e99e3a** (G4, N = 8 and 16, every tile size; per test in the G4 report): fp32 only 3 words in each of 2 mixed tests with tanh at N = 16 (T_TINY, Task 1.16); bf16 words in 22 tests with a sigmoid, tanh or SELU set (134,112 words over 154 test-points) and their cycles in 118 test-points (Decision 5: the fp32 tail and refits); int8 cycles and results identical everywhere, words changed in 238 test-points: the 6 `req_random` tests 157,649 words (redrawn for the new units), 13 sigmoid and SELU tests 14,053 (the ladder, Task 1.16's SELU, rounding), 20 others 1,030, at most 39 in one test-point (round half up at ties). Every changed word passes the true-function gates.
 - **Crosses (spec Risk 3)** hold done with an L3 grant: reached at 6 of 7 points (0 at N16 T16); hold done with a bank done: unreachable by design (`a_hold_done_no_bank`, shown firing by a forced mutant); an add set's last beat with the next accept: excluded by design (`rq_room` reads `busy_o`; `a_add_last_no_accept`, shown firing by `m_roomonly`).
 - **Depth (Yosys dchr, topological levels, not timing; information only).** Generic units: `int8Requantizer` 45, `int8QuantizedAdder` 34, `add_lanes` with sienna_top's drivers at N = 32 35 (stage 1 from hold_mem's read mux 16). History: `tfliteAdd` 52 against `tfliteRequant`'s 53; `add_lanes` with drivers 54.
 

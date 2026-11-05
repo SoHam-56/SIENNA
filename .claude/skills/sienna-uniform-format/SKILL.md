@@ -113,7 +113,7 @@ raises overflow only when the normalized exponent is non-negative (fp32Adder's D
   GEMM bf16 error, max |hw - ref| / max |ref| against float64 on the same bf16 operands, worst shape per depth K
   (N 16 T 4, 67 shapes; sets and cycles identical in all 67):
 
-  | K | bf16 sums (`ba0_gemm_bf16`, main c05c332) | fp32 sums (`ba3f_gemm_bf16`, bf16_accum 0341b75) |
+  | K | bf16 sums (`ba0_gemm_bf16`, main 32fed2b) | fp32 sums (`ba3f_gemm_bf16`, bf16_accum 2fb0b51) |
   |---|---|---|
   | 16 | 1.6e-02 | 3.2e-03 |
   | 64 | 2.7e-02 | 3.1e-03 |

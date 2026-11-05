@@ -1202,7 +1202,7 @@ int8   64 tanh      2   32  2048       10606     339392     11.16    357.25   32
 (* = the signed-zero case: rows of zeros in every job.)
 
 
-5. WORKLOADS BEYOND MLPERF TINY (2026-11-02; branch workloads; every GEMM on the layer engine, T = 4; golden = the model on the CPU in float64) =====
+5. WORKLOADS BEYOND MLPERF TINY (2026-11-02; tag model_suite_v8; every GEMM on the layer engine, T = 4; golden = the model on the CPU in float64) =====
 Labels: cycles MEASURED per unit (a 128-token sentence, an image, a heartbeat, or a packed set); us DERIVED at 950 MHz; MACs are the model's own per unit;
         slot% = MACs / (sets x N^3), DERIVED (the share of set slots holding real multiply-accumulates); agree = units whose class or token equals the
         CPU golden's; tier = the activation lanes' accuracy tier (0: 1%, 1: 5%, 2: 10%). Host ops: BERT softmax, LayerNorm, GELU, embeddings, residual

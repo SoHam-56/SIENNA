@@ -182,7 +182,8 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0][4:0]  g_shx;
   logic [NUM_LANES-1:0][23:0] g_mout;
   logic [NUM_LANES-1:0][5:0]  g_shout;
-  sienna_fmt_pkg::lane_params_t [NUM_LANES-1:0] g_par;  // per lane: the bundle gpnae takes
+  sienna_fmt_pkg::lane_params_t [NUM_LANES-1:0] g_par, g_par_q;  // per lane: the bundle gpnae takes, and its register (timing: the entry select and the ADD's zero point mux stay out of the lane's rescale stage; the first element reaches a lane five cycles after g_accept, the bundle one)
+  always_ff @(posedge clk_i) g_par_q <= g_par;  // no reset: a lane reads it with an element
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
@@ -461,7 +462,7 @@ module sienna_pipe #(
           .out           (l5),
           .control_word_i(gpnae_ctrl[g]),
           .tier_i        (g_tier),
-          .par_i         (g_par[g]),
+          .par_i         (g_par_q[g]),
           .coef_wr_i     (coef_wr_i),
           .coef_addr_i   (coef_addr_i),
           .coef_data_i   (coef_data_i),

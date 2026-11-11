@@ -122,10 +122,6 @@ module sienna_pipe #(
   function automatic logic is_byp_code(input logic [CONTROL_WIDTH-1:0] c);
     return (c == CONTROL_WIDTH'(3'b100)) || (c == CONTROL_WIDTH'(3'b101));
   endfunction
-  // Lane k's element i of the set the activation stage holds: a run along a row, or for a packed set down column k % N.
-  function automatic int elem(input int k, input int i, input logic pk);
-    return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
-  endfunction
 `ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
   initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
 `endif
@@ -607,17 +603,38 @@ module sienna_pipe #(
   // =========================================================================
   // GPNAE TO CENTRAL BUFFER WRITE LOGIC
   // =========================================================================
-  always_ff @(posedge clk_i) begin
-    // Beat b of the wide read holds element elem(k, b) in word k, the element lane k would have taken.
-    if (!sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && g_state != G_IDLE && act_bypass && fill_v)
-      for (int k = 0; k < NUM_LANES; k++)
-        gpnae_out_mem[act_wr_base + elem(k, int'(fill_count[k]), g_pack)] <=
-            (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];  // floats: +0 for a negative word
-    if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && byp_wr)  // a requantized beat lands where its own tag says, so it may leave the pipeline after its set left the stage
-      for (int k = 0; k < NUM_LANES; k++) gpnae_out_mem[(byp_bank ? SRAM_DEPTH : 0) + elem(k, int'(byp_idx), byp_pack)] <= fill_d[k];
-    // L5 collector: a lane's result is written to the bank the cycle it arrives, so its credit goes back the next cycle.
-    for (int i = 0; i < NUM_LANES; i++)
-      if (gpnae_done[i] && l5_want[i]) gpnae_out_mem[act_wr_base + elem(i, int'(done_count[i]), g_pack)] <= gpnae_result[i];
+  // Beat b of the wide read holds in word k the element lane k would have taken: k * PER_LANE + b along a row, or for a packed set element b
+  // down column k % N, ((k / N) * PER_LANE + b) * N + k % N. Entry e has one owner lane and element index in each order, so each entry's write
+  // enable compares its owner's counter with a constant instead of decoding every lane's address against it (timing); the three writers keep
+  // their order: the float bypass fill, the requantized bypass beat, then the L5 collector, which writes a lane's result the cycle it arrives.
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_w;  // the float bypass fill's words: ReLU drops a negative word to +0
+  logic fill_wr;
+  assign fill_wr = !sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && g_state != G_IDLE && act_bypass && fill_v;
+  always_comb
+    for (int k = 0; k < NUM_LANES; k++)
+      fill_w[k] = (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];
+  for (genvar e = 0; e < 2 * SRAM_DEPTH; e++) begin : G_OUT_MEM
+    localparam int EB = e / SRAM_DEPTH;  // the bank
+    localparam int EX = e % SRAM_DEPTH;  // the element in it
+    localparam int KU = EX / PER_LANE;  // along a row: lane KU's element IU
+    localparam int IU = EX % PER_LANE;
+    localparam int KP = ((EX / N) / PER_LANE) * N + (EX % N);  // down a column: lane KP's element IP (a packed set needs N to divide the lanes)
+    localparam int IP = (EX / N) % PER_LANE;
+    localparam bit PK = (KP < NUM_LANES);
+    always_ff @(posedge clk_i) begin
+      if (fill_wr && int'(act_wr) == EB) begin
+        if (!g_pack && int'(fill_count[KU]) == IU) gpnae_out_mem[e] <= fill_w[KU];
+        if (PK && g_pack && int'(fill_count[PK ? KP : 0]) == IP) gpnae_out_mem[e] <= fill_w[PK ? KP : 0];
+      end
+      if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && byp_wr && int'(byp_bank) == EB) begin  // lands where its own tag says, so it may leave after its set left the stage
+        if (!byp_pack && int'(byp_idx) == IU) gpnae_out_mem[e] <= fill_d[KU];
+        if (PK && byp_pack && int'(byp_idx) == IP) gpnae_out_mem[e] <= fill_d[PK ? KP : 0];
+      end
+      if (int'(act_wr) == EB) begin
+        if (!g_pack && gpnae_done[KU] && l5_want[KU] && int'(done_count[KU]) == IU) gpnae_out_mem[e] <= gpnae_result[KU];
+        if (PK && g_pack && gpnae_done[PK ? KP : 0] && l5_want[PK ? KP : 0] && int'(done_count[PK ? KP : 0]) == IP) gpnae_out_mem[e] <= gpnae_result[PK ? KP : 0];
+      end
+    end
   end
 
   // =========================================================================

@@ -2502,7 +2502,7 @@ module TB_sienna #(
       $fclose(fc);
       $display("[LAYER] coef: %0d load-path writes from %s", nw, cf);
       if (FAULT == 5) $display("  [FAULT 5] write 5 of %s driven with bit 0 flipped", cf);
-      @(posedge clk_i);
+      repeat (2) @(posedge clk_i);  // a taken write lands in the lane's table one edge after it was taken
       cc_image({cf, ".img"});  // the image the host packed into cf
       cc_check({"load ", cf});
     endtask
@@ -3156,7 +3156,7 @@ module TB_sienna #(
       coef_wr = 1'b0;
       $fclose(fc);
       $display("[MODEL] coef: %0d load-path writes from %s", n, cf);
-      @(posedge clk_i);
+      repeat (2) @(posedge clk_i);  // a taken write lands in the lane's table one edge after it was taken
       #1;
       cc_image({cf, ".img"});  // the image the host packed into cf
       cc_check({"load ", cf});

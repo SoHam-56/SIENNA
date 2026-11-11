@@ -105,7 +105,6 @@ module sienna_sched #(
   logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0] pk_map_q;
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
   sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] pk_lane_q;
-  logic [31:0] total_sets;
   logic active;
 
   function automatic logic [DIM_W-1:0] tiles(input logic [DIM_W-1:0] x);
@@ -218,7 +217,7 @@ module sienna_sched #(
   logic wl_pre, wl_may, wl_take_bias, wl_take_tile, wl_bias_due;
   logic wl_opened;  // the loader's block has its region's fill open
   logic wb_gr;  // the loader's bias row is granted, not yet in
-  logic [31:0] wt_gr;  // the loader's tile rows granted so far
+  logic [DIM_W-1:0] wt_tg;  // the loader's tiles granted so far (N rows each)
   logic [TOW-1:0] wt_out;  // tile rows granted, not yet in
   logic wb_grant, wt_grant;
   logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
@@ -229,7 +228,10 @@ module sienna_sched #(
 
   // ── Set issuer: for each block, row tile and pass, N rows of A (and B if not cached) on the credits it grants, then the start ──
   logic [DIM_W-1:0] is_r, is_p;  // the set being received, or the next to grant when none is
-  logic [31:0] n_issued, n_done;
+  // Sets started and not yet complete, bounded by the pipeline's SETS_IN_FLIGHT; the layer is done once every block is issued and none is out.
+  localparam int NOW = 8;
+  logic [NOW-1:0] n_out;
+  logic [LFSR_WIDTH-1:0] seed_mul;  // 0x85EBCA6B times the sets started so far, kept by adding the constant per start (no multiplier)
   logic is_res_pass, is_cached_pass;
   logic pend;  // a set is granted and not yet started
   logic [RCW-1:0] a_need, w_need;  // its rows still to come
@@ -269,7 +271,7 @@ module sienna_sched #(
   // A residual pass writes identity rows on the north bus, so it waits for no cache tile row to be outstanding, and holds back new tile grants.
   assign s_grant   = g_ok && (!g_res || wt_out == '0);
   assign wb_grant  = live && wl_may && bias_q && !wl_bias_done && !wb_gr;
-  assign wt_grant  = live && wl_may && cached && (!bias_q || wl_bias_done) && (wt_gr < 32'(dt) * 32'(N)) && (int'(wt_out) <= N) &&
+  assign wt_grant  = live && wl_may && cached && (!bias_q || wl_bias_done) && (wt_tg < dt) && (int'(wt_out) <= N) &&
                      !(g_ok && g_res) && !(pend && is_res_pass);
   // One grant per stream per cycle: a set's, a bias row's or a tile's are never due together, so the counts never add.
   assign a_rows.credit = s_grant ? RCW'(N) : '0;
@@ -292,7 +294,7 @@ module sienna_sched #(
     p_cached   = is_cached_pass;
     p_wc_last  = is_cached_pass && (is_r == rt - 1) && (is_p == dt - 1);
     p_tile     = WCTW'(int'(is_blk[0]) * HALF + int'(is_p));
-    p_seed     = LFSR_WIDTH'(seed_q ^ (32'h85EBCA6B * n_issued));
+    p_seed     = seed_q ^ seed_mul;
   end
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
@@ -314,7 +316,6 @@ module sienna_sched #(
       pk_map_q <= '0;
       pk_act_q <= '0;
       pk_lane_q <= '0;
-      total_sets <= '0;
       wl_blk <= '0;
       wl_bias_done <= 1'b0;
       wl_tile <= '0;
@@ -327,14 +328,14 @@ module sienna_sched #(
       is_r <= '0;
       is_p <= '0;
       wb_gr <= 1'b0;
-      wt_gr <= '0;
+      wt_tg <= '0;
       wt_out <= '0;
       pend <= 1'b0;
       a_need <= '0;
       w_need <= '0;
       a_row <= '0;
-      n_issued <= '0;
-      n_done <= '0;
+      n_out <= '0;
+      seed_mul <= '0;
       done_o <= 1'b0;
     end else begin
       done_o <= 1'b0;
@@ -357,7 +358,6 @@ module sienna_sched #(
         pk_map_q <= cfg_pack_map_i;
         pk_act_q <= cfg_pack_act_i;
         pk_lane_q <= cfg_pack_lane_i;
-        total_sets <= 32'(r) * 32'(c) * 32'(d + DIM_W'(cfg_residual_i));
         wl_blk <= '0;
         wl_bias_done <= 1'b0;
         wl_tile <= '0;
@@ -370,14 +370,14 @@ module sienna_sched #(
         is_r <= '0;
         is_p <= '0;
         wb_gr <= 1'b0;
-        wt_gr <= '0;
+        wt_tg <= '0;
         wt_out <= '0;
         pend <= 1'b0;
         a_need <= '0;
         w_need <= '0;
         a_row <= '0;
-        n_issued <= '0;
-        n_done <= '0;
+        n_out <= '0;
+        seed_mul <= '0;
       end else if (active) begin
         // Loader: a block is loaded once its bias (if any) and, for a cached layer, its tiles are in.
         begin
@@ -398,12 +398,12 @@ module sienna_sched #(
             wl_row <= '0;
             wl_opened <= 1'b0;
             wb_gr <= 1'b0;
-            wt_gr <= '0;
+            wt_tg <= '0;
           end else begin
             if (wl_take_bias) wl_bias_done <= 1'b1;
             if (wb_grant) wb_gr <= 1'b1;
             else if (wl_take_bias) wb_gr <= 1'b0;
-            if (wt_grant) wt_gr <= wt_gr + 32'(N);
+            if (wt_grant) wt_tg <= wt_tg + 1'b1;
             if (wl_take_tile) begin
               wl_row <= last_row ? '0 : wl_row + 1'b1;
               wl_tile <= tiles_now;
@@ -425,7 +425,7 @@ module sienna_sched #(
           if (w_set_row) w_need <= w_need - 1'b1;
         end
         if (p_start) begin
-          n_issued <= n_issued + 1;
+          seed_mul <= seed_mul + LFSR_WIDTH'(32'h85EBCA6B);
           if (is_p == np - 1) begin
             is_p <= '0;
             if (is_r == rt - 1) begin
@@ -437,8 +437,8 @@ module sienna_sched #(
             end else is_r <= is_r + 1'b1;
           end else is_p <= is_p + 1'b1;
         end
-        if (p_complete) n_done <= n_done + 1;
-        if (n_issued == total_sets && n_done == total_sets && is_blk == ct) begin
+        n_out <= n_out + NOW'(p_start) - NOW'(p_complete);
+        if (is_blk == ct && n_out == '0) begin
           active <= 1'b0;
           done_o <= 1'b1;
         end
@@ -458,6 +458,8 @@ module sienna_sched #(
   a_pack_shape: assert property (@(posedge clk_i) disable iff (!rstn_i)
                                  (cfg_load_i && !active && cfg_pack_shift_i != '0) |-> (cfg_n_i == DIM_W'(N) && cfg_kb_i == DIM_W'(N) && !cfg_residual_i))
     else $error("sienna_top: a packed layer is N columns and N deep, without a residual");
+  a_sets_out_fit: assert property (@(posedge clk_i) disable iff (!rstn_i) n_out != '1)
+    else $error("sienna_top: %0d sets in flight, the count's limit", n_out);
   a_one_north: assert property (@(posedge clk_i) disable iff (!rstn_i) !(p_wc_we && p_north_we))
     else $error("sienna_top: a cache fill and a set's B row on the north bus in one cycle");
   // A row's put and whether its stream held a credit for it, registered: a host may drive its puts at the edge.

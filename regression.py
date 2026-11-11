@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 323), ("int8", "tanh", 32, 323))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 325), ("int8", "tanh", 32, 325))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 2 for the pipelined input stage
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5999,10 +5999,10 @@ def test_rtl_lat():
 
 @perf_selftest
 def test_lane_stage_int8():
-    with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4)
-        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})
-        assert stage("selu", 16) == 93 and stage("tanh", 16) == 93 and stage("sigmoid", 16) == 93
-        assert stage("selu", 8) == 52 and stage("tanh", 8) == 47 and stage("sigmoid", 8) == 47
+    with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4),
+        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the two stages of the pipelined input stage (ACT_IN_LATENCY 4)
+        assert stage("selu", 16) == 95 and stage("tanh", 16) == 95 and stage("sigmoid", 16) == 95
+        assert stage("selu", 8) == 54 and stage("tanh", 8) == 49 and stage("sigmoid", 8) == 49
 
 
 @perf_selftest

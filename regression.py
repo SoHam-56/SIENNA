@@ -2961,7 +2961,7 @@ FMT = "fp32"  # the build's format; perf_main() sets it
 
 def lane_lat(f: str) -> dict:
     """The gpnae lane's latencies in a format, from the package: the Horner step (LOOP), the input stage (ACT_IN), the post multiply and add."""
-    return {"LOOP": fmt_pkg.get(f, "HORNER_STEP_LATENCY"), "ACT_IN": fmt_pkg.get(f, "LANE_MUL_LATENCY") + 1, "ML": fmt_pkg.get(f, "LANE_MUL_LATENCY"),
+    return {"LOOP": fmt_pkg.get(f, "HORNER_STEP_LATENCY"), "ACT_IN": fmt_pkg.get(f, "ACT_IN_LATENCY"), "ML": fmt_pkg.get(f, "LANE_MUL_LATENCY"),
             "AL": fmt_pkg.get(f, "LANE_ADD_LATENCY"), "RQ": fmt_pkg.get(f, "REQUANT_LATENCY")}
 
 

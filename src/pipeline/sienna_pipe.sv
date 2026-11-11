@@ -435,6 +435,16 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o
   assign coef_ready_o = (&lane_idle) && (sets_out == '0) && !host_accept;
 
+  // Dropout's lane seeds take three register stages, so the reseed at p_accept reads a register (timing): stage 1 the seed of seed_src, the id
+  // pooling will accept next; stage 2 the two half products of the constant multiply; stage 3 their sum, folded. seed_src skips the id accepted or
+  // passed this cycle and a null set after it: an accept follows an accept by four cycles at least and a null by one, and nulls are two apart, so
+  // the id accepted three cycles on is always seed_src now.
+  logic [ID_W-1:0] seed_src, seed_src1;
+  logic [31:0] seed_x1;  // stage 1
+  assign seed_src1 = p_next_id + ID_W'(p_accept || p_null);
+  assign seed_src  = seed_src1 + ID_W'(set_accum[seed_src1] || set_hold[seed_src1]);
+  always_ff @(posedge clk_i) seed_x1 <= 32'(set_seed[seed_src]);  // no reset: read only at p_accept, after its set's host_accept
+
   generate
     genvar g;
     for (g = 0; g < NUM_LANES; g++) begin : backend_lanes
@@ -534,12 +544,19 @@ module sienna_pipe #(
         assign maxpool_out_valid[g] = drp.put;
       end
 
-      // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied.
-      logic [31:0] lane_mul;
+      // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
+      localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);
+      logic [31:0] seed_xc, seed_pa, lane_mul;
+      logic [15:0] seed_pb;  // the high half's product: only its low 16 bits reach the 32-bit result
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
-      assign lane_mul  = (32'(set_seed[p_next_id]) ^ (32'h9E3779B9 * (g + 1))) * 32'h85EBCA6B;
-      assign lane_mix  = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
-      assign lane_seed = (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
+      assign seed_xc = seed_x1 ^ LANE_C;
+      always_ff @(posedge clk_i) begin  // no reset, as seed_x1
+        seed_pa   <= seed_xc * 32'h0000_CA6B;
+        seed_pb   <= 16'(seed_xc * 32'h0000_85EB);
+        lane_seed <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
+      end
+      assign lane_mul = seed_pa + {seed_pb, 16'b0};
+      assign lane_mix = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
 
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;

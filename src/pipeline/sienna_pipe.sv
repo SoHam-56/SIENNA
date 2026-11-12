@@ -439,6 +439,7 @@ module sienna_pipe #(
   // pooling will accept next; stage 2 the two half products of the constant multiply; stage 3 their sum, folded. seed_src skips the id accepted or
   // passed this cycle and a null set after it: an accept follows an accept by four cycles at least and a null by one, and nulls are two apart, so
   // the id accepted three cycles on is always seed_src now.
+  logic p_null;  // declared here, before the seed stages read it
   logic [ID_W-1:0] seed_src, seed_src1;
   logic [31:0] seed_x1;  // stage 1
   assign seed_src1 = p_next_id + ID_W'(p_accept || p_null);
@@ -770,7 +771,7 @@ module sienna_pipe #(
   logic g_null_done;  // a partial set, summed in the PEs, passes with no result and no activation bank
   assign g_null_done = (g_state == G_IDLE) && (mesh_sets != 0) && set_accum[g_next_id] && !rq_drain;
   // Pooling completes sets in id order: a partial in one cycle, never right after another completion, so pulses stay one cycle.
-  logic complete_q, p_null;
+  logic complete_q;
   logic set_complete;  // a set completes this cycle, with its last word into the output register
   logic [ID_W-1:0] set_done_id;
   assign p_null = (p_state == P_IDLE) && (gp_sets != 0) && (set_accum[p_next_id] || set_hold[p_next_id]) && !complete_q;

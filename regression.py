@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 327), ("int8", "tanh", 32, 327))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 4 for the pipelined input stage (ACT_IN_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 328), ("int8", "tanh", 32, 328))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5994,15 +5994,15 @@ def test_link_bytes():
 @perf_selftest
 def test_rtl_lat():
     assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 4, 6, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 5, 6, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
 def test_lane_stage_int8():
     with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4),
-        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the three stages of the pipelined input stage (ACT_IN_LATENCY 5)
-        assert stage("selu", 16) == 96 and stage("tanh", 16) == 96 and stage("sigmoid", 16) == 96
-        assert stage("selu", 8) == 55 and stage("tanh", 8) == 50 and stage("sigmoid", 8) == 50
+        stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the three stages of the pipelined input stage (ACT_IN_LATENCY 5) and the requantize's fifth (REQUANT_LATENCY 5)
+        assert stage("selu", 16) == 97 and stage("tanh", 16) == 97 and stage("sigmoid", 16) == 97
+        assert stage("selu", 8) == 57 and stage("tanh", 8) == 51 and stage("sigmoid", 8) == 51
 
 
 @perf_selftest

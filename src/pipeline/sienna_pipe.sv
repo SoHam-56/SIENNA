@@ -192,6 +192,8 @@ module sienna_pipe #(
   // a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector, a combinational read port per
   // pooling lane.
   localparam int AM_AW = $clog2(2 * SRAM_DEPTH);
+  logic fill_v;  // the parallel lane fill's beat (declared here, before the bank's write ports read it)
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
   logic [2*NUM_LANES-1:0] am_we;
   logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr;
   logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata;
@@ -976,8 +978,6 @@ module sienna_pipe #(
   // =========================================================================
   // PARALLEL LANE FILL: each result beat gives every lane its next element at once
   // =========================================================================
-  logic fill_v;
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
   // Requantizing builds: the lanes, the bypass write and every fill counter see requantized beats, REQUANT_LATENCY cycles after the wide read.
   if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ
     logic rq_v;  // requantize's output beat

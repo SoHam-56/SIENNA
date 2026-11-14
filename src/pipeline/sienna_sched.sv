@@ -133,6 +133,9 @@ module sienna_sched #(
                                             .has_credit_o(), .count_o(l0_cnt));
   assign host.put = p_start;
   assign host.data = p_side;
+  logic [DIM_W-1:0] wl_blk;  // block the loader works on (declared here, before the sideband and the cache links read them)
+  logic [DIM_W-1:0] is_p;  // the issuer's next pass to grant
+  logic is_res_pass;  // that pass is the residual's
   always_comb begin
     p_side_base          = '0;
     p_side_base.wc_last       = p_wc_last;
@@ -204,7 +207,6 @@ module sienna_sched #(
     $fatal(1, "sienna_top: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::ACC_DATA_WIDTH);
   end
   sienna_fmt_pkg::requant_scale_t [N-1:0] scale_buf[2];  // the requantize scales of the block each half holds
-  logic [DIM_W-1:0] wl_blk;  // block the loader works on
   logic wl_bias_done;  // its bias row is in
   logic [DIM_W-1:0] wl_tile;  // tiles of it complete
   logic [RW-1:0] wl_row;
@@ -227,12 +229,12 @@ module sienna_sched #(
   assign wl_bias_due = wl_pre && bias_q && !wl_bias_done;  // the next weight row the loader expects is its block's bias
 
   // ── Set issuer: for each block, row tile and pass, N rows of A (and B if not cached) on the credits it grants, then the start ──
-  logic [DIM_W-1:0] is_r, is_p;  // the set being received, or the next to grant when none is
+  logic [DIM_W-1:0] is_r;  // the set being received
   // Sets started and not yet complete, bounded by the pipeline's SETS_IN_FLIGHT; the layer is done once every block is issued and none is out.
   localparam int NOW = 8;
   logic [NOW-1:0] n_out;
   logic [LFSR_WIDTH-1:0] seed_mul;  // 0x85EBCA6B times the sets started so far, kept by adding the constant per start (no multiplier)
-  logic is_res_pass, is_cached_pass;
+  logic is_cached_pass;
   logic pend;  // a set is granted and not yet started
   logic [RCW-1:0] a_need, w_need;  // its rows still to come
   logic [RW-1:0] a_row;  // its A rows in, for the residual pass's identity row

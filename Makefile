@@ -479,6 +479,7 @@ lint: $(PKG_DEP)
 		$(DESIGN_FILES) \
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/top/$(TESTBENCH)
+	@$(PYTHON) $(SM_LIB_DIR)/scripts/declared_first.py --label "sienna $(FMT)" --top sienna_top $(patsubst +define+%,-D %,$(FMT_DEF)) -D SYNTHESIS --root $(PRJ_DIR) -f $(PRJ_DIR)/src/sienna_rtl.f
 	@echo "-- Lint complete"
 
 debug: VERILATOR_FLAGS += --debug --gdbbt

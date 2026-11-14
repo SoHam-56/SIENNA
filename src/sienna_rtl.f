@@ -5,6 +5,7 @@ SystolicMesh/ArithmeticLibrary/src/fmt/sienna_fmt_pkg.sv
 SystolicMesh/ArithmeticLibrary/src/credit/credit_link_if.sv
 SystolicMesh/ArithmeticLibrary/src/credit/credit_counter.sv
 SystolicMesh/ArithmeticLibrary/src/credit/credit_reg.sv
+SystolicMesh/ArithmeticLibrary/src/mem/mem_array.sv
 SystolicMesh/ArithmeticLibrary/src/multipliers/R4Booth.sv
 SystolicMesh/ArithmeticLibrary/src/multipliers/karatsubaUnsigned.sv
 SystolicMesh/ArithmeticLibrary/src/multipliers/fp32Multiplier.sv
@@ -27,6 +28,7 @@ SystolicMesh/ArithmeticLibrary/src/multipliers/int24Multiplier.sv
 SystolicMesh/src/engine/ProcessingElement.sv
 SystolicMesh/src/engine/AccumulationUnit.sv
 SystolicMesh/src/mem/MeshOutputSram.sv
+SystolicMesh/src/mem/row_writer.sv
 SystolicMesh/src/top/SystolicArray.sv
 SystolicMesh/src/top/SystolicMesh.sv
 GPNAE/src/lane/gpnae_pkg.sv

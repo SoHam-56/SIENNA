@@ -1002,7 +1002,7 @@ module TB_sienna #(
             for (int l = 0; l < NUM_LANES; l++) pj[l] = 0;
             if (tr_on && tr_fd)
               for (int e = 0; e < SRAM_DEPTH; e++)
-                $fdisplay(tr_fd, "A %s %0d %0d %h", tr_pass, tr_k[int'(dut.G_SET.G_COPY[0].pipe.p_next_id)], e, dut.G_SET.G_COPY[0].pipe.gpnae_out_mem[dut.G_SET.G_COPY[0].pipe.act_rd_base+e]);
+                $fdisplay(tr_fd, "A %s %0d %0d %h", tr_pass, tr_k[int'(dut.G_SET.G_COPY[0].pipe.p_next_id)], e, dut.G_SET.G_COPY[0].pipe.act_mem.mem[dut.G_SET.G_COPY[0].pipe.act_rd_base+e]);
           end
           for (int l = 0; l < NUM_LANES; l++)
             if (dut.G_SET.G_COPY[0].pipe.dropout_in_valid[l]) begin

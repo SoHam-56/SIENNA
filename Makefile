@@ -83,6 +83,7 @@ TOP_FILES = \
 	fifo/fwft.sv
 
 SM_FILES = \
+	mem/row_writer.sv \
 	top/SystolicMesh.sv \
 	top/SystolicArray.sv \
 	mem/MeshOutputSram.sv \
@@ -135,7 +136,8 @@ CREDIT_FILES = \
 	credit_link_if.sv \
 	credit_counter.sv \
 	credit_reg.sv \
-	credit_link_checker.sv
+	credit_link_checker.sv \
+	../mem/mem_array.sv
 
 DESIGN_FILES = \
 	$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv \

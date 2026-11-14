@@ -188,7 +188,17 @@ module sienna_pipe #(
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
 
   // Intermediate Memory Buffer
-  logic [DATA_WIDTH-1:0] gpnae_out_mem  [0:2*SRAM_DEPTH-1];
+  // The activation banks are one mem_array (act_mem: a module boundary, so synthesis can swap it for a macro): two banks of SRAM_DEPTH words,
+  // a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector, a combinational read port per
+  // pooling lane.
+  localparam int AM_AW = $clog2(2 * SRAM_DEPTH);
+  logic [2*NUM_LANES-1:0] am_we;
+  logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr;
+  logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata;
+  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] am_rdata;
+  mem_array #(.DEPTH(2 * SRAM_DEPTH), .WIDTH(DATA_WIDTH), .NW(2 * NUM_LANES), .NR(NUM_LANES), .SYNC_READ(1'b0)) act_mem (
+      .clk_i(clk_i), .we_i(am_we), .waddr_i(am_waddr), .wmask_i('1), .wdata_i(am_wdata), .re_i('1), .raddr_i(am_raddr), .rdata_o(am_rdata));
 
 
   logic [NUM_LANES-1:0][RESULT_DATA_WIDTH-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
@@ -623,46 +633,39 @@ module sienna_pipe #(
   // GPNAE TO CENTRAL BUFFER WRITE LOGIC
   // =========================================================================
   // Beat b of the wide read holds in word k the element lane k would have taken: k * PER_LANE + b along a row, or for a packed set element b
-  // down column k % N, ((k / N) * PER_LANE + b) * N + k % N. Entry e has one owner lane and element index in each order, so each entry's write
-  // enable compares its owner's counter with a constant instead of decoding every lane's address against it (timing); the three writers keep
-  // their order: the float bypass fill, the requantized bypass beat, then the L5 collector, which writes a lane's result the cycle it arrives.
+  // down column k % N, ((k / N) * PER_LANE + b) * N + k % N (a packed set needs N to divide the lanes). Lane k's element i goes to that entry of
+  // the bank: on port k the float bypass fill or the requantized bypass beat (one of the two per build), on port NUM_LANES + k the L5
+  // collector, which writes a lane's result the cycle it arrives and wins over the fill (the higher port) as the statement order did.
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_w;  // the float bypass fill's words: ReLU drops a negative word to +0
   logic fill_wr;
   assign fill_wr = !sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && g_state != G_IDLE && act_bypass && fill_v;
+  function automatic logic [AM_AW-1:0] am_entry(input logic bank, input int k, input int i, input logic pk);
+    return AM_AW'((bank ? SRAM_DEPTH : 0) + (pk ? ((k / N) * PER_LANE + i) * N + k % N : k * PER_LANE + i));
+  endfunction
   always_comb
-    for (int k = 0; k < NUM_LANES; k++)
+    for (int k = 0; k < NUM_LANES; k++) begin
       fill_w[k] = (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];
-  for (genvar e = 0; e < 2 * SRAM_DEPTH; e++) begin : G_OUT_MEM
-    localparam int EB = e / SRAM_DEPTH;  // the bank
-    localparam int EX = e % SRAM_DEPTH;  // the element in it
-    localparam int KU = EX / PER_LANE;  // along a row: lane KU's element IU
-    localparam int IU = EX % PER_LANE;
-    localparam int KP = ((EX / N) / PER_LANE) * N + (EX % N);  // down a column: lane KP's element IP (a packed set needs N to divide the lanes)
-    localparam int IP = (EX / N) % PER_LANE;
-    localparam bit PK = (KP < NUM_LANES);
-    always_ff @(posedge clk_i) begin
-      if (fill_wr && int'(act_wr) == EB) begin
-        if (!g_pack && int'(fill_count[KU]) == IU) gpnae_out_mem[e] <= fill_w[KU];
-        if (PK && g_pack && int'(fill_count[PK ? KP : 0]) == IP) gpnae_out_mem[e] <= fill_w[PK ? KP : 0];
+      if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin  // the bypass beat lands where its own tag says, so it may leave after its set left the stage
+        am_we[k]    = byp_wr && int'(byp_idx) < PER_LANE;
+        am_waddr[k] = am_entry(byp_bank, k, int'(byp_idx), byp_pack);
+        am_wdata[k] = fill_d[k];
+      end else begin
+        am_we[k]    = fill_wr && int'(fill_count[k]) < PER_LANE;
+        am_waddr[k] = am_entry(act_wr, k, int'(fill_count[k]), g_pack);
+        am_wdata[k] = fill_w[k];
       end
-      if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && byp_wr && int'(byp_bank) == EB) begin  // lands where its own tag says, so it may leave after its set left the stage
-        if (!byp_pack && int'(byp_idx) == IU) gpnae_out_mem[e] <= fill_d[KU];
-        if (PK && byp_pack && int'(byp_idx) == IP) gpnae_out_mem[e] <= fill_d[PK ? KP : 0];
-      end
-      if (int'(act_wr) == EB) begin
-        if (!g_pack && gpnae_done[KU] && l5_want[KU] && int'(done_count[KU]) == IU) gpnae_out_mem[e] <= gpnae_result[KU];
-        if (PK && g_pack && gpnae_done[PK ? KP : 0] && l5_want[PK ? KP : 0] && int'(done_count[PK ? KP : 0]) == IP) gpnae_out_mem[e] <= gpnae_result[PK ? KP : 0];
-      end
+      am_we[NUM_LANES+k]    = gpnae_done[k] && l5_want[k] && int'(done_count[k]) < PER_LANE;
+      am_waddr[NUM_LANES+k] = am_entry(act_wr, k, int'(done_count[k]), g_pack);
+      am_wdata[NUM_LANES+k] = gpnae_result[k];
     end
-  end
 
   // =========================================================================
   // WINDOW DISPATCHER FSM
   // =========================================================================
   // Windows go to lanes round-robin, so NUM_LANES of them can be dispatched at once: lane L
   // takes windows L, L+NUM_LANES, ... exactly as before, but all lanes are written in the same
-  // cycle instead of one per cycle. gpnae_out_mem is a register array, so the parallel reads
-  // are free. Row and column are carried per lane rather than divided out of a window index,
+  // cycle instead of one per cycle. act_mem has a combinational read port per lane, so the parallel
+  // reads are free. Row and column are carried per lane rather than divided out of a window index,
   // which would cost NUM_LANES dividers by a non-power-of-two.
   localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;
   localparam int ADV_R = NUM_LANES / POOL_OUT_COLS;  // rows and columns a lane moves by per group of windows
@@ -681,15 +684,19 @@ module sienna_pipe #(
   logic [DATA_WIDTH-1:0] lane_val[NUM_LANES];
   logic                  disp_can_write;
 
-  always_comb begin
+  logic [NUM_LANES-1:0] lane_in_img;  // the lane's element is inside the image (not padding)
+  always_comb  // the addresses apart from the values read at them: one block for both would read as a loop to Verilator
     for (int L = 0; L < NUM_LANES; L++) begin
       automatic logic signed [31:0] ir = signed'(lane_r[L] * STRIDE_ROWS + disp_pr) - signed'(PADDING);
       automatic logic signed [31:0] ic = signed'(lane_c[L] * STRIDE_COLS + disp_pc) - signed'(PADDING);
-      lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
-      lane_val[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS))
-                    ? gpnae_out_mem[act_rd_base+ir*IN_COLS+ic] : sienna_fmt_pkg::LOWEST_VALUE;  // the pad: -infinity in floats, -128 in int8
+      lane_in_img[L] = (ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS);
+      am_raddr[L] = lane_in_img[L] ? AM_AW'(act_rd_base + ir * IN_COLS + ic) : '0;
     end
-  end
+  always_comb
+    for (int L = 0; L < NUM_LANES; L++) begin
+      lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
+      lane_val[L] = lane_in_img[L] ? am_rdata[L] : sienna_fmt_pkg::LOWEST_VALUE;  // the pad: -infinity in floats, -128 in int8
+    end
 
   // One active lane without an L7 credit (L9 with a 1x1 pool) stalls the whole group, which keeps every lane on the same element.
   always_comb begin
@@ -1031,18 +1038,21 @@ module sienna_pipe #(
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
     if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_ADD
       localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
-      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_mem[PER_LANE];  // the hold set's requantized beats (N^2 words); no reset, read only after its own write
       logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
+      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_q;  // the hold beat at add_idx
       assign hold_idx    = HMW'(tg_idx[RQL-1]);
       assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
       assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
-      always_ff @(posedge clk_i) if (hold_wr) hold_mem[hold_idx] <= rq_d;  // the hold beat's own index (hold_idx)
+      // The hold set's requantized beats (N^2 words) in one mem_array: written at the hold beat's own index, read combinationally; no reset,
+      // read only after its own write.
+      mem_array #(.DEPTH(PER_LANE), .WIDTH(NUM_LANES * DATA_WIDTH), .SYNC_READ(1'b0)) hold_mem (
+          .clk_i(clk_i), .we_i(hold_wr), .waddr_i(hold_idx), .wmask_i(1'b1), .wdata_i(rq_d), .re_i(1'b1), .raddr_i(add_idx), .rdata_o(hold_q));
       add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
-          .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_mem[add_idx]), .q2_i(rq_d),
+          .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_q), .q2_i(rq_d),
           .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),
           .valid_o(add_v), .result_o(add_d), .tag_o(add_tag), .busy_o(add_busy));
 `ifndef SYNTHESIS
-      assign add_q1_s = hold_mem[add_idx];
+      assign add_q1_s = hold_q;
       // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
       a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
         else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");

@@ -153,6 +153,7 @@ module TB_sienna #(
     logic sum_open;  // the last set put was a partial sum: it completes before the mesh frees its staging bank, so no drain until the sum ends
     set_side_t side_put;
     assign side_put = set_side_t'(host_lnk[0].data[SIDE_W-1:0]);
+    logic pipeline_complete_o;  // the DUT's completion pulse, counted here and awaited by collect_outputs
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) begin
         tb_inflight <= 0;
@@ -194,7 +195,6 @@ module TB_sienna #(
     logic west_write_enable_i, west_write_reset_i;
     logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] west_write_data_i;
 
-    logic                                  pipeline_complete_o;
     logic                        [ID_W-1:0] done_set_id_o;
     logic systolic_busy_tb, gpnae_busy_tb;
     logic maxpool_busy_tb, dropout_busy_tb;
@@ -746,6 +746,7 @@ module TB_sienna #(
 
     // The output words reach actual_results from the L9 consumer, a set at a time in window order.
 
+    integer lane_fd;  // the lane status log, closed on a timeout
     // ── Collect outputs — with heartbeat ─────────────────────────────────
     task automatic collect_outputs();
       automatic int waited = 0;
@@ -1015,7 +1016,6 @@ module TB_sienna #(
       end
     end
 
-    integer       lane_fd;
     logic   [4:0] prev_current_state;
     logic         lane_log_init_done;
 
@@ -1233,6 +1233,8 @@ module TB_sienna #(
     int rq_id[$], rq_bank[$], rq_byp[$], rq_add[$];
     int add_drain_hold = 0;  // cycles an add set's drain held the next grant, which it does by design
     int ov_rq = 0, rq_wait = 0;
+    int res_holds = 0, res_add_beats = 0, res_add_stray = 0, cross_rel_grant = 0, cross_hold_bank = 0;
+    int res_add_set[int];  // add_lanes' fill beats per add set of the pass, by the set's number
     int ov_lane = 0, rq_hold = 0, rq_null_wait = 0, rq_null_pass = 0, rd_in = 0;  // rd_in: wide reads of the stage's set so far
     wire next_ready = res_ready && dut.G_SET.G_COPY[0].pipe.mesh_sets != 0 && !dut.G_SET.G_COPY[0].pipe.set_accum[dut.G_SET.G_COPY[0].pipe.g_next_id];  // the next set's result is ready to push
     initial forever begin
@@ -1293,8 +1295,6 @@ module TB_sienna #(
     end
 
     // int8 residual (spec Risk 3): hold sets done, add_lanes' fill beats, and the same-cycle crosses of a hold set's done with an L3 grant and with a bank done.
-    int res_holds = 0, res_add_beats = 0, res_add_stray = 0, cross_rel_grant = 0, cross_hold_bank = 0;
-    int res_add_set[int];  // add_lanes' fill beats per add set of the pass, by the set's number
     initial forever begin
       @(negedge clk_i);
       if (EXP_W == 0 && stream_on && rstn_i) begin

@@ -480,6 +480,7 @@ lint: $(PKG_DEP)
 		$(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) \
 		$(TB_DIR)/top/$(TESTBENCH)
 	@$(PYTHON) $(SM_LIB_DIR)/scripts/declared_first.py --label "sienna $(FMT)" --top sienna_top $(patsubst +define+%,-D %,$(FMT_DEF)) -D SYNTHESIS --root $(PRJ_DIR) -f $(PRJ_DIR)/src/sienna_rtl.f
+	@$(PYTHON) $(SM_LIB_DIR)/scripts/declared_first.py --label "$(TOP_MODULE) $(TB_MODE) $(FMT)" --top $(TOP_MODULE) -G MODE=$(TB_MODE_NUM) $(patsubst +define+%,-D %,$(FMT_DEF)) --timescale 1ns/1ps $(addprefix -I,$(SRC_DIR)/top $(TB_DIR)/top $(SM_DIR) $(SM_LIB_DIR) $(GPNAE_DIR) $(MAXPOOL_DIR) $(DROPOUT_DIR)) $(DESIGN_FILES) $(addprefix $(TB_DIR)/,$(TB_PKG_FILES)) $(TB_DIR)/top/$(TESTBENCH)
 	@echo "-- Lint complete"
 
 debug: VERILATOR_FLAGS += --debug --gdbbt

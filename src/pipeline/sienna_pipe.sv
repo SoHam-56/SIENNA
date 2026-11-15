@@ -69,10 +69,6 @@ module sienna_pipe #(
   localparam int ACC_DATA_WIDTH    = sienna_fmt_pkg::ACC_DATA_WIDTH;  // sums and bias: int32 in int8, fp32 in every float format
   localparam int RESULT_DATA_WIDTH = sienna_fmt_pkg::RESULT_DATA_WIDTH;  // mesh result words: int32 in int8, DATA_WIDTH in floats
 
-  if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
-    $fatal(1, "sienna_top: SRAM_DEPTH %0d must be N*N (%0d)", SRAM_DEPTH, N * N);
-  end
-
   localparam int GPNAE_ADDR_LINES = 5;
   localparam int GPNAE_CTRL_WIDTH = 3;
   localparam int GPNAE_FIFO_DEPTH = 2 ** GPNAE_ADDR_LINES;
@@ -81,17 +77,6 @@ module sienna_pipe #(
   // the depth directly; at any other lane count it would leave the later lanes empty and index
   // gpnae_out_mem past its end.
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;
-
-  // Lanes take contiguous blocks of PER_LANE elements, so the division has to be exact: a
-  // remainder would be dropped silently, and PER_LANE must fit a lane's input FIFO.
-`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
-  initial begin
-    if ((SRAM_DEPTH % NUM_LANES) != 0)
-      $error("sienna_top: NUM_LANES (%0d) must divide SRAM_DEPTH (%0d)", NUM_LANES, SRAM_DEPTH);
-    if (PER_LANE > GPNAE_FIFO_DEPTH)
-      $error("sienna_top: PER_LANE (%0d) exceeds GPNAE_FIFO_DEPTH (%0d)", PER_LANE, GPNAE_FIFO_DEPTH);
-  end
-`endif
 
   localparam int FCNT_W = $clog2(PER_LANE + 1);  // what fill_count/done_count actually range over
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
@@ -112,9 +97,27 @@ module sienna_pipe #(
   localparam int CRW = $clog2(SETS_IN_FLIGHT + 1);
   localparam int PEW = $clog2(PACK_ENTRIES);
   localparam int LGN = $clog2(N);
-`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
-  initial if (PACK_ENTRIES < 2 || (PACK_ENTRIES & (PACK_ENTRIES - 1)) != 0) $error("sienna_top: PACK_ENTRIES (%0d) must be a power of two >= 2", PACK_ENTRIES);
-`endif
+  localparam int AM_AW = $clog2(2 * SRAM_DEPTH);  // the activation banks' word address
+  localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
+  localparam int L3_W   = NUM_LANES * RESULT_DATA_WIDTH + 3;  // a result beat: {packed, last, first, one word per lane}
+  localparam int L3_CRW = $clog2(PER_LANE + 1);  // a set's beats granted in one cycle
+  localparam int BUS_STAGES = 2 * LINK_STAGES;  // rows, cache writes and bias pass as many stages as the put (L0 then L1)
+  localparam int BUS_W = 5 + 2 * HOST_WORDS * DATA_WIDTH + WCAW + N * ACC_DATA_WIDTH;
+  localparam int L5W = $clog2(LANE_OUT_SLOTS + 1);
+  localparam int L5_MAX = (LANE_OUT_SLOTS > LANE_K) ? LANE_OUT_SLOTS : LANE_K;  // the lane's out counter; never below K, which it checks
+  localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;  // the window dispatcher's groups
+  localparam int ADV_R = NUM_LANES / POOL_OUT_COLS;  // rows and columns a lane moves by per group of windows
+  localparam int ADV_C = NUM_LANES % POOL_OUT_COLS;
+
+  `include "sienna_set_side.svh"
+  localparam int SIDE_W = $bits(set_side_t);
+
+  // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
+  // A partial set is summed in the mesh's PEs and leaves no result; it passes this stage in G_IDLE as a null.
+  typedef enum logic [1:0] {G_IDLE, G_FEED, G_LATCH, G_ROUND} g_state_t;
+  // Pooling stage: dispatch windows into FIFO2, then wait for maxpool and dropout to drain.
+  typedef enum logic [1:0] {P_IDLE, P_DISPATCH, P_WAIT} p_state_t;
+
   // A packed set's lanes each take one column: N must divide the lanes; the mesh packs only collapsed; pooling must be the identity.
   function automatic logic [PEW-1:0] ent_of(input logic [N/2-1:0][PEW-1:0] map, input logic [2:0] sh, input int col);
     return (sh == '0) ? map[0] : map[col >> (LGN - int'(sh))];
@@ -122,18 +125,14 @@ module sienna_pipe #(
   function automatic logic is_byp_code(input logic [CONTROL_WIDTH-1:0] c);
     return (c == CONTROL_WIDTH'(3'b100)) || (c == CONTROL_WIDTH'(3'b101));
   endfunction
-`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
-  initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
-`endif
+  // Lane k's element i goes to this entry of the activation bank: k * PER_LANE + i along a row, or for a packed set element i down column k % N.
+  function automatic logic [AM_AW-1:0] am_entry(input logic bank, input int k, input int i, input logic pk);
+    return AM_AW'((bank ? SRAM_DEPTH : 0) + (pk ? ((k / N) * PER_LANE + i) * N + k % N : k * PER_LANE + i));
+  endfunction
 
-  // Activation stage: read a mesh result into FIFO1, fill the lanes, write gpnae_out_mem.
-  // A partial set is summed in the mesh's PEs and leaves no result; it passes this stage in G_IDLE as a null.
-  typedef enum logic [1:0] {G_IDLE, G_FEED, G_LATCH, G_ROUND} g_state_t;
-  // Pooling stage: dispatch windows into FIFO2, then wait for maxpool and dropout to drain.
-  typedef enum logic [1:0] {P_IDLE, P_DISPATCH, P_WAIT} p_state_t;
+  // ── The stages' state and the set bookkeeping ──
   g_state_t g_state;
   p_state_t p_state;
-
   logic host_accept, g_accept, g_done, p_accept, p_release, pool_done;
   // g_done: the stage may take the next set; bank_done: bank bank_sel holds a whole set (later than g_done for an int8 ReLU or linear set).
   logic bank_done, bank_sel, byp_all_in, rq_drain;
@@ -143,11 +142,6 @@ module sienna_pipe #(
   logic [FCNT_W-1:0] byp_idx;  // its element within each lane's block
   logic hold_done;  // int8: a hold set's last beat is in hold_mem: its L6 reservation goes back, pooling may pass it
   logic fill_add;  // int8: the fill beat this cycle came through add_lanes
-`ifndef SYNTHESIS
-  logic add_in_s, hold_wr_s;
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
-  logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_sienna's layer mode, +hold_check)
-`endif
   logic [1:0] act_full;  // per activation bank: a finished activation not yet dispatched
   logic act_wr, act_rd;  // bank the lanes write, bank the dispatcher reads
   int act_wr_base, act_rd_base;
@@ -172,8 +166,13 @@ module sienna_pipe #(
   logic [PEW-1:0] lane_ent[NUM_LANES];  // the entry each lane uses for that set
   logic [PEW-1:0] p_lane_ent[NUM_LANES];  // and each pooling lane for the pooled set
   logic [CONTROL_WIDTH-1:0] lane_act[NUM_LANES];
-  logic act_bypass;  // every lane's code is ReLU or linear; declared here because the lane-control block above its old place reads it
+  logic act_bypass;  // every lane's code is ReLU or linear
   logic [CRW-1:0] gp_sets;  // sets past the activation stage and not yet complete; pooling takes them in id order
+  logic g_null_done;  // a partial set, summed in the PEs, passes with no result and no activation bank
+  logic complete_q;
+  logic set_complete;  // a set completes this cycle, with its last word into the output register
+  logic [ID_W-1:0] set_done_id;
+  logic streaming_complete;  // every lane's windows of the pooled set are out of dropout
   // int8: the requantize and GPNAE parameters of the set the activation stage holds (g_*); p_zp: dropout's drop value for the pooled set.
   sienna_fmt_pkg::requant_scale_t [N-1:0] g_scale;  // per output channel: the requantize scale
   sienna_fmt_pkg::lane_entry_t [NUM_LANES-1:0] g_lane;  // per lane: its column block's entry
@@ -183,6 +182,137 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0][23:0] g_mout;
   logic [NUM_LANES-1:0][5:0]  g_shout;
   sienna_fmt_pkg::lane_params_t [NUM_LANES-1:0] g_par, g_par_q;  // per lane: the bundle gpnae takes, and its register (timing: the entry select and the ADD's zero point mux stay out of the lane's rescale stage; the first element reaches a lane five cycles after g_accept, the bundle one)
+  sienna_fmt_pkg::add_params_t g_add_w;  // the activation stage's set's ADD words
+  logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
+  // ── The activation banks (act_mem): a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector,
+  // a combinational read port per pooling lane ──
+  logic fill_v;  // the parallel lane fill's beat
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_w;  // the float bypass fill's words: ReLU drops a negative word to +0
+  logic fill_wr;
+  logic [2*NUM_LANES-1:0] am_we;
+  logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr;
+  logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata;
+  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] am_rdata;
+  // ── The mesh's result beats and status ──
+  logic [NUM_LANES-1:0][RESULT_DATA_WIDTH-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
+  logic                                 wide_rd_valid;  // a result beat arrives on L3
+  logic                  systolic_mult_complete;
+  logic north_queue_empty, west_queue_empty;
+  // ── The links: L0 host, L1 staging, L3 results, L6 activation bank; the write buses beside them ──
+  logic live;  // out of reset for a cycle: no consumer here advertises before it
+  logic drained;  // the pipeline has been empty a while: every internal link must hold all its credits (set in the checks)
+  set_side_t side;  // the put's sideband
+  logic [1:0] l1_cnt;  // staging credits held here or passed to the host and not yet spent
+  logic l0_grant;
+  logic [BUS_W-1:0] bus_in, bus_out;
+  logic m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we;
+  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] m_north, m_west;
+  logic [WCAW-1:0] m_wc_addr;
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] m_bias;
+  logic l3_armed;  // beats granted for a set the stage has not taken yet
+  logic l3_grant, l6_room, rq_room;
+  logic l4_room;  // every lane holds a whole set's words of L4 credits
+  logic l3_first, l3_last, l3_pk;
+  logic g_fed;  // a beat of the stage's set has arrived
+  logic [1:0] l6_cnt;  // banks the activation stage may fill
+  logic [1:0] l6_rsv;  // of those, reserved by a grant whose set has not filled its bank yet
+  logic [1:0] l6_owed;  // pooling's advertisement still to send
+  logic l6_credit;
+  // ── The backend lanes: L4 in, L5 out, the fill and collect counters ──
+  logic [      DATA_WIDTH-1:0] gpnae_signal_i     [NUM_LANES];  // L4: the word put to lane k
+  logic                        gpnae_wr_en        [NUM_LANES];  // L4 put
+  logic                        gpnae_last         [NUM_LANES];  // L4: the set's last word for the lane
+  logic [GPNAE_CTRL_WIDTH-1:0] gpnae_ctrl         [NUM_LANES];
+  logic [      DATA_WIDTH-1:0] gpnae_result       [NUM_LANES];  // L5 data
+  logic                        gpnae_done         [NUM_LANES];  // L5 put
+  logic                        fifo2_wr_valid     [NUM_LANES];  // L7 put (with a 1x1 pool, dropout's input)
+  logic                        fifo2_rd_ready     [NUM_LANES];  // FIFO2 pops: an L8 put
+  logic [      DATA_WIDTH-1:0] fifo2_wr_data      [NUM_LANES];
+  logic [      DATA_WIDTH-1:0] byp_data           [NUM_LANES];  // with a 1x1 pool: the dispatched word, straight to dropout
+  logic [       NUM_LANES-1:0] byp_valid;
+  logic [      DATA_WIDTH-1:0] fifo2_rd_data      [NUM_LANES];
+  logic                        fifo2_rd_valid     [NUM_LANES];
+  logic                        maxpool_out_valid  [NUM_LANES];  // a window's result into dropout
+  logic                        dropout_in_valid   [NUM_LANES];
+  logic [      DATA_WIDTH-1:0] dropout_data_in    [NUM_LANES];
+  logic                        dropout_valid_out  [NUM_LANES];
+  logic [          FCNT_W-1:0] fill_count         [NUM_LANES];
+  logic [          FCNT_W-1:0] done_count         [NUM_LANES];
+  logic                        load_finalized     [NUM_LANES];
+  logic                        lane_collected     [NUM_LANES];
+  logic                        lane_collected_n   [NUM_LANES];
+  logic [           TOT_W-1:0] total_elements;
+  logic [           TOT_W-1:0] filled_total;
+  logic [          FCNT_W-1:0] fill_count_n       [NUM_LANES];
+  logic [          FCNT_W-1:0] done_count_n       [NUM_LANES];
+  logic                        load_finalized_n   [NUM_LANES];
+  logic                        gpnae_last_n       [NUM_LANES];
+  logic                        gpnae_wr_en_n      [NUM_LANES];
+  logic [      DATA_WIDTH-1:0] gpnae_signal_n     [NUM_LANES];
+  logic [           TOT_W-1:0] filled_total_n;
+  logic [$clog2(FIFO2_DEPTH):0] fifo2_count[NUM_LANES];
+  logic all_collected;  // every lane has returned all its PER_LANE elements
+  logic all_lanes_collected;
+  logic [GPNAE_ADDR_LINES:0] l4_cnt[NUM_LANES];  // L4 credits the stage holds per lane
+  logic                      l4_cr [NUM_LANES];  // L4 credit, lane to stage
+  logic                      l5_cr [NUM_LANES];  // L5 credit, collector to lane
+  logic [L5W-1:0]            l5_owed[NUM_LANES];  // the collector's advertisement still to send
+  logic [L5W-1:0]            l5_out[NUM_LANES];  // L5 credits the lane holds
+  logic [NUM_LANES-1:0][GPNAE_ADDR_LINES:0] lane_outst;  // words put to a lane whose results are not back
+  logic [NUM_LANES-1:0][FCNT_W-1:0] l4_n;  // L4 puts per lane for the stage's set
+  logic [NUM_LANES-1:0] l5_want;  // the lane's result is due: the stage holds its set and not all results are in
+  logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o
+  // L7 (L9 through dropout with a 1x1 pool): the dispatcher's words into each pooling lane, a credit counter per lane.
+  logic [15:0]               pin_cnt[NUM_LANES];
+  logic                      pin_cr [NUM_LANES];
+  logic [NUM_LANES-1:0]      pin_room;  // the lane takes the next dispatched word: a credit beyond the put now in flight
+  // Dropout's lane seeds: the id pooling will accept next, and its seed registered (stage 1 of three).
+  logic p_null;  // the pooling stage passes a partial or hold set this cycle
+  logic [ID_W-1:0] seed_src, seed_src1;
+  logic [31:0] seed_x1;
+  // ── The window dispatcher ──
+  logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
+  logic [           $clog2(POOL_H+1)-1:0] disp_pr;
+  logic [           $clog2(POOL_W+1)-1:0] disp_pc;
+  logic                                   disp_done;
+  logic [    $clog2(POOL_OUT_ROWS+1)-1:0] lane_r     [NUM_LANES];
+  logic [    $clog2(POOL_OUT_COLS+1)-1:0] lane_c     [NUM_LANES];
+  logic [$clog2(MAXPOOL_OUT_COUNT+1)-1:0] lane_win   [NUM_LANES];
+  logic [                  NUM_LANES-1:0] lane_active;
+  logic [DATA_WIDTH-1:0] lane_val[NUM_LANES];
+  logic                  disp_can_write;
+  logic [NUM_LANES-1:0] lane_in_img;  // the lane's element is inside the image (not padding)
+  // ── The pooling lanes' window counts ──
+  logic [TOT_W-1:0] lane_windows_total[NUM_LANES];
+  logic [TOT_W-1:0] mp_out_count[NUM_LANES];  // this set's windows out of maxpool
+  logic [TOT_W-1:0] dropout_out_count[NUM_LANES], dropout_out_count_n[NUM_LANES];
+  logic any_mp_active;  // a lane has windows of the pooled set still to leave maxpool; never with a 1x1 pool, which skips it
+  logic any_dropout_active;
+`ifndef SYNTHESIS
+  logic add_in_s, hold_wr_s;
+  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_q1_s, add_q2_s, hold_d_s;  // simulation only: the ADD stage's inputs and the hold beats, for the truth dump
+  logic hm_any;  // simulation only: hold_mem holds unread hold beats (TB_sienna's layer mode, +hold_check)
+`endif
+
+  if (SRAM_DEPTH != N * N) begin : G_BAD_SRAM_DEPTH  // L3 grants SRAM_DEPTH/NUM_LANES beats, the mesh pushes N*N/NUM_LANES
+    $fatal(1, "sienna_top: SRAM_DEPTH %0d must be N*N (%0d)", SRAM_DEPTH, N * N);
+  end
+`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
+  // Lanes take contiguous blocks of PER_LANE elements, so the division has to be exact: a remainder would be dropped silently, and PER_LANE
+  // must fit a lane's input FIFO.
+  initial begin
+    if ((SRAM_DEPTH % NUM_LANES) != 0)
+      $error("sienna_top: NUM_LANES (%0d) must divide SRAM_DEPTH (%0d)", NUM_LANES, SRAM_DEPTH);
+    if (PER_LANE > GPNAE_FIFO_DEPTH)
+      $error("sienna_top: PER_LANE (%0d) exceeds GPNAE_FIFO_DEPTH (%0d)", PER_LANE, GPNAE_FIFO_DEPTH);
+  end
+  initial if (PACK_ENTRIES < 2 || (PACK_ENTRIES & (PACK_ENTRIES - 1)) != 0) $error("sienna_top: PACK_ENTRIES (%0d) must be a power of two >= 2", PACK_ENTRIES);
+  initial if (NUM_IDS < SETS_IN_FLIGHT) $error("sienna_top: ID_W=%0d is too narrow for %0d sets in flight", ID_W, SETS_IN_FLIGHT);
+`endif
+
+
   always_ff @(posedge clk_i) g_par_q <= g_par;  // no reset: a lane reads it with an element
   assign act_wr_base = act_wr ? SRAM_DEPTH : 0;
   assign act_rd_base = act_rd ? SRAM_DEPTH : 0;
@@ -191,33 +321,12 @@ module sienna_pipe #(
   // The activation banks are one mem_array (act_mem: a module boundary, so synthesis can swap it for a macro): two banks of SRAM_DEPTH words,
   // a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector, a combinational read port per
   // pooling lane.
-  localparam int AM_AW = $clog2(2 * SRAM_DEPTH);
-  logic fill_v;  // the parallel lane fill's beat (declared here, before the bank's write ports read it)
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
-  logic [2*NUM_LANES-1:0] am_we;
-  logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr;
-  logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata;
-  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] am_rdata;
   mem_array #(.DEPTH(2 * SRAM_DEPTH), .WIDTH(DATA_WIDTH), .NW(2 * NUM_LANES), .NR(NUM_LANES), .SYNC_READ(1'b0)) act_mem (
       .clk_i(clk_i), .we_i(am_we), .waddr_i(am_waddr), .wmask_i('1), .wdata_i(am_wdata), .re_i('1), .raddr_i(am_raddr), .rdata_o(am_rdata));
-
-
-  logic [NUM_LANES-1:0][RESULT_DATA_WIDTH-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
-  logic                                 wide_rd_valid;  // a result beat arrives on L3
-  logic                  systolic_mult_complete;
-  logic north_queue_empty, west_queue_empty;
 
   // =========================================================================
   // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
   // =========================================================================
-  `include "sienna_set_side.svh"
-  sienna_fmt_pkg::add_params_t g_add_w;  // the activation stage's set's ADD words
-  logic [7:0] g_add_zpo;  // its ADD's output zero point, the lanes' input zero point (P-3)
-  localparam int SIDE_W = $bits(set_side_t);
-  localparam int STG_W  = WCTW + 7;  // the mesh's staging sideband
-  localparam int L3_W   = NUM_LANES * RESULT_DATA_WIDTH + 3;  // a result beat: {packed, last, first, one word per lane}
-  localparam int L3_CRW = $clog2(PER_LANE + 1);  // a set's beats granted in one cycle
   credit_link_if #(.DATA_W(SIDE_W), .CRW(1)) l0 ();  // the host link after its register stages
   credit_link_if #(.DATA_W(STG_W), .CRW(1)) l1p ();  // staging, this side of its register stages
   credit_link_if #(.DATA_W(STG_W), .CRW(1)) l1m ();  // staging, the mesh's side
@@ -234,16 +343,11 @@ module sienna_pipe #(
     assign wc_region[r].credit = wcm[r].credit;
   end
 
-  logic live;  // out of reset for a cycle: no consumer here advertises before it
-  logic drained;  // the pipeline has been empty a while: every internal link must hold all its credits (set below)
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) live <= 1'b0;
     else live <= 1'b1;
 
   // L0 and L1: a host put is the set's start and goes to the mesh at once; a staging credit passes to the host while the entry admits.
-  set_side_t side;
-  logic [1:0] l1_cnt;  // staging credits held here or passed to the host and not yet spent
-  logic l0_grant;
   assign side = l0.data;
   assign host_accept = l0.put;
   assign l1p.put = l0.put;
@@ -255,13 +359,6 @@ module sienna_pipe #(
   assign l0.credit = l0_grant;
 
   // Rows, cache writes and bias pass as many stages as the put (L0 then L1), so a set's rows reach its bank before its put.
-  localparam int BUS_STAGES = 2 * LINK_STAGES;
-  localparam int BUS_W = 5 + 2 * HOST_WORDS * DATA_WIDTH + WCAW + N * ACC_DATA_WIDTH;
-  logic [BUS_W-1:0] bus_in, bus_out;
-  logic m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we;
-  logic [HOST_WORDS-1:0][DATA_WIDTH-1:0] m_north, m_west;
-  logic [WCAW-1:0] m_wc_addr;
-  logic [N-1:0][ACC_DATA_WIDTH-1:0] m_bias;
   assign bus_in = {north_write_enable_i, west_write_enable_i, north_write_reset_i, west_write_reset_i, wc_write_enable_i,
                    north_write_data_i, west_write_data_i, wc_write_addr_i, bias_i};
   if (BUS_STAGES == 0) begin : G_BUS_WIRE
@@ -285,11 +382,6 @@ module sienna_pipe #(
   assign {m_north_we, m_west_we, m_north_rst, m_west_rst, m_wc_we, m_north, m_west, m_wc_addr, m_bias} = bus_out;
 
   // L3: the stage grants a set's PER_LANE beats while idle with a bank reserved; it takes the next result set when its beats are granted.
-  logic l3_armed;  // beats granted for a set the stage has not taken yet
-  logic l3_grant, l6_room, rq_room;
-  logic l4_room;  // every lane holds a whole set's words of L4 credits
-  logic l3_first, l3_last, l3_pk;
-  logic g_fed;  // a beat of the stage's set has arrived
   // Not while a partial set waits to pass: the next result's beats could then arrive before the stage takes its set.
   assign l3_grant = live && (g_state == G_IDLE) && !l3_armed && l6_room && rq_room && l4_room && !(mesh_sets != 0 && set_accum[g_next_id]);
   assign l3c.credit = l3_grant ? L3_CRW'(PER_LANE) : '0;
@@ -298,10 +390,6 @@ module sienna_pipe #(
   assign {l3_pk, l3_last, l3_first} = l3c.data[L3_W-1-:3];
 
   // L6: activation bank link inside this module; the activation stage spends a credit per bank it fills, pooling returns one per release.
-  logic [1:0] l6_cnt;  // banks the activation stage may fill
-  logic [1:0] l6_rsv;  // of those, reserved by a grant whose set has not filled its bank yet
-  logic [1:0] l6_owed;  // pooling's advertisement still to send
-  logic l6_credit;
   credit_counter #(.MAX(2), .CRW(1)) l6_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(l6.put), .credit_i(l6.credit), .has_credit_o(),
                                             .count_o(l6_cnt));
   assign l6_room = l6_cnt > l6_rsv;
@@ -309,47 +397,6 @@ module sienna_pipe #(
   assign l6.data = bank_sel;
   assign l6_credit = p_release || (live && l6_owed != 0);
   assign l6.credit = l6_credit;
-
-  // Backend Arrays
-  logic [      DATA_WIDTH-1:0] gpnae_signal_i     [NUM_LANES];  // L4: the word put to lane k
-  logic                        gpnae_wr_en        [NUM_LANES];  // L4 put
-  logic                        gpnae_last         [NUM_LANES];  // L4: the set's last word for the lane
-  logic [GPNAE_CTRL_WIDTH-1:0] gpnae_ctrl         [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] gpnae_result       [NUM_LANES];  // L5 data
-  logic                        gpnae_done         [NUM_LANES];  // L5 put
-
-  logic                        fifo2_wr_valid     [NUM_LANES];  // L7 put (with a 1x1 pool, dropout's input)
-  logic                        fifo2_rd_ready     [NUM_LANES];  // FIFO2 pops: an L8 put
-  logic [      DATA_WIDTH-1:0] fifo2_wr_data      [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] byp_data           [NUM_LANES];  // with a 1x1 pool: the dispatched word, straight to dropout
-  logic [       NUM_LANES-1:0] byp_valid;
-  logic [      DATA_WIDTH-1:0] fifo2_rd_data      [NUM_LANES];
-  logic                        fifo2_rd_valid     [NUM_LANES];
-
-  logic                        maxpool_out_valid  [NUM_LANES];  // a window's result into dropout
-
-  logic                        dropout_in_valid   [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] dropout_data_in    [NUM_LANES];
-  logic                        dropout_valid_out  [NUM_LANES];
-
-  logic [          FCNT_W-1:0] fill_count         [NUM_LANES];
-  logic [          FCNT_W-1:0] done_count         [NUM_LANES];
-  logic                        load_finalized     [NUM_LANES];
-  logic                        lane_collected     [NUM_LANES];
-  logic                        lane_collected_n   [NUM_LANES];
-
-  logic [           TOT_W-1:0] total_elements;
-  logic [           TOT_W-1:0] filled_total;
-
-  logic [          FCNT_W-1:0] fill_count_n       [NUM_LANES];
-  logic [          FCNT_W-1:0] done_count_n       [NUM_LANES];
-  logic                        load_finalized_n   [NUM_LANES];
-  logic                        gpnae_last_n       [NUM_LANES];
-  logic                        gpnae_wr_en_n      [NUM_LANES];
-  logic [      DATA_WIDTH-1:0] gpnae_signal_n     [NUM_LANES];
-  logic [           TOT_W-1:0] filled_total_n;
-
-  logic [$clog2(FIFO2_DEPTH):0] fifo2_count[NUM_LANES];
 
   always_ff @(posedge clk_i or negedge rstn_i) begin
     if (!rstn_i) begin
@@ -360,9 +407,6 @@ module sienna_pipe #(
     end
   end
 
-  logic all_collected;
-  // Every lane gets PER_LANE elements, so a set is done only when every lane has returned all of them.
-  logic all_lanes_collected;
   always_comb begin
     all_lanes_collected = 1'b1;
     for (int i = 0; i < NUM_LANES; i++) if (!lane_collected[i]) all_lanes_collected = 1'b0;
@@ -401,21 +445,6 @@ module sienna_pipe #(
   );
 
   // L4, L5 per lane: the stage spends an L4 credit per word; the collector grants LANE_OUT_SLOTS and returns each the cycle after its result.
-  localparam int L5W = $clog2(LANE_OUT_SLOTS + 1);
-  localparam int L5_MAX = (LANE_OUT_SLOTS > LANE_K) ? LANE_OUT_SLOTS : LANE_K;  // the lane's out counter; never below K, which it checks
-  logic [GPNAE_ADDR_LINES:0] l4_cnt[NUM_LANES];  // L4 credits the stage holds per lane
-  logic                      l4_cr [NUM_LANES];  // L4 credit, lane to stage
-  logic                      l5_cr [NUM_LANES];  // L5 credit, collector to lane
-  logic [L5W-1:0]            l5_owed[NUM_LANES];  // the collector's advertisement still to send
-  logic [L5W-1:0]            l5_out[NUM_LANES];  // L5 credits the lane holds
-  logic [NUM_LANES-1:0][GPNAE_ADDR_LINES:0] lane_outst;  // words put to a lane whose results are not back
-  logic [NUM_LANES-1:0][FCNT_W-1:0] l4_n;  // L4 puts per lane for the stage's set
-  logic [NUM_LANES-1:0] l5_want;  // the lane's result is due: the stage holds its set and not all results are in
-  // L7 (L9 through dropout with a 1x1 pool): the dispatcher's words into each pooling lane, a credit counter per lane.
-  logic [15:0]               pin_cnt[NUM_LANES];
-  logic                      pin_cr [NUM_LANES];
-  logic [NUM_LANES-1:0]      pin_room;  // the lane takes the next dispatched word: a credit beyond the put now in flight
-
   always_comb begin
     l4_room = 1'b1;
     for (int i = 0; i < NUM_LANES; i++) if (int'(l4_cnt[i]) < PER_LANE) l4_room = 1'b0;
@@ -444,16 +473,12 @@ module sienna_pipe #(
     end
   end
 
-  logic [NUM_LANES-1:0] lane_idle;  // each lane's idle_o
   assign coef_ready_o = (&lane_idle) && (sets_out == '0) && !host_accept;
 
   // Dropout's lane seeds take three register stages, so the reseed at p_accept reads a register (timing): stage 1 the seed of seed_src, the id
   // pooling will accept next; stage 2 the two half products of the constant multiply; stage 3 their sum, folded. seed_src skips the id accepted or
   // passed this cycle and a null set after it: an accept follows an accept by four cycles at least and a null by one, and nulls are two apart, so
   // the id accepted three cycles on is always seed_src now.
-  logic p_null;  // declared here, before the seed stages read it
-  logic [ID_W-1:0] seed_src, seed_src1;
-  logic [31:0] seed_x1;  // stage 1
   assign seed_src1 = p_next_id + ID_W'(p_accept || p_null);
   assign seed_src  = seed_src1 + ID_W'(set_accum[seed_src1] || set_hold[seed_src1]);
   always_ff @(posedge clk_i) seed_x1 <= 32'(set_seed[seed_src]);  // no reset: read only at p_accept, after its set's host_accept
@@ -461,9 +486,23 @@ module sienna_pipe #(
   generate
     genvar g;
     for (g = 0; g < NUM_LANES; g++) begin : backend_lanes
-
+      localparam int PIN_MAX = POOL_BYPASS ? OUT_MAX : FIFO2_DEPTH;  // L7, or L9 through dropout with a 1x1 pool
+      localparam int PIN_CRW = POOL_BYPASS ? OUT_CRW : 1;
+      localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);  // the lane's seed mix constant
+      logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
+      // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
+      logic [31:0] seed_xc, seed_pa, lane_mul;
+      logic [15:0] seed_pb;  // the high half's product: only its low 16 bits reach the 32-bit result
+      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
+      // The output register, as final_result_o was.
+      logic                  oq_put;
+      logic [DATA_WIDTH-1:0] oq_data;
       credit_link_if #(.DATA_W(DATA_WIDTH + 1), .CRW(1)) l4 ();  // L4: {last, word}
       credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(1)) l5 ();  // L5: one result per put
+      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(PIN_CRW)) pin ();  // the dispatcher's words
+      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) drp ();  // into dropout: window results, or pin itself
+      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) l9p ();  // out of dropout, into the output register
+      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) l9q ();  // out of the output register, into L9's register stages
       assign l4.put  = gpnae_wr_en[g];
       assign l4.data = {gpnae_last[g], gpnae_signal_i[g]};
       assign l4_cr[g] = l4.credit;
@@ -493,13 +532,6 @@ module sienna_pipe #(
       );
 
       // L7 into FIFO2, or with a 1x1 pool straight into dropout on L9's credits; L8 FIFO2 -> maxpool -> dropout; L9 out.
-      localparam int PIN_MAX = POOL_BYPASS ? OUT_MAX : FIFO2_DEPTH;
-      localparam int PIN_CRW = POOL_BYPASS ? OUT_CRW : 1;
-      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(PIN_CRW)) pin ();  // the dispatcher's words
-      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) drp ();  // into dropout: window results, or pin itself
-      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) l9p ();  // out of dropout, into the output register
-      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) l9q ();  // out of the output register, into L9's register stages
-      logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
       assign pin.put  = POOL_BYPASS ? byp_valid[g] : fifo2_wr_valid[g];
       assign pin.data = POOL_BYPASS ? byp_data[g] : fifo2_wr_data[g];
       assign pin_cr[g] = pin.credit != '0;
@@ -558,10 +590,6 @@ module sienna_pipe #(
       end
 
       // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
-      localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);
-      logic [31:0] seed_xc, seed_pa, lane_mul;
-      logic [15:0] seed_pb;  // the high half's product: only its low 16 bits reach the 32-bit result
-      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       assign seed_xc = seed_x1 ^ LANE_C;
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
         seed_pa   <= seed_xc * 32'h0000_CA6B;
@@ -590,8 +618,6 @@ module sienna_pipe #(
       assign dropout_valid_out[g] = l9p.put;
 
       // The output register, as final_result_o was; L9's credits pass it unregistered, which only spends them earlier.
-      logic                  oq_put;
-      logic [DATA_WIDTH-1:0] oq_data;
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) begin
           oq_put  <= 1'b0;
@@ -638,12 +664,7 @@ module sienna_pipe #(
   // down column k % N, ((k / N) * PER_LANE + b) * N + k % N (a packed set needs N to divide the lanes). Lane k's element i goes to that entry of
   // the bank: on port k the float bypass fill or the requantized bypass beat (one of the two per build), on port NUM_LANES + k the L5
   // collector, which writes a lane's result the cycle it arrives and wins over the fill (the higher port) as the statement order did.
-  logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_w;  // the float bypass fill's words: ReLU drops a negative word to +0
-  logic fill_wr;
   assign fill_wr = !sienna_fmt_pkg::HAS_REQUANT_EPILOGUE && g_state != G_IDLE && act_bypass && fill_v;
-  function automatic logic [AM_AW-1:0] am_entry(input logic bank, input int k, input int i, input logic pk);
-    return AM_AW'((bank ? SRAM_DEPTH : 0) + (pk ? ((k / N) * PER_LANE + i) * N + k % N : k * PER_LANE + i));
-  endfunction
   always_comb
     for (int k = 0; k < NUM_LANES; k++) begin
       fill_w[k] = (lane_act[k] == CONTROL_WIDTH'(3'b100)) ? sienna_fmt_pkg::fmt_relu(fill_d[k], '0) : fill_d[k];
@@ -669,24 +690,6 @@ module sienna_pipe #(
   // cycle instead of one per cycle. act_mem has a combinational read port per lane, so the parallel
   // reads are free. Row and column are carried per lane rather than divided out of a window index,
   // which would cost NUM_LANES dividers by a non-power-of-two.
-  localparam int NUM_GROUPS = (MAXPOOL_OUT_COUNT + NUM_LANES - 1) / NUM_LANES;
-  localparam int ADV_R = NUM_LANES / POOL_OUT_COLS;  // rows and columns a lane moves by per group of windows
-  localparam int ADV_C = NUM_LANES % POOL_OUT_COLS;
-
-  logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
-  logic [           $clog2(POOL_H+1)-1:0] disp_pr;
-  logic [           $clog2(POOL_W+1)-1:0] disp_pc;
-  logic                                   disp_done;
-
-  logic [    $clog2(POOL_OUT_ROWS+1)-1:0] lane_r     [NUM_LANES];
-  logic [    $clog2(POOL_OUT_COLS+1)-1:0] lane_c     [NUM_LANES];
-  logic [$clog2(MAXPOOL_OUT_COUNT+1)-1:0] lane_win   [NUM_LANES];
-  logic [                  NUM_LANES-1:0] lane_active;
-
-  logic [DATA_WIDTH-1:0] lane_val[NUM_LANES];
-  logic                  disp_can_write;
-
-  logic [NUM_LANES-1:0] lane_in_img;  // the lane's element is inside the image (not padding)
   always_comb  // the addresses apart from the values read at them: one block for both would read as a loop to Verilator
     for (int L = 0; L < NUM_LANES; L++) begin
       automatic logic signed [31:0] ir = signed'(lane_r[L] * STRIDE_ROWS + disp_pr) - signed'(PADDING);
@@ -772,17 +775,11 @@ module sienna_pipe #(
   // =========================================================================
   // STAGE CONTROLLERS: the mesh, activation (G) and pooling (P) each hold one set
   // =========================================================================
-  logic streaming_complete;
-
   // The stage takes the next real set once its beats are granted; the beats follow when the mesh has the result.
   assign g_accept = (g_state == G_IDLE) && l3_armed && (mesh_sets != 0) && !set_accum[g_next_id];
   assign g_done = (g_state == G_ROUND) && (act_bypass ? byp_all_in : all_collected);
-  logic g_null_done;  // a partial set, summed in the PEs, passes with no result and no activation bank
   assign g_null_done = (g_state == G_IDLE) && (mesh_sets != 0) && set_accum[g_next_id] && !rq_drain;
   // Pooling completes sets in id order: a partial in one cycle, never right after another completion, so pulses stay one cycle.
-  logic complete_q;
-  logic set_complete;  // a set completes this cycle, with its last word into the output register
-  logic [ID_W-1:0] set_done_id;
   assign p_null = (p_state == P_IDLE) && (gp_sets != 0) && (set_accum[p_next_id] || set_hold[p_next_id]) && !complete_q;
   assign p_accept = (p_state == P_IDLE) && (gp_sets != 0) && !set_accum[p_next_id] && !set_hold[p_next_id] && act_full[act_rd];
   assign p_release = (p_state == P_DISPATCH) && disp_done;  // the bank is copied into FIFO2
@@ -959,6 +956,8 @@ module sienna_pipe #(
         endcase
     end
   end else begin : G_NO_REQ_SETS
+    logic unused_add_words;  // only add_lanes reads it, in a build with the residual ADD
+    logic unused_lane_words;  // a float lane takes no parameters
     assign g_scale   = '0;
     assign g_lane    = '0;
     assign g_zp      = '0;
@@ -971,8 +970,8 @@ module sienna_pipe #(
     assign p_zp      = '0;
     assign g_add_w   = '0;
     assign g_add_zpo = '0;
-    wire unused_add_words = ^g_add_w;  // only add_lanes reads it, in a build with the residual ADD
-    wire unused_lane_words = ^{g_add, g_add_zpo, g_zp, g_mx, g_shx, g_mout, g_shout, g_zout};  // a float lane takes no parameters
+    assign unused_add_words = ^g_add_w;
+    assign unused_lane_words = ^{g_add, g_add_zpo, g_zp, g_mx, g_shx, g_mout, g_shout, g_zout};
   end
 
   // =========================================================================
@@ -980,8 +979,27 @@ module sienna_pipe #(
   // =========================================================================
   // Requantizing builds: the lanes, the bypass write and every fill counter see requantized beats, REQUANT_LATENCY cycles after the wide read.
   if (sienna_fmt_pkg::HAS_REQUANT_EPILOGUE) begin : G_REQ
+    localparam int RQL = sienna_fmt_pkg::REQUANT_LATENCY;
+    localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
+    localparam int RQ_HOLD = (RQL > 2) ? RQL - 2 : 0;  // beats granted now arrive 2 or more cycles later
     logic rq_v;  // requantize's output beat
     logic [NUM_LANES-1:0][DATA_WIDTH-1:0] rq_d;
+    // Each beat's destination rides beside int8Requantizer, which takes its own scale, zero point and clamp at stage 1.
+    logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
+    logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
+    logic [RQL-1:0] tg_byp, tg_bank, tg_hold, tg_add;
+    logic [RQL-1:0] tg_pack;
+    logic [FCNT_W-1:0] tg_idx[RQL];
+    // The residual ADD (HAS_RESIDUAL_ADD): hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
+    logic hold_wr, add_in, rq_out, add_v, add_busy;
+    logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_d;
+    logic [ATW-1:0] add_tag;
+    // The fill sees one source a cycle: requantize's non-ADD beats, or add_lanes' beats with their own tags.
+    logic f_byp, f_bank, f_pack;
+    logic [FCNT_W-1:0] f_idx;
+    if (RQL < 2) begin : G_BAD_RQL  // the tag line below shifts RQL-1 stages behind a registered first one
+      $fatal(1, "sienna_top: REQUANT_LATENCY %0d; the requantize tag line needs at least 2", RQL);
+    end
     requant_lanes #(
         .NUM_LANES(NUM_LANES),
         .N        (N),
@@ -998,16 +1016,6 @@ module sienna_pipe #(
         .valid_o (rq_v),
         .result_o(rq_d)
     );
-    // Each beat's destination rides beside int8Requantizer, which takes its own scale, zero point and clamp at stage 1.
-    localparam int RQL = sienna_fmt_pkg::REQUANT_LATENCY;
-    if (RQL < 2) begin : G_BAD_RQL  // the tag line below shifts RQL-1 stages behind a registered first one
-      $fatal(1, "sienna_top: REQUANT_LATENCY %0d; the requantize tag line needs at least 2", RQL);
-    end
-    logic [FCNT_W-1:0] rq_in;  // beats of the stage's set that entered the pipeline
-    logic [RQL-1:0] tg_v;  // a beat at each pipeline stage
-    logic [RQL-1:0] tg_byp, tg_bank, tg_hold, tg_add;
-    logic [RQL-1:0] tg_pack;
-    logic [FCNT_W-1:0] tg_idx[RQL];
     always_ff @(posedge clk_i or negedge rstn_i) begin
       if (!rstn_i) begin
         rq_in <= '0;
@@ -1028,11 +1036,6 @@ module sienna_pipe #(
       for (int i = 1; i < RQL; i++) tg_idx[i] <= tg_idx[i-1];
     end
     assign byp_all_in = (rq_in == PER_LANE[FCNT_W-1:0]);  // the last beat is in: the stage may leave while it drains
-    // The residual ADD (HAS_RESIDUAL_ADD): hold beats wait in hold_mem by beat index; add beats meet them there and go through add_lanes.
-    localparam int ATW = 3 + FCNT_W;  // add_lanes' tag: {bypass, bank, packed, element index}
-    logic hold_wr, add_in, rq_out, add_v, add_busy;
-    logic [NUM_LANES-1:0][DATA_WIDTH-1:0] add_d;
-    logic [ATW-1:0] add_tag;
     assign hold_wr     = rq_v && tg_hold[RQL-1];
     assign add_in      = rq_v && tg_add[RQL-1];
     assign rq_out      = rq_v && !tg_hold[RQL-1] && !tg_add[RQL-1];
@@ -1040,6 +1043,12 @@ module sienna_pipe #(
       localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
       logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
       logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_q;  // the hold beat at add_idx
+`ifndef SYNTHESIS
+      logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
+      logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
+      logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
+      sienna_fmt_pkg::add_params_t g_add_w_q;  // the ADD words before the last edge
+`endif
       assign hold_idx    = HMW'(tg_idx[RQL-1]);
       assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
       assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
@@ -1056,7 +1065,6 @@ module sienna_pipe #(
       // Spec Risk 3: a hold set's done never meets a bank done (rq_room keeps add_lanes empty through a hold set's drain).
       a_hold_done_no_bank: assert property (@(posedge clk_i) disable iff (!rstn_i) !(hold_done && bank_done))
         else $error("sienna_top: a_hold_done_no_bank: a hold set's last beat reached hold_mem in the cycle a bank completed");
-      logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) hm_v <= '0;
         else begin
@@ -1064,7 +1072,6 @@ module sienna_pipe #(
           if (add_in) hm_v[add_idx] <= 1'b0;
         end
       assign hm_any = |hm_v;  // hold_mem holds a hold set's beats its add set has not read: TB_sienna's layer-mode hold window
-      logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
       assign hm_below = hm_v & ((PER_LANE'(1) << add_idx) - PER_LANE'(1));
       a_hold_push_empty: assert property (@(posedge clk_i) disable iff (!rstn_i) hold_wr |-> !hm_v[hold_idx])
         else $error("sienna_top: a_hold_push_empty: hold beat %0d overwrote one its add set had not read", tg_idx[RQL-1]);
@@ -1072,8 +1079,6 @@ module sienna_pipe #(
                                        add_in |-> (tg_idx[RQL-1] < PER_LANE[FCNT_W-1:0]) && hm_v[add_idx] && (hm_below == '0))
         else $error("sienna_top: a_add_pop_full: add beat %0d read hold_mem[%0d] where no hold beat waits, or before an earlier unread one",
                     tg_idx[RQL-1], add_idx);
-      logic hold_left_q, act_wr_q;  // a hold set left the stage at the last edge; act_wr before that edge
-      sienna_fmt_pkg::add_params_t g_add_w_q;  // the ADD words before the last edge
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) {hold_left_q, act_wr_q} <= '0;
         else {hold_left_q, act_wr_q} <= {g_done && g_hold, act_wr};
@@ -1100,16 +1105,12 @@ module sienna_pipe #(
       assign hm_any   = 1'b0;
 `endif
     end
-    // The fill sees one source a cycle (Task 2.7's a_fill_one_source checks it): requantize's non-ADD beats, or add_lanes' beats with their own tags.
-    logic f_byp, f_bank, f_pack;
-    logic [FCNT_W-1:0] f_idx;
     assign fill_v   = rq_out || add_v;
     assign fill_d   = add_v ? add_d : rq_d;
     assign fill_add = add_v;
     assign {f_byp, f_bank, f_pack, f_idx} = add_v ? add_tag : {tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]};
     assign rq_drain = |tg_v || add_busy;
     // Beats granted now arrive 2 or more cycles later; after an add set, grant only once no add beat is in requantize or add_lanes.
-    localparam int RQ_HOLD = (RQL > 2) ? RQL - 2 : 0;
     always_comb begin
       rq_room = !(|(tg_v & tg_add)) && !add_busy;
       for (int i = 0; i < RQ_HOLD; i++) if (tg_v[i]) rq_room = 1'b0;
@@ -1246,10 +1247,6 @@ module sienna_pipe #(
   // =========================================================================
   // POOLING LANES: FIFO2 -> maxpool -> dropout on credit links (L8); each lane counts its set's windows out of maxpool and dropout
   // =========================================================================
-  logic [TOT_W-1:0] lane_windows_total[NUM_LANES];
-  logic [TOT_W-1:0] mp_out_count[NUM_LANES];  // this set's windows out of maxpool
-  logic [TOT_W-1:0] dropout_out_count[NUM_LANES], dropout_out_count_n[NUM_LANES];
-
   always_comb begin
     for (int i = 0; i < NUM_LANES; i++) begin
       lane_windows_total[i] = (MAXPOOL_OUT_COUNT[TOT_W-1:0] / NUM_LANES) +
@@ -1313,14 +1310,12 @@ module sienna_pipe #(
   assign systolic_busy_o = (mesh_sets != 0) || ((g_state != G_IDLE) && !g_fed);  // a set not yet pushed to the activation stage
   assign gpnae_busy_o = (g_state != G_IDLE) && g_fed;  // the stage takes its set before the result: busy once a beat is in
 
-  logic any_mp_active;  // a lane has windows of the pooled set still to leave maxpool; never with a 1x1 pool, which skips it
   always_comb begin
     any_mp_active = 1'b0;
     for (int i = 0; i < NUM_LANES; i++) if (!POOL_BYPASS && mp_out_count[i] < lane_windows_total[i]) any_mp_active = 1'b1;
   end
   assign maxpool_busy_o = (p_state != P_IDLE) && any_mp_active;
 
-  logic any_dropout_active;
   always_comb begin
     any_dropout_active = 1'b0;
     for (int i = 0; i < NUM_LANES; i++) if (dropout_valid_out[i]) any_dropout_active = 1'b1;
@@ -1328,11 +1323,20 @@ module sienna_pipe #(
   assign dropout_busy_o = any_dropout_active;
 
 `ifndef SYNTHESIS
+  localparam int QUIET = GPNAE_FIFO_DEPTH + 8 + 4 * LINK_STAGES;  // past the lanes' 32-cycle advertisement after reset
+  localparam bit PACK_OK = (NUM_LANES % N == 0) && (COLLAPSE_K != 0) && POOL_BYPASS;
   // The accept's terms, registered: sampled assertion values miss a combinational host_accept when the host drives the start at the edge.
   logic acc_q, acc_accum_q, acc_prev_accum_q, last_accum;  // acc_prev_accum_q: the accept before this one was a partial sum
   logic acc_hold_q, acc_add_q;  // the registered accept was a hold set, an add set
   logic acc_credit_q, acc_mready_q;  // a host credit was granted and a staging credit held, at the put
   logic [2:0] acc_shift_q;
+  logic mput_q, mrows_q;  // the mesh-side put's terms, registered: the set's rows are in its bank (B only when uncached)
+  logic [L3_CRW-1:0] l3_rx;  // a result beat's frame: beat index within the stage's set
+  int quiet_n;  // cycles the pipeline has been empty
+  int drain_n;  // drain rises since reset; testbenches print it and require drained after their last set
+  logic drained_q;
+  logic l4_count_ok;  // every lane got PER_LANE words of a lane set, none of a ReLU or linear one
+  logic [NUM_LANES-1:0] l5_put_v, l5_starved;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {acc_q, acc_accum_q, acc_shift_q, acc_prev_accum_q, last_accum, acc_credit_q, acc_mready_q, acc_hold_q, acc_add_q} <= '0;
     else begin
@@ -1340,13 +1344,9 @@ module sienna_pipe #(
       {acc_credit_q, acc_mready_q} <= {l0_out != 0, l1_cnt != 0};
       if (host_accept) last_accum <= side.accumulate;
     end
-  // The mesh-side put's terms, registered: the set's rows are in its bank (B only when uncached).
-  logic mput_q, mrows_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {mput_q, mrows_q} <= '0;
     else {mput_q, mrows_q} <= {l1m.put, !west_queue_empty && (l1m.data[5] || !north_queue_empty)};  // data[5]: weight_cached
-  // A result beat's frame: beat index within the stage's set.
-  logic [L3_CRW-1:0] l3_rx;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) l3_rx <= '0;
     else if (g_state == G_IDLE) l3_rx <= '0;
@@ -1368,8 +1368,6 @@ module sienna_pipe #(
     else $error("sienna_top: result beat %0d out of frame (first %0b, last %0b, packed %0b against the stage's %0b)", l3_rx, l3_first,
                 l3_last, l3_pk, g_pack);
   // Protocol checkers on the mesh side of L1 and L3, and on L6, checked whenever the pipeline has been empty a while.
-  localparam int QUIET = GPNAE_FIFO_DEPTH + 8 + 4 * LINK_STAGES;  // past the lanes' 32-cycle advertisement after reset
-  int quiet_n;
   // last_accum: a partial set completes as it passes the stage, before the mesh broadcasts its staging bank, so an open sum is never drained.
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) quiet_n <= 0;
@@ -1377,8 +1375,6 @@ module sienna_pipe #(
       quiet_n <= 0;
     else if (quiet_n < QUIET) quiet_n <= quiet_n + 1;
   assign drained = (quiet_n == QUIET);
-  int drain_n;  // drain rises since reset; testbenches print it and require drained after their last set
-  logic drained_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) begin
       drain_n   <= 0;
@@ -1391,8 +1387,6 @@ module sienna_pipe #(
   credit_link_checker #(.SLOTS(PER_LANE)) l3_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l3m));
   credit_link_checker #(.SLOTS(2)) l6_chk (.clk_i(clk_i), .rstn_i(rstn_i), .drained_i(drained), .lnk(l6));
   // L4, L5 (Task 2 carries, Review Focus 5): a lane's words and results, checked on registered terms.
-  logic l4_count_ok;  // every lane got PER_LANE words of a lane set, none of a ReLU or linear one
-  logic [NUM_LANES-1:0] l5_put_v, l5_starved;
   always_comb begin
     l4_count_ok = 1'b1;
     for (int i = 0; i < NUM_LANES; i++) begin
@@ -1427,7 +1421,6 @@ module sienna_pipe #(
     else $error("sienna_top: pipeline_complete_o held for more than one cycle");
   a_complete_dispatched: assert property (@(posedge clk_i) disable iff (!rstn_i) pool_done |-> disp_done)
     else $error("sienna_top: pooling completed a set it never dispatched");
-  localparam bit PACK_OK = (NUM_LANES % N == 0) && (COLLAPSE_K != 0) && POOL_BYPASS;
   a_pack_lanes: assert property (@(posedge clk_i) disable iff (!rstn_i) (acc_q && acc_shift_q != '0) |-> PACK_OK)
     else $error("sienna_top: a packed set needs N (%0d) to divide NUM_LANES (%0d), collapse-k 1 and a 1x1 pool", N, NUM_LANES);
   a_pack_range: assert property (@(posedge clk_i) disable iff (!rstn_i) acc_q |-> int'(acc_shift_q) < LGN)

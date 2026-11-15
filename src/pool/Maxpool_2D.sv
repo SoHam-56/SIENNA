@@ -27,6 +27,9 @@ module Maxpool_2D #(
                                              ((IN_COLS - SEG_COLS) / STRIDE_COLS) + 1;
   localparam int OUT_SIZE = OUT_ROWS * OUT_COLS;
   localparam int IN_SIZE = IN_ROWS * IN_COLS;
+  localparam logic [DATA_WIDTH-1:0] FLOOR = sienna_fmt_pkg::LOWEST_VALUE;  // the format's lowest value: -infinity in floats, -128 in int8
+  localparam bit SINGLE_SEG = (OUT_SIZE == 1);
+  localparam int OCW = $clog2(OUT_MAX + 1);
 
   typedef enum logic [2:0] {
     IDLE,
@@ -36,36 +39,29 @@ module Maxpool_2D #(
     FINISH
   } state_t;
 
-  state_t state, next_state;
-
-  localparam logic [DATA_WIDTH-1:0] FLOOR = sienna_fmt_pkg::LOWEST_VALUE;  // the format's lowest value: -infinity in floats, -128 in int8
-
-  logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
-  logic [$clog2(IN_SIZE+1)-1:0] input_count;
-  logic input_collection_done;
-
-  logic [DATA_WIDTH-1:0] output_buffer[0:OUT_SIZE-1];
-  logic [$clog2(OUT_SIZE+1)-1:0] output_count;
-  logic processing_done;
-
-  logic [$clog2(OUT_ROWS+1)-1:0] out_r;
-  logic [$clog2(OUT_COLS+1)-1:0] out_c;
-
   // a > b in the build's format: the package's compare (floats sign-magnitude with +0 equal to -0, int8 signed codes)
   function automatic logic is_greater(input logic [DATA_WIDTH-1:0] a, input logic [DATA_WIDTH-1:0] b);
     return sienna_fmt_pkg::fmt_greater_than(a, b);
   endfunction
 
   // Links: elements arrive on in, results leave on out; an input is granted only with output credits reserved for all its results.
-  localparam bit SINGLE_SEG = (OUT_SIZE == 1);
   logic [DATA_WIDTH-1:0] data_in;
   logic valid_in;
   logic [DATA_WIDTH-1:0] out_data;
   logic out_valid;
-  assign data_in  = in.data;
-  assign valid_in = in.put;
-  assign out.put  = out_valid;
-  assign out.data = out_data;
+  logic live;  // out of reset for a cycle: no input is granted before it
+  logic [OCW-1:0] out_cnt;  // output credits held, reserved or not
+  logic grant;  // the IN_SIZE input credits of one more input go out this cycle
+  // The batch FSM's state and buffers.
+  state_t state, next_state;
+  logic [DATA_WIDTH-1:0] input_buffer[0:IN_ROWS-1][0:IN_COLS-1];
+  logic [$clog2(IN_SIZE+1)-1:0] input_count;
+  logic input_collection_done;
+  logic [DATA_WIDTH-1:0] output_buffer[0:OUT_SIZE-1];
+  logic [$clog2(OUT_SIZE+1)-1:0] output_count;
+  logic processing_done;
+  logic [$clog2(OUT_ROWS+1)-1:0] out_r;
+  logic [$clog2(OUT_COLS+1)-1:0] out_c;
 
   if (DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH) begin : G_BAD_DATA_WIDTH  // the package's compare and floor are at its width
     $fatal(1, "Maxpool_2D: DATA_WIDTH %0d, but the build's words are %0d bits", DATA_WIDTH, sienna_fmt_pkg::DATA_WIDTH);
@@ -82,16 +78,17 @@ module Maxpool_2D #(
              OUT_CRW, $bits(in.data), $bits(in.credit), $bits(out.data), $bits(out.credit));
 `endif
 
-  logic live;  // out of reset for a cycle: no input is granted before it
+  assign data_in  = in.data;
+  assign valid_in = in.put;
+  assign out.put  = out_valid;
+  assign out.data = out_data;
+
   always_ff @(posedge clk or negedge rst_n)
     if (!rst_n) live <= 1'b0;
     else live <= 1'b1;
 
-  localparam int OCW = $clog2(OUT_MAX + 1);
-  logic [OCW-1:0] out_cnt;  // output credits held, reserved or not
   credit_counter #(.MAX(OUT_MAX), .CRW(OUT_CRW)) out_cc (.clk_i(clk), .rstn_i(rst_n), .put_i(out.put), .credit_i(out.credit),
                                                         .has_credit_o(), .count_o(out_cnt));
-  logic grant;  // the IN_SIZE input credits of one more input go out this cycle
   assign in.credit = grant ? IN_CRW'(IN_SIZE) : '0;
 
 `ifndef SYNTHESIS
@@ -115,13 +112,11 @@ module Maxpool_2D #(
       logic [DATA_WIDTH-1:0]        run_max;
       logic [$clog2(IN_SIZE+1)-1:0] in_cnt;
       logic [$clog2(AHEAD+1)-1:0]   rsv;  // windows granted whose result is not out yet, each holding one output credit
+      logic [DATA_WIDTH-1:0]        nxt_max;  // the incoming element folded in, so the last one is emitted the cycle it arrives
 
       // A window is granted when it can reserve an output credit no other granted window holds; the result never waits.
       assign grant = live && (int'(rsv) < AHEAD) && (int'(out_cnt) > int'(rsv));
-
-      // Folding the incoming element in combinationally lets the last one be emitted on the
-      // cycle it arrives rather than one later.
-      wire [DATA_WIDTH-1:0] nxt_max = is_greater(data_in, run_max) ? data_in : run_max;
+      assign nxt_max = is_greater(data_in, run_max) ? data_in : run_max;
 
       always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -147,135 +142,131 @@ module Maxpool_2D #(
         end
       end
     end else begin : gen_batch
-
-
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) state <= IDLE;
-    else state <= next_state;
-  end
-
-  // One input at a time: granted from IDLE once the output credits of all its results are held.
-  assign grant = live && (state == IDLE) && (int'(out_cnt) >= OUT_SIZE);
-
-  always_comb begin
-    next_state = state;
-    case (state)
-      IDLE:           if (grant) next_state = COLLECT_INPUT;
-      COLLECT_INPUT:  if (input_collection_done) next_state = PROCESS;
-      PROCESS:        if (processing_done) next_state = OUTPUT_RESULTS;
-      OUTPUT_RESULTS: if (output_count >= OUT_SIZE) next_state = FINISH;
-      FINISH:         next_state = IDLE;
-      default:        next_state = IDLE;
-    endcase
-  end
-
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      input_count <= '0;
-      input_collection_done <= 1'b0;
-      for (int i = 0; i < IN_ROWS; i++) begin
-        for (int j = 0; j < IN_COLS; j++) input_buffer[i][j] <= '0;
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) state <= IDLE;
+        else state <= next_state;
       end
-    end else begin
-      case (state)
-        IDLE: begin
+
+      // One input at a time: granted from IDLE once the output credits of all its results are held.
+      assign grant = live && (state == IDLE) && (int'(out_cnt) >= OUT_SIZE);
+
+      always_comb begin
+        next_state = state;
+        case (state)
+          IDLE:           if (grant) next_state = COLLECT_INPUT;
+          COLLECT_INPUT:  if (input_collection_done) next_state = PROCESS;
+          PROCESS:        if (processing_done) next_state = OUTPUT_RESULTS;
+          OUTPUT_RESULTS: if (output_count >= OUT_SIZE) next_state = FINISH;
+          FINISH:         next_state = IDLE;
+          default:        next_state = IDLE;
+        endcase
+      end
+
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
           input_count <= '0;
           input_collection_done <= 1'b0;
-        end
-        COLLECT_INPUT: begin
-          if (valid_in && input_count < IN_SIZE) begin
-            input_buffer[input_count/IN_COLS][input_count%IN_COLS] <= data_in;
-            input_count <= input_count + 1'b1;
-            if (input_count + 1'b1 >= IN_SIZE) input_collection_done <= 1'b1;
+          for (int i = 0; i < IN_ROWS; i++) begin
+            for (int j = 0; j < IN_COLS; j++) input_buffer[i][j] <= '0;
           end
+        end else begin
+          case (state)
+            IDLE: begin
+              input_count <= '0;
+              input_collection_done <= 1'b0;
+            end
+            COLLECT_INPUT: begin
+              if (valid_in && input_count < IN_SIZE) begin
+                input_buffer[input_count/IN_COLS][input_count%IN_COLS] <= data_in;
+                input_count <= input_count + 1'b1;
+                if (input_count + 1'b1 >= IN_SIZE) input_collection_done <= 1'b1;
+              end
+            end
+            default: ;
+          endcase
         end
-        default: ;
-      endcase
-    end
-  end
+      end
 
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      out_r <= '0;
-      out_c <= '0;
-      processing_done <= 1'b0;
-      for (int i = 0; i < OUT_SIZE; i++) output_buffer[i] <= '0;
-    end else begin
-      case (state)
-        IDLE: begin
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
           out_r <= '0;
           out_c <= '0;
           processing_done <= 1'b0;
-        end
-        PROCESS: begin
-          logic [DATA_WIDTH-1:0] max_val;
-          logic signed [31:0] in_row;
-          logic signed [31:0] in_col;
-          logic in_bounds;
-          logic [DATA_WIDTH-1:0] current_val;
+          for (int i = 0; i < OUT_SIZE; i++) output_buffer[i] <= '0;
+        end else begin
+          case (state)
+            IDLE: begin
+              out_r <= '0;
+              out_c <= '0;
+              processing_done <= 1'b0;
+            end
+            PROCESS: begin
+              logic [DATA_WIDTH-1:0] max_val;
+              logic signed [31:0] in_row;
+              logic signed [31:0] in_col;
+              logic in_bounds;
+              logic [DATA_WIDTH-1:0] current_val;
 
-          // Initialize with correct minimum floor
-          max_val = FLOOR;  // -infinity for floats, the most negative integer otherwise
+              // Initialize with correct minimum floor
+              max_val = FLOOR;  // -infinity for floats, the most negative integer otherwise
 
-          for (int sr = 0; sr < SEG_ROWS; sr++) begin
-            for (int sc = 0; sc < SEG_COLS; sc++) begin
-              if (PADDING == 1) begin
-                in_row = signed'(out_r * STRIDE_ROWS + sr) - 1;
-                in_col = signed'(out_c * STRIDE_COLS + sc) - 1;
-              end else begin
-                in_row = signed'(out_r * STRIDE_ROWS + sr);
-                in_col = signed'(out_c * STRIDE_COLS + sc);
+              for (int sr = 0; sr < SEG_ROWS; sr++) begin
+                for (int sc = 0; sc < SEG_COLS; sc++) begin
+                  if (PADDING == 1) begin
+                    in_row = signed'(out_r * STRIDE_ROWS + sr) - 1;
+                    in_col = signed'(out_c * STRIDE_COLS + sc) - 1;
+                  end else begin
+                    in_row = signed'(out_r * STRIDE_ROWS + sr);
+                    in_col = signed'(out_c * STRIDE_COLS + sc);
+                  end
+
+                  in_bounds = (in_row >= 0) && (in_row < IN_ROWS) &&
+                              (in_col >= 0) && (in_col < IN_COLS);
+
+                  if (in_bounds) begin
+                    current_val = input_buffer[in_row][in_col];
+                    if (is_greater(current_val, max_val)) max_val = current_val;
+                  end
+                end
               end
 
-              in_bounds = (in_row >= 0) && (in_row < IN_ROWS) &&
-                          (in_col >= 0) && (in_col < IN_COLS);
+              output_buffer[out_r*OUT_COLS+out_c] <= max_val;
 
-              if (in_bounds) begin
-                current_val = input_buffer[in_row][in_col];
-                if (is_greater(current_val, max_val)) max_val = current_val;
+              if (out_c < OUT_COLS - 1) begin
+                out_c <= out_c + 1'b1;
+              end else begin
+                out_c <= '0;
+                if (out_r < OUT_ROWS - 1) out_r <= out_r + 1'b1;
+                else processing_done <= 1'b1;
               end
             end
-          end
-
-          output_buffer[out_r*OUT_COLS+out_c] <= max_val;
-
-          if (out_c < OUT_COLS - 1) begin
-            out_c <= out_c + 1'b1;
-          end else begin
-            out_c <= '0;
-            if (out_r < OUT_ROWS - 1) out_r <= out_r + 1'b1;
-            else processing_done <= 1'b1;
-          end
+            default: ;
+          endcase
         end
-        default: ;
-      endcase
-    end
-  end
+      end
 
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      out_data <= '0;
-      out_valid <= 1'b0;
-      output_count <= '0;
-    end else begin
-      case (state)
-        IDLE: begin
+      always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+          out_data <= '0;
           out_valid <= 1'b0;
           output_count <= '0;
+        end else begin
+          case (state)
+            IDLE: begin
+              out_valid <= 1'b0;
+              output_count <= '0;
+            end
+            OUTPUT_RESULTS: begin
+              if (output_count < OUT_SIZE) begin
+                out_data <= output_buffer[output_count];
+                out_valid <= 1'b1;
+                output_count <= output_count + 1'b1;
+              end else out_valid <= 1'b0;
+            end
+            default: out_valid <= 1'b0;
+          endcase
         end
-        OUTPUT_RESULTS: begin
-          if (output_count < OUT_SIZE) begin
-            out_data <= output_buffer[output_count];
-            out_valid <= 1'b1;
-            output_count <= output_count + 1'b1;
-          end else out_valid <= 1'b0;
-        end
-        default: out_valid <= 1'b0;
-      endcase
-    end
-  end
-
-
+      end
     end
   endgenerate
 

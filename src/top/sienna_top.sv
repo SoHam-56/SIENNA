@@ -105,6 +105,13 @@ module sienna_top #(
   localparam int SW = $clog2(COPIES + 1);
   `include "sienna_set_side.svh"
   localparam int SIDE_W = $bits(set_side_t);
+  localparam int ENTRY_BITS = $bits(sienna_fmt_pkg::lane_entry_t);
+
+  logic idle_put;  // the unused contract's inputs put or write this cycle; a_idle_contract checks it registered, since a host may drive at the edge
+  logic coef_ready, coef_take;  // the load interlock: a write reaches the lanes only while nothing is in flight
+`ifdef SYNTHESIS
+  logic unused_idle_put;  // checks only
+`endif
 
   if (SET_PORT != 0 && SET_PORT != 1) begin : G_BAD_SET_PORT
     $fatal(1, "sienna_top: SET_PORT %0d: 0 (the layer contract) or 1 (the set contract)", SET_PORT);
@@ -115,7 +122,6 @@ module sienna_top #(
   end
 
   // I3: every plain-vector boundary port is as wide as the define's package says; WIDTH warnings are off in the Makefile, so a port written at another width would truncate silently.
-  localparam int ENTRY_BITS = $bits(sienna_fmt_pkg::lane_entry_t);
   if ($bits(bias_i) != N * ACC_DATA_WIDTH || $bits(w_bias_i) != N * ACC_DATA_WIDTH ||
       $bits(north_write_data_i) != HOST_WORDS * DATA_WIDTH || $bits(west_write_data_i) != HOST_WORDS * DATA_WIDTH ||
       $bits(w_req_scale_i) != N * $bits(sienna_fmt_pkg::requant_scale_t) || $bits(cfg_lane_i) != ENTRY_BITS ||
@@ -138,20 +144,21 @@ module sienna_top #(
              $bits(out[0].credit));
 `endif
 
-  // Whether the unused contract's inputs put or write this cycle; a_idle_contract checks it registered, since a host may drive at the edge.
-  logic idle_put;
-  logic coef_ready, coef_take;  // the load interlock: a write reaches the lanes only while nothing is in flight
   assign coef_take    = coef_wr_i && coef_ready;
   assign coef_ready_o = coef_ready;
 
   if (SET_PORT == 0) begin : G_LAYER
-    credit_link_if #(.DATA_W(SIDE_W), .CRW(1)) l0 ();  // sienna_sched's sets into the pipeline
-    credit_link_if #(.DATA_W(1), .CRW(1)) wc[2] ();  // its cache regions
     logic [N-1:0][ACC_DATA_WIDTH-1:0] bias;
     logic wc_we, north_we, west_we, set_done;
     logic [WCAW-1:0] wc_addr;
     logic [N-1:0][DATA_WIDTH-1:0] north, west;
     logic pipe_ready;
+    logic unused_done_id, unused_busy;  // the layer contract reports completion through sienna_sched only
+    logic [ID_W-1:0] unused_id;
+    logic [3:0] unused_busys;
+    logic unused_set_inputs;  // only the set contract reads them
+    credit_link_if #(.DATA_W(SIDE_W), .CRW(1)) l0 ();  // sienna_sched's sets into the pipeline
+    credit_link_if #(.DATA_W(1), .CRW(1)) wc[2] ();  // its cache regions
     assign coef_ready = pipe_ready && !busy_o && !cfg_load_i;  // a layer in flight keeps the lanes' memory as it started
     sienna_sched #(
         .N            (N),
@@ -197,9 +204,6 @@ module sienna_top #(
         .west_write_data_o   (west),
         .set_done_i          (set_done)
     );
-    logic unused_done_id, unused_busy;  // the layer contract reports completion through sienna_sched only
-    logic [ID_W-1:0] unused_id;
-    logic [3:0] unused_busys;
     sienna_pipe #(
         .NUM_LANES        (NUM_LANES),
         .N                (N),
@@ -262,10 +266,10 @@ module sienna_top #(
 `ifndef SYNTHESIS
     // a_coef_frozen: no lane's coefficient memory takes a write from a layer's configure to its done_o (tracked apart from the interlock).
     logic [NUM_LANES-1:0] landed;  // per lane: its memory's write strobe, the only way its contents change after reset
+    logic layer_on, landed_q, on_q;  // a layer configured and not yet done; both terms registered
     for (genvar g = 0; g < NUM_LANES; g++) begin : G_LANDED
       assign landed[g] = pipe.backend_lanes[g].gpnae.COEF.wr_i;
     end
-    logic layer_on, landed_q, on_q;  // a layer configured and not yet done; both terms registered
     always_ff @(posedge clk_i or negedge rstn_i)
       if (!rstn_i) layer_on <= 1'b0;
       else if (cfg_load_i) layer_on <= 1'b1;
@@ -290,26 +294,27 @@ module sienna_top #(
     assign dropout_busy_o      = '0;
     assign idle_put = host[0].put || wc_region[0].put || wc_region[1].put || wc_write_enable_i || north_write_enable_i || north_write_reset_i ||
                       west_write_enable_i || west_write_reset_i;
-    wire unused_set_inputs = ^{host[0].data, wc_region[0].data, wc_region[1].data, bias_i, wc_write_addr_i, north_write_data_i,
-                               west_write_data_i, drained_i};  // only the set contract reads them
+    assign unused_set_inputs = ^{host[0].data, wc_region[0].data, wc_region[1].data, bias_i, wc_write_addr_i, north_write_data_i,
+                                 west_write_data_i, drained_i};
 
   end else begin : G_SET
     logic [SW-1:0] sel;  // the copy whose turn it is
     logic [COPIES-1:0] put;  // per copy: the host's put this cycle
     logic [COPIES-1:0] wc_cred[2];  // per region: this cycle's credit from each copy
     logic [COPIES-1:0] copy_ready;  // per copy: its coef_ready_o
+    logic unused_layer_inputs;  // only the layer contract reads them
     assign coef_ready = &copy_ready;
     for (genvar c = 0; c < COPIES; c++) begin : G_COPY
       logic mine;  // the turn is this copy's: the row buses reach it
+      credit_link_if #(.DATA_W(1), .CRW(1)) wcc[2] ();  // the copy's cache regions
+      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) outl[NUM_LANES] ();  // the copy's L9
       assign mine   = (COPIES == 1) || (sel == SW'(c));
       assign put[c] = host[c].put;
-      credit_link_if #(.DATA_W(1), .CRW(1)) wcc[2] ();  // the copy's cache regions
       for (genvar r = 0; r < 2; r++) begin : G_WCC
         assign wcc[r].put    = wc_region[r].put;
         assign wcc[r].data   = wc_region[r].data;
         assign wc_cred[r][c] = wcc[r].credit;
       end
-      credit_link_if #(.DATA_W(DATA_WIDTH), .CRW(OUT_CRW)) outl[NUM_LANES] ();  // the copy's L9
       for (genvar l = 0; l < NUM_LANES; l++) begin : G_OUT
         assign out[c*NUM_LANES+l].put  = outl[l].put;
         assign out[c*NUM_LANES+l].data = outl[l].data;
@@ -375,11 +380,11 @@ module sienna_top #(
 `ifndef SYNTHESIS
       // a_coef_frozen: no lane of this copy takes a coefficient write while a set put to it has not completed (tracked apart from the interlock).
       logic [NUM_LANES-1:0] landed;  // per lane: its memory's write strobe, the only way its contents change after reset
+      logic [7:0] in_flight;  // sets put to this copy, less those completed
+      logic landed_q, on_q;  // both terms registered
       for (genvar g = 0; g < NUM_LANES; g++) begin : G_LANDED
         assign landed[g] = pipe.backend_lanes[g].gpnae.COEF.wr_i;
       end
-      logic [7:0] in_flight;  // sets put to this copy, less those completed
-      logic landed_q, on_q;  // both terms registered
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) in_flight <= '0;
         else in_flight <= in_flight + 8'(put[c]) - 8'(pipeline_complete_o[c]);
@@ -392,25 +397,42 @@ module sienna_top #(
     end
 
     if (COPIES == 1) begin : G_ONE  // one pipeline: L2 is its own, and there is no turn
+      logic unused_one;  // COPIES > 1 only: the turn and the drain checks
       assign sel = '0;
       for (genvar r = 0; r < 2; r++) begin : G_WC
         assign wc_region[r].credit = wc_cred[r][0];
       end
-      wire unused_one = ^{put, drained_i};  // COPIES > 1 only: the turn and the drain checks
+      assign unused_one = ^{put, drained_i};
     end else begin : G_MULTI  // COPIES pipelines behind one host: sets go to the copies in turn, one set per put
+      logic live;  // out of reset for a cycle: no region credit before it
+      logic [COPIES-1:0] wc_got[2];  // per region: copies whose region credit came back and has not gone up yet
+`ifndef SYNTHESIS
+      logic [COPIES-1:0] p_cached, p_last, p_region;  // per copy: the put set reads the cache, is marked its fill's last, and its region
+      logic [1:0] wc_put;  // the host opens a fill of the region this cycle
+      logic [1:0] f_open, f_started;  // the L2 contract per region: the fill is open; a set of it has been put
+      logic [COPIES-1:0] f_marked[2];  // copies that took their marked set of the open fill
+      logic any_put, set_cached, set_last, set_region;
+      logic [SW-1:0] set_copy;
+      logic pq, pq_turn, pq_after_last, pq_short;  // a put and its terms, registered: a host may drive its puts at the edge
+      logic [SW-1:0] pq_copy;
+      logic pq_region;
+      logic dq, dq_short;  // at drain, a fill with sets put must have reached every copy's marked set
+      logic [COPIES-1:0] dq_marked;
+      logic dq_region;
+`else
+      logic unused_drained;  // checks only
+`endif
       // The turn moves on with each put to the copy whose turn it is.
       always_ff @(posedge clk_i or negedge rstn_i) begin
         if (!rstn_i) sel <= '0;
         else if (put[sel]) sel <= (sel == SW'(COPIES - 1)) ? '0 : sel + 1'b1;
       end
 
-      logic live;  // out of reset for a cycle: no region credit before it
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) live <= 1'b0;
         else live <= 1'b1;
 
       // L2: a fill goes to every copy at once; a region's credit goes up only when every copy has returned its own.
-      logic [COPIES-1:0] wc_got[2];  // copies whose region credit came back and has not gone up yet
       for (genvar r = 0; r < 2; r++) begin : G_WC
         logic all_back;
         assign all_back = live && &(wc_got[r] | wc_cred[r]);
@@ -421,7 +443,6 @@ module sienna_top #(
       end
 
 `ifndef SYNTHESIS
-      logic [COPIES-1:0] p_cached, p_last, p_region;  // per copy: the put set reads the cache, is marked its fill's last, and its region
       for (genvar c = 0; c < COPIES; c++) begin : G_SIDE
         set_side_t side;
         assign side = host[c].data;
@@ -429,13 +450,8 @@ module sienna_top #(
         assign p_last[c] = side.wc_last;
         assign p_region[c] = side.weight_tile[WCTW-1];
       end
-      logic [1:0] wc_put;  // the host opens a fill of the region this cycle
       assign wc_put = {wc_region[1].put, wc_region[0].put};
       // The L2 contract, tracked per region: a fill is open from its put until every copy has taken its marked set.
-      logic [1:0] f_open, f_started;  // the fill is open; a set of it has been put
-      logic [COPIES-1:0] f_marked[2];  // copies that took their marked set of the open fill
-      logic any_put, set_cached, set_last, set_region;
-      logic [SW-1:0] set_copy;
       always_comb begin
         any_put = |put;
         set_copy = sel;
@@ -470,9 +486,6 @@ module sienna_top #(
               end
             end
       // A put and its terms, registered: a host may drive its puts at the edge.
-      logic pq, pq_turn, pq_after_last, pq_short;
-      logic [SW-1:0] pq_copy;
-      logic pq_region;
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) {pq, pq_turn, pq_after_last, pq_short, pq_copy, pq_region} <= '0;
         else begin
@@ -499,9 +512,6 @@ module sienna_top #(
         else $error("sienna_top: region %0d's fill reached only some copies with their marked sets when another set was put: the rest never close it",
                     pq_region);
       // At drain, a fill with sets put must have reached every copy's marked set, else its region credit never returns.
-      logic dq, dq_short;
-      logic [COPIES-1:0] dq_marked;
-      logic dq_region;
       always_ff @(posedge clk_i or negedge rstn_i)
         if (!rstn_i) {dq, dq_short, dq_marked, dq_region} <= '0;
         else begin
@@ -520,7 +530,7 @@ module sienna_top #(
         else $error("sienna_top: drained with region %0d's fill reaching only copies %b with their marked sets: its credit never returns",
                     dq_region, dq_marked);
 `else
-      wire unused_drained = drained_i;  // checks only
+      assign unused_drained = drained_i;
 `endif
     end
     assign copy_sel_o = sel;
@@ -532,29 +542,27 @@ module sienna_top #(
     assign done_o        = 1'b0;
     assign set_done_o    = 1'b0;
     assign idle_put = cfg_load_i || a_rows.put || w_rows.put;
-    wire unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_tier_i, cfg_train_i, cfg_seed_i, cfg_lane_i,
-                                 cfg_add_i, cfg_pack_shift_i, cfg_pack_map_i, cfg_pack_act_i, cfg_pack_lane_i, a_rows.data, w_rows.data,
-                                 w_bias_i, w_req_scale_i};  // only the layer contract reads them
+    assign unused_layer_inputs = ^{cfg_m_i, cfg_kb_i, cfg_n_i, cfg_residual_i, cfg_bias_i, cfg_act_i, cfg_tier_i, cfg_train_i, cfg_seed_i, cfg_lane_i,
+                                   cfg_add_i, cfg_pack_shift_i, cfg_pack_map_i, cfg_pack_act_i, cfg_pack_lane_i, a_rows.data, w_rows.data,
+                                   w_bias_i, w_req_scale_i};
   end
 
 `ifndef SYNTHESIS
-  // The unused contract's inputs, registered: a host that drives at the edge is still seen.
-  logic idle_put_q;
+  logic idle_put_q;  // the unused contract's inputs, registered: a host that drives at the edge is still seen
+  logic take_q, ready_q;  // a coefficient write and the interlock, both registered
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) idle_put_q <= 1'b0;
     else idle_put_q <= idle_put;
   a_idle_contract: assert property (@(posedge clk_i) disable iff (!rstn_i) !idle_put_q)
     else $error("sienna_top: a_idle_contract: a put or write on the %s contract, which SET_PORT = %0d leaves unused", (SET_PORT == 0) ? "set" : "layer",
                 SET_PORT);
-  // A coefficient write reaches the lanes only while the interlock is ready. Both terms are registered.
-  logic take_q, ready_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {take_q, ready_q} <= 2'b01;
     else {take_q, ready_q} <= {coef_take, coef_ready};
   a_load_ready: assert property (@(posedge clk_i) disable iff (!rstn_i) take_q |-> ready_q)
     else $error("sienna_top: a_load_ready: a coefficient write reached the lanes while a set or layer was in flight");
 `else
-  wire unused_idle_put = idle_put;  // checks only
+  assign unused_idle_put = idle_put;
 `endif
 
 endmodule

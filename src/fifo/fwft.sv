@@ -16,6 +16,20 @@ module fwft #(
 
     output wire [ADDR_WIDTH:0] count_o
 );
+  localparam int OCW = $clog2(OUT_MAX + 1);
+
+  // The words, the pointers and the count.
+  logic [DATA_WIDTH-1:0] mem[0:FIFO_DEPTH-1];
+  logic [ADDR_WIDTH-1:0] wr_ptr;
+  logic [ADDR_WIDTH-1:0] rd_ptr;
+  logic [ADDR_WIDTH:0] count;
+  // The reader's credits, and a write or a pop this cycle.
+  logic [OCW-1:0] out_cnt;
+  wire wr_fire;
+  wire rd_fire;
+  // Input credits: freed slots not yet credited, and the credit.
+  logic [ADDR_WIDTH:0] in_owed;
+  logic in_cr;
 
 `ifndef SYNTHESIS
   // Interface widths are not elaboration constants in Verilator, so the link widths are checked at time 0.
@@ -25,27 +39,17 @@ module fwft #(
              $bits(in.data), $bits(in.credit), $bits(out.data), $bits(out.credit));
 `endif
 
-  logic [DATA_WIDTH-1:0] mem[0:FIFO_DEPTH-1];
-
-  logic [ADDR_WIDTH-1:0] wr_ptr;
-  logic [ADDR_WIDTH-1:0] rd_ptr;
-  logic [ADDR_WIDTH:0] count;
-
-  localparam int OCW = $clog2(OUT_MAX + 1);
-  logic [OCW-1:0] out_cnt;
   credit_counter #(.MAX(OUT_MAX), .CRW(OUT_CRW)) out_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(out.put), .credit_i(out.credit),
                                                         .has_credit_o(), .count_o(out_cnt));
 
-  wire wr_fire = in.put;
-  wire rd_fire = (count != 0) && (out_cnt != 0);
+  assign wr_fire = in.put;
+  assign rd_fire = (count != 0) && (out_cnt != 0);
 
   assign out.put  = rd_fire;
   assign out.data = mem[rd_ptr];
   assign count_o  = count;
 
   // Input credits: one per free slot, FIFO_DEPTH after reset, then one per pop, at most one a cycle.
-  logic [ADDR_WIDTH:0] in_owed;
-  logic in_cr;
   assign in.credit = in_cr;
 
   always_ff @(posedge clk_i or negedge rstn_i) begin

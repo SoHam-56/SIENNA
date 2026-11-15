@@ -23,6 +23,7 @@ module requant_lanes #(
     localparam int CW = (N > 1) ? $clog2(N) : 1;
     logic [BW-1:0] beat;
     logic [NUM_LANES-1:0] done;
+    logic unused_lane_words;  // the entries' lane words are GPNAE's
 
     always_ff @(posedge clk_i or negedge rstn_i) begin
       if (!rstn_i) beat <= '0;
@@ -48,15 +49,16 @@ module requant_lanes #(
       );
     end
     assign valid_o = done[0];  // every lane takes the same beats
-    wire unused_lane_words = ^entry_i;  // the entries' lane words are GPNAE's
+    assign unused_lane_words = ^entry_i;
   end else begin : G_PASS
+    logic unused_requant_inputs;  // only a requantizing build reads them
     if (sienna_fmt_pkg::RESULT_DATA_WIDTH != sienna_fmt_pkg::DATA_WIDTH) begin : G_BAD_WIDTH  // a pass-through cannot narrow
       $fatal(1, "requant_lanes: the mesh gives %0d-bit results, the lanes take %0d-bit words", sienna_fmt_pkg::RESULT_DATA_WIDTH,
              sienna_fmt_pkg::DATA_WIDTH);
     end
     assign valid_o  = valid_i;
     assign result_o = acc_i;
-    wire unused_requant_inputs = ^{clk_i, rstn_i, clear_i, scale_i, packed_i, entry_i};  // only a requantizing build reads them
+    assign unused_requant_inputs = ^{clk_i, rstn_i, clear_i, scale_i, packed_i, entry_i};
   end
 
 endmodule

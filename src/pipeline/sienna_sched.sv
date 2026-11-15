@@ -78,23 +78,18 @@ module sienna_sched #(
   localparam int BIAS_SHIFT = ACC_DATA_WIDTH - sienna_fmt_pkg::BIAS_DATA_WIDTH;  // the widening: low bits zero, 0 where BIAS_DATA_WIDTH == ACC_DATA_WIDTH
   localparam int RCW = $clog2(N + 1);  // row credits: a set's or a tile's N in one cycle
   localparam int TOW = $clog2(2 * N + 1);  // cache tile rows outstanding: at most two tiles
+  localparam int NOW = 8;  // sets started and not yet complete, bounded by the pipeline's SETS_IN_FLIGHT
 
-`ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the row links are checked at time 0
-  initial
-    if ($bits(a_rows.data) != N * DATA_WIDTH || $bits(a_rows.credit) != RCW || $bits(w_rows.data) != N * DATA_WIDTH ||
-        $bits(w_rows.credit) != RCW)
-      $fatal(1, "sienna_top: the row links need data %0d bits and credit %0d, found A %0d and %0d, W %0d and %0d", N * DATA_WIDTH, RCW,
-             $bits(a_rows.data), $bits(a_rows.credit), $bits(w_rows.data), $bits(w_rows.credit));
-`endif
-  logic [N-1:0][DATA_WIDTH-1:0] a_data_i, w_data_i;  // the rows put this cycle
-  assign a_data_i = a_rows.data;
-  assign w_data_i = w_rows.data;
+  `include "sienna_set_side.svh"
+
+  function automatic logic [DIM_W-1:0] tiles(input logic [DIM_W-1:0] x);
+    return (x + DIM_W'(N - 1)) / DIM_W'(N);
+  endfunction
+
+  // The rows put this cycle, and the first cycle out of reset.
+  logic [N-1:0][DATA_WIDTH-1:0] a_data_i, w_data_i;
   logic live;  // out of reset for a cycle: no row credit before it
-  always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) live <= 1'b0;
-    else live <= 1'b1;
-
-  // ── Configuration and what follows from it ────────────────────────────
+  // Configuration and what follows from it.
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
   logic [DIM_W-1:0] rt_m1, dt_m1, np_m1;  // rt - 1, dt - 1, np - 1, registered at the load: no decrementer in the issuer's cone
   logic p_last, r_last, p_dlast, p_dt;  // is_p == np - 1, is_r == rt - 1, is_p == dt - 1, is_p == dt, kept with is_p and is_r
@@ -108,15 +103,8 @@ module sienna_sched #(
   logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0] pk_act_q;
   sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] pk_lane_q;
   logic active;
-
-  function automatic logic [DIM_W-1:0] tiles(input logic [DIM_W-1:0] x);
-    return (x + DIM_W'(N - 1)) / DIM_W'(N);
-  endfunction
-
   logic int_res;  // an int8 residual layer: pass dt-1 holds, pass dt adds
-  assign int_res = sienna_fmt_pkg::HAS_RESIDUAL_ADD && res_q;
-
-  // ── The pipeline this layer runs on (sienna_pipe, beside this in sienna_top) ──
+  // The pipeline this layer runs on (sienna_pipe, beside this in sienna_top): a set's start and its sideband, the buses.
   logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
   logic [N-1:0][ACC_DATA_WIDTH-1:0]       p_bias;
   sienna_fmt_pkg::requant_scale_t [N-1:0] p_scale;  // the requantize scales of the set being started
@@ -126,18 +114,62 @@ module sienna_sched #(
   logic                          p_wc_last;  // the set is its block's last cached pass: the region's fill closes with it
   logic                          p_west_we, p_north_we;
   logic [LFSR_WIDTH-1:0]         p_seed;
-
-  // The pipeline's host link (L0): this layer holds up to two staging credits and puts each set with its last row.
-  `include "sienna_set_side.svh"
   set_side_t p_side, p_side_base;  // the sideband; the base before a residual's add set takes its identity requantize
-  logic [1:0] l0_cnt;
+  logic [1:0] l0_cnt;  // the staging credits held (L0)
+  // The cache regions (L2).
+  logic wc_has[2];  // per region: its credit is held
+  logic wl_put;  // the loader opens its block's fill this cycle
+  // The weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache.
+  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_buf[2];
+  sienna_fmt_pkg::requant_scale_t [N-1:0] scale_buf[2];  // the requantize scales of the block each half holds
+  logic [DIM_W-1:0] wl_blk;  // block the loader works on
+  logic wl_bias_done;  // its bias row is in
+  logic [DIM_W-1:0] wl_tile;  // tiles of it complete
+  logic [RW-1:0] wl_row;
+  logic [DIM_W-1:0] tiles_in[2];  // complete tiles in each half, for the block that half holds
+  logic [1:0] bias_in;  // the bias row for the block each half holds is in
+  logic wl_pre, wl_may, wl_take_bias, wl_take_tile, wl_bias_due;
+  logic wl_opened;  // the loader's block has its region's fill open
+  logic wb_gr;  // the loader's bias row is granted, not yet in
+  logic [DIM_W-1:0] wt_tg;  // the loader's tiles granted so far (N rows each)
+  logic [TOW-1:0] wt_out;  // tile rows granted, not yet in
+  logic wb_grant, wt_grant;
+  // The set issuer: for each block, row tile and pass, N rows of A (and B if not cached) on the credits it grants, then the start.
+  logic [DIM_W-1:0] is_blk;  // block the issuer works on
+  logic [DIM_W-1:0] is_p;  // the issuer's next pass to grant
+  logic [DIM_W-1:0] is_r;  // the set being received
+  logic is_res_pass;  // that pass is the residual's
+  logic is_cached_pass;
+  logic [NOW-1:0] n_out;  // sets started and not yet complete
+  logic [LFSR_WIDTH-1:0] seed_mul;  // 0x85EBCA6B times the sets started so far, kept by adding the constant per start (no multiplier)
+  logic pend;  // a set is granted and not yet started
+  logic [RCW-1:0] a_need, w_need;  // its rows still to come
+  logic [RW-1:0] a_row;  // its A rows in, for the residual pass's identity row
+  logic a_take, w_set_row;  // an A row; a weight row that is the set's B row
+  logic w_is_b;  // a weight row is the pending set's B row
+  logic s_grant;  // a set's row credits go out this cycle
+  logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
+  logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok;
+
+`ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the row links are checked at time 0
+  initial
+    if ($bits(a_rows.data) != N * DATA_WIDTH || $bits(a_rows.credit) != RCW || $bits(w_rows.data) != N * DATA_WIDTH ||
+        $bits(w_rows.credit) != RCW)
+      $fatal(1, "sienna_top: the row links need data %0d bits and credit %0d, found A %0d and %0d, W %0d and %0d", N * DATA_WIDTH, RCW,
+             $bits(a_rows.data), $bits(a_rows.credit), $bits(w_rows.data), $bits(w_rows.credit));
+`endif
+  assign a_data_i = a_rows.data;
+  assign w_data_i = w_rows.data;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) live <= 1'b0;
+    else live <= 1'b1;
+
+  assign int_res = sienna_fmt_pkg::HAS_RESIDUAL_ADD && res_q;
+
   credit_counter #(.MAX(2), .CRW(1)) l0_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(host.put), .credit_i(host.credit),
                                             .has_credit_o(), .count_o(l0_cnt));
   assign host.put = p_start;
   assign host.data = p_side;
-  logic [DIM_W-1:0] wl_blk;  // block the loader works on (declared here, before the sideband and the cache links read them)
-  logic [DIM_W-1:0] is_p;  // the issuer's next pass to grant
-  logic is_res_pass;  // that pass is the residual's
   always_comb begin
     p_side_base          = '0;
     p_side_base.wc_last       = p_wc_last;
@@ -179,13 +211,12 @@ module sienna_sched #(
         add_q.in1_zero_point <= cfg_lane_i.zero_point;
       end
   end else begin : G_NO_ADD_SIDE
+    logic unused_add_words;  // only a build with the residual ADD reads them
     assign p_side = p_side_base;  // no residual: no add set is ever put
-    wire unused_add_words = ^cfg_add_i;  // only a build with the residual ADD reads them
+    assign unused_add_words = ^cfg_add_i;
   end
 
   // The cache regions (L2): the loader puts once per cached block's fill, on the region of its half, when it holds that region's credit.
-  logic wc_has[2];  // per region: its credit is held
-  logic wl_put;  // the loader opens its block's fill this cycle
   for (genvar r = 0; r < 2; r++) begin : G_WC
     credit_counter #(.MAX(1), .CRW(1)) cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(wc_region[r].put), .credit_i(wc_region[r].credit),
                                            .has_credit_o(), .count_o(wc_has[r]));
@@ -204,50 +235,21 @@ module sienna_sched #(
   assign set_done_o = p_complete;
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
-  logic [N-1:0][ACC_DATA_WIDTH-1:0] bias_buf[2];
   if ($bits(bias_buf[0][0]) != sienna_fmt_pkg::ACC_DATA_WIDTH) begin : G_BAD_BIAS_W  // the widened bias would truncate or pad silently
     $fatal(1, "sienna_top: bias words are %0d bits, the mesh's bias input %0d", $bits(bias_buf[0][0]), sienna_fmt_pkg::ACC_DATA_WIDTH);
   end
-  sienna_fmt_pkg::requant_scale_t [N-1:0] scale_buf[2];  // the requantize scales of the block each half holds
-  logic wl_bias_done;  // its bias row is in
-  logic [DIM_W-1:0] wl_tile;  // tiles of it complete
-  logic [RW-1:0] wl_row;
-  logic [DIM_W-1:0] is_blk;  // block the issuer works on
-  logic [DIM_W-1:0] tiles_in[2];  // complete tiles in each half, for the block that half holds
-  logic [1:0] bias_in;  // the bias row for the block each half holds is in
-
   // The loader may start block b once the issuer has finished block b-2, whose half it overwrites, and (cached) has opened the half's fill on its region's credit.
   // Uncached, block b's bias row follows block b-1's last B row in the stream, so its credit waits until that set's are granted.
-  logic wl_pre, wl_may, wl_take_bias, wl_take_tile, wl_bias_due;
-  logic wl_opened;  // the loader's block has its region's fill open
-  logic wb_gr;  // the loader's bias row is granted, not yet in
-  logic [DIM_W-1:0] wt_tg;  // the loader's tiles granted so far (N rows each)
-  logic [TOW-1:0] wt_out;  // tile rows granted, not yet in
-  logic wb_grant, wt_grant;
-  logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
   assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk + 1) && (cached || wl_blk <= g_blk);
   assign wl_put = wl_pre && cached && !wl_opened && wc_has[wl_blk[0]];
   assign wl_may = wl_pre && (!cached || wl_opened);
   assign wl_bias_due = wl_pre && bias_q && !wl_bias_done;  // the next weight row the loader expects is its block's bias
 
   // ── Set issuer: for each block, row tile and pass, N rows of A (and B if not cached) on the credits it grants, then the start ──
-  logic [DIM_W-1:0] is_r;  // the set being received
-  // Sets started and not yet complete, bounded by the pipeline's SETS_IN_FLIGHT; the layer is done once every block is issued and none is out.
-  localparam int NOW = 8;
-  logic [NOW-1:0] n_out;
-  logic [LFSR_WIDTH-1:0] seed_mul;  // 0x85EBCA6B times the sets started so far, kept by adding the constant per start (no multiplier)
-  logic is_cached_pass;
-  logic pend;  // a set is granted and not yet started
-  logic [RCW-1:0] a_need, w_need;  // its rows still to come
-  logic [RW-1:0] a_row;  // its A rows in, for the residual pass's identity row
-  logic a_take, w_set_row;  // an A row; a weight row that is the set's B row
-  logic s_grant;  // a set's row credits go out this cycle
-
   assign is_res_pass    = res_q && p_dt;
   assign is_cached_pass = cached && !is_res_pass;
   assign a_take         = a_rows.put;
   // A weight row is the pending set's B row while it needs any (they precede the next bias row in the stream), else the loader's.
-  logic w_is_b;
   assign w_is_b         = !cached && pend && (w_need != '0);
   assign wl_take_bias   = w_rows.put && !w_is_b && wl_bias_due;
   assign wl_take_tile   = w_rows.put && cached && !wl_bias_due;
@@ -265,7 +267,6 @@ module sienna_sched #(
       end else g_p = is_p + 1'b1;
     end
   end
-  logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok;
   assign g_res     = res_q && (g_p == dt);
   assign g_need_w  = !cached && !g_res;  // an uncached layer's B rows come with the set
   assign g_l0_ok   = int'(l0_cnt) > int'(pend);  // an L0 credit held beyond the pending set's
@@ -485,6 +486,11 @@ module sienna_sched #(
   assign busy_o = active;
 
 `ifndef SYNTHESIS
+  logic ap_q, ap_ok_q, wp_q, wp_ok_q;  // a row's put and whether its stream held a credit for it, registered: a host may drive its puts at the edge
+  logic wgb_q, wgn_q;  // a bias row's weight credit and a set's or tile's, registered
+  logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias) where the bias rides the row
+  logic chk_bias_h;
+  logic [N-1:0][DATA_WIDTH-1:0] chk_bias_row;
   a_pack_shape: assert property (@(posedge clk_i) disable iff (!rstn_i)
                                  (cfg_load_i && !active && cfg_pack_shift_i != '0) |-> (cfg_n_i == DIM_W'(N) && cfg_kb_i == DIM_W'(N) && !cfg_residual_i))
     else $error("sienna_top: a packed layer is N columns and N deep, without a residual");
@@ -492,8 +498,6 @@ module sienna_sched #(
     else $error("sienna_top: %0d sets in flight, the count's limit", n_out);
   a_one_north: assert property (@(posedge clk_i) disable iff (!rstn_i) !(p_wc_we && p_north_we))
     else $error("sienna_top: a cache fill and a set's B row on the north bus in one cycle");
-  // A row's put and whether its stream held a credit for it, registered: a host may drive its puts at the edge.
-  logic ap_q, ap_ok_q, wp_q, wp_ok_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {ap_q, ap_ok_q, wp_q, wp_ok_q} <= '0;
     else {ap_q, ap_ok_q, wp_q, wp_ok_q} <= {a_take, pend && a_need != '0, w_rows.put,
@@ -503,16 +507,12 @@ module sienna_sched #(
   a_w_granted: assert property (@(posedge clk_i) disable iff (!rstn_i) wp_q |-> wp_ok_q)
     else $error("sienna_top: a weight row arrived with no credit granted for the row the stream is at (bias, cache tile or a set's B row)");
   // The weight credit mux sends one grant: a bias row's must never come with a set's B rows or a tile's.
-  logic wgb_q, wgn_q;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {wgb_q, wgn_q} <= '0;
     else {wgb_q, wgn_q} <= {wb_grant, (s_grant && g_need_w) || wt_grant};
   a_w_one_grant: assert property (@(posedge clk_i) disable iff (!rstn_i) !(wgb_q && wgn_q))
     else $error("sienna_top: a bias row's weight credit and a set's or tile's N in one cycle: the credit mux sent only N");
   // A float bias row word must land in bias_buf as the word followed by zeros, -0 and subnormals included.
-  logic chk_bias_v;  // registered copy of the loader's bias write (active && wl_take_bias) where the bias rides the row
-  logic chk_bias_h;
-  logic [N-1:0][DATA_WIDTH-1:0] chk_bias_row;
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) chk_bias_v <= 1'b0;
     else chk_bias_v <= active && wl_take_bias && BIAS_ROW;

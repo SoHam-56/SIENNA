@@ -18,29 +18,45 @@ module dropout #(
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
     input wire [DATA_WIDTH-1:0] zero_point_i  // the dropped word where the format has a zero point (int8, D-5); floats ignore it
 );
+  localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
+  localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
+  localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
+  localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
+  localparam int KQ_DEPTH = 16;  // keep/drop decisions waiting for their product
 
-  // The downstream credit is the upstream's: a beat is put here only on a slot already reserved past this unit's pipeline.
-  wire                  in_valid = in.put;
-  wire [DATA_WIDTH-1:0] data_in  = in.data;
+  // The beat in and the beat out.
+  wire                   in_valid;
+  wire  [DATA_WIDTH-1:0] data_in;
   logic [DATA_WIDTH-1:0] data_out;
   logic                  valid_out;
-  assign out.put   = valid_out;
-  assign out.data  = data_out;
-  assign in.credit = out.credit;
+  // The LFSR: a fresh word per beat.
+  logic [LFSR_WIDTH-1:0] lfsr_state, lfsr_next;
+  // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
+  logic keep_q[KQ_DEPTH];
+  logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
+  logic                  mult_valid_in;
+  logic [DATA_WIDTH-1:0] mult_out;
+  logic                  mult_done;
+
 `ifndef SYNTHESIS
   // Interface widths are not elaboration constants in Verilator, so the link widths are checked at time 0.
   initial
     if ($bits(in.data) != DATA_WIDTH || $bits(out.data) != DATA_WIDTH || $bits(in.credit) != $bits(out.credit))
       $fatal(1, "dropout: links need data %0d bits and equal credit widths, found %0d/%0d and %0d/%0d", DATA_WIDTH, $bits(in.data),
              $bits(in.credit), $bits(out.data), $bits(out.credit));
+  // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
+  initial begin
+    if (SCALES && DROPOUT_P_PERCENT != 50 && CONST_SCALE == sienna_fmt_pkg::DROPOUT_KEEP_SCALE)
+      $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
+  end
 `endif
 
-  localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
-  localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
-  localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
-  localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
-
-  logic [LFSR_WIDTH-1:0] lfsr_state, lfsr_next;
+  // The downstream credit is the upstream's: a beat is put here only on a slot already reserved past this unit's pipeline.
+  assign in_valid  = in.put;
+  assign data_in   = in.data;
+  assign out.put   = valid_out;
+  assign out.data  = data_out;
+  assign in.credit = out.credit;
 
   // A fresh 32-bit word per beat, so neighbouring keep/drop decisions are independent.
   always_comb begin
@@ -58,26 +74,9 @@ module dropout #(
     else if (in_valid) lfsr_state <= lfsr_next;
   end
 
-  // The scale is fixed at elaboration; a different drop rate needs its own 1/(1-p).
-`ifndef SYNTHESIS  // parameter checks; synthesis tools ignore or reject initial blocks
-  initial begin
-    if (SCALES && DROPOUT_P_PERCENT != 50 && CONST_SCALE == sienna_fmt_pkg::DROPOUT_KEEP_SCALE)
-      $error("dropout: CONST_SCALE is 2.0, which is only 1/(1-p) for DROPOUT_P_PERCENT = 50");
-  end
-`endif
-
-  // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
-  localparam int KQ_DEPTH = 16;
-  logic keep_q[KQ_DEPTH];
-  logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
-
   // ---------------------------------------------------------
   // MUX Bypass Logic
   // ---------------------------------------------------------
-  logic                  mult_valid_in;
-  logic [DATA_WIDTH-1:0] mult_out;
-  logic                  mult_done;
-
   always_comb begin
     mult_valid_in = 1'b0;
     data_out      = '0;

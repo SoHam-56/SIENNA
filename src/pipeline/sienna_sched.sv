@@ -96,6 +96,8 @@ module sienna_sched #(
 
   // ── Configuration and what follows from it ────────────────────────────
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
+  logic [DIM_W-1:0] rt_m1, dt_m1, np_m1;  // rt - 1, dt - 1, np - 1, registered at the load: no decrementer in the issuer's cone
+  logic p_last, r_last, p_dlast, p_dt;  // is_p == np - 1, is_r == rt - 1, is_p == dt - 1, is_p == dt, kept with is_p and is_r
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
   logic [1:0] tier_q;
@@ -151,7 +153,7 @@ module sienna_sched #(
     p_side_base.tier          = tier_q;
     p_side_base.entry         = {pk_lane_q, lane_q};
     p_side_base.scale         = p_scale;
-    p_side_base.res_hold      = int_res && (is_p == dt - 1);  // the conv's words and clamp, linear: its beats wait in hold_mem
+    p_side_base.res_hold      = int_res && p_dlast;  // the conv's words and clamp, linear: its beats wait in hold_mem
     p_side_base.res_add       = int_res && is_res_pass;  // identity requantize, the ADD's words, the layer's activation
     if (p_side_base.res_hold) p_side_base.act[0] = CONTROL_WIDTH'(3'b101);
   end
@@ -241,7 +243,7 @@ module sienna_sched #(
   logic a_take, w_set_row;  // an A row; a weight row that is the set's B row
   logic s_grant;  // a set's row credits go out this cycle
 
-  assign is_res_pass    = res_q && (is_p == dt);
+  assign is_res_pass    = res_q && p_dt;
   assign is_cached_pass = cached && !is_res_pass;
   assign a_take         = a_rows.put;
   // A weight row is the pending set's B row while it needs any (they precede the next bias row in the stream), else the loader's.
@@ -257,9 +259,9 @@ module sienna_sched #(
     g_blk = is_blk;
     g_p   = is_p;
     if (pend) begin
-      if (is_p == np - 1) begin
+      if (p_last) begin
         g_p = '0;
-        if (is_r == rt - 1) g_blk = is_blk + 1'b1;
+        if (r_last) g_blk = is_blk + 1'b1;
       end else g_p = is_p + 1'b1;
     end
   end
@@ -289,12 +291,12 @@ module sienna_sched #(
       for (int c = 0; c < N; c++) p_north[c] = (c == int'(a_row)) ? ONE : '0;
     p_wc_we    = wl_take_tile;
     p_wc_addr  = WCAW'((int'(wl_blk[0]) * HALF + int'(wl_tile)) * N * N + int'(wl_row) * N);
-    p_acc      = int_res ? (is_p < dt - 1) : (is_p != np - 1);  // int8 residual: the hold set closes the conv's sum, the add set is its own
+    p_acc      = int_res ? (is_p < dt_m1) : !p_last;  // int8 residual: the hold set closes the conv's sum, the add set is its own
     p_bias_v   = bias_q && (is_p == 0);
     p_bias     = bias_buf[is_blk[0]];
     p_scale    = scale_buf[is_blk[0]];
     p_cached   = is_cached_pass;
-    p_wc_last  = is_cached_pass && (is_r == rt - 1) && (is_p == dt - 1);
+    p_wc_last  = is_cached_pass && r_last && p_dlast;
     p_tile     = WCTW'(int'(is_blk[0]) * HALF + int'(is_p));
     p_seed     = seed_q ^ seed_mul;
   end
@@ -306,6 +308,13 @@ module sienna_sched #(
       ct <= '0;
       dt <= '0;
       np <= '0;
+      rt_m1 <= '0;
+      dt_m1 <= '0;
+      np_m1 <= '0;
+      p_last <= 1'b0;
+      r_last <= 1'b0;
+      p_dlast <= 1'b0;
+      p_dt <= 1'b0;
       res_q <= 1'b0;
       bias_q <= 1'b0;
       cached <= 1'b0;
@@ -348,6 +357,13 @@ module sienna_sched #(
         ct <= c;
         dt <= d;
         np <= d + DIM_W'(cfg_residual_i);
+        rt_m1 <= r - 1'b1;
+        dt_m1 <= d - 1'b1;
+        np_m1 <= d + DIM_W'(cfg_residual_i) - 1'b1;
+        p_last <= (d + DIM_W'(cfg_residual_i)) == DIM_W'(1);  // is_p and is_r start at 0
+        r_last <= r == DIM_W'(1);
+        p_dlast <= d == DIM_W'(1);
+        p_dt <= d == '0;
         res_q <= cfg_residual_i;
         bias_q <= cfg_bias_i || sienna_fmt_pkg::HAS_REQUANT_EPILOGUE;  // a requantizing build: every block's bias beat carries its requantize words
         cached <= (r > 1) && (d <= DIM_W'(HALF));
@@ -428,16 +444,28 @@ module sienna_sched #(
         end
         if (p_start) begin
           seed_mul <= seed_mul + LFSR_WIDTH'(32'h85EBCA6B);
-          if (is_p == np - 1) begin
+          if (p_last) begin
             is_p <= '0;
-            if (is_r == rt - 1) begin
+            p_last <= np_m1 == '0;
+            p_dlast <= dt_m1 == '0;
+            p_dt <= dt == '0;
+            if (r_last) begin
               is_r <= '0;
+              r_last <= rt_m1 == '0;
               is_blk <= is_blk + 1'b1;
               // This half is free for block is_blk + 2 once its sets are broadcast.
               tiles_in[is_blk[0]] <= '0;
               bias_in[is_blk[0]] <= 1'b0;
-            end else is_r <= is_r + 1'b1;
-          end else is_p <= is_p + 1'b1;
+            end else begin
+              is_r <= is_r + 1'b1;
+              r_last <= DIM_W'(is_r + 1'b1) == rt_m1;
+            end
+          end else begin
+            is_p <= is_p + 1'b1;
+            p_last <= DIM_W'(is_p + 1'b1) == np_m1;
+            p_dlast <= DIM_W'(is_p + 1'b1) == dt_m1;
+            p_dt <= DIM_W'(is_p + 1'b1) == dt;
+          end
         end
         n_out <= n_out + NOW'(p_start) - NOW'(p_complete);
         if (is_blk == ct && n_out == '0) begin

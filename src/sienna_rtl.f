@@ -23,6 +23,7 @@ SystolicMesh/ArithmeticLibrary/src/multipliers/int8Multiplier.sv
 SystolicMesh/ArithmeticLibrary/src/adders/bf16Adder.sv
 SystolicMesh/ArithmeticLibrary/src/adders/int32Adder.sv
 SystolicMesh/ArithmeticLibrary/src/converters/fp32ToBf16.sv
+SystolicMesh/ArithmeticLibrary/src/multipliers/intMulPipe.sv
 SystolicMesh/ArithmeticLibrary/src/multipliers/int16Multiplier.sv
 SystolicMesh/ArithmeticLibrary/src/multipliers/int24Multiplier.sv
 SystolicMesh/src/engine/ProcessingElement.sv

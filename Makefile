@@ -108,6 +108,7 @@ SM_LIB_FILES = \
 	src/adders/bf16Adder.sv \
 	src/adders/int32Adder.sv \
 	src/converters/fp32ToBf16.sv \
+	src/multipliers/intMulPipe.sv \
 	src/multipliers/int16Multiplier.sv \
 	src/multipliers/int24Multiplier.sv
 
@@ -633,10 +634,10 @@ add-lanes:
 	mkdir -p $(ADDL_DIR)
 	$(PYTHON) regression.py --action add-vectors $(TB_DIR)/add_lanes.mem --truth $(ADDL_DIR)/add_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv $(TB_DIR)/units/TB_add_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_add_lanes,$(ADDL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/multipliers/intMulPipe.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv $(TB_DIR)/units/TB_add_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_add_lanes --Mdir $(ADDL_DIR) \
-	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv \
+	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/multipliers/intMulPipe.sv $(SM_LIB_DIR)/src/quantized/int8QuantizedAdder.sv $(SRC_DIR)/lanes/add_lanes.sv \
 	  $(TB_DIR)/units/TB_add_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(ADDL_DIR)/sim $(SIM_RUN) | tee $(ADDL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(ADDL_DIR)/sim.log && \
@@ -649,10 +650,10 @@ rq-lanes:
 	mkdir -p $(RQL_DIR)
 	$(PYTHON) regression.py --action rq-vectors $(TB_DIR)/rq_lanes.mem --truth $(RQL_DIR)/rq_lanes_truth.json
 ifeq ($(SIM),vcs)
-	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv,+define+FMT_INT8)
+	$(call vcs_build,TB_requant_lanes,$(RQL_DIR),$(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/multipliers/intMulPipe.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv,+define+FMT_INT8)
 else
 	$(VERILATOR) --binary --timing --assert --sv -j $(shell nproc) $(filter --Wno-%,$(VERILATOR_FLAGS)) -Werror-USERFATAL +define+FMT_INT8 --top-module TB_requant_lanes --Mdir $(RQL_DIR) \
-	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv -o sim
+	  $(SM_LIB_DIR)/src/fmt/sienna_fmt_pkg.sv $(SM_LIB_DIR)/src/multipliers/intMulPipe.sv $(SM_LIB_DIR)/src/quantized/int8Requantizer.sv $(SRC_DIR)/lanes/requant_lanes.sv $(TB_DIR)/units/TB_requant_lanes.sv -o sim
 endif
 	set -o pipefail; cd $(TB_DIR) && $(RQL_DIR)/sim $(SIM_RUN) | tee $(RQL_DIR)/sim.log && command grep -q '^RESULT: PASSED' $(RQL_DIR)/sim.log && \
 	  ! command grep -qE '%[E]rror|%[F]atal|\[[F]ATAL\]|Assertion [f]ailed|^([E]rror|[F]atal): "|^[E]rror-\[' $(RQL_DIR)/sim.log || { echo "TB_requant_lanes: failed ($(RQL_DIR)/sim.log)"; exit 1; }

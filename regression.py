@@ -2981,7 +2981,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
     N, T, lanes = P["N"], P["TILE_SIZE"], P["NUM_LANES"]
     per_lane = P["SRAM_DEPTH"] // lanes
     K = N if collapse else T  # depth each array multiplies
-    U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (6 in fp32 and bf16, 2 in int8)
+    U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (8 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
     LAT = 1 + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: tree over the partials and the bias
     words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split()) if words is None else words
@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 333), ("int8", "tanh", 32, 333))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 134), ("bf16", "sigmoid", 8, 175), ("int8", "selu", 32, 340), ("int8", "tanh", 32, 340))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5869,7 +5869,7 @@ def perf_trace(name):
 @perf_selftest
 def test_accumulate_outputs_every_third_set():
     a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
-    assert a["first_latency"] == 133  # host start of pass 0 to the completion of pass 2, read off the trace by hand
+    assert a["first_latency"] == 150  # host start of pass 0 to the completion of pass 2, read off the trace by hand (133 before rounds D-G)
     assert statistics.mean(a["steady"]) == 19.0  # cycles per depth pass: 57 per output of 3 passes
     outs = [x for x in a["sets"] if x["latency"] is not None]
     assert len(outs) == 8 and all(x["latency"] > 0 and x["out"] >= 0 for x in outs)
@@ -5879,7 +5879,7 @@ def test_accumulate_outputs_every_third_set():
 @perf_selftest
 def test_single_pass_unchanged():
     a = pa.analyse(perf_trace("matmul_relu_nopool"), 24)
-    assert a["first_latency"] == a["sets"][0]["latency"] == 95  # the pre-fix report's value
+    assert a["first_latency"] == a["sets"][0]["latency"] == 112  # 95 before rounds D-G (2026-11-15): the result read and bank write registers (+2), fp32Adder 7 stages and 8 slots (+15)
     assert statistics.mean(a["steady"]) == 19.0
     assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
 
@@ -5889,9 +5889,9 @@ def test_residual_hold_add_pairs():
     ev = pa.events(open(os.path.join(PERF_FIX, "int8_residual_relu_N8_T2_int8.trace")).read())
     a = pa.analyse(ev, 18, 1, [0x56, 0x58] * 9)  # add_<k>.mem's flags: hold sets and add sets in turn, ReLU, bias on the hold set
     assert a["hold"] == [3] * 9 and [x["act"] for x in a["sets"][1::2]] == [3] * 9  # G 115-118 (hold), 126-129 (add), off the trace by hand
-    assert all(x["act"] is None and x["latency"] is None and x["mesh"] == 26 for x in a["sets"][0::2])  # a hold set outputs nothing
-    assert a["first_latency"] == 146 - 85 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion
-    assert a["steady"] and all(g == 11.0 for g in a["steady"])  # 22 cycles per hold/add pair
+    assert all(x["act"] is None and x["latency"] is None and x["mesh"] >= 28 for x in a["sets"][0::2]) and a["sets"][0]["mesh"] == 28  # a hold set outputs nothing; mesh 26 before rounds D-G (the result read register), later holds wait on the stage
+    assert a["first_latency"] == 69 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion (61 before rounds D-G)
+    assert a["steady"] and all(g == 14.5 for g in a["steady"])  # 29 cycles per hold/add pair at N 8: activation-bound since rounds D-G (the requantize's 7 stages and grant hold, the bank write register); 22 and host-bound before
 
 
 PERF_P8 = dict(N=8, TILE_SIZE=2, NUM_LANES=32, HOST_WORDS=8, SRAM_DEPTH=64, IN_ROWS=8, IN_COLS=8, POOL_H=1, POOL_W=1, STRIDE_ROWS=1,
@@ -5904,7 +5904,7 @@ def test_mesh_lat_passes():
         a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
         P16 = {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}
         m1, m3 = pa.model({"act": "linear"}, True, P16, 256), pa.model({"act": "linear", "accum_passes": 3}, True, P16, 256)
-        assert m1["mesh_lat"] == 72 and m3["mesh_lat"] == 72 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 110
+        assert m1["mesh_lat"] == 87 and m3["mesh_lat"] == 87 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 125  # 72 / 110 before round G: 8 slots, the reducer tree 4 levels of 7
 
 
 @perf_selftest
@@ -5993,16 +5993,16 @@ def test_link_bytes():
 
 @perf_selftest
 def test_rtl_lat():
-    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (3, 6, 7, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert pa.UNIT_LAT == {"fp32": (8, 7), "bf16": (3, 7), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (4, 7, 7, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
 def test_lane_stage_int8():
     with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4),
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the three stages of the pipelined input stage (ACT_IN_LATENCY 5) and the requantize's fifth (REQUANT_LATENCY 5)
-        assert stage("selu", 16) == 102 and stage("tanh", 16) == 100 and stage("sigmoid", 16) == 100  # perf_abc_int8 measured 101 / 98 / 98 (2026-11-14)
-        assert stage("selu", 8) == 66 and stage("tanh", 8) == 58 and stage("sigmoid", 8) == 58
+        assert stage("selu", 16) == 108 and stage("tanh", 16) == 104 and stage("sigmoid", 16) == 104  # rounds D-F (2026-11-15): the input stage +2, the Horner step +1, the requantize +1; confirmed by the perf rows below
+        assert stage("selu", 8) == 76 and stage("tanh", 8) == 66 and stage("sigmoid", 8) == 66
 
 
 @perf_selftest
@@ -6017,11 +6017,11 @@ def test_lane_cycle_targets():
 @perf_selftest
 def test_lane_group_float():
     with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 88 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 64
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 142 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 253  # sigmoid: F2's 5 rounds
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 93 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 69  # rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 156 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 259  # sigmoid: F2's 5 rounds
     with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 71 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 233
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 170 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 170  # F1's 34-cycle shorter tail
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 74 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 237  # rounds D-F: the input stage +1, the Horner add +1 a round
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 185 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 185  # F1's 34-cycle shorter tail, on fp32Adder's 7 stages
 
 
 @perf_selftest
@@ -6037,8 +6037,8 @@ def test_lane_kinds():
 
 @perf_selftest
 def test_tail_ops_bf16():
-    with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 5 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
-        assert [pa.tail_ops(t) for t in range(3)] == [10 + 3 * 17 + 14 + 2 * 27 + 10, 10 + 3 * 17 + 14 + 27 + 10, 10 + 3 * 17 + 14 + 10] == [139, 112, 85]  # F1: tier 0 degree 2
+    with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 7 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
+        assert [pa.tail_ops(t) for t in range(3)] == [10 + 3 * 19 + 18 + 2 * 29 + 10, 10 + 3 * 19 + 18 + 29 + 10, 10 + 3 * 19 + 18 + 10] == [153, 124, 95]  # F1: tier 0 degree 2; fp32Adder 7 stages since round G
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──

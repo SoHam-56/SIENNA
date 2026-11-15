@@ -19,6 +19,12 @@ module dropout #(
     input wire [DATA_WIDTH-1:0] zero_point_i  // the dropped word where the format has a zero point (int8, D-5); floats ignore it
 );
   localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
+  // A positive power of two as the scale (2.0 at p = 50%) is an exponent increment: one register, the same words as fmt_mul (subnormal inputs
+  // and underflow flush to a signed zero, overflow to infinity, NaN to the canonical quiet NaN). Both float formats carry 8 exponent bits; the
+  // tests below use shifts, not part-selects, so an int8 build (DATA_WIDTH 8, SCALES 0) elaborates them too.
+  localparam logic [7:0] SCALE_EXP = 8'(CONST_SCALE >> (DATA_WIDTH - 9));
+  localparam bit POW2 = SCALES && (DATA_WIDTH > 9) && !CONST_SCALE[DATA_WIDTH-1] && (SCALE_EXP != 8'd0) && (SCALE_EXP != 8'hFF)
+                        && ((CONST_SCALE & ((DATA_WIDTH'(1) << (DATA_WIDTH - 9)) - DATA_WIDTH'(1))) == '0);
   localparam logic [63:0] MAX_LFSR_VAL_64 = 64'((64'(1) << LFSR_WIDTH) - 64'(1));
   localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
   localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
@@ -116,6 +122,31 @@ module dropout #(
   end else if (!SCALES) begin : G_KEEP
     assign mult_out  = '0;
     assign mult_done = 1'b0;
+  end else if (POW2 && sienna_fmt_pkg::DROPOUT_SCALE_LATENCY != 1) begin : G_BAD_POW2_LATENCY
+    $fatal(1, "dropout: a power-of-two scale takes one cycle, but DROPOUT_SCALE_LATENCY is %0d", sienna_fmt_pkg::DROPOUT_SCALE_LATENCY);
+  end else if (POW2) begin : G_POW2  // x * 2^k by the exponent: the fp32Multiplier's product of x and the constant was the fp32 top's path
+    localparam int MAN_W = DATA_WIDTH - 9;
+    localparam logic signed [9:0] SCALE_K = 10'($signed({2'b00, SCALE_EXP})) - 10'sd127;  // the increment
+    localparam logic [DATA_WIDTH-1:0] CANONICAL_QNAN = {1'b0, 8'hFF, 1'b1, {(MAN_W - 1) {1'b0}}};
+    function automatic logic [DATA_WIDTH-1:0] pow2_scale(input logic [DATA_WIDTH-1:0] x);
+      logic sign;
+      logic [7:0] e;
+      logic [MAN_W-1:0] man;
+      logic signed [9:0] ne;
+      sign = x[DATA_WIDTH-1];
+      e    = x[DATA_WIDTH-2-:8];
+      man  = x[MAN_W-1:0];
+      ne   = 10'($signed({2'b00, e})) + SCALE_K;
+      if (e == 8'hFF) return (man != '0) ? CANONICAL_QNAN : x;  // NaN, infinity
+      if (e == 8'd0 || ne <= 10'sd0) return {sign, {(DATA_WIDTH - 1) {1'b0}}};  // a subnormal or zero input, or an underflow
+      if (ne >= 10'sd255) return {sign, 8'hFF, {MAN_W{1'b0}}};
+      return {sign, ne[7:0], man};
+    endfunction
+    always_ff @(posedge clk or negedge rst_n)
+      if (!rst_n) mult_done <= 1'b0;
+      else mult_done <= mult_valid_in;
+    always_ff @(posedge clk)
+      if (mult_valid_in) mult_out <= pow2_scale(data_in);
   end else if (sienna_fmt_pkg::mul_latency(DATA_WIDTH, DATA_WIDTH) != sienna_fmt_pkg::DROPOUT_SCALE_LATENCY) begin : G_BAD_LATENCY
     $fatal(1, "dropout: fmt_mul takes %0d cycles at %0d bits, but DROPOUT_SCALE_LATENCY is %0d", sienna_fmt_pkg::mul_latency(DATA_WIDTH, DATA_WIDTH),
            DATA_WIDTH, sienna_fmt_pkg::DROPOUT_SCALE_LATENCY);

@@ -190,9 +190,10 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_d;
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] fill_w;  // the float bypass fill's words: ReLU drops a negative word to +0
   logic fill_wr;
-  logic [2*NUM_LANES-1:0] am_we;
-  logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr;
-  logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata;
+  logic [2*NUM_LANES-1:0] am_we, am_we_q;  // the write ports, and their register ahead of the banks (the fill's code mux and ReLU into the 64-port write mux was the bf16 top's path)
+  logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr, am_waddr_q;
+  logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata, am_wdata_q;
+  logic bank_done_q, bank_sel_q;  // bank_done a cycle on, when its last word is in the bank
   logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] am_rdata;
   // ── The mesh's result beats and status ──
@@ -270,8 +271,9 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0]      pin_room;  // the lane takes the next dispatched word: a credit beyond the put now in flight
   // Dropout's lane seeds: the id pooling will accept next, and its seed registered (stage 1 of three).
   logic p_null;  // the pooling stage passes a partial or hold set this cycle
-  logic [ID_W-1:0] seed_src, seed_src1;
+  logic [31:0] seed_after[NUM_IDS];  // per id: its seed, or the next id's where it is a partial or hold set (the id pooling passes, not accepts)
   logic [31:0] seed_x1;
+  logic p_accept_q;  // the accept a cycle on: the LFSR loads then, a cycle before the first beat can reach dropout (the dispatcher's put is registered)
   // ── The window dispatcher ──
   logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
   logic [           $clog2(POOL_H+1)-1:0] disp_pr;
@@ -322,7 +324,16 @@ module sienna_pipe #(
   // a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector, a combinational read port per
   // pooling lane.
   mem_array #(.DEPTH(2 * SRAM_DEPTH), .WIDTH(DATA_WIDTH), .NW(2 * NUM_LANES), .NR(NUM_LANES), .SYNC_READ(1'b0)) act_mem (
-      .clk_i(clk_i), .we_i(am_we), .waddr_i(am_waddr), .wmask_i('1), .wdata_i(am_wdata), .re_i('1), .raddr_i(am_raddr), .rdata_o(am_rdata));
+      .clk_i(clk_i), .we_i(am_we_q), .waddr_i(am_waddr_q), .wmask_i('1), .wdata_i(am_wdata_q), .re_i('1), .raddr_i(am_raddr), .rdata_o(am_rdata));
+  // The write ports a cycle on: a set's bank is done (L6) the cycle its last word lands.
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) {am_we_q, bank_done_q} <= '0;
+    else {am_we_q, bank_done_q} <= {am_we, bank_done};
+  always_ff @(posedge clk_i) begin  // no reset: read only beside am_we_q and bank_done_q
+    am_waddr_q <= am_waddr;
+    am_wdata_q <= am_wdata;
+    bank_sel_q <= bank_sel;
+  end
 
   // =========================================================================
   // LINKS: L0 host -> here, L1 here -> mesh, L3 mesh -> activation, L6 activation -> pooling; L2 passes to the mesh
@@ -393,8 +404,8 @@ module sienna_pipe #(
   credit_counter #(.MAX(2), .CRW(1)) l6_cc (.clk_i(clk_i), .rstn_i(rstn_i), .put_i(l6.put), .credit_i(l6.credit), .has_credit_o(),
                                             .count_o(l6_cnt));
   assign l6_room = l6_cnt > l6_rsv;
-  assign l6.put = bank_done;
-  assign l6.data = bank_sel;
+  assign l6.put = bank_done_q;
+  assign l6.data = bank_sel_q;
   assign l6_credit = p_release || (live && l6_owed != 0);
   assign l6.credit = l6_credit;
 
@@ -475,13 +486,19 @@ module sienna_pipe #(
 
   assign coef_ready_o = (&lane_idle) && (sets_out == '0) && !host_accept;
 
-  // Dropout's lane seeds take three register stages, so the reseed at p_accept reads a register (timing): stage 1 the seed of seed_src, the id
-  // pooling will accept next; stage 2 the two half products of the constant multiply; stage 3 their sum, folded. seed_src skips the id accepted or
-  // passed this cycle and a null set after it: an accept follows an accept by four cycles at least and a null by one, and nulls are two apart, so
-  // the id accepted three cycles on is always seed_src now.
-  assign seed_src1 = p_next_id + ID_W'(p_accept || p_null);
-  assign seed_src  = seed_src1 + ID_W'(set_accum[seed_src1] || set_hold[seed_src1]);
-  always_ff @(posedge clk_i) seed_x1 <= 32'(set_seed[seed_src]);  // no reset: read only at p_accept, after its set's host_accept
+  // Dropout's lane seeds take four register stages and the LFSR loads the cycle after the accept (a beat reaches dropout two cycles after it
+  // at the soonest): stage 1 the seed of the id pooling will accept next, from a per-id table of the seed of the id or of the one after it where
+  // the id is a partial or hold set (pooling passes those); stage 2 the two half products of the constant multiply; stage 3 their sum; stage 4
+  // folded. The id read skips the one accepted or passed this cycle: an accept follows an accept by four cycles at least and a null by one, and
+  // nulls are two apart, so the id accepted three cycles on is the one read now. The table is a cycle behind set_seed, which is written at an
+  // id's host_accept, long before its accept here; its +1 only drives the final select, so the accept's own cone stays out of the read mux.
+  always_ff @(posedge clk_i)  // no reset: read only at p_accept, after its set's host_accept
+    for (int i = 0; i < NUM_IDS; i++)
+      seed_after[i] <= 32'(set_seed[(set_accum[i] || set_hold[i]) ? ID_W'(i + 1) : ID_W'(i)]);
+  always_ff @(posedge clk_i) seed_x1 <= (p_accept || p_null) ? seed_after[ID_W'(p_next_id + 1'b1)] : seed_after[p_next_id];
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) p_accept_q <= 1'b0;
+    else p_accept_q <= p_accept;
 
   generate
     genvar g;
@@ -491,7 +508,7 @@ module sienna_pipe #(
       localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);  // the lane's seed mix constant
       logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
       // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
-      logic [31:0] seed_xc, seed_pa, lane_mul;
+      logic [31:0] seed_xc, seed_pa, lane_mul, lane_mul_q;
       logic [15:0] seed_pb;  // the high half's product: only its low 16 bits reach the 32-bit result
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       // The output register, as final_result_o was.
@@ -589,15 +606,17 @@ module sienna_pipe #(
         assign maxpool_out_valid[g] = drp.put;
       end
 
-      // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
+      // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 to 4
+      // (the sum, then its fold and the all-zero check: together they were the fp32 top's path).
       assign seed_xc = seed_x1 ^ LANE_C;
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
-        seed_pa   <= seed_xc * 32'h0000_CA6B;
-        seed_pb   <= 16'(seed_xc * 32'h0000_85EB);
-        lane_seed <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
+        seed_pa    <= seed_xc * 32'h0000_CA6B;
+        seed_pb    <= 16'(seed_xc * 32'h0000_85EB);
+        lane_mul_q <= lane_mul;
+        lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end
       assign lane_mul = seed_pa + {seed_pb, 16'b0};
-      assign lane_mix = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
+      assign lane_mix = LFSR_WIDTH'(lane_mul_q ^ (lane_mul_q >> 16));
 
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;
@@ -611,7 +630,7 @@ module sienna_pipe #(
           .in           (drp),
           .out          (l9p),
           .training_mode(set_train[p_set_id]),
-          .reseed_i     (p_accept),
+          .reseed_i     (p_accept_q),
           .seed_i       (lane_seed),
           .zero_point_i (p_zp[g])
       );
@@ -865,7 +884,7 @@ module sienna_pipe #(
         act_full[act_rd] <= 1'b0;
         act_rd <= ~act_rd;
       end
-      gp_sets <= gp_sets + CRW'(bank_done || g_null_done) + CRW'(hold_done) - CRW'(set_complete);
+      gp_sets <= gp_sets + CRW'(bank_done_q) + CRW'(g_null_done) + CRW'(hold_done) - CRW'(set_complete);
       sets_out  <= sets_out + CRW'(host_accept) - CRW'(set_complete);
       l0_out    <= l0_out + CRW'(l0_grant) - CRW'(host_accept);
       mesh_sets <= mesh_sets + CRW'(host_accept) - CRW'(g_accept || g_null_done);

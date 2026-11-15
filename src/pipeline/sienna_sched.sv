@@ -92,6 +92,19 @@ module sienna_sched #(
   // Configuration and what follows from it.
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
   logic [DIM_W-1:0] rt_m1, dt_m1, np_m1;  // rt - 1, dt - 1, np - 1, registered at the load: no decrementer in the issuer's cone
+  // The configuration a cycle on: the load acts on these (the host's dimensions into the tile counts and the counters was an input path).
+  logic                     c_load;
+  logic [DIM_W-1:0]         c_m, c_kb, c_n;
+  logic                     c_residual, c_bias, c_train;
+  logic [CONTROL_WIDTH-1:0] c_act;
+  logic [1:0]               c_tier;
+  logic [LFSR_WIDTH-1:0]    c_seed;
+  sienna_fmt_pkg::lane_entry_t c_lane;
+  sienna_fmt_pkg::add_params_t c_add;
+  logic [2:0]                                  c_pack_shift;
+  logic [N/2-1:0][$clog2(PACK_ENTRIES)-1:0]    c_pack_map;
+  logic [PACK_ENTRIES-1:1][CONTROL_WIDTH-1:0]  c_pack_act;
+  sienna_fmt_pkg::lane_entry_t [PACK_ENTRIES-1:1] c_pack_lane;
   logic p_last, r_last, p_dlast, p_dt;  // is_p == np - 1, is_r == rt - 1, is_p == dt - 1, is_p == dt, kept with is_p and is_r
   logic res_q, bias_q, cached, train_q;
   logic [CONTROL_WIDTH-1:0] act_q;
@@ -351,32 +364,32 @@ module sienna_sched #(
       done_o <= 1'b0;
     end else begin
       done_o <= 1'b0;
-      if (cfg_load_i && !active) begin
-        automatic logic [DIM_W-1:0] r = tiles(cfg_m_i), c = tiles(cfg_n_i), d = tiles(cfg_kb_i);
+      if (c_load && !active) begin
+        automatic logic [DIM_W-1:0] r = tiles(c_m), c = tiles(c_n), d = tiles(c_kb);
         active <= 1'b1;
         rt <= r;
         ct <= c;
         dt <= d;
-        np <= d + DIM_W'(cfg_residual_i);
+        np <= d + DIM_W'(c_residual);
         rt_m1 <= r - 1'b1;
         dt_m1 <= d - 1'b1;
-        np_m1 <= d + DIM_W'(cfg_residual_i) - 1'b1;
-        p_last <= (d + DIM_W'(cfg_residual_i)) == DIM_W'(1);  // is_p and is_r start at 0
+        np_m1 <= d + DIM_W'(c_residual) - 1'b1;
+        p_last <= (d + DIM_W'(c_residual)) == DIM_W'(1);  // is_p and is_r start at 0
         r_last <= r == DIM_W'(1);
         p_dlast <= d == DIM_W'(1);
         p_dt <= d == '0;
-        res_q <= cfg_residual_i;
-        bias_q <= cfg_bias_i || sienna_fmt_pkg::HAS_REQUANT_EPILOGUE;  // a requantizing build: every block's bias beat carries its requantize words
+        res_q <= c_residual;
+        bias_q <= c_bias || sienna_fmt_pkg::HAS_REQUANT_EPILOGUE;  // a requantizing build: every block's bias beat carries its requantize words
         cached <= (r > 1) && (d <= DIM_W'(HALF));
-        train_q <= cfg_train_i;
-        act_q <= cfg_act_i;
-        tier_q <= cfg_tier_i;
-        seed_q <= cfg_seed_i;
-        lane_q <= cfg_lane_i;
-        pk_shift_q <= cfg_pack_shift_i;
-        pk_map_q <= cfg_pack_map_i;
-        pk_act_q <= cfg_pack_act_i;
-        pk_lane_q <= cfg_pack_lane_i;
+        train_q <= c_train;
+        act_q <= c_act;
+        tier_q <= c_tier;
+        seed_q <= c_seed;
+        lane_q <= c_lane;
+        pk_shift_q <= c_pack_shift;
+        pk_map_q <= c_pack_map;
+        pk_act_q <= c_pack_act;
+        pk_lane_q <= c_pack_lane;
         wl_blk <= '0;
         wl_bias_done <= 1'b0;
         wl_tile <= '0;
@@ -483,7 +496,28 @@ module sienna_sched #(
       scale_buf[wl_blk[0]] <= w_req_scale_i;
     end
 
-  assign busy_o = active;
+  assign busy_o = active || c_load;  // busy from the cycle after the load, before active sets
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) c_load <= 1'b0;
+    else c_load <= cfg_load_i && !active;
+  always_ff @(posedge clk_i)  // no reset: read only with c_load
+    if (cfg_load_i) begin
+      c_m          <= cfg_m_i;
+      c_kb         <= cfg_kb_i;
+      c_n          <= cfg_n_i;
+      c_residual   <= cfg_residual_i;
+      c_bias       <= cfg_bias_i;
+      c_act        <= cfg_act_i;
+      c_tier       <= cfg_tier_i;
+      c_train      <= cfg_train_i;
+      c_seed       <= cfg_seed_i;
+      c_lane       <= cfg_lane_i;
+      c_add        <= cfg_add_i;
+      c_pack_shift <= cfg_pack_shift_i;
+      c_pack_map   <= cfg_pack_map_i;
+      c_pack_act   <= cfg_pack_act_i;
+      c_pack_lane  <= cfg_pack_lane_i;
+    end
 
 `ifndef SYNTHESIS
   logic ap_q, ap_ok_q, wp_q, wp_ok_q;  // a row's put and whether its stream held a credit for it, registered: a host may drive its puts at the edge

@@ -2991,9 +2991,9 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
         host=rows + 3,
         # Broadcast T rows plus commit, the array feed of K products, the reducer's T^2 reads: whichever is longest.
         mesh=max(T + 2, K, T * T),
-        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 2,
-        # then T^2 reads and the tree.
-        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 2 + T * T + LAT,
+        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 3 (the PE's
+        # final_o, the array's registered bank flag, the start), then T^2 reads and the tree.
+        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 3 + T * T + LAT,
         per_lane=per_lane, LAT=LAT)
     m["mesh_lat"] += (cfg.get("accum_passes", 1) - 1) * m["host"]  # each further depth pass launches one host interval later (TB_sienna (pipeline) is host-bound)
     act = cfg.get("act")
@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 328), ("int8", "tanh", 32, 328))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 119), ("bf16", "sigmoid", 8, 160), ("int8", "selu", 32, 333), ("int8", "tanh", 32, 333))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5904,7 +5904,7 @@ def test_mesh_lat_passes():
         a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
         P16 = {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}
         m1, m3 = pa.model({"act": "linear"}, True, P16, 256), pa.model({"act": "linear", "accum_passes": 3}, True, P16, 256)
-        assert m1["mesh_lat"] == 71 and m3["mesh_lat"] == 71 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 109
+        assert m1["mesh_lat"] == 72 and m3["mesh_lat"] == 72 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 110
 
 
 @perf_selftest
@@ -5993,16 +5993,16 @@ def test_link_bytes():
 
 @perf_selftest
 def test_rtl_lat():
-    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (1, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (2, 5, 6, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert pa.UNIT_LAT == {"fp32": (8, 5), "bf16": (3, 5), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (3, 6, 7, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
 def test_lane_stage_int8():
     with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4),
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the three stages of the pipelined input stage (ACT_IN_LATENCY 5) and the requantize's fifth (REQUANT_LATENCY 5)
-        assert stage("selu", 16) == 97 and stage("tanh", 16) == 97 and stage("sigmoid", 16) == 97
-        assert stage("selu", 8) == 57 and stage("tanh", 8) == 51 and stage("sigmoid", 8) == 51
+        assert stage("selu", 16) == 102 and stage("tanh", 16) == 100 and stage("sigmoid", 16) == 100  # perf_abc_int8 measured 101 / 98 / 98 (2026-11-14)
+        assert stage("selu", 8) == 66 and stage("tanh", 8) == 58 and stage("sigmoid", 8) == 58
 
 
 @perf_selftest

@@ -45,7 +45,7 @@ module sienna_sched #(
     output logic                    busy_o,
     output logic                    done_o,  // one cycle: the layer's last result has left
 
-    // L10 puts must come from registered state: a put reaches a_rows.credit and w_rows.credit combinationally inside this module.
+    // L10 credits leave a cycle after their grant (registered); the counts inside move with the grant.
     credit_link_if.consumer          a_rows,  // L10: one row of N words per put; a set's N credits may come with the last row's put (count 1 + N - 1 = N after it), so the producer counter needs MAX >= N
     credit_link_if.consumer          w_rows,  // L10: one row of N words per put, in the weight stream's order; two cache tiles may be granted, so the producer counter needs MAX 2N
     // int8 only: with each block's bias row on the weight stream
@@ -92,8 +92,10 @@ module sienna_sched #(
   // Configuration and what follows from it.
   logic [DIM_W-1:0] rt, ct, dt, np;  // row tiles, column blocks, weight tiles per block, passes per output tile
   logic [DIM_W-1:0] rt_m1, dt_m1, np_m1;  // rt - 1, dt - 1, np - 1, registered at the load: no decrementer in the issuer's cone
+  logic [DIM_W-1:0] is_blk1, is_p1, wt_tg1;  // is_blk + 1, is_p + 1, wt_tg + 1, kept with them (the increments ahead of the issue compares were 1.16 ns at 45 nm)
   // The configuration a cycle on: the load acts on these (the host's dimensions into the tile counts and the counters was an input path).
-  logic                     c_load;
+  logic                     c_load, c_load2;  // the configuration registered, then its tile counts: the load follows c_load2
+  logic [DIM_W-1:0]         c_r, c_c, c_d;  // tiles(c_m), tiles(c_n), tiles(c_kb), off the load's own cycle (c_kb into np_m1 was 1.07 ns)
   logic [DIM_W-1:0]         c_m, c_kb, c_n;
   logic                     c_residual, c_bias, c_train;
   logic [CONTROL_WIDTH-1:0] c_act;
@@ -118,7 +120,8 @@ module sienna_sched #(
   logic active;
   logic int_res;  // an int8 residual layer: pass dt-1 holds, pass dt adds
   // The pipeline this layer runs on (sienna_pipe, beside this in sienna_top): a set's start and its sideband, the buses.
-  logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_wc_we;
+  logic                          p_start, p_acc, p_bias_v, p_cached, p_complete, p_complete_q, p_wc_we;  // p_complete_q: set_done_i registered, so the pipe's completion cone stays out of n_out
+  logic [RCW-1:0] a_credit_q, w_credit_q;  // the row credits, registered (the issue cone with the output delay was 1.18 ns)
   logic [N-1:0][ACC_DATA_WIDTH-1:0]       p_bias;
   sienna_fmt_pkg::requant_scale_t [N-1:0] p_scale;  // the requantize scales of the set being started
   logic [N-1:0][DATA_WIDTH-1:0]        p_west, p_north;
@@ -245,6 +248,9 @@ module sienna_sched #(
   assign west_write_enable_o  = p_west_we;
   assign west_write_data_o    = p_west;
   assign p_complete           = set_done_i;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) p_complete_q <= 1'b0;
+    else p_complete_q <= p_complete;
   assign set_done_o = p_complete;
 
   // ── Weight loader: bias rows and, for cached layers, each block's tiles into half c%2 of the cache ──
@@ -253,7 +259,7 @@ module sienna_sched #(
   end
   // The loader may start block b once the issuer has finished block b-2, whose half it overwrites, and (cached) has opened the half's fill on its region's credit.
   // Uncached, block b's bias row follows block b-1's last B row in the stream, so its credit waits until that set's are granted.
-  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk + 1) && (cached || wl_blk <= g_blk);
+  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk1) && (cached || wl_blk <= g_blk);
   assign wl_put = wl_pre && cached && !wl_opened && wc_has[wl_blk[0]];
   assign wl_may = wl_pre && (!cached || wl_opened);
   assign wl_bias_due = wl_pre && bias_q && !wl_bias_done;  // the next weight row the loader expects is its block's bias
@@ -276,8 +282,8 @@ module sienna_sched #(
     if (pend) begin
       if (p_last) begin
         g_p = '0;
-        if (r_last) g_blk = is_blk + 1'b1;
-      end else g_p = is_p + 1'b1;
+        if (r_last) g_blk = is_blk1;
+      end else g_p = is_p1;
     end
   end
   assign g_res     = res_q && (g_p == dt);
@@ -292,8 +298,14 @@ module sienna_sched #(
   assign wt_grant  = live && wl_may && cached && (!bias_q || wl_bias_done) && (wt_tg < dt) && (int'(wt_out) <= N) &&
                      !(g_ok && g_res) && !(pend && is_res_pass);
   // One grant per stream per cycle: a set's, a bias row's or a tile's are never due together, so the counts never add.
-  assign a_rows.credit = s_grant ? RCW'(N) : '0;
-  assign w_rows.credit = (s_grant && g_need_w) || wt_grant ? RCW'(N) : RCW'(int'(wb_grant));
+  always_ff @(posedge clk_i or negedge rstn_i)  // the credits a cycle after the grant; the counts below move with the grant
+    if (!rstn_i) {a_credit_q, w_credit_q} <= '0;
+    else begin
+      a_credit_q <= s_grant ? RCW'(N) : '0;
+      w_credit_q <= (s_grant && g_need_w) || wt_grant ? RCW'(N) : RCW'(int'(wb_grant));
+    end
+  assign a_rows.credit = a_credit_q;
+  assign w_rows.credit = w_credit_q;
 
   // Drive the pipeline: A rows on west; B rows, identity rows or cache fills on north.
   always_comb begin
@@ -350,10 +362,13 @@ module sienna_sched #(
       tiles_in[1] <= '0;
       bias_in <= '0;
       is_blk <= '0;
+      is_blk1 <= DIM_W'(1);
       is_r <= '0;
       is_p <= '0;
+      is_p1 <= DIM_W'(1);
       wb_gr <= 1'b0;
       wt_tg <= '0;
+      wt_tg1 <= DIM_W'(1);
       wt_out <= '0;
       pend <= 1'b0;
       a_need <= '0;
@@ -364,8 +379,8 @@ module sienna_sched #(
       done_o <= 1'b0;
     end else begin
       done_o <= 1'b0;
-      if (c_load && !active) begin
-        automatic logic [DIM_W-1:0] r = tiles(c_m), c = tiles(c_n), d = tiles(c_kb);
+      if (c_load2 && !active) begin
+        automatic logic [DIM_W-1:0] r = c_r, c = c_c, d = c_d;
         active <= 1'b1;
         rt <= r;
         ct <= c;
@@ -399,10 +414,13 @@ module sienna_sched #(
         tiles_in[1] <= '0;
         bias_in <= '0;
         is_blk <= '0;
+        is_blk1 <= DIM_W'(1);
         is_r <= '0;
         is_p <= '0;
+        is_p1 <= DIM_W'(1);
         wb_gr <= 1'b0;
         wt_tg <= '0;
+        wt_tg1 <= DIM_W'(1);
         wt_out <= '0;
         pend <= 1'b0;
         a_need <= '0;
@@ -431,11 +449,15 @@ module sienna_sched #(
             wl_opened <= 1'b0;
             wb_gr <= 1'b0;
             wt_tg <= '0;
+            wt_tg1 <= DIM_W'(1);
           end else begin
             if (wl_take_bias) wl_bias_done <= 1'b1;
             if (wb_grant) wb_gr <= 1'b1;
             else if (wl_take_bias) wb_gr <= 1'b0;
-            if (wt_grant) wt_tg <= wt_tg + 1'b1;
+            if (wt_grant) begin
+              wt_tg  <= wt_tg1;
+              wt_tg1 <= wt_tg1 + 1'b1;
+            end
             if (wl_take_tile) begin
               wl_row <= last_row ? '0 : wl_row + 1'b1;
               wl_tile <= tiles_now;
@@ -460,13 +482,15 @@ module sienna_sched #(
           seed_mul <= seed_mul + LFSR_WIDTH'(32'h85EBCA6B);
           if (p_last) begin
             is_p <= '0;
+            is_p1 <= DIM_W'(1);
             p_last <= np_m1 == '0;
             p_dlast <= dt_m1 == '0;
             p_dt <= dt == '0;
             if (r_last) begin
               is_r <= '0;
               r_last <= rt_m1 == '0;
-              is_blk <= is_blk + 1'b1;
+              is_blk  <= is_blk1;
+              is_blk1 <= is_blk1 + 1'b1;
               // This half is free for block is_blk + 2 once its sets are broadcast.
               tiles_in[is_blk[0]] <= '0;
               bias_in[is_blk[0]] <= 1'b0;
@@ -475,13 +499,14 @@ module sienna_sched #(
               r_last <= DIM_W'(is_r + 1'b1) == rt_m1;
             end
           end else begin
-            is_p <= is_p + 1'b1;
-            p_last <= DIM_W'(is_p + 1'b1) == np_m1;
-            p_dlast <= DIM_W'(is_p + 1'b1) == dt_m1;
-            p_dt <= DIM_W'(is_p + 1'b1) == dt;
+            is_p  <= is_p1;
+            is_p1 <= is_p1 + 1'b1;
+            p_last <= is_p1 == np_m1;
+            p_dlast <= is_p1 == dt_m1;
+            p_dt <= is_p1 == dt;
           end
         end
-        n_out <= n_out + NOW'(p_start) - NOW'(p_complete);
+        n_out <= n_out + NOW'(p_start) - NOW'(p_complete_q);
         if (is_blk == ct && n_out == '0) begin
           active <= 1'b0;
           done_o <= 1'b1;
@@ -496,10 +521,12 @@ module sienna_sched #(
       scale_buf[wl_blk[0]] <= w_req_scale_i;
     end
 
-  assign busy_o = active || c_load;  // busy from the cycle after the load, before active sets
+  assign busy_o = active || c_load || c_load2;  // busy from the cycle after the load, before active sets
   always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) c_load <= 1'b0;
-    else c_load <= cfg_load_i && !active;
+    if (!rstn_i) {c_load, c_load2} <= '0;
+    else {c_load, c_load2} <= {cfg_load_i && !active, c_load && !active};
+  always_ff @(posedge clk_i)  // no reset: read only with c_load2
+    if (c_load) {c_r, c_c, c_d} <= {tiles(c_m), tiles(c_n), tiles(c_kb)};
   always_ff @(posedge clk_i)  // no reset: read only with c_load
     if (cfg_load_i) begin
       c_m          <= cfg_m_i;

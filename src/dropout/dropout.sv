@@ -29,6 +29,7 @@ module dropout #(
   localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
   localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
   localparam int KQ_DEPTH = 16;  // keep/drop decisions waiting for their product
+  localparam int HW = LFSR_WIDTH / 2;  // the threshold compare runs in two halves, kept as flags beside the state (the 32-bit compare on the next word was 1.03 ns at 45 nm)
 
   // The beat in and the beat out.
   wire                   in_valid;
@@ -36,7 +37,9 @@ module dropout #(
   logic [DATA_WIDTH-1:0] data_out;
   logic                  valid_out;
   // The LFSR: a fresh word per beat.
-  logic [LFSR_WIDTH-1:0] lfsr_state, lfsr_next;
+  logic [LFSR_WIDTH-1:0] lfsr_state, lfsr_next, lfsr_next2, seed_next;  // the state, one and two beats on, and the seed one beat on
+  logic hi_gt, hi_eq, lo_ge;  // lfsr_next against DROPOUT_THRESHOLD by halves: the next beat's decision, kept with the state
+  logic keep_next, keep_seed;  // the beat arriving now is kept; the seed's first draw is kept
   // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
   logic keep_q[KQ_DEPTH];
   logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
@@ -65,24 +68,57 @@ module dropout #(
   assign in.credit = out.credit;
 
   // A fresh 32-bit word per beat, so neighbouring keep/drop decisions are independent.
+  // One beat's advance of the LFSR: 32 steps per beat.
+  function automatic logic [LFSR_WIDTH-1:0] lfsr_step(input logic [LFSR_WIDTH-1:0] s);
+    lfsr_step = s;
+    for (int i = 0; i < LFSR_WIDTH; i++) begin
+      if (LFSR_WIDTH == 32)
+        lfsr_step = {lfsr_step[30:0], lfsr_step[31] ^ lfsr_step[21] ^ lfsr_step[1] ^ lfsr_step[0]};
+      else lfsr_step = {lfsr_step[LFSR_WIDTH-2:0], lfsr_step[LFSR_WIDTH-1] ^ lfsr_step[1]};
+    end
+  endfunction
+  function automatic logic [2:0] above_by_halves(input logic [LFSR_WIDTH-1:0] v);  // {high half greater, high half equal, low half not below}
+    return {v[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW], v[LFSR_WIDTH-1:HW] == DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW],
+            v[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]};
+  endfunction
+
+  // The words one and two beats on, and the seed's first word, as plain loops (the testbench reads these nets).
   always_comb begin
     lfsr_next = lfsr_state;
     for (int i = 0; i < LFSR_WIDTH; i++) begin
-      if (LFSR_WIDTH == 32)
-        lfsr_next = {lfsr_next[30:0], lfsr_next[31] ^ lfsr_next[21] ^ lfsr_next[1] ^ lfsr_next[0]};
+      if (LFSR_WIDTH == 32) lfsr_next = {lfsr_next[30:0], lfsr_next[31] ^ lfsr_next[21] ^ lfsr_next[1] ^ lfsr_next[0]};
       else lfsr_next = {lfsr_next[LFSR_WIDTH-2:0], lfsr_next[LFSR_WIDTH-1] ^ lfsr_next[1]};
     end
+    lfsr_next2 = lfsr_next;
+    for (int i = 0; i < LFSR_WIDTH; i++) begin
+      if (LFSR_WIDTH == 32) lfsr_next2 = {lfsr_next2[30:0], lfsr_next2[31] ^ lfsr_next2[21] ^ lfsr_next2[1] ^ lfsr_next2[0]};
+      else lfsr_next2 = {lfsr_next2[LFSR_WIDTH-2:0], lfsr_next2[LFSR_WIDTH-1] ^ lfsr_next2[1]};
+    end
+    seed_next = seed_i;
+    for (int i = 0; i < LFSR_WIDTH; i++) begin
+      if (LFSR_WIDTH == 32) seed_next = {seed_next[30:0], seed_next[31] ^ seed_next[21] ^ seed_next[1] ^ seed_next[0]};
+      else seed_next = {seed_next[LFSR_WIDTH-2:0], seed_next[LFSR_WIDTH-1] ^ seed_next[1]};
+    end
+    // The decision for the beat arriving now: the flags hold lfsr_next >= DROPOUT_THRESHOLD by halves; a beat arriving as the LFSR reseeds
+    // is the seed's first draw (the state advances from the seed for it).
+    keep_seed = (seed_next[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) ||
+                ((seed_next[LFSR_WIDTH-1:HW] == DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) && (seed_next[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]));
+    keep_next = reseed_i ? keep_seed : (hi_gt || (hi_eq && lo_ge));
   end
 
   always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) lfsr_state <= '1;
-    else if (reseed_i) lfsr_state <= seed_i;
-    else if (in_valid) lfsr_state <= lfsr_next;
+    if (!rst_n) begin
+      lfsr_state <= '1;
+      {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_step('1));  // the word after the reset state
+    end else if (reseed_i) begin
+      lfsr_state <= in_valid ? seed_next : seed_i;
+      {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_step(seed_next) : seed_next);
+    end else if (in_valid) begin
+      lfsr_state <= lfsr_next;
+      {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_next2);
+    end
   end
 
-  // ---------------------------------------------------------
-  // MUX Bypass Logic
-  // ---------------------------------------------------------
   always_comb begin
     mult_valid_in = 1'b0;
     data_out      = '0;
@@ -94,7 +130,7 @@ module dropout #(
       valid_out = in_valid;
     end else if (!SCALES) begin
       // Training with no scale: in the same cycle, a kept beat unchanged, a dropped beat the format's dropped word (int8: the zero point, D-5).
-      data_out  = (lfsr_next >= DROPOUT_THRESHOLD) ? data_in : sienna_fmt_pkg::fmt_drop(data_in, zero_point_i);
+      data_out  = keep_next ? data_in : sienna_fmt_pkg::fmt_drop(data_in, zero_point_i);
       valid_out = in_valid;
     end else begin
       mult_valid_in = in_valid;
@@ -110,7 +146,7 @@ module dropout #(
       kq_rd <= '0;
     end else begin
       if (SCALES && training_mode && in_valid) begin
-        keep_q[kq_wr] <= (lfsr_next >= DROPOUT_THRESHOLD);  // the word this beat advances to
+        keep_q[kq_wr] <= keep_next;  // the word this beat advances to
         kq_wr <= kq_wr + 1'b1;
       end
       if (SCALES && training_mode && mult_done) kq_rd <= kq_rd + 1'b1;

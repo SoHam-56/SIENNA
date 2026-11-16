@@ -273,7 +273,7 @@ module sienna_pipe #(
   logic p_null;  // the pooling stage passes a partial or hold set this cycle
   logic [31:0] seed_after[NUM_IDS];  // per id: its seed, or the next id's where it is a partial or hold set (the id pooling passes, not accepts)
   logic [31:0] seed_x1;
-  logic p_accept_q;  // the accept a cycle on: the LFSR loads then, a cycle before the first beat can reach dropout (the dispatcher's put is registered)
+  logic p_accept_q, p_accept_qq;  // the accept one and two cycles on: the LFSR loads at the second, as the first beat can reach dropout (the dispatcher's put is registered; dropout takes a beat with its reseed)
   // ── The window dispatcher ──
   logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
   logic [           $clog2(POOL_H+1)-1:0] disp_pr;
@@ -497,8 +497,8 @@ module sienna_pipe #(
       seed_after[i] <= 32'(set_seed[(set_accum[i] || set_hold[i]) ? ID_W'(i + 1) : ID_W'(i)]);
   always_ff @(posedge clk_i) seed_x1 <= (p_accept || p_null) ? seed_after[ID_W'(p_next_id + 1'b1)] : seed_after[p_next_id];
   always_ff @(posedge clk_i or negedge rstn_i)
-    if (!rstn_i) p_accept_q <= 1'b0;
-    else p_accept_q <= p_accept;
+    if (!rstn_i) {p_accept_q, p_accept_qq} <= '0;
+    else {p_accept_q, p_accept_qq} <= {p_accept, p_accept_q};
 
   generate
     genvar g;
@@ -508,8 +508,9 @@ module sienna_pipe #(
       localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);  // the lane's seed mix constant
       logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
       // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
-      logic [31:0] seed_xc, seed_pa, lane_mul, lane_mul_q;
-      logic [15:0] seed_pb;  // the high half's product: only its low 16 bits reach the 32-bit result
+      logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
+      logic [31:0] seed_p1, seed_p2, seed_p3, seed_p4;  // the constant multiply by bytes: four partial products, summed a stage later (one 32 x 16 product was 1.22 ns at 45 nm)
+      logic [31:0] lane_mul, lane_mul_q;
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       // The output register, as final_result_o was.
       logic                  oq_put;
@@ -608,14 +609,16 @@ module sienna_pipe #(
 
       // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 to 4
       // (the sum, then its fold and the all-zero check: together they were the fp32 top's path).
-      assign seed_xc = seed_x1 ^ LANE_C;
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
-        seed_pa    <= seed_xc * 32'h0000_CA6B;
-        seed_pb    <= 16'(seed_xc * 32'h0000_85EB);
+        seed_xq    <= seed_x1 ^ LANE_C;
+        seed_p1    <= seed_xq * 32'h0000_006B;
+        seed_p2    <= seed_xq * 32'h0000_CA00;
+        seed_p3    <= seed_xq * 32'h00EB_0000;
+        seed_p4    <= seed_xq * 32'h8500_0000;
         lane_mul_q <= lane_mul;
         lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end
-      assign lane_mul = seed_pa + {seed_pb, 16'b0};
+      assign lane_mul = seed_p1 + seed_p2 + seed_p3 + seed_p4;  // seed_xq * 0x85EBCA6B mod 2^32
       assign lane_mix = LFSR_WIDTH'(lane_mul_q ^ (lane_mul_q >> 16));
 
       assign dropout_in_valid[g] = drp.put;
@@ -630,7 +633,7 @@ module sienna_pipe #(
           .in           (drp),
           .out          (l9p),
           .training_mode(set_train[p_set_id]),
-          .reseed_i     (p_accept_q),
+          .reseed_i     (p_accept_qq),
           .seed_i       (lane_seed),
           .zero_point_i (p_zp[g])
       );

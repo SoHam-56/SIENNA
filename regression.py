@@ -2991,9 +2991,9 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
         host=rows + 3,
         # Broadcast T rows plus commit, the array feed of K products, the reducer's T^2 reads: whichever is longest.
         mesh=max(T + 2, K, T * T),
-        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 3 (the PE's
-        # final_o, the array's registered bank flag, the start), then T^2 reads and the tree.
-        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 3 + T * T + LAT,
+        # Launch to written: broadcast T+2, feed registers 2, skew 2(T-1), depth K-1, multiply, add, final flag 4 (the PE's
+        # final_o, the array's registered bank flag, the start decision, the reducers' registered start since round H), then T^2 reads and the tree.
+        mesh_lat=(T + 2) + 2 + 2 * (T - 1) + (K - 1) + MUL_LAT + ADD_LAT + 4 + T * T + LAT,
         per_lane=per_lane, LAT=LAT)
     m["mesh_lat"] += (cfg.get("accum_passes", 1) - 1) * m["host"]  # each further depth pass launches one host interval later (TB_sienna (pipeline) is host-bound)
     act = cfg.get("act")
@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 134), ("bf16", "sigmoid", 8, 175), ("int8", "selu", 32, 340), ("int8", "tanh", 32, 340))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 135), ("bf16", "sigmoid", 8, 175), ("int8", "selu", 32, 344), ("int8", "tanh", 32, 344))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5994,15 +5994,15 @@ def test_link_bytes():
 @perf_selftest
 def test_rtl_lat():
     assert pa.UNIT_LAT == {"fp32": (8, 7), "bf16": (3, 7), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (4, 7, 7, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
 def test_lane_stage_int8():
     with perf_fmt("int8"):  # no tail path, so the stage is data-free; F3's image, as its prototype measured at N = 8 and 16 (activation_perf_regression.log 4),
         stage = lambda act, n: pa.lane_stage(act, {"SRAM_DEPTH": n * n, "NUM_LANES": 32})  # plus the three stages of the pipelined input stage (ACT_IN_LATENCY 5) and the requantize's fifth (REQUANT_LATENCY 5)
-        assert stage("selu", 16) == 108 and stage("tanh", 16) == 104 and stage("sigmoid", 16) == 104  # rounds D-F (2026-11-15): the input stage +2, the Horner step +1, the requantize +1; confirmed by the perf rows below
-        assert stage("selu", 8) == 76 and stage("tanh", 8) == 66 and stage("sigmoid", 8) == 66
+        assert stage("selu", 16) == 113 and stage("tanh", 16) == 107 and stage("sigmoid", 16) == 107  # rounds D-F (2026-11-15): the input stage +2, the Horner step +1, the requantize +1; confirmed by the perf rows below
+        assert stage("selu", 8) == 85 and stage("tanh", 8) == 73 and stage("sigmoid", 8) == 73  # round H (2026-11-16): the Horner step +1, the requantize +2
 
 
 @perf_selftest
@@ -6017,8 +6017,8 @@ def test_lane_cycle_targets():
 @perf_selftest
 def test_lane_group_float():
     with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 93 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 69  # rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 156 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 259  # sigmoid: F2's 5 rounds
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 94 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 70  # rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 157 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 261  # round H: the fp32 input stage +1 (the exp split's second register)  # sigmoid: F2's 5 rounds
     with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
         assert pa.lane_cycles([0.0] * 8, "selu", 12) == 74 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 237  # rounds D-F: the input stage +1, the Horner add +1 a round
         assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 185 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 185  # F1's 34-cycle shorter tail, on fp32Adder's 7 stages

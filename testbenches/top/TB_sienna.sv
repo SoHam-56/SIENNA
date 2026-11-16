@@ -895,7 +895,6 @@ module TB_sienna #(
     //   P pass k lane j word keep   lane's j-th dropout input (window j*NUM_LANES + lane) and dropout's keep decision for it
     //   D pass k i word       the i-th output word (window order)
     localparam int TR_TPD = N / TILE_SIZE;  // output tiles per dimension, one reducer each
-    localparam logic [63:0] TR_THR = (((64'(1) << LFSR_WIDTH) - 64'(1)) * 64'(DROPOUT_P_PERCENT)) / 64'(100);  // dropout.sv's threshold
     logic [TR_TPD*TR_TPD-1:0] tr_we;
     logic [TR_TPD*TR_TPD-1:0][31:0] tr_addr;
     logic [TR_TPD*TR_TPD-1:0][ACC_DATA_WIDTH-1:0] tr_sum;
@@ -912,9 +911,22 @@ module TB_sienna #(
         end
       end
     end
-    logic [LFSR_WIDTH-1:0] tr_lfsr[NUM_LANES];
+    // dropout's decision for the beat arriving now, from its registered flags (lfsr_next >= the threshold by halves) and, as it reseeds,
+    // the seed's first word: a beat with the reseed draws from the seed. Registers and ports only.
+    localparam logic [63:0] TR_THR = (((64'(1) << LFSR_WIDTH) - 64'(1)) * 64'(DROPOUT_P_PERCENT)) / 64'(100);  // dropout.sv's threshold
+    function automatic logic [LFSR_WIDTH-1:0] tr_lfsr_step(input logic [LFSR_WIDTH-1:0] s);
+      tr_lfsr_step = s;
+      for (int i = 0; i < LFSR_WIDTH; i++) begin
+        if (LFSR_WIDTH == 32) tr_lfsr_step = {tr_lfsr_step[30:0], tr_lfsr_step[31] ^ tr_lfsr_step[21] ^ tr_lfsr_step[1] ^ tr_lfsr_step[0]};
+        else tr_lfsr_step = {tr_lfsr_step[LFSR_WIDTH-2:0], tr_lfsr_step[LFSR_WIDTH-1] ^ tr_lfsr_step[1]};
+      end
+    endfunction
+    logic tr_keep[NUM_LANES];
     for (genvar g = 0; g < NUM_LANES; g++) begin : TR_LANE
-      assign tr_lfsr[g] = dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.lfsr_next;  // the word this beat advances to decides keep
+      assign tr_keep[g] = dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.reseed_i
+                          ? (64'(tr_lfsr_step(dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.seed_i)) >= TR_THR)
+                          : (dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.hi_gt ||
+                             (dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.hi_eq && dut.G_SET.G_COPY[0].pipe.backend_lanes[g].dropout_inst.lo_ge));
     end
     function automatic int tr_elem(input int k, input int i, input bit pk);  // sienna_top's elem(): lane k's element i
       return pk ? ((k / N) * PER_LANE + i) * N + (k % N) : k * PER_LANE + i;
@@ -1009,7 +1021,7 @@ module TB_sienna #(
             if (dut.G_SET.G_COPY[0].pipe.dropout_in_valid[l]) begin
               if (tr_on && tr_fd)
                 $fdisplay(tr_fd, "P %s %0d %0d %0d %h %0d", tr_pass, tr_k[int'(dut.G_SET.G_COPY[0].pipe.p_set_id)], l, pj[l], dut.G_SET.G_COPY[0].pipe.dropout_data_in[l],
-                          64'(tr_lfsr[l]) >= TR_THR);
+                          tr_keep[l]);
               pj[l]++;
             end
         end

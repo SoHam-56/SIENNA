@@ -2530,14 +2530,17 @@ module TB_sienna #(
       logic [DATA_WIDTH-1:0] v;
       logic [31:0] w32;
       bit finished;
-      static int failed = 0, osp, mid_reset = 0, msp, tier = 0;
+      int failed, osp, mid_reset, msp, tier;
       string between_f, first_f;
-      static int between = 0, busy_load = 0, busy_tries = 0, busy_refused = 0, busy_n = 0;
+      int between, busy_load, busy_tries, busy_refused, busy_n;
       logic [8:0] busy_a[8];  // +coef_busy: the writes' addresses and data
       logic [31:0] busy_d[8];
       string busy_f;
-      static int hold_wait = 0, hold_check = 0;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
+      int hold_wait, hold_check;  // +hold_wait: the mid-stream reset waits for the hold window; +hold_check: it must land in it
 
+      failed = 0; mid_reset = 0; tier = 0;  // assigned here, not initialized: VCS refuses static initializers of block variables in a generate
+      between = 0; busy_load = 0; busy_tries = 0; busy_refused = 0; busy_n = 0;
+      hold_wait = 0; hold_check = 0;
       void'($value$plusargs("out_slots=%d", out_slots));
       void'($value$plusargs("out_stall_pct=%d", out_stall_pct));
       void'($value$plusargs("in_stall_pct=%d", in_stall_pct));

@@ -29,6 +29,8 @@ module dropout #(
   localparam logic [63:0] THRESHOLD_CALC_64 = (MAX_LFSR_VAL_64 * 64'(DROPOUT_P_PERCENT)) / 64'(100);
   localparam logic [LFSR_WIDTH-1:0] DROPOUT_THRESHOLD = THRESHOLD_CALC_64[LFSR_WIDTH-1:0];
   localparam int KQ_DEPTH = 16;  // keep/drop decisions waiting for their product
+  typedef logic [LFSR_WIDTH-1:0][LFSR_WIDTH-1:0] adv_t;  // an advance of k words as XOR masks: row j selects the state bits that make bit j
+  localparam adv_t ADV1 = adv_masks(1), ADV2 = adv_masks(2), ADV3 = adv_masks(3);  // one balanced XOR tree per bit (the 32-step loops left a chain: 3 words were 4.9 ns at 45 nm, 0.4 ns as masks)
   localparam int HW = LFSR_WIDTH / 2;  // the threshold compare runs in two halves, kept as flags beside the state (the 32-bit compare on the next word was 1.03 ns at 45 nm)
 
   // The beat in and the beat out.
@@ -70,28 +72,39 @@ module dropout #(
 
   // A fresh 32-bit word per beat, so neighbouring keep/drop decisions are independent.
   // One beat's advance of the LFSR: 32 steps per beat.
-  function automatic logic [LFSR_WIDTH-1:0] lfsr_step(input logic [LFSR_WIDTH-1:0] s);
-    lfsr_step = s;
+  function automatic logic [LFSR_WIDTH-1:0] lfsr_loop(input logic [LFSR_WIDTH-1:0] s);  // the step as 32 shifts: for the masks only
+    lfsr_loop = s;
     for (int i = 0; i < LFSR_WIDTH; i++) begin
       if (LFSR_WIDTH == 32)
-        lfsr_step = {lfsr_step[30:0], lfsr_step[31] ^ lfsr_step[21] ^ lfsr_step[1] ^ lfsr_step[0]};
-      else lfsr_step = {lfsr_step[LFSR_WIDTH-2:0], lfsr_step[LFSR_WIDTH-1] ^ lfsr_step[1]};
+        lfsr_loop = {lfsr_loop[30:0], lfsr_loop[31] ^ lfsr_loop[21] ^ lfsr_loop[1] ^ lfsr_loop[0]};
+      else lfsr_loop = {lfsr_loop[LFSR_WIDTH-2:0], lfsr_loop[LFSR_WIDTH-1] ^ lfsr_loop[1]};
     end
+  endfunction
+  function automatic adv_t adv_masks(input int k);  // advance each unit vector k words: column i of the k-word map
+    logic [LFSR_WIDTH-1:0] v;
+    adv_masks = '0;
+    for (int i = 0; i < LFSR_WIDTH; i++) begin
+      v = LFSR_WIDTH'(1) << i;
+      for (int r = 0; r < k; r++) v = lfsr_loop(v);
+      for (int j = 0; j < LFSR_WIDTH; j++) adv_masks[j][i] = v[j];
+    end
+  endfunction
+  function automatic logic [LFSR_WIDTH-1:0] lfsr_adv(input logic [LFSR_WIDTH-1:0] s, input adv_t m);  // the advance m holds, as XOR trees
+    for (int j = 0; j < LFSR_WIDTH; j++) lfsr_adv[j] = ^(s & m[j]);
+  endfunction
+  function automatic logic [LFSR_WIDTH-1:0] lfsr_step(input logic [LFSR_WIDTH-1:0] s);  // one beat: 32 LFSR steps
+    return lfsr_adv(s, ADV1);
   endfunction
   function automatic logic [2:0] above_by_halves(input logic [LFSR_WIDTH-1:0] v);  // {high half greater, high half equal, low half not below}
     return {v[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW], v[LFSR_WIDTH-1:HW] == DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW],
             v[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]};
   endfunction
 
-  // The words one and two beats on (from their registers), and the seed's first word as a plain loop (the testbench reads these nets).
+  // The words one and two beats on (from their registers), and the seed's first word (the testbench reads these nets).
   always_comb begin
     lfsr_next  = lfsr_n1;
     lfsr_next2 = lfsr_n2;
-    seed_next = seed_i;
-    for (int i = 0; i < LFSR_WIDTH; i++) begin
-      if (LFSR_WIDTH == 32) seed_next = {seed_next[30:0], seed_next[31] ^ seed_next[21] ^ seed_next[1] ^ seed_next[0]};
-      else seed_next = {seed_next[LFSR_WIDTH-2:0], seed_next[LFSR_WIDTH-1] ^ seed_next[1]};
-    end
+    seed_next  = lfsr_adv(seed_i, ADV1);
     // The decision for the beat arriving now: the flags hold lfsr_next >= DROPOUT_THRESHOLD by halves; a beat arriving as the LFSR reseeds
     // is the seed's first draw (the state advances from the seed for it).
     keep_seed = (seed_next[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) ||
@@ -107,9 +120,9 @@ module dropout #(
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_step('1));  // the word after the reset state
     end else if (reseed_i) begin
       lfsr_state <= in_valid ? seed_next : seed_i;
-      lfsr_n1    <= in_valid ? lfsr_step(seed_next) : seed_next;
-      lfsr_n2    <= in_valid ? lfsr_step(lfsr_step(seed_next)) : lfsr_step(seed_next);
-      {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_step(seed_next) : seed_next);
+      lfsr_n1    <= in_valid ? lfsr_adv(seed_i, ADV2) : seed_next;  // each straight from the seed: no advance waits on another
+      lfsr_n2    <= in_valid ? lfsr_adv(seed_i, ADV3) : lfsr_adv(seed_i, ADV2);
+      {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_adv(seed_i, ADV2) : seed_next);
     end else if (in_valid) begin
       lfsr_state <= lfsr_n1;
       lfsr_n1    <= lfsr_n2;

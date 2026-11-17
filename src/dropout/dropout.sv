@@ -133,7 +133,7 @@ module dropout #(
   end
 `ifndef SYNTHESIS
   a_seed_next: assert property (@(posedge clk) disable iff (!rst_n) reseed_i |-> seed_i == $past(seed_next_i))
-    else $error("dropout: a_seed_next: seed_i %h at a reseed is not the cycle before's seed_next_i %h", seed_i, $past(seed_next_i));
+    else $error("dropout: a_seed_next: seed_i %h at a reseed is not the cycle before's seed_next_i", seed_i);  // no $past here: xsim finds no clock for it outside the property
 `endif
 
   always_comb begin

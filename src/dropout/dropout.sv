@@ -38,6 +38,7 @@ module dropout #(
   logic                  valid_out;
   // The LFSR: a fresh word per beat.
   logic [LFSR_WIDTH-1:0] lfsr_state, lfsr_next, lfsr_next2, seed_next;  // the state, one and two beats on, and the seed one beat on
+  logic [LFSR_WIDTH-1:0] lfsr_n1, lfsr_n2;  // lfsr_next and lfsr_next2 as registers: each takes one advance per beat, and the flags compare a register (two advances into the compare were 1.12-1.28 ns)
   logic hi_gt, hi_eq, lo_ge;  // lfsr_next against DROPOUT_THRESHOLD by halves: the next beat's decision, kept with the state
   logic keep_next, keep_seed;  // the beat arriving now is kept; the seed's first draw is kept
   // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
@@ -82,18 +83,10 @@ module dropout #(
             v[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]};
   endfunction
 
-  // The words one and two beats on, and the seed's first word, as plain loops (the testbench reads these nets).
+  // The words one and two beats on (from their registers), and the seed's first word as a plain loop (the testbench reads these nets).
   always_comb begin
-    lfsr_next = lfsr_state;
-    for (int i = 0; i < LFSR_WIDTH; i++) begin
-      if (LFSR_WIDTH == 32) lfsr_next = {lfsr_next[30:0], lfsr_next[31] ^ lfsr_next[21] ^ lfsr_next[1] ^ lfsr_next[0]};
-      else lfsr_next = {lfsr_next[LFSR_WIDTH-2:0], lfsr_next[LFSR_WIDTH-1] ^ lfsr_next[1]};
-    end
-    lfsr_next2 = lfsr_next;
-    for (int i = 0; i < LFSR_WIDTH; i++) begin
-      if (LFSR_WIDTH == 32) lfsr_next2 = {lfsr_next2[30:0], lfsr_next2[31] ^ lfsr_next2[21] ^ lfsr_next2[1] ^ lfsr_next2[0]};
-      else lfsr_next2 = {lfsr_next2[LFSR_WIDTH-2:0], lfsr_next2[LFSR_WIDTH-1] ^ lfsr_next2[1]};
-    end
+    lfsr_next  = lfsr_n1;
+    lfsr_next2 = lfsr_n2;
     seed_next = seed_i;
     for (int i = 0; i < LFSR_WIDTH; i++) begin
       if (LFSR_WIDTH == 32) seed_next = {seed_next[30:0], seed_next[31] ^ seed_next[21] ^ seed_next[1] ^ seed_next[0]};
@@ -109,13 +102,19 @@ module dropout #(
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       lfsr_state <= '1;
+      lfsr_n1    <= lfsr_step('1);
+      lfsr_n2    <= lfsr_step(lfsr_step('1));
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_step('1));  // the word after the reset state
     end else if (reseed_i) begin
       lfsr_state <= in_valid ? seed_next : seed_i;
+      lfsr_n1    <= in_valid ? lfsr_step(seed_next) : seed_next;
+      lfsr_n2    <= in_valid ? lfsr_step(lfsr_step(seed_next)) : lfsr_step(seed_next);
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_step(seed_next) : seed_next);
     end else if (in_valid) begin
-      lfsr_state <= lfsr_next;
-      {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_next2);
+      lfsr_state <= lfsr_n1;
+      lfsr_n1    <= lfsr_n2;
+      lfsr_n2    <= lfsr_step(lfsr_n2);
+      {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_n2);
     end
   end
 

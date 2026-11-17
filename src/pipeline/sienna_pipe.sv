@@ -494,7 +494,7 @@ module sienna_pipe #(
   // id's host_accept, long before its accept here; its +1 only drives the final select, so the accept's own cone stays out of the read mux.
   always_ff @(posedge clk_i)  // no reset: read only at p_accept, after its set's host_accept
     for (int i = 0; i < NUM_IDS; i++)
-      seed_after[i] <= 32'(set_seed[(set_accum[i] || set_hold[i]) ? ID_W'(i + 1) : ID_W'(i)]);
+      seed_after[i] <= 32'(set_seed[(set_accum[i] || set_hold[i]) ? ID_W'(unsigned'(i + 1)) : ID_W'(unsigned'(i))]);  // unsigned: a size cast of the int keeps its sign, and ids 8-15 read X in 4-state
   always_ff @(posedge clk_i) seed_x1 <= (p_accept || p_null) ? seed_after[ID_W'(p_next_id + 1'b1)] : seed_after[p_next_id];
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {p_accept_q, p_accept_qq} <= '0;

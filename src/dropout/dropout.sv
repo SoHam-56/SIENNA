@@ -72,20 +72,15 @@ module dropout #(
 
   // A fresh 32-bit word per beat, so neighbouring keep/drop decisions are independent.
   // One beat's advance of the LFSR: 32 steps per beat.
-  function automatic logic [LFSR_WIDTH-1:0] lfsr_loop(input logic [LFSR_WIDTH-1:0] s);  // the step as 32 shifts: for the masks only
-    lfsr_loop = s;
-    for (int i = 0; i < LFSR_WIDTH; i++) begin
-      if (LFSR_WIDTH == 32)
-        lfsr_loop = {lfsr_loop[30:0], lfsr_loop[31] ^ lfsr_loop[21] ^ lfsr_loop[1] ^ lfsr_loop[0]};
-      else lfsr_loop = {lfsr_loop[LFSR_WIDTH-2:0], lfsr_loop[LFSR_WIDTH-1] ^ lfsr_loop[1]};
-    end
-  endfunction
   function automatic adv_t adv_masks(input int k);  // advance each unit vector k words: column i of the k-word map
     logic [LFSR_WIDTH-1:0] v;
     adv_masks = '0;
     for (int i = 0; i < LFSR_WIDTH; i++) begin
       v = LFSR_WIDTH'(1) << i;
-      for (int r = 0; r < k; r++) v = lfsr_loop(v);
+      for (int r = 0; r < k; r++)  // k beats of 32 single-bit steps, written out here: DC will not evaluate a function call in this constant function (ELAB-425)
+        for (int b = 0; b < LFSR_WIDTH; b++)
+          if (LFSR_WIDTH == 32) v = {v[30:0], v[31] ^ v[21] ^ v[1] ^ v[0]};
+          else v = {v[LFSR_WIDTH-2:0], v[LFSR_WIDTH-1] ^ v[1]};
       for (int j = 0; j < LFSR_WIDTH; j++) adv_masks[j][i] = v[j];
     end
   endfunction

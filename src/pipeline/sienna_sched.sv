@@ -166,6 +166,9 @@ module sienna_sched #(
   logic s_grant;  // a set's row credits go out this cycle
   logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
   logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok;
+  logic [DIM_W-1:0] gc_blk[4], gc_p[4];  // its candidates: the next block's first set, this block's pass 0, pass is_p1, pass is_p
+  logic [3:0] gc_res, gc_bias, gc_tile, gc_blk_ok, gc_wl_le;  // g_res, g_bias_ok, g_tile_ok, g_blk < ct and wl_blk <= g_blk for each
+  logic [1:0] gc_sel;  // which one it is, from registers only
 
 `ifndef SYNTHESIS  // interface widths are not elaboration constants in Verilator, so the row links are checked at time 0
   initial
@@ -259,7 +262,7 @@ module sienna_sched #(
   end
   // The loader may start block b once the issuer has finished block b-2, whose half it overwrites, and (cached) has opened the half's fill on its region's credit.
   // Uncached, block b's bias row follows block b-1's last B row in the stream, so its credit waits until that set's are granted.
-  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk1) && (cached || wl_blk <= g_blk);
+  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk1) && (cached || gc_wl_le[gc_sel]);
   assign wl_put = wl_pre && cached && !wl_opened && wc_has[wl_blk[0]];
   assign wl_may = wl_pre && (!cached || wl_opened);
   assign wl_bias_due = wl_pre && bias_q && !wl_bias_done;  // the next weight row the loader expects is its block's bias
@@ -286,12 +289,23 @@ module sienna_sched #(
       end else g_p = is_p1;
     end
   end
-  assign g_res     = res_q && (g_p == dt);
+  // Its checks are made for each candidate and chosen late (through the g_blk mux they were 1.12 ns into wt_tg1).
+  assign gc_blk = '{is_blk1, is_blk, is_blk, is_blk};
+  assign gc_p   = '{'0, '0, is_p1, is_p};
+  assign gc_sel = !pend ? 2'd3 : !p_last ? 2'd2 : r_last ? 2'd0 : 2'd1;
+  for (genvar k = 0; k < 4; k++) begin : G_GC
+    assign gc_res[k]    = res_q && (gc_p[k] == dt);
+    assign gc_bias[k]   = !bias_q || bias_in[gc_blk[k][0]] || (wl_take_bias && wl_blk == gc_blk[k]);  // its bias row in, or arriving now
+    assign gc_tile[k]   = !(cached && !gc_res[k]) || tiles_in[gc_blk[k][0]] > gc_p[k];
+    assign gc_blk_ok[k] = gc_blk[k] < ct;
+    assign gc_wl_le[k]  = wl_blk <= gc_blk[k];
+  end
+  assign g_res     = gc_res[gc_sel];
   assign g_need_w  = !cached && !g_res;  // an uncached layer's B rows come with the set
   assign g_l0_ok   = int'(l0_cnt) > int'(pend);  // an L0 credit held beyond the pending set's
-  assign g_bias_ok = !bias_q || bias_in[g_blk[0]] || (wl_take_bias && wl_blk == g_blk);  // its bias row in, or arriving now
-  assign g_tile_ok = !(cached && !g_res) || tiles_in[g_blk[0]] > g_p;
-  assign g_ok      = live && active && (g_blk < ct) && (!pend || p_start) && g_l0_ok && g_bias_ok && g_tile_ok;
+  assign g_bias_ok = gc_bias[gc_sel];
+  assign g_tile_ok = gc_tile[gc_sel];
+  assign g_ok      = live && active && gc_blk_ok[gc_sel] && (!pend || p_start) && g_l0_ok && g_bias_ok && g_tile_ok;
   // A residual pass writes identity rows on the north bus, so it waits for no cache tile row to be outstanding, and holds back new tile grants.
   assign s_grant   = g_ok && (!g_res || wt_out == '0);
   assign wb_grant  = live && wl_may && bias_q && !wl_bias_done && !wb_gr;

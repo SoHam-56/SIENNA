@@ -16,6 +16,7 @@ module dropout #(
     input wire                  training_mode,
     input wire                  reseed_i,  // load seed_i into the LFSR; only between sets
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
+    input wire [LFSR_WIDTH-1:0] seed_next_i,  // the seed_i of the next cycle (sienna_pipe's lane_seed before its register): the reseed's flags form a cycle early
     input wire [DATA_WIDTH-1:0] zero_point_i  // the dropped word where the format has a zero point (int8, D-5); floats ignore it
 );
   localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
@@ -43,6 +44,7 @@ module dropout #(
   logic [LFSR_WIDTH-1:0] lfsr_n1, lfsr_n2;  // lfsr_next and lfsr_next2 as registers: each takes one advance per beat, and the flags compare a register (two advances into the compare were 1.12-1.28 ns)
   logic hi_gt, hi_eq, lo_ge;  // lfsr_next against DROPOUT_THRESHOLD by halves: the next beat's decision, kept with the state
   logic keep_next, keep_seed;  // the beat arriving now is kept; the seed's first draw is kept
+  logic [2:0] sd1_q, sd2_q;  // the flags of seed_i one and two words on, formed from seed_next_i a cycle early (seed_i into keep_q was 1.13-1.25 ns)
   // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
   logic keep_q[KQ_DEPTH];
   logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
@@ -102,8 +104,7 @@ module dropout #(
     seed_next  = lfsr_adv(seed_i, ADV1);
     // The decision for the beat arriving now: the flags hold lfsr_next >= DROPOUT_THRESHOLD by halves; a beat arriving as the LFSR reseeds
     // is the seed's first draw (the state advances from the seed for it).
-    keep_seed = (seed_next[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) ||
-                ((seed_next[LFSR_WIDTH-1:HW] == DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) && (seed_next[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]));
+    keep_seed = sd1_q[2] || (sd1_q[1] && sd1_q[0]);
     keep_next = reseed_i ? keep_seed : (hi_gt || (hi_eq && lo_ge));
   end
 
@@ -117,7 +118,7 @@ module dropout #(
       lfsr_state <= in_valid ? seed_next : seed_i;
       lfsr_n1    <= in_valid ? lfsr_adv(seed_i, ADV2) : seed_next;  // each straight from the seed: no advance waits on another
       lfsr_n2    <= in_valid ? lfsr_adv(seed_i, ADV3) : lfsr_adv(seed_i, ADV2);
-      {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_adv(seed_i, ADV2) : seed_next);
+      {hi_gt, hi_eq, lo_ge} <= in_valid ? sd2_q : sd1_q;
     end else if (in_valid) begin
       lfsr_state <= lfsr_n1;
       lfsr_n1    <= lfsr_n2;
@@ -125,6 +126,15 @@ module dropout #(
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_n2);
     end
   end
+
+  always_ff @(posedge clk) begin  // no reset, as lane_seed: read only at a reseed
+    sd1_q <= above_by_halves(lfsr_adv(seed_next_i, ADV1));
+    sd2_q <= above_by_halves(lfsr_adv(seed_next_i, ADV2));
+  end
+`ifndef SYNTHESIS
+  a_seed_next: assert property (@(posedge clk) disable iff (!rst_n) reseed_i |-> seed_i == $past(seed_next_i))
+    else $error("dropout: a_seed_next: seed_i %h at a reseed is not the cycle before's seed_next_i %h", seed_i, $past(seed_next_i));
+`endif
 
   always_comb begin
     mult_valid_in = 1'b0;

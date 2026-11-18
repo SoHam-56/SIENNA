@@ -1086,7 +1086,9 @@ module sienna_pipe #(
     if (sienna_fmt_pkg::HAS_RESIDUAL_ADD) begin : G_ADD
       localparam int HMW = (PER_LANE > 1) ? $clog2(PER_LANE) : 1;  // hold_mem's index: a beat index below PER_LANE
       logic [HMW-1:0] hold_idx, add_idx;  // hold_mem's write index (hold beat) and read index (add beat)
-      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_q;  // the hold beat at add_idx
+      logic [HMW-1:0] add_idx_e;  // add_idx a cycle early (the tags shift every cycle): hold_mem is read then, into hold_q
+      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_q;  // the hold beat at add_idx, registered (the read select's 256-bit fanout into add_lanes' q1 - zp1 was int8's 1.091 ns, tg_idx -> s1_d1)
+      logic [NUM_LANES-1:0][DATA_WIDTH-1:0] hold_rd_e;  // hold_mem at add_idx_e
 `ifndef SYNTHESIS
       logic [PER_LANE-1:0] hm_v;  // hold_mem's beats written by a hold set and not yet read by its add set
       logic [PER_LANE-1:0] hm_below;  // unread beats below the add beat's read index: an add set reads in beat order
@@ -1095,11 +1097,14 @@ module sienna_pipe #(
 `endif
       assign hold_idx    = HMW'(tg_idx[RQL-1]);
       assign add_idx     = HMW'(tg_idx[RQL-1]);  // an add beat reads the hold beat of its own index
+      assign add_idx_e   = HMW'(tg_idx[RQL-2]);
       assign hold_done   = hold_wr && (tg_idx[RQL-1] == PER_LANE[FCNT_W-1:0] - 1'b1);
       // The hold set's requantized beats (N^2 words) in one mem_array: written at the hold beat's own index, read combinationally; no reset,
       // read only after its own write.
       mem_array #(.DEPTH(PER_LANE), .WIDTH(NUM_LANES * DATA_WIDTH), .SYNC_READ(1'b0)) hold_mem (
-          .clk_i(clk_i), .we_i(hold_wr), .waddr_i(hold_idx), .wmask_i(1'b1), .wdata_i(rq_d), .re_i(1'b1), .raddr_i(add_idx), .rdata_o(hold_q));
+          .clk_i(clk_i), .we_i(hold_wr), .waddr_i(hold_idx), .wmask_i(1'b1), .wdata_i(rq_d), .re_i(1'b1), .raddr_i(add_idx_e), .rdata_o(hold_rd_e));
+      // What the combinational read at add_idx saw a cycle later: the word, or the hold beat written to it at this edge.
+      always_ff @(posedge clk_i) hold_q <= (hold_wr && hold_idx == add_idx_e) ? rq_d : hold_rd_e;
       add_lanes #(.NUM_LANES(NUM_LANES), .TAG_W(ATW)) addl (
           .clk_i(clk_i), .rstn_i(rstn_i), .valid_i(add_in), .q1_i(hold_q), .q2_i(rq_d),
           .tag_i({tg_byp[RQL-1], tg_bank[RQL-1], tg_pack[RQL-1], tg_idx[RQL-1]}), .words_i(g_add_w),

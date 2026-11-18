@@ -511,7 +511,7 @@ module sienna_pipe #(
       logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
       logic [31:0] seed_p1, seed_p2, seed_p3, seed_p4;  // the constant multiply by bytes: four partial products, summed a stage later (one 32 x 16 product was 1.22 ns at 45 nm)
       logic [31:0] lane_mul, lane_mul_q;
-      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed, lane_seed_n;  // lane_seed_n: the word lane_seed loads, also dropout's seed_next_i
+      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       // The output register, as final_result_o was.
       logic                  oq_put;
       logic [DATA_WIDTH-1:0] oq_data;
@@ -616,11 +616,10 @@ module sienna_pipe #(
         seed_p3    <= seed_xq * 32'h00EB_0000;
         seed_p4    <= seed_xq * 32'h8500_0000;
         lane_mul_q <= lane_mul;
-        lane_seed  <= lane_seed_n;
+        lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end
       assign lane_mul = seed_p1 + seed_p2 + seed_p3 + seed_p4;  // seed_xq * 0x85EBCA6B mod 2^32
       assign lane_mix = LFSR_WIDTH'(lane_mul_q ^ (lane_mul_q >> 16));
-      assign lane_seed_n = (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
 
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;
@@ -636,7 +635,6 @@ module sienna_pipe #(
           .training_mode(set_train[p_set_id]),
           .reseed_i     (p_accept_qq),
           .seed_i       (lane_seed),
-          .seed_next_i  (lane_seed_n),
           .zero_point_i (p_zp[g])
       );
       assign dropout_valid_out[g] = l9p.put;

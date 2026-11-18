@@ -14,7 +14,7 @@ module TB_dropout_fmt #(
   credit_link_if #(.DATA_W(W), .CRW((FAULT == 6) ? 2 : 1)) in_l ();
   credit_link_if #(.DATA_W(W), .CRW(1)) out_l ();
   dropout #(.LFSR_WIDTH(32)) dut (
-      .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(1'b1), .reseed_i(reseed), .seed_i(32'h2ACE002A), .seed_next_i(32'h2ACE002A),
+      .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(1'b1), .reseed_i(reseed), .seed_i(32'h2ACE002A),
       .zero_point_i('0));
 
   logic drained = 0;

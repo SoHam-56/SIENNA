@@ -16,7 +16,7 @@ module TB_dropout_int8;
   credit_link_if #(.DATA_W(W), .CRW(1)) in_l ();
   credit_link_if #(.DATA_W(W), .CRW(1)) out_l ();
   dropout #(.LFSR_WIDTH(32)) dut (
-      .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(training), .reseed_i(reseed), .seed_i(SEED), .seed_next_i(SEED),
+      .clk(clk), .rst_n(rst_n), .in(in_l), .out(out_l), .training_mode(training), .reseed_i(reseed), .seed_i(SEED),
       .zero_point_i(zp));
 
   logic drained = 0;

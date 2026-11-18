@@ -78,7 +78,8 @@ module sienna_pipe #(
   // gpnae_out_mem past its end.
   localparam int PER_LANE = SRAM_DEPTH / NUM_LANES;
 
-  localparam int SEED_SH[18] = '{0, 1, 3, 5, 6, 9, 11, 14, 15, 16, 17, 19, 21, 22, 23, 24, 26, 31};  // the set bits of 0x85EBCA6B, the seed mix's multiplier
+  localparam int SEED_POS[5] = '{7, 9, 11, 27, 31};  // 0x85EBCA6B in signed digits: these + terms, the - terms below (12 terms, not the binary 18)
+  localparam int SEED_NEG[7] = '{0, 2, 4, 14, 18, 20, 25};
   localparam int FCNT_W = $clog2(PER_LANE + 1);  // what fill_count/done_count actually range over
   localparam int TOT_W = $clog2(SRAM_DEPTH + 1);
 
@@ -123,32 +124,28 @@ module sienna_pipe #(
   function automatic logic [PEW-1:0] ent_of(input logic [N/2-1:0][PEW-1:0] map, input logic [2:0] sh, input int col);
     return (sh == '0) ? map[0] : map[col >> (LGN - int'(sh))];
   endfunction
-  // x * 0x85EBCA6B mod 2^32 as {sum, carry}: its 18 shifted copies of x through six levels of 3:2 compressors, no carry chain.
-  function automatic logic [63:0] seed_mul_cs(input logic [31:0] x);
-    logic [31:0] l0[18], l1[12], l2[8], l3[6], l4[4], l5[3];
-    for (int i = 0; i < 18; i++) l0[i] = x << SEED_SH[i];
-    for (int i = 0; i < 6; i++) begin  // 18 -> 12
-      l1[2*i]   = l0[3*i] ^ l0[3*i+1] ^ l0[3*i+2];
-      l1[2*i+1] = ((l0[3*i] & l0[3*i+1]) | (l0[3*i] & l0[3*i+2]) | (l0[3*i+1] & l0[3*i+2])) << 1;
-    end
-    for (int i = 0; i < 4; i++) begin  // 12 -> 8
-      l2[2*i]   = l1[3*i] ^ l1[3*i+1] ^ l1[3*i+2];
-      l2[2*i+1] = ((l1[3*i] & l1[3*i+1]) | (l1[3*i] & l1[3*i+2]) | (l1[3*i+1] & l1[3*i+2])) << 1;
-    end
-    for (int i = 0; i < 2; i++) begin  // 8 -> 6: six through two compressors, two passed on
-      l3[2*i]   = l2[3*i] ^ l2[3*i+1] ^ l2[3*i+2];
-      l3[2*i+1] = ((l2[3*i] & l2[3*i+1]) | (l2[3*i] & l2[3*i+2]) | (l2[3*i+1] & l2[3*i+2])) << 1;
-    end
-    l3[4] = l2[6];
-    l3[5] = l2[7];
-    for (int i = 0; i < 2; i++) begin  // 6 -> 4
-      l4[2*i]   = l3[3*i] ^ l3[3*i+1] ^ l3[3*i+2];
-      l4[2*i+1] = ((l3[3*i] & l3[3*i+1]) | (l3[3*i] & l3[3*i+2]) | (l3[3*i+1] & l3[3*i+2])) << 1;
-    end
-    l5[0] = l4[0] ^ l4[1] ^ l4[2];  // 4 -> 3
-    l5[1] = ((l4[0] & l4[1]) | (l4[0] & l4[2]) | (l4[1] & l4[2])) << 1;
-    l5[2] = l4[3];
-    return {l5[0] ^ l5[1] ^ l5[2], ((l5[0] & l5[1]) | (l5[0] & l5[2]) | (l5[1] & l5[2])) << 1};  // 3 -> 2
+  // 3:2 compressor: a + b + c == sum + carry.
+  function automatic logic [63:0] seed_csa(input logic [31:0] a, input logic [31:0] b, input logic [31:0] c);
+    return {a ^ b ^ c, ((a & b) | (a & c) | (b & c)) << 1};
+  endfunction
+  // x * 0x85EBCA6B mod 2^32 as four words that sum to it: the signed-digit terms (x << i, ~(x << i) for a - term, its +1s as the row 7)
+  // through three levels of 3:2 compressors, 13 -> 9 -> 6 -> 4; seed_mul_add finishes it.
+  function automatic logic [127:0] seed_mul_rows(input logic [31:0] x);
+    logic [31:0] l0[13], l1[9], l2[6];
+    for (int i = 0; i < 5; i++) l0[i] = x << SEED_POS[i];
+    for (int i = 0; i < 7; i++) l0[5+i] = ~(x << SEED_NEG[i]);
+    l0[12] = 32'd7;
+    for (int i = 0; i < 4; i++) {l1[2*i], l1[2*i+1]} = seed_csa(l0[3*i], l0[3*i+1], l0[3*i+2]);  // 13 -> 9
+    l1[8] = l0[12];
+    for (int i = 0; i < 3; i++) {l2[2*i], l2[2*i+1]} = seed_csa(l1[3*i], l1[3*i+1], l1[3*i+2]);  // 9 -> 6
+    return {seed_csa(l2[0], l2[1], l2[2]), seed_csa(l2[3], l2[4], l2[5])};  // 6 -> 4
+  endfunction
+  // The four words' sum: 4 -> 3 -> 2, then the one carry add.
+  function automatic logic [31:0] seed_mul_add(input logic [127:0] r);
+    logic [31:0] s1, c1, s2, c2;
+    {s1, c1} = seed_csa(r[127:96], r[95:64], r[63:32]);
+    {s2, c2} = seed_csa(s1, c1, r[31:0]);
+    return s2 + c2;
   endfunction
   function automatic logic is_byp_code(input logic [CONTROL_WIDTH-1:0] c);
     return (c == CONTROL_WIDTH'(3'b100)) || (c == CONTROL_WIDTH'(3'b101));
@@ -537,7 +534,7 @@ module sienna_pipe #(
       logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
       // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
       logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
-      logic [31:0] seed_ps, seed_pc;  // seed_xq * 0x85EBCA6B in carry-save form (sum, carry), added a stage later (its 18 shifted terms as byte products, each with its own add, were 1.15-1.18 ns)
+      logic [127:0] seed_rows;  // seed_xq * 0x85EBCA6B as four words, summed a stage later (18 terms through six levels, merged across lanes, were 1.207 ns at 5181d91)
       logic [31:0] lane_mul, lane_mul_q;
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       // The output register, as final_result_o was.
@@ -639,11 +636,11 @@ module sienna_pipe #(
       // (the sum, then its fold and the all-zero check: together they were the fp32 top's path).
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
         seed_xq    <= seed_x1 ^ LANE_C;
-        {seed_ps, seed_pc} <= seed_mul_cs(seed_xq);
+        seed_rows  <= seed_mul_rows(seed_xq);
         lane_mul_q <= lane_mul;
         lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end
-      assign lane_mul = seed_ps + seed_pc;  // seed_xq * 0x85EBCA6B mod 2^32: the one carry add
+      assign lane_mul = seed_mul_add(seed_rows);  // seed_xq * 0x85EBCA6B mod 2^32: two compressor levels and the one carry add
       assign lane_mix = LFSR_WIDTH'(lane_mul_q ^ (lane_mul_q >> 16));
 
       assign dropout_in_valid[g] = drp.put;

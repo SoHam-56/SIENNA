@@ -141,6 +141,17 @@ module sienna_pipe #(
     return {seed_csa(l2[0], l2[1], l2[2]), seed_csa(l2[3], l2[4], l2[5])};  // 6 -> 4
   endfunction
   // The four words to two: 4 -> 3 -> 2; their one carry add is the next stage's.
+  // The four words' sum, begun: 4 -> 3 -> 2, then the low 16 bits' add with its carry and the high 16 for either carry, as
+  // {lo[16:0], hi0[15:0], hi1[15:0]}; the next stage only selects the high half.
+  function automatic logic [48:0] seed_mul_part(input logic [127:0] r);
+    logic [63:0] sc;
+    logic [16:0] lo;
+    logic [15:0] hi0;
+    sc  = seed_mul_two(r);
+    lo  = {1'b0, sc[47:32]} + {1'b0, sc[15:0]};
+    hi0 = sc[63:48] + sc[31:16];
+    return {lo, hi0, hi0 + 16'd1};
+  endfunction
   function automatic logic [63:0] seed_mul_two(input logic [127:0] r);
     logic [31:0] s1, c1;
     {s1, c1} = seed_csa(r[127:96], r[95:64], r[63:32]);
@@ -534,8 +545,8 @@ module sienna_pipe #(
       // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
       logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
       logic [127:0] seed_rows;  // seed_xq * 0x85EBCA6B as four words, summed a stage later (18 terms through six levels, merged across lanes, were 1.207 ns at 5181d91)
-      logic [63:0] lane_sc_q;  // seed_xq * 0x85EBCA6B as two words, added in the fold's stage (their add after the compressors, from seed_rows merged
-      logic [31:0] lane_mul;   // across lanes, was the fp32 top's 1.17 ns at fe83391, backend_lanes[i].seed_rows -> backend_lanes[j].lane_mul_q)
+      logic [48:0] lane_part_q;  // seed_xq * 0x85EBCA6B as a carry select, the high half chosen in the fold's stage (the whole add after the
+      logic [31:0] lane_mul;     // compressors was the fp32 top's 1.17 ns at fe83391; the whole add in the fold's stage, bf16's 1.216 at dd6d28e)
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
       // The output register, as final_result_o was.
       logic                  oq_put;
@@ -637,10 +648,10 @@ module sienna_pipe #(
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
         seed_xq    <= seed_x1 ^ LANE_C;
         seed_rows  <= seed_mul_rows(seed_xq);
-        lane_sc_q  <= seed_mul_two(seed_rows);
+        lane_part_q <= seed_mul_part(seed_rows);
         lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end
-      assign lane_mul = lane_sc_q[63:32] + lane_sc_q[31:0];  // seed_xq * 0x85EBCA6B mod 2^32: the one carry add
+      assign lane_mul = {lane_part_q[48] ? lane_part_q[15:0] : lane_part_q[31:16], lane_part_q[47:32]};  // seed_xq * 0x85EBCA6B mod 2^32
       assign lane_mix = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
 
       assign dropout_in_valid[g] = drp.put;

@@ -143,11 +143,11 @@ module sienna_pipe #(
   // The four words to two: 4 -> 3 -> 2; their one carry add is the next stage's.
   // The four words' sum, begun: 4 -> 3 -> 2, then the low 16 bits' add with its carry and the high 16 for either carry, as
   // {lo[16:0], hi0[15:0], hi1[15:0]}; the next stage only selects the high half.
-  function automatic logic [48:0] seed_mul_part(input logic [127:0] r);
+  function automatic logic [48:0] seed_mul_part(input logic [63:0] sc_i);
     logic [63:0] sc;
     logic [16:0] lo;
     logic [15:0] hi0;
-    sc  = seed_mul_two(r);
+    sc  = sc_i;
     lo  = {1'b0, sc[47:32]} + {1'b0, sc[15:0]};
     hi0 = sc[63:48] + sc[31:16];
     return {lo, hi0, hi0 + 16'd1};
@@ -544,7 +544,8 @@ module sienna_pipe #(
       logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
       // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
       logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
-      logic [127:0] seed_rows;  // seed_xq * 0x85EBCA6B as four words, summed a stage later (18 terms through six levels, merged across lanes, were 1.207 ns at 5181d91)
+      logic [63:0] seed_rows;  // seed_xq * 0x85EBCA6B as two words: all five compressor levels here, so the next stage is the add alone (two
+                               // levels and the add there were 1.093 ns in the host's seed-stage block at 49a4d0b, 1.138 in the int8 top)
       logic [48:0] lane_part_q;  // seed_xq * 0x85EBCA6B as a carry select, the high half chosen in the fold's stage (the whole add after the
       logic [31:0] lane_mul;     // compressors was the fp32 top's 1.17 ns at fe83391; the whole add in the fold's stage, bf16's 1.216 at dd6d28e)
       logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
@@ -647,7 +648,7 @@ module sienna_pipe #(
       // (the sum, then its fold and the all-zero check: together they were the fp32 top's path).
       always_ff @(posedge clk_i) begin  // no reset, as seed_x1
         seed_xq    <= seed_x1 ^ LANE_C;
-        seed_rows  <= seed_mul_rows(seed_xq);
+        seed_rows  <= seed_mul_two(seed_mul_rows(seed_xq));
         lane_part_q <= seed_mul_part(seed_rows);
         lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
       end

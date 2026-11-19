@@ -2983,7 +2983,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
     K = N if collapse else T  # depth each array multiplies
     U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (8 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
-    LAT = (2 if T * T >= 256 else 1) + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: the arrays' read (two cycles from 256 pixels), the tree over the partials and the bias
+    LAT = max(1, -(-clog2(T * T) // 6)) + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: the arrays' read (one cycle per 64:1 select stage), the tree over the partials and the bias
     words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split()) if words is None else words
     rows = -(-words // P["HOST_WORDS"])
     m = dict(

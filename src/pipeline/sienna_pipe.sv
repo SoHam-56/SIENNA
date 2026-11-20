@@ -750,7 +750,8 @@ module sienna_pipe #(
       dropout #(
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
-          .LFSR_WIDTH       (LFSR_WIDTH)
+          .LFSR_WIDTH       (LFSR_WIDTH),
+          .SEED_LEAD        (2)
       ) dropout_inst (
           .clk          (clk_i),
           .rst_n        (rstn_i),
@@ -759,6 +760,7 @@ module sienna_pipe #(
           .training_mode(set_train[p_set_id]),
           .reseed_i     (p_accept_qq),
           .seed_i       (lane_seed),
+          .seed_early_i (lane_d1),  // lane_seed two cycles ahead
           .zero_point_i (p_zp[g])
       );
       assign dropout_valid_out[g] = l9p.put;

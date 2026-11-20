@@ -20,9 +20,10 @@ INT8 = {"int8Multiplier", "int16Multiplier", "int24Multiplier", "int32Adder", "i
 BF16 = {"bf16Multiplier", "bf16Adder", "bf16WideMultiplier", "fp32ToBf16"}
 FORBIDDEN = {"fp32": BF16 | INT8, "bf16": INT8, "int8": UNITS - INT8}  # another precision's units; bf16 builds keep fp32 sums and GPNAE's fp32 tail
 FORBIDDEN["default"] = FORBIDDEN["fp32"]
-EXPECTED = {  # outside the lanes: the mesh's product and sums (and narrowing), dropout's keep multiply, the lane feed's requantize and the ADD
+EXPECTED = {  # outside the lanes: the mesh's product and sums (and narrowing), the lane feed's requantize and the ADD; dropout's 2.0 keep scale is an
+    # exponent increment in both float formats since 833dee1 (G_POW2), so no float multiplier of its own
     "fp32": {"fp32Multiplier", "fp32Adder"},
-    "bf16": {"bf16WideMultiplier", "fp32Adder", "fp32ToBf16", "bf16Multiplier"},
+    "bf16": {"bf16WideMultiplier", "fp32Adder", "fp32ToBf16"},
     "int8": {"int8Multiplier", "int32Adder", "int8Requantizer", "int8QuantizedAdder"},
 }
 EXPECTED["default"] = EXPECTED["fp32"]  # no define elaborates fp32

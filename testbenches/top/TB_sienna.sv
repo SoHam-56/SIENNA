@@ -1718,11 +1718,13 @@ module TB_sienna #(
       end
     end
 
-    task automatic accum_null_pass();
-      automatic int G = k_accum_passes - 1;  // the first set the stream activates; its golden is the sum of sets 0..G
-      automatic int n = 4 + k_accum_passes, waited = 0, errs = 0, n_exact = 0;
-      automatic logic [DATA_WIDTH-1:0] exp_q[$], bnd_q[$];
-      string info;
+    logic [DATA_WIDTH-1:0] anp_exp_q[$], anp_bnd_q[$];  // accum_null_pass's goldens and bounds (module-scope: as automatic locals they crashed xsim 2025.2's kernel, D13)
+    task accum_null_pass();  // static, with plain locals: as an automatic task xsim 2025.2's kernel crashed on entry (D13)
+      int G, n, waited, errs, n_exact, k;
+      string info, fn;
+      G = k_accum_passes - 1;  // the first set the stream activates; its golden is the sum of sets 0..G
+      n = 4 + k_accum_passes;
+      {waited, errs, n_exact} = '0;
       $display("\n[STAGE] ACCUMULATE: 4 partial sets of zeros, then sets 0..%0d as one sum; checkers bound", G);
       if (k_packed != 0) begin
         $display("  [Accum] skipped: a packed set cannot be a partial sum");
@@ -1738,9 +1740,11 @@ module TB_sienna #(
       tr_seq++;
       tr_on = 1;
       for (int j = 0; j < n; j++) begin
-        automatic int k = (j < 4) ? 0 : j - 4;  // the stream set whose rows this pass sends
-        read_mem_file($sformatf("matrix_west_%0d.mem", k), west_data_queue);
-        read_mem_file($sformatf("matrix_north_%0d.mem", k), north_data_queue);
+        k = (j < 4) ? 0 : j - 4;  // the stream set whose rows this pass sends
+        fn = $sformatf("matrix_west_%0d.mem", k);  // names as variables: xsim passed an empty string for these expressions here
+        read_mem_file(fn, west_data_queue);
+        fn = $sformatf("matrix_north_%0d.mem", k);
+        read_mem_file(fn, north_data_queue);
         if (j < 4) foreach (west_data_queue[i]) west_data_queue[i] = '0;
         accumulate_i = (j < n - 1) || $test$plusargs("acc_open");  // on purpose with +acc_open: the sum never closes
         activation_function_i = act_of(G);
@@ -1777,8 +1781,11 @@ module TB_sienna #(
         $display("  [FAULT acc] the accumulate pass's first output corrupted");
       end
       // Narrow floats: regression.py's bit-exact golden of this pass (the zero partials move the mesh's accumulator slots); int8 and fp32: set G's own.
-      read_mem_file((EXACT_GOLDEN != 0 && IS_INT == 0) ? "expected_accum.mem" : $sformatf("expected_output_%0d.mem", G), exp_q);
-      read_mem_file($sformatf("bound_output_%0d.mem", G), bnd_q);
+      if (EXACT_GOLDEN != 0 && IS_INT == 0) fn = "expected_accum.mem";
+      else fn = $sformatf("expected_output_%0d.mem", G);
+      read_mem_file(fn, anp_exp_q);
+      fn = $sformatf("bound_output_%0d.mem", G);
+      read_mem_file(fn, anp_bnd_q);
       if (acc_bounds.size() != n || !drained) begin
         failed++;
         $display("  [FAIL] Accumulate pass: %0d of %0d sets completed, drained=%0b", acc_bounds.size(), n, drained);
@@ -1788,21 +1795,21 @@ module TB_sienna #(
             failed++;
             $display("  [FAIL] Accumulate pass: partial set %0d left %0d outputs", j, acc_bounds[j]);
           end
-        if (acc_results.size() != exp_q.size()) begin
+        if (acc_results.size() != anp_exp_q.size()) begin
           failed++;
-          $display("  [FAIL] Accumulate pass: %0d outputs, expected %0d", acc_results.size(), exp_q.size());
+          $display("  [FAIL] Accumulate pass: %0d outputs, expected %0d", acc_results.size(), anp_exp_q.size());
         end
         // int8 and narrow floats bit-exact (check_tolerance takes only identical bits there); fp32 within its tolerance and bound.
-        for (int i = 0; i < exp_q.size() && i < acc_results.size(); i++) begin
+        for (int i = 0; i < anp_exp_q.size() && i < acc_results.size(); i++) begin
           total_elements++;
-          if (acc_results[i] === exp_q[i]) begin
+          if (acc_results[i] === anp_exp_q[i]) begin
             exact_passed++;
             n_exact++;
-          end else if (check_tolerance(exp_q[i], acc_results[i], (i < bnd_q.size()) ? bnd_q[i] : '0, info)) tol_passed++;
+          end else if (check_tolerance(anp_exp_q[i], acc_results[i], (i < anp_bnd_q.size()) ? anp_bnd_q[i] : '0, info)) tol_passed++;
           else begin
             failed++;
             errs++;
-            $display("  [FAIL] Accumulate pass [%0d] exp=0x%h got=0x%h | %s", i, exp_q[i], acc_results[i], info);
+            $display("  [FAIL] Accumulate pass [%0d] exp=0x%h got=0x%h | %s", i, anp_exp_q[i], acc_results[i], info);
           end
         end
       end

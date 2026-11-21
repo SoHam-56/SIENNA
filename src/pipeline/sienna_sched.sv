@@ -167,6 +167,11 @@ module sienna_sched #(
   logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
   logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok;
   logic [DIM_W-1:0] gc_blk[4], gc_p[4];  // its candidates: the next block's first set, this block's pass 0, pass is_p1, pass is_p
+  // The block compares as counters, each moved by one with the counters it compares (is_blk1 < ct, the magnitude compare at the head
+  // of the issue and loader grants, was the scheduler's limit at 0.8 ns: is_blk1 -> gc_blk_ok -> g_ok -> wt_tg1, 1.03-1.08 ns).
+  logic [DIM_W-1:0]        blk_rem, wl_rem;  // ct - is_blk, ct - wl_blk
+  logic signed [DIM_W:0]   wl_ahead;  // wl_blk - is_blk
+  logic blk_lt_ct, blk1_lt_ct, wl_lt_ct, wl_le_blk, wl_le_blk1, wl_eq_blk, wl_eq_blk1;
   logic [3:0] gc_res, gc_bias, gc_tile, gc_blk_ok, gc_wl_le;  // g_res, g_bias_ok, g_tile_ok, g_blk < ct and wl_blk <= g_blk for each
   logic [1:0] gc_sel;  // which one it is, from registers only
 
@@ -262,7 +267,14 @@ module sienna_sched #(
   end
   // The loader may start block b once the issuer has finished block b-2, whose half it overwrites, and (cached) has opened the half's fill on its region's credit.
   // Uncached, block b's bias row follows block b-1's last B row in the stream, so its credit waits until that set's are granted.
-  assign wl_pre = active && (wl_blk < ct) && (wl_blk <= is_blk1) && (cached || gc_wl_le[gc_sel]);
+  assign blk_lt_ct  = blk_rem != '0;  // is_blk < ct
+  assign blk1_lt_ct = |blk_rem[DIM_W-1:1];  // is_blk1 < ct: ct - is_blk > 1
+  assign wl_lt_ct   = wl_rem != '0;  // wl_blk < ct
+  assign wl_le_blk  = wl_ahead <= 0;  // wl_blk <= is_blk
+  assign wl_le_blk1 = wl_ahead <= 1;  // wl_blk <= is_blk1
+  assign wl_eq_blk  = wl_ahead == 0;
+  assign wl_eq_blk1 = wl_ahead == 1;
+  assign wl_pre = active && wl_lt_ct && wl_le_blk1 && (cached || gc_wl_le[gc_sel]);
   assign wl_put = wl_pre && cached && !wl_opened && wc_has[wl_blk[0]];
   assign wl_may = wl_pre && (!cached || wl_opened);
   assign wl_bias_due = wl_pre && bias_q && !wl_bias_done;  // the next weight row the loader expects is its block's bias
@@ -295,10 +307,10 @@ module sienna_sched #(
   assign gc_sel = !pend ? 2'd3 : !p_last ? 2'd2 : r_last ? 2'd0 : 2'd1;
   for (genvar k = 0; k < 4; k++) begin : G_GC
     assign gc_res[k]    = res_q && (gc_p[k] == dt);
-    assign gc_bias[k]   = !bias_q || bias_in[gc_blk[k][0]] || (wl_take_bias && wl_blk == gc_blk[k]);  // its bias row in, or arriving now
+    assign gc_bias[k]   = !bias_q || bias_in[gc_blk[k][0]] || (wl_take_bias && ((k == 0) ? wl_eq_blk1 : wl_eq_blk));  // its bias row in, or arriving now
     assign gc_tile[k]   = !(cached && !gc_res[k]) || tiles_in[gc_blk[k][0]] > gc_p[k];
-    assign gc_blk_ok[k] = gc_blk[k] < ct;
-    assign gc_wl_le[k]  = wl_blk <= gc_blk[k];
+    assign gc_blk_ok[k] = (k == 0) ? blk1_lt_ct : blk_lt_ct;  // gc_blk[k] < ct (gc_blk[0] is is_blk1, the others is_blk)
+    assign gc_wl_le[k]  = (k == 0) ? wl_le_blk1 : wl_le_blk;  // wl_blk <= gc_blk[k]
   end
   assign g_res     = gc_res[gc_sel];
   assign g_need_w  = !cached && !g_res;  // an uncached layer's B rows come with the set
@@ -368,6 +380,8 @@ module sienna_sched #(
       pk_act_q <= '0;
       pk_lane_q <= '0;
       wl_blk <= '0;
+      {blk_rem, wl_rem} <= '0;
+      wl_ahead <= '0;
       wl_bias_done <= 1'b0;
       wl_tile <= '0;
       wl_row <= '0;
@@ -420,6 +434,9 @@ module sienna_sched #(
         pk_act_q <= c_pack_act;
         pk_lane_q <= c_pack_lane;
         wl_blk <= '0;
+        blk_rem <= c;  // is_blk and wl_blk start at 0
+        wl_rem <= c;
+        wl_ahead <= '0;
         wl_bias_done <= 1'b0;
         wl_tile <= '0;
         wl_row <= '0;
@@ -443,6 +460,8 @@ module sienna_sched #(
         n_out <= '0;
         seed_mul <= '0;
       end else if (active) begin
+        automatic logic signed [DIM_W:0] ahead;  // wl_blk - is_blk after this edge's steps
+        ahead = wl_ahead;
         // Loader: a block is loaded once its bias (if any) and, for a cached layer, its tiles are in.
         begin
           automatic logic bias_now = wl_bias_done || wl_take_bias;
@@ -457,6 +476,8 @@ module sienna_sched #(
           wt_out <= wt_out + (wt_grant ? TOW'(N) : '0) - TOW'(wl_take_tile);
           if (wl_may && (!bias_q || bias_now) && (!cached || tiles_now == dt)) begin
             wl_blk <= wl_blk + 1'b1;
+            wl_rem <= wl_rem - 1'b1;
+            ahead = ahead + 1;
             wl_bias_done <= 1'b0;
             wl_tile <= '0;
             wl_row <= '0;
@@ -505,6 +526,8 @@ module sienna_sched #(
               r_last <= rt_m1 == '0;
               is_blk  <= is_blk1;
               is_blk1 <= is_blk1 + 1'b1;
+              blk_rem <= blk_rem - 1'b1;
+              ahead = ahead - 1;
               // This half is free for block is_blk + 2 once its sets are broadcast.
               tiles_in[is_blk[0]] <= '0;
               bias_in[is_blk[0]] <= 1'b0;
@@ -521,7 +544,8 @@ module sienna_sched #(
           end
         end
         n_out <= n_out + NOW'(p_start) - NOW'(p_complete_q);
-        if (is_blk == ct && n_out == '0) begin
+        wl_ahead <= ahead;
+        if (blk_rem == '0 && n_out == '0) begin  // is_blk == ct
           active <= 1'b0;
           done_o <= 1'b1;
         end
@@ -603,4 +627,13 @@ module sienna_sched #(
   end
 `endif
 
+`ifndef SYNTHESIS
+  // The counters stand for the compares they replaced: each flag equals its compare on every active cycle.
+  a_blk_flags: assert property (@(posedge clk_i) disable iff (!rstn_i) active |->
+      (blk_lt_ct == (is_blk < ct)) && (blk1_lt_ct == (is_blk1 < ct)) && (wl_lt_ct == (wl_blk < ct)) && (wl_le_blk == (wl_blk <= is_blk))
+      && (wl_le_blk1 == (wl_blk <= is_blk1)) && (wl_eq_blk == (wl_blk == is_blk)) && (wl_eq_blk1 == (wl_blk == is_blk1))
+      && ((blk_rem == '0) == (is_blk == ct)))
+    else $error("sienna_sched: a_blk_flags: is_blk %0d wl_blk %0d ct %0d, but blk_rem %0d wl_rem %0d wl_ahead %0d", is_blk, wl_blk, ct, blk_rem,
+                wl_rem, wl_ahead);
+`endif
 endmodule

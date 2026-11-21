@@ -3061,7 +3061,7 @@ def lane_kinds(xs: list, act: str) -> tuple:
 def tail_ops(tier: int = 0) -> int:
     """gpnae_tail's cycles for one element alone, start to T_DONE: each fp32 step is request, issue, unit, update (latency + 2)."""
     ts = gpnae_model.default_mem("bf16").tail[tier]
-    cm, ca = UNIT_LAT["fp32"][0] + 2, UNIT_LAT["fp32"][1] + 2
+    cm, ca = fmt_pkg.get("fp32", "LANE_MUL_LATENCY") + 2, fmt_pkg.get("fp32", "LANE_ADD_LATENCY") + 2  # the tail's units are the lane kind (the mesh's fp32 multiply is MUL_LATENCY)
     return cm + (ts.deg + 1) * (cm + ca) + 2 * ca + ts.newton * (cm + ca + cm) + cm  # k; Horner; D and y0; Newton; E y
 
 
@@ -5993,7 +5993,7 @@ def test_link_bytes():
 
 @perf_selftest
 def test_rtl_lat():
-    assert pa.UNIT_LAT == {"fp32": (8, 7), "bf16": (3, 7), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
+    assert pa.UNIT_LAT == {"fp32": (9, 7), "bf16": (3, 7), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
     assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 

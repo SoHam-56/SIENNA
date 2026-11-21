@@ -32,7 +32,9 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 SIM = os.environ.get("SIENNA_SIM", "verilator")  # the simulator: make SIM=vcs exports SIENNA_SIM=vcs to every flow it starts
 SIM_DIR = os.path.join(ROOT, "VCS" if SIM == "vcs" else "Verilator")  # make vcs builds <top>_sim there, as make verilator does in Verilator/
 SIM_TARGET = "vcs" if SIM == "vcs" else "verilator"
-FIRED = re.compile(r'Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]|^(?:Error|Fatal): "|^Error-\[|: started at .* failed at', re.M)  # Verilator's and VCS's forms
+# xsim's $error is "Error: <message>" with no quote; its two known false firings (sim_differences D6/D10, the bank-final assertions) are left out
+XSIM_FALSE = r"SystolicArray: read or release with no final set|ProcessingElement: bank \d+ released before its set was final"
+FIRED = re.compile(r'Assertion failed|%Error|%Fatal|\[FATAL\]|\[FAIL\]|^(?:Error|Fatal): "|^Error-\[|: started at .* failed at|^(?:Error|Fatal): (?!"|' + XSIM_FALSE + ')', re.M)  # Verilator's and VCS's forms
 sys.path.insert(0, ROOT)
 sys.path.append(os.path.join(ROOT, "GPNAE", "scripts"))  # appended: the submodules have their own regression.py, which must not shadow ours
 sys.path.append(os.path.join(ROOT, "SystolicMesh", "scripts"))

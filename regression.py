@@ -5869,7 +5869,7 @@ def perf_trace(name):
 @perf_selftest
 def test_accumulate_outputs_every_third_set():
     a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
-    assert a["first_latency"] == 151  # host start of pass 0 to the completion of pass 2, read off the trace by hand (133 before rounds D-G, 150 before round H)
+    assert a["first_latency"] == 153  # host start of pass 0 to the completion of pass 2, read off the trace by hand (133 before rounds D-G, 150 before round H, 151 before the bf16 mesh multiply went 3 -> 5)
     assert statistics.mean(a["steady"]) == 19.0  # cycles per depth pass: 57 per output of 3 passes
     outs = [x for x in a["sets"] if x["latency"] is not None]
     assert len(outs) == 8 and all(x["latency"] > 0 and x["out"] >= 0 for x in outs)
@@ -5879,7 +5879,7 @@ def test_accumulate_outputs_every_third_set():
 @perf_selftest
 def test_single_pass_unchanged():
     a = pa.analyse(perf_trace("matmul_relu_nopool"), 24)
-    assert a["first_latency"] == a["sets"][0]["latency"] == 113  # 112 before round H; 95 before rounds D-G (2026-11-15): the result read and bank write registers (+2), fp32Adder 7 stages and 8 slots (+15)
+    assert a["first_latency"] == a["sets"][0]["latency"] == 115  # 113 before the bf16 mesh multiply went 3 -> 5; 112 before round H; 95 before rounds D-G (2026-11-15): the result read and bank write registers (+2), fp32Adder 7 stages and 8 slots (+15)
     assert statistics.mean(a["steady"]) == 19.0
     assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
 
@@ -5889,8 +5889,8 @@ def test_residual_hold_add_pairs():
     ev = pa.events(open(os.path.join(PERF_FIX, "int8_residual_relu_N8_T2_int8.trace")).read())
     a = pa.analyse(ev, 18, 1, [0x56, 0x58] * 9)  # add_<k>.mem's flags: hold sets and add sets in turn, ReLU, bias on the hold set
     assert a["hold"] == [3] * 9 and [x["act"] for x in a["sets"][1::2]] == [3] * 9  # G 115-118 (hold), 126-129 (add), off the trace by hand
-    assert all(x["act"] is None and x["latency"] is None and x["mesh"] >= 29 for x in a["sets"][0::2]) and a["sets"][0]["mesh"] == 29  # a hold set outputs nothing; mesh 28 before round H, 26 before rounds D-G (the result read register), later holds wait on the stage
-    assert a["first_latency"] == 76 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion (69 before round H, 61 before rounds D-G)
+    assert all(x["act"] is None and x["latency"] is None and x["mesh"] >= 31 for x in a["sets"][0::2]) and a["sets"][0]["mesh"] == 31  # a hold set outputs nothing; mesh 29 before the int8 mesh multiply went 2 -> 4, 28 before round H, 26 before rounds D-G (the result read register), later holds wait on the stage
+    assert a["first_latency"] == 78 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion (76 before the int8 mesh multiply went 2 -> 4, 69 before round H, 61 before rounds D-G)
     assert a["steady"] and all(g == 18.0 for g in a["steady"])  # 36 cycles per hold/add pair at N 8 (29 before round H: REQUANT 7 -> 9 on both sets, QUANT_ADD 7 -> 10): activation-bound since rounds D-G (the requantize's stages and grant hold, the bank write register); 22 and host-bound before
 
 
@@ -5904,7 +5904,7 @@ def test_mesh_lat_passes():
         a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
         P16 = {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}
         m1, m3 = pa.model({"act": "linear"}, True, P16, 256), pa.model({"act": "linear", "accum_passes": 3}, True, P16, 256)
-        assert m1["mesh_lat"] == 88 and m3["mesh_lat"] == 88 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 126  # 87 / 125 before round H, 72 / 110 before round G: 8 slots, the reducer tree 4 levels of 7
+        assert m1["mesh_lat"] == 90 and m3["mesh_lat"] == 90 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 128  # 88 / 126 before the bf16 mesh multiply went 3 -> 5, 87 / 125 before round H, 72 / 110 before round G: 8 slots, the reducer tree 4 levels of 7
 
 
 @perf_selftest

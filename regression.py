@@ -6886,7 +6886,7 @@ def idle_fault_main(argv) -> None:
         cmd = ["make", mr.SIM_TARGET, "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     text = r.stdout + r.stderr
-    fired = "a_idle_contract" in text and re.search(r'Assertion failed|%Error|^(?:Error|Fatal): "|: started at .* failed at', text, re.M) is not None
+    fired = any("a_idle_contract" in x and mr.FIRED.search(x) for x in text.splitlines())  # the runner's error forms: Verilator's, VCS's and xsim's
     planted = f"[FAULT {4 if a.set_port == 0 else 8}]" in text
     print("\n".join(x for x in text.splitlines() if "a_idle_contract" in x or "FAULT" in x)[:2000])
     v = "CAUGHT" if fired and planted else ("SURVIVED" if planted else "OTHER")

@@ -1781,7 +1781,10 @@ class RtlLayer:
         f = re.search(r"\[RES\] first hold window closed (\d+) cycles into the layer", r.stdout)
         self.first_free = int(f.group(1)) if f else None
         if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
-            sys.stdout.write((r.stdout + r.stderr)[-3000:])
+            # every line that fired and the bench's [FAULT n] notes first: xsim runs on past an error, so the tail alone can be all
+            # known-false lines (D6/D10) with the real message long before it
+            hits = [x for x in (r.stdout + r.stderr).splitlines() if FIRED.search(x) or x.startswith("[FAULT ")]
+            sys.stdout.write("\n".join(hits[:40]) + "\n" + (r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the layer simulation")
         coef_image_ran(r.stdout, tag, int(job.get("coef") is not None) + int(job.get("between") is not None))
         m = re.search(r"\[LAYER\] sets=(\d+) outputs=(\d+) cycles=(\d+) a_rows=(\d+)/(\d+) w_rows=(\d+)/(\d+)", r.stdout)
@@ -1890,7 +1893,10 @@ class RtlSets:
                            cwd=os.path.dirname(self.bin),
                            capture_output=True, text=True)
         if FIRED.search(r.stdout + r.stderr):  # neither assertions nor the TB's own checks change the exit code
-            sys.stdout.write((r.stdout + r.stderr)[-3000:])
+            # every line that fired and the bench's [FAULT n] notes first: xsim runs on past an error, so the tail alone can be all
+            # known-false lines (D6/D10) with the real message long before it
+            hits = [x for x in (r.stdout + r.stderr).splitlines() if FIRED.search(x) or x.startswith("[FAULT ")]
+            sys.stdout.write("\n".join(hits[:40]) + "\n" + (r.stdout + r.stderr)[-3000:])
             raise RuntimeError(f"{tag}: an assertion or a testbench check failed in the model simulation")
         coef_image_ran(r.stdout, tag, int(coef is not None))
         try:  # a count with an x or z fails the model run by name

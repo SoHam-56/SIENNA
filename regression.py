@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 135), ("bf16", "sigmoid", 8, 175), ("int8", "selu", 32, 344), ("int8", "tanh", 32, 344))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 149), ("bf16", "sigmoid", 8, 194), ("int8", "selu", 32, 344), ("int8", "tanh", 32, 344))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); the floats re-set 2026-11-23 for the 0.8 ns Horner loop (Soham: up to +2 loop cycles; fp32 lane multiply 8 -> 10, bf16 multiply 3 -> 4 and add 6 -> 7, the bf16 tail's multiply 8 -> 10): 135 -> 149, 175 -> 194; int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5994,7 +5994,7 @@ def test_link_bytes():
 @perf_selftest
 def test_rtl_lat():
     assert pa.UNIT_LAT == {"fp32": (11, 7), "bf16": (5, 7), "int8": (4, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 32, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
@@ -6017,11 +6017,11 @@ def test_lane_cycle_targets():
 @perf_selftest
 def test_lane_group_float():
     with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 94 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 70  # rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 157 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 261  # round H: the fp32 input stage +1 (the exp split's second register)  # sigmoid: F2's 5 rounds
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 102 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 78  # 94 / 70 before the lane multiply 8 -> 10 (2026-11-23); rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 171 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 232  # 157 / 261 before the lane multiply 8 -> 10 and K 16 -> 32 (2026-11-23; K alone gives 228); round H: the fp32 input stage +1 (the exp split's second register)  # sigmoid: F2's 5 rounds
     with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 74 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 237  # rounds D-F: the input stage +1, the Horner add +1 a round
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 185 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 185  # F1's 34-cycle shorter tail, on fp32Adder's 7 stages
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 79 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 219  # 74 / 237 before the multiply 3 -> 4, add 6 -> 7 and K 16 -> 32 (2026-11-23; K alone gives 216); rounds D-F: the input stage +1, the Horner add +1 a round
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 204 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 204  # 185 before the bf16 loop +2 and the tail multiply 8 -> 10 (2026-11-23); F1's 34-cycle shorter tail, on fp32Adder's 7 stages
 
 
 @perf_selftest
@@ -6037,8 +6037,8 @@ def test_lane_kinds():
 
 @perf_selftest
 def test_tail_ops_bf16():
-    with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 7 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
-        assert [pa.tail_ops(t) for t in range(3)] == [10 + 3 * 19 + 18 + 2 * 29 + 10, 10 + 3 * 19 + 18 + 29 + 10, 10 + 3 * 19 + 18 + 10] == [153, 124, 95]  # F1: tier 0 degree 2; fp32Adder 7 stages since round G
+    with perf_fmt("bf16"):  # fp32 units, multiply 10 + 2 and add 7 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
+        assert [pa.tail_ops(t) for t in range(3)] == [12 + 3 * 21 + 18 + 2 * 33 + 12, 12 + 3 * 21 + 18 + 33 + 12, 12 + 3 * 21 + 18 + 12] == [171, 138, 105]  # F1: tier 0 degree 2; fp32Adder 7 stages since round G; [153, 124, 95] before the tail multiply 8 -> 10 (2026-11-23)
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──

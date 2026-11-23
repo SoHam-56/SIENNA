@@ -32,7 +32,7 @@ module sienna_pipe #(
     parameter int    LINK_STAGES       = 0,  // register stages on the host, staging, result and output links (L0, L1, L3, L9); the write buses and the completion get as many as the put
     parameter int    OUT_MAX           = 64,  // the most L9 credits a downstream consumer may grant per lane
     parameter int    OUT_CRW           = 1,   // L9 credit width
-    parameter int    LANE_OUT_SLOTS    = 16   // the collector's L5 slots per lane: one barrel group; below 16 a lane can never start (a_l5_starved)
+    parameter int    LANE_OUT_SLOTS    = 32   // the collector's L5 slots per lane: one barrel group; below K (32) a lane can never start (a_l5_starved)
 ) (
     input logic clk_i,
     input logic rstn_i,
@@ -89,7 +89,7 @@ module sienna_pipe #(
   localparam int MP_WIN = POOL_H * POOL_W;  // a maxpool window's elements, granted at once on L8
   localparam int MP_CRW = $clog2(MP_WIN + 1);
   localparam int MP_AHEAD = 2;  // windows maxpool grants ahead, so FIFO2 streams one element a cycle
-  localparam int LANE_K = 16;  // gpnae's K: a lane starts a group only with this many L5 credits
+  localparam int LANE_K = 32;  // gpnae's K: a lane starts a group only with this many L5 credits
 
   localparam int POOL_OUT_ROWS = (IN_ROWS + 2 * PADDING - POOL_H) / STRIDE_ROWS + 1;
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;

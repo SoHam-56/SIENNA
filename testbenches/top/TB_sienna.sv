@@ -258,7 +258,7 @@ module TB_sienna #(
         .PACK_ENTRIES     (PACK_ENTRIES),
         .LINK_STAGES      (LINK_STAGES),
         .OUT_MAX          (OUT_CAP),
-        .LANE_OUT_SLOTS   ((FAULT == 6) ? 8 : 16)
+        .LANE_OUT_SLOTS   ((FAULT == 6) ? 8 : 32)
     ) dut (
         .clk_i                      (clk_i),
         .rstn_i                     (rstn_i),
@@ -328,7 +328,7 @@ module TB_sienna #(
     longint starved = 0;  // lane-cycles of a streaming pass with no L9 credit held by the DUT
     logic [DATA_WIDTH-1:0] lane_q[NUM_LANES][$];  // each lane's words of the set being output
     localparam bit TB_POOL_BYPASS = (POOL_H == 1) && (POOL_W == 1) && (STRIDE_ROWS == 1) && (STRIDE_COLS == 1) && (PADDING == 0);
-    localparam int TB_L5 = (FAULT == 6) ? 8 : 16;  // the collector's L5 slots per lane
+    localparam int TB_L5 = (FAULT == 6) ? 8 : 32;  // the collector's L5 slots per lane: as the pipeline instance's LANE_OUT_SLOTS
     initial begin
       void'($value$plusargs("out_slots=%d", out_slots));
       void'($value$plusargs("out_stall_pct=%d", out_stall_pct));

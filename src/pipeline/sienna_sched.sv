@@ -168,7 +168,7 @@ module sienna_sched #(
   logic w_is_b;  // a weight row is the pending set's B row
   logic s_grant;  // a set's row credits go out this cycle
   logic [DIM_W-1:0] g_blk, g_p;  // the set the next grant is for
-  logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok;
+  logic g_res, g_need_w, g_l0_ok, g_bias_ok, g_tile_ok, g_ok, g_ok_res;
   logic [DIM_W-1:0] gc_blk[4], gc_p[4];  // its candidates: the next block's first set, this block's pass 0, pass is_p1, pass is_p
   // The block compares as counters, each moved by one with the counters it compares (is_blk1 < ct, the magnitude compare at the head
   // of the issue and loader grants, was the scheduler's limit at 0.8 ns: is_blk1 -> gc_blk_ok -> g_ok -> wt_tg1, 1.03-1.08 ns).
@@ -321,11 +321,14 @@ module sienna_sched #(
   assign g_bias_ok = gc_bias[gc_sel];
   assign g_tile_ok = gc_tile[gc_sel];
   assign g_ok      = live && active && gc_blk_ok[gc_sel] && (!pend || p_start) && g_l0_ok && g_bias_ok && g_tile_ok;
+  // g_ok && g_res without the tile check: a residual candidate's gc_tile is 1 (it needs no cache tile), so the loader's grant does not
+  // wait on the tiles_in select and its compare (is_blk -> tiles_in[..] -> gc_tile -> g_ok -> wt_grant -> wt_tg was fp32's 0.981).
+  assign g_ok_res  = g_res && live && active && gc_blk_ok[gc_sel] && (!pend || p_start) && g_l0_ok && g_bias_ok;
   // A residual pass writes identity rows on the north bus, so it waits for no cache tile row to be outstanding, and holds back new tile grants.
   assign s_grant   = g_ok && (!g_res || wt_out == '0);
   assign wb_grant  = live && wl_may && bias_q && !wl_bias_done && !wb_gr;
   assign wt_grant  = live && wl_may && cached && (!bias_q || wl_bias_done) && (wt_tg < dt) && (int'(wt_out) <= N) &&
-                     !(g_ok && g_res) && !(pend && is_res_pass);
+                     !g_ok_res && !(pend && is_res_pass);
   // One grant per stream per cycle: a set's, a bias row's or a tile's are never due together, so the counts never add.
   always_ff @(posedge clk_i or negedge rstn_i)  // the credits a cycle after the grant; the counts below move with the grant
     if (!rstn_i) {a_credit_q, w_credit_q} <= '0;
@@ -651,5 +654,8 @@ module sienna_sched #(
       && ((blk_rem == '0) == (is_blk == ct)))
     else $error("sienna_sched: a_blk_flags: is_blk %0d wl_blk %0d ct %0d, but blk_rem %0d wl_rem %0d wl_ahead %0d", is_blk, wl_blk, ct, blk_rem,
                 wl_rem, wl_ahead);
+  // The loader's residual check is the set grant's: g_ok_res leaves out only the tile check, which a residual candidate always passes.
+  a_g_ok_res: assert property (@(posedge clk_i) disable iff (!rstn_i) g_ok_res == (g_ok && g_res) && (!g_res || g_tile_ok))
+    else $error("sienna_sched: a_g_ok_res: g_ok_res %0b, but g_ok %0b g_res %0b g_tile_ok %0b", g_ok_res, g_ok, g_res, g_tile_ok);
 `endif
 endmodule

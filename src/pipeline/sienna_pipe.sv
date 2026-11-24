@@ -32,7 +32,7 @@ module sienna_pipe #(
     parameter int    LINK_STAGES       = 0,  // register stages on the host, staging, result and output links (L0, L1, L3, L9); the write buses and the completion get as many as the put
     parameter int    OUT_MAX           = 64,  // the most L9 credits a downstream consumer may grant per lane
     parameter int    OUT_CRW           = 1,   // L9 credit width
-    parameter int    LANE_OUT_SLOTS    = 16   // the collector's L5 slots per lane: one barrel group; below 16 a lane can never start (a_l5_starved)
+    parameter int    LANE_OUT_SLOTS    = 32   // the collector's L5 slots per lane: one barrel group; below K (32) a lane can never start (a_l5_starved)
 ) (
     input logic clk_i,
     input logic rstn_i,
@@ -89,7 +89,7 @@ module sienna_pipe #(
   localparam int MP_WIN = POOL_H * POOL_W;  // a maxpool window's elements, granted at once on L8
   localparam int MP_CRW = $clog2(MP_WIN + 1);
   localparam int MP_AHEAD = 2;  // windows maxpool grants ahead, so FIFO2 streams one element a cycle
-  localparam int LANE_K = 16;  // gpnae's K: a lane starts a group only with this many L5 credits
+  localparam int LANE_K = 32;  // gpnae's K: a lane starts a group only with this many L5 credits
 
   localparam int POOL_OUT_ROWS = (IN_ROWS + 2 * PADDING - POOL_H) / STRIDE_ROWS + 1;
   localparam int POOL_OUT_COLS = (IN_COLS + 2 * PADDING - POOL_W) / STRIDE_COLS + 1;
@@ -151,6 +151,36 @@ module sienna_pipe #(
     lo  = {1'b0, sc[47:32]} + {1'b0, sc[15:0]};
     hi0 = sc[63:48] + sc[31:16];
     return {lo, hi0, hi0 + 16'd1};
+  endfunction
+  // seed_mul_part from the two words already compressed, over two stages of byte adds (DC builds these adders as ripples: 16 bits
+  // in one stage were the tops' 1.22-1.26 ns). Stage a: each byte's sum, the high bytes for either carry, as
+  // {lo_l[8:0], lo_h0[8:0], lo_h1[8:0], hi_l0[8:0], hi_l1[8:0], hi_h0[7:0], hi_h1[7:0]} (hi_l1 the low byte of hi0 + 1).
+  function automatic logic [61:0] seed_part_a(input logic [63:0] sc);
+    logic [8:0] lo_l, lo_h0, lo_h1, hi_l0, hi_l1;
+    logic [7:0] hi_h0, hi_h1;
+    lo_l  = {1'b0, sc[39:32]} + {1'b0, sc[7:0]};
+    lo_h0 = {1'b0, sc[47:40]} + {1'b0, sc[15:8]};
+    lo_h1 = {1'b0, sc[47:40]} + {1'b0, sc[15:8]} + 9'd1;
+    hi_l0 = {1'b0, sc[55:48]} + {1'b0, sc[23:16]};
+    hi_l1 = {1'b0, sc[55:48]} + {1'b0, sc[23:16]} + 9'd1;
+    hi_h0 = sc[63:56] + sc[31:24];
+    hi_h1 = sc[63:56] + sc[31:24] + 8'd1;
+    return {lo_l, lo_h0, lo_h1, hi_l0, hi_l1, hi_h0, hi_h1};
+  endfunction
+  // Stage b: the carry selects, giving seed_mul_part's {lo[16:0], hi0[15:0], hi1[15:0]}.
+  function automatic logic [48:0] seed_part_b(input logic [61:0] a);
+    logic [8:0] lo_l, lo_h0, lo_h1, hi_l0, hi_l1;
+    logic [7:0] hi_h0, hi_h1;
+    {lo_l, lo_h0, lo_h1, hi_l0, hi_l1, hi_h0, hi_h1} = a;
+    return {lo_l[8] ? lo_h1 : lo_h0, lo_l[7:0], hi_l0[8] ? hi_h1 : hi_h0, hi_l0[7:0], hi_l1[8] ? hi_h1 : hi_h0, hi_l1[7:0]};
+  endfunction
+  // The lane seed from a seed_mul_part result: the high half's select, the fold, the all-zero LFSR state replaced.
+  function automatic logic [LFSR_WIDTH-1:0] seed_fold(input logic [48:0] part);
+    logic [31:0] m;
+    logic [LFSR_WIDTH-1:0] x;
+    m = {part[48] ? part[15:0] : part[31:16], part[47:32]};
+    x = LFSR_WIDTH'(m ^ (m >> 16));
+    return (x == '0) ? '1 : x;
   endfunction
   function automatic logic [63:0] seed_mul_two(input logic [127:0] r);
     logic [31:0] s1, c1;
@@ -306,8 +336,24 @@ module sienna_pipe #(
   logic [NUM_LANES-1:0]      pin_room;  // the lane takes the next dispatched word: a credit beyond the put now in flight
   // Dropout's lane seeds: the id pooling will accept next, and its seed registered (stage 1 of three).
   logic p_null;  // the pooling stage passes a partial or hold set this cycle
-  logic [31:0] seed_after[NUM_IDS];  // per id: its seed, or the next id's where it is a partial or hold set (the id pooling passes, not accepts)
+  // The lane seeds are mixed when an id's seed is written (host_accept), not when it is read, and kept per lane and id (lane_tab in each
+  // lane): the multiply then takes six shallow stages long before its use (four tight ones before the reseed were the tops' worst, 1.09-1.22
+  // ns). sw_* carry a written seed and its id to the lanes' write pipelines.
+  localparam int SW_LAT = 7;  // host_accept to the lane table's write
+  logic [SW_LAT-1:0] sw_v;
+  logic [ID_W-1:0]   sw_id[SW_LAT];
+  logic [31:0]       sw_seed;
+  logic [ID_W-1:0]   sa_src[NUM_IDS];  // per id: the id whose seed it takes (its own, or the next where it is a partial or hold set)
+  // seed_tab: every lane's mixed seed per id, one 1024-bit row per id, in a mem_array (a stub in the ideal-memory flows, a macro later):
+  // written by the lanes' write pipelines together, read at the two ids pooling may take next (sync read), then chosen a cycle later.
+  logic [NUM_LANES*LFSR_WIDTH-1:0]       seed_wd;  // the row being written: lane g's seed at g*LFSR_WIDTH
+  logic [1:0][NUM_LANES*LFSR_WIDTH-1:0]  seed_rd;  // the rows of the id pooling accepts next and of the one after
+  logic [1:0][ID_W-1:0]                  seed_ra;
+  logic                                  seed_rsel_q;  // the second row: an accept or a pass, registered beside the read
+`ifndef SYNTHESIS
+  logic [31:0] seed_after[NUM_IDS];  // the previous seed path, kept as a reference: each lane's lane_seed must equal it at every reseed
   logic [31:0] seed_x1;
+`endif
   logic p_accept_q, p_accept_qq;  // the accept one and two cycles on: the LFSR loads at the second, as the first beat can reach dropout (the dispatcher's put is registered; dropout takes a beat with its reseed)
   // ── The window dispatcher ──
   logic [        $clog2(NUM_GROUPS+1)-1:0] disp_g;
@@ -527,10 +573,27 @@ module sienna_pipe #(
   // folded. The id read skips the one accepted or passed this cycle: an accept follows an accept by four cycles at least and a null by one, and
   // nulls are two apart, so the id accepted three cycles on is the one read now. The table is a cycle behind set_seed, which is written at an
   // id's host_accept, long before its accept here; its +1 only drives the final select, so the accept's own cone stays out of the read mux.
-  always_ff @(posedge clk_i)  // no reset: read only at p_accept, after its set's host_accept
-    for (int i = 0; i < NUM_IDS; i++)
-      seed_after[i] <= 32'(set_seed[(set_accum[i] || set_hold[i]) ? ID_W'(unsigned'(i + 1)) : ID_W'(unsigned'(i))]);  // unsigned: a size cast of the int keeps its sign, and ids 8-15 read X in 4-state
+  always_comb
+    for (int i = 0; i < NUM_IDS; i++) sa_src[i] = (set_accum[i] || set_hold[i]) ? ID_W'(unsigned'(i + 1)) : ID_W'(unsigned'(i));  // unsigned: a size cast of the int keeps its sign, and ids 8-15 read X in 4-state
+  assign seed_ra[0] = sa_src[p_next_id];
+  assign seed_ra[1] = sa_src[ID_W'(p_next_id + 1'b1)];
+  mem_array #(.DEPTH(NUM_IDS), .WIDTH(NUM_LANES * LFSR_WIDTH), .NW(1), .NR(2), .SYNC_READ(1'b1)) seed_tab (
+      .clk_i(clk_i), .we_i(sw_v[SW_LAT-1]), .waddr_i(sw_id[SW_LAT-1]), .wmask_i(1'b1), .wdata_i(seed_wd), .re_i(2'b11), .raddr_i(seed_ra),
+      .rdata_o(seed_rd));  // no reset: a row is read at a reseed only after its id's write
+  always_ff @(posedge clk_i) seed_rsel_q <= p_accept || p_null;
+  always_ff @(posedge clk_i or negedge rstn_i)
+    if (!rstn_i) sw_v <= '0;
+    else sw_v <= {sw_v[SW_LAT-2:0], host_accept};
+  always_ff @(posedge clk_i) begin  // no reset: read only beside sw_v
+    sw_seed  <= 32'(side.seed);
+    sw_id[0] <= host_next_id;
+    for (int k = 1; k < SW_LAT; k++) sw_id[k] <= sw_id[k-1];
+  end
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i)  // the reference: no reset, read only at p_accept, after its set's host_accept
+    for (int i = 0; i < NUM_IDS; i++) seed_after[i] <= 32'(set_seed[sa_src[i]]);
   always_ff @(posedge clk_i) seed_x1 <= (p_accept || p_null) ? seed_after[ID_W'(p_next_id + 1'b1)] : seed_after[p_next_id];
+`endif
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {p_accept_q, p_accept_qq} <= '0;
     else {p_accept_q, p_accept_qq} <= {p_accept, p_accept_q};
@@ -542,12 +605,21 @@ module sienna_pipe #(
       localparam int PIN_CRW = POOL_BYPASS ? OUT_CRW : 1;
       localparam logic [31:0] LANE_C = 32'h9E3779B9 * (g + 1);  // the lane's seed mix constant
       logic [$clog2(PIN_MAX + 1)-1:0] pin_n;
-      // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 and 3.
-      logic [31:0] seed_xq;  // the lane's seed word, registered: seed_x1 fans out to every lane
-      logic [127:0] seed_rows;  // seed_xq * 0x85EBCA6B as four words, summed a stage later (18 terms through six levels, merged across lanes, were 1.207 ns at 5181d91)
-      logic [48:0] lane_part_q;  // seed_xq * 0x85EBCA6B as a carry select, the high half chosen in the fold's stage (the whole add after the
-      logic [31:0] lane_mul;     // compressors was the fp32 top's 1.17 ns at fe83391; the whole add in the fold's stage, bf16's 1.216 at dd6d28e)
-      logic [LFSR_WIDTH-1:0] lane_mix, lane_seed;
+      // The lane's seed: (seed ^ C_g) * 0x85EBCA6B, folded, mixed at the id's write (w_*) into lane_tab, then read as the id is accepted.
+      logic [31:0]           w_xq;  // the written seed ^ C_g
+      logic [127:0]          w_rows;  // three compressor levels: four words
+      logic [63:0]           w_sc;  // two more: two words
+      logic [61:0]           w_pa;  // their add: the byte sums
+      logic [48:0]           w_part;  // then the carry selects
+      logic [LFSR_WIDTH-1:0] w_seed;  // then the select, fold and zero fix
+      logic [LFSR_WIDTH-1:0] lane_x1, lane_d1, lane_d2;  // the chosen row's seed and two stages, so lane_seed lands as before
+      logic [LFSR_WIDTH-1:0] lane_seed;
+`ifndef SYNTHESIS
+      logic [31:0] seed_xq;  // the reference: the previous per-lane mix of seed_x1, four stages
+      logic [127:0] seed_rows;
+      logic [48:0] lane_part_q;
+      logic [LFSR_WIDTH-1:0] ref_seed;
+`endif
       // The output register, as final_result_o was.
       logic                  oq_put;
       logic [DATA_WIDTH-1:0] oq_data;
@@ -645,21 +717,41 @@ module sienna_pipe #(
 
       // A nonlinear mix, since an XOR-only one makes the 16 lanes' masks linearly tied: (seed ^ C_g) * 0x85EBCA6B, folded, over stages 2 to 4
       // (the sum, then its fold and the all-zero check: together they were the fp32 top's path).
-      always_ff @(posedge clk_i) begin  // no reset, as seed_x1
-        seed_xq    <= seed_x1 ^ LANE_C;
-        seed_rows  <= seed_mul_rows(seed_xq);
-        lane_part_q <= seed_mul_part(seed_rows);
-        lane_seed  <= (lane_mix == '0) ? '1 : lane_mix;  // an all-zero LFSR state would lock up
+      // The write: eight stages from host_accept, one compressor group, half the add or the fold per stage.
+      always_ff @(posedge clk_i) begin  // no reset: read only beside sw_v
+        w_xq   <= sw_seed ^ LANE_C;
+        w_rows <= seed_mul_rows(w_xq);
+        w_sc   <= seed_mul_two(w_rows);
+        w_pa   <= seed_part_a(w_sc);
+        w_part <= seed_part_b(w_pa);
+        w_seed <= seed_fold(w_part);  // an all-zero LFSR state would lock up: seed_fold replaces it
       end
-      assign lane_mul = {lane_part_q[48] ? lane_part_q[15:0] : lane_part_q[31:16], lane_part_q[47:32]};  // seed_xq * 0x85EBCA6B mod 2^32
-      assign lane_mix = LFSR_WIDTH'(lane_mul ^ (lane_mul >> 16));
+      assign seed_wd[g*LFSR_WIDTH+:LFSR_WIDTH] = w_seed;
+      // The read: seed_tab's registered rows stand where the old per-id table copy stood, then the row's choice and two stages.
+      always_ff @(posedge clk_i) begin  // no reset: read only at the reseed, after its set's host_accept and the write
+        lane_x1   <= seed_rsel_q ? seed_rd[1][g*LFSR_WIDTH+:LFSR_WIDTH] : seed_rd[0][g*LFSR_WIDTH+:LFSR_WIDTH];
+        lane_d1   <= lane_x1;
+        lane_d2   <= lane_d1;
+        lane_seed <= lane_d2;
+      end
+`ifndef SYNTHESIS
+      always_ff @(posedge clk_i) begin  // the reference: the previous four-stage mix of seed_x1
+        seed_xq     <= seed_x1 ^ LANE_C;
+        seed_rows   <= seed_mul_rows(seed_xq);
+        lane_part_q <= seed_mul_part(seed_rows);
+        ref_seed    <= seed_fold(lane_part_q);
+      end
+      a_lane_seed_ref: assert property (@(posedge clk_i) disable iff (!rstn_i) p_accept_qq |-> lane_seed == ref_seed)
+        else $error("sienna_top: a_lane_seed_ref: lane %0d's mixed-at-write seed %h differs from the read-time mix %h at the reseed", g, lane_seed, ref_seed);
+`endif
 
       assign dropout_in_valid[g] = drp.put;
       assign dropout_data_in[g]  = drp.data;
       dropout #(
           .DATA_WIDTH       (DATA_WIDTH),
           .DROPOUT_P_PERCENT(DROPOUT_P_PERCENT),
-          .LFSR_WIDTH       (LFSR_WIDTH)
+          .LFSR_WIDTH       (LFSR_WIDTH),
+          .SEED_LEAD        (2)
       ) dropout_inst (
           .clk          (clk_i),
           .rst_n        (rstn_i),
@@ -668,6 +760,7 @@ module sienna_pipe #(
           .training_mode(set_train[p_set_id]),
           .reseed_i     (p_accept_qq),
           .seed_i       (lane_seed),
+          .seed_early_i (lane_d1),  // lane_seed two cycles ahead
           .zero_point_i (p_zp[g])
       );
       assign dropout_valid_out[g] = l9p.put;

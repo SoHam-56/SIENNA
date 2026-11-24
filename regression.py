@@ -1645,7 +1645,7 @@ def _run_make_live(log_path: str, fmt_name: str = "fp32", N: int = 16, T: int = 
 
 
 def _parse_log(raw: str, test: str = "-") -> dict:
-    fired = re.search(r'^.*(?:Assertion failed|%Error).*$|^(?:Error|Fatal): ".*$|^Error-\[.*$|^.*: started at .* failed at.*$', raw, re.M)  # Verilator's and VCS's forms
+    fired = re.search(r'^.*(?:Assertion failed|%Error).*$|^(?:Error|Fatal): ".*$|^Error-\[.*$|^.*: started at .* failed at.*$|^(?:Error|Fatal): (?!"|' + mr.XSIM_FALSE + ').*$', raw, re.M)  # xsim: "Error: <message>", less its known false firings  # Verilator's and VCS's forms
     if fired:  # a firing assertion leaves the exit code and the TB's counts untouched, so the log is the only witness
         return {"status": "ASSERT", "total": 0, "exact": 0, "tol": 0, "failed": 1, "cyc": 0, "fired": fired.group(0).strip()}
     if "FATAL" in raw or "[FATAL] Timeout" in raw:
@@ -2983,7 +2983,7 @@ def model(cfg: dict, collapse: bool = True, P: dict = None, words: int = None) -
     K = N if collapse else T  # depth each array multiplies
     U = min(K, ADD_LAT + 1)  # partial sums per PE pixel: the adder loop plus one (8 in fp32 and bf16, 2 in int8)
     RP = 1 if collapse else N // T  # depth slices summed per output tile
-    LAT = (2 if T * T >= 256 else 1) + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: the arrays' read (two cycles from 256 pixels), the tree over the partials and the bias
+    LAT = max(1, -(-clog2(T * T) // 6)) + ADD_LAT * clog2(RP * U + 1)  # reducer read to write: the arrays' read (one cycle per 64:1 select stage), the tree over the partials and the bias
     words = len(open(os.path.join(mr.TB_DIR, "matrix_west_0.mem")).read().split()) if words is None else words
     rows = -(-words // P["HOST_WORDS"])
     m = dict(
@@ -3061,7 +3061,7 @@ def lane_kinds(xs: list, act: str) -> tuple:
 def tail_ops(tier: int = 0) -> int:
     """gpnae_tail's cycles for one element alone, start to T_DONE: each fp32 step is request, issue, unit, update (latency + 2)."""
     ts = gpnae_model.default_mem("bf16").tail[tier]
-    cm, ca = UNIT_LAT["fp32"][0] + 2, UNIT_LAT["fp32"][1] + 2
+    cm, ca = fmt_pkg.get("fp32", "LANE_MUL_LATENCY") + 2, fmt_pkg.get("fp32", "LANE_ADD_LATENCY") + 2  # the tail's units are the lane kind (the mesh's fp32 multiply is MUL_LATENCY)
     return cm + (ts.deg + 1) * (cm + ca) + 2 * ca + ts.newton * (cm + ca + cm) + cm  # k; Horner; D and y0; Newton; E y
 
 
@@ -3120,7 +3120,7 @@ def lane_stage(act: str, P: dict, collapse: bool = True) -> int:
     return med(out)  # done_o, lane_collected, g_done, back in G_IDLE
 
 
-LANE_TARGETS = (("fp32", "sigmoid", 8, 135), ("bf16", "sigmoid", 8, 175), ("int8", "selu", 32, 344), ("int8", "tanh", 32, 344))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
+LANE_TARGETS = (("fp32", "sigmoid", 8, 149), ("bf16", "sigmoid", 8, 194), ("int8", "selu", 32, 344), ("int8", "tanh", 32, 344))  # cycles per set at T = 2, measured with F1 to F3 (activation_perf_regression.log 4); the floats re-set 2026-11-23 for the 0.8 ns Horner loop (Soham: up to +2 loop cycles; fp32 lane multiply 8 -> 10, bf16 multiply 3 -> 4 and add 6 -> 7, the bf16 tail's multiply 8 -> 10): 135 -> 149, 175 -> 194; int8 + 5 for the pipelined input stage (ACT_IN_LATENCY 5) and the requantize (REQUANT_LATENCY 5)
 
 
 def lane_target_cycles(fmt: str, act: str, n: int) -> int:
@@ -5869,7 +5869,7 @@ def perf_trace(name):
 @perf_selftest
 def test_accumulate_outputs_every_third_set():
     a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
-    assert a["first_latency"] == 151  # host start of pass 0 to the completion of pass 2, read off the trace by hand (133 before rounds D-G, 150 before round H)
+    assert a["first_latency"] == 153  # host start of pass 0 to the completion of pass 2, read off the trace by hand (133 before rounds D-G, 150 before round H, 151 before the bf16 mesh multiply went 3 -> 5)
     assert statistics.mean(a["steady"]) == 19.0  # cycles per depth pass: 57 per output of 3 passes
     outs = [x for x in a["sets"] if x["latency"] is not None]
     assert len(outs) == 8 and all(x["latency"] > 0 and x["out"] >= 0 for x in outs)
@@ -5879,7 +5879,7 @@ def test_accumulate_outputs_every_third_set():
 @perf_selftest
 def test_single_pass_unchanged():
     a = pa.analyse(perf_trace("matmul_relu_nopool"), 24)
-    assert a["first_latency"] == a["sets"][0]["latency"] == 113  # 112 before round H; 95 before rounds D-G (2026-11-15): the result read and bank write registers (+2), fp32Adder 7 stages and 8 slots (+15)
+    assert a["first_latency"] == a["sets"][0]["latency"] == 115  # 113 before the bf16 mesh multiply went 3 -> 5; 112 before round H; 95 before rounds D-G (2026-11-15): the result read and bank write registers (+2), fp32Adder 7 stages and 8 slots (+15)
     assert statistics.mean(a["steady"]) == 19.0
     assert len(a["sets"]) == 24 and all(x["out"] >= 0 for x in a["sets"])
 
@@ -5889,8 +5889,8 @@ def test_residual_hold_add_pairs():
     ev = pa.events(open(os.path.join(PERF_FIX, "int8_residual_relu_N8_T2_int8.trace")).read())
     a = pa.analyse(ev, 18, 1, [0x56, 0x58] * 9)  # add_<k>.mem's flags: hold sets and add sets in turn, ReLU, bias on the hold set
     assert a["hold"] == [3] * 9 and [x["act"] for x in a["sets"][1::2]] == [3] * 9  # G 115-118 (hold), 126-129 (add), off the trace by hand
-    assert all(x["act"] is None and x["latency"] is None and x["mesh"] >= 29 for x in a["sets"][0::2]) and a["sets"][0]["mesh"] == 29  # a hold set outputs nothing; mesh 28 before round H, 26 before rounds D-G (the result read register), later holds wait on the stage
-    assert a["first_latency"] == 76 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion (69 before round H, 61 before rounds D-G)
+    assert all(x["act"] is None and x["latency"] is None and x["mesh"] >= 31 for x in a["sets"][0::2]) and a["sets"][0]["mesh"] == 31  # a hold set outputs nothing; mesh 29 before the int8 mesh multiply went 2 -> 4, 28 before round H, 26 before rounds D-G (the result read register), later holds wait on the stage
+    assert a["first_latency"] == 78 and a["sets"][1]["add"]  # the hold set's host start to the add set's completion (76 before the int8 mesh multiply went 2 -> 4, 69 before round H, 61 before rounds D-G)
     assert a["steady"] and all(g == 18.0 for g in a["steady"])  # 36 cycles per hold/add pair at N 8 (29 before round H: REQUANT 7 -> 9 on both sets, QUANT_ADD 7 -> 10): activation-bound since rounds D-G (the requantize's stages and grant hold, the bank write register); 22 and host-bound before
 
 
@@ -5904,7 +5904,7 @@ def test_mesh_lat_passes():
         a = pa.analyse(perf_trace("matmul_accum3_bias_linear_nopool"), 24, passes=3)
         P16 = {**PERF_P8, "N": 16, "TILE_SIZE": 4, "HOST_WORDS": 16, "SRAM_DEPTH": 256}
         m1, m3 = pa.model({"act": "linear"}, True, P16, 256), pa.model({"act": "linear", "accum_passes": 3}, True, P16, 256)
-        assert m1["mesh_lat"] == 88 and m3["mesh_lat"] == 88 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 126  # 87 / 125 before round H, 72 / 110 before round G: 8 slots, the reducer tree 4 levels of 7
+        assert m1["mesh_lat"] == 90 and m3["mesh_lat"] == 90 + 2 * min(a["host_gaps"]) == next(x["mesh"] for x in a["sets"] if x["mesh"] is not None) == 128  # 88 / 126 before the bf16 mesh multiply went 3 -> 5, 87 / 125 before round H, 72 / 110 before round G: 8 slots, the reducer tree 4 levels of 7
 
 
 @perf_selftest
@@ -5993,8 +5993,8 @@ def test_link_bytes():
 
 @perf_selftest
 def test_rtl_lat():
-    assert pa.UNIT_LAT == {"fp32": (8, 7), "bf16": (3, 7), "int8": (2, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
-    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 16, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
+    assert pa.UNIT_LAT == {"fp32": (11, 7), "bf16": (5, 7), "int8": (4, 1)}  # sienna_fmt_pkg's MUL_LATENCY, ADD_LATENCY per define, through fmt_pkg.py
+    assert (pa.FX_LAT, pa.REQ_LAT, pa.QADD_LAT, pa.GROUP_K, pa.TAIL_CTX) == (5, 9, 10, 32, 8)  # fixedPointMultiplyAdd, REQUANT_LATENCY, QUANT_ADD_LATENCY, gpnae's K, TAIL_CONTEXTS
 
 
 @perf_selftest
@@ -6017,11 +6017,11 @@ def test_lane_cycle_targets():
 @perf_selftest
 def test_lane_group_float():
     with perf_fmt("fp32"):  # one group from its first G_CAP at s; the stage model built on it is 2 above rs3_b2_perf_fp32_n8 on every config, as Batch A's
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 94 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 70  # rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 157 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 261  # round H: the fp32 input stage +1 (the exp split's second register)  # sigmoid: F2's 5 rounds
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 102 and pa.lane_cycles([0.0] * 2, "tanh", 6) == 78  # 94 / 70 before the lane multiply 8 -> 10 (2026-11-23); rounds D-G (2026-11-15): the input stage +1, fp32Adder 5 -> 7
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 171 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 232  # 157 / 261 before the lane multiply 8 -> 10 and K 16 -> 32 (2026-11-23; K alone gives 228); round H: the fp32 input stage +1 (the exp split's second register)  # sigmoid: F2's 5 rounds
     with perf_fmt("bf16"):  # the same against rs3_b2_perf_bf16_n8; -3.0 runs on the fp32 tail
-        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 74 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 237  # rounds D-F: the input stage +1, the Horner add +1 a round
-        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 185 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 185  # F1's 34-cycle shorter tail, on fp32Adder's 7 stages
+        assert pa.lane_cycles([0.0] * 8, "selu", 12) == 79 and pa.lane_cycles([0.0] * 32, "tanh", 36) == 219  # 74 / 237 before the multiply 3 -> 4, add 6 -> 7 and K 16 -> 32 (2026-11-23; K alone gives 216); rounds D-F: the input stage +1, the Horner add +1 a round
+        assert pa.lane_cycles([-3.0] * 8, "sigmoid", 12) == 204 and pa.lane_cycles([-3.0] + [0.5] * 7, "sigmoid", 12) == 204  # 185 before the bf16 loop +2 and the tail multiply 8 -> 10 (2026-11-23); F1's 34-cycle shorter tail, on fp32Adder's 7 stages
 
 
 @perf_selftest
@@ -6037,8 +6037,8 @@ def test_lane_kinds():
 
 @perf_selftest
 def test_tail_ops_bf16():
-    with perf_fmt("bf16"):  # fp32 units, multiply 8 + 2 and add 7 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
-        assert [pa.tail_ops(t) for t in range(3)] == [10 + 3 * 19 + 18 + 2 * 29 + 10, 10 + 3 * 19 + 18 + 29 + 10, 10 + 3 * 19 + 18 + 10] == [153, 124, 95]  # F1: tier 0 degree 2; fp32Adder 7 stages since round G
+    with perf_fmt("bf16"):  # fp32 units, multiply 10 + 2 and add 7 + 2 per step: k, Horner (deg + 1 rounds), D and y0, Newton (mul, add, mul), E y
+        assert [pa.tail_ops(t) for t in range(3)] == [12 + 3 * 21 + 18 + 2 * 33 + 12, 12 + 3 * 21 + 18 + 33 + 12, 12 + 3 * 21 + 18 + 12] == [171, 138, 105]  # F1: tier 0 degree 2; fp32Adder 7 stages since round G; [153, 124, 95] before the tail multiply 8 -> 10 (2026-11-23)
 
 
 # ── tool: the int8 layer references (was test_tflite_ref.py) ──
@@ -6886,7 +6886,7 @@ def idle_fault_main(argv) -> None:
         cmd = ["make", mr.SIM_TARGET, "TRACE=0", "FMT=fp32", "N=8", "TILE=2", "LANES=32", "GEN_PKG=0", "EXTRA_FLAGS=-GFAULT=8"]
     r = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True)
     text = r.stdout + r.stderr
-    fired = "a_idle_contract" in text and re.search(r'Assertion failed|%Error|^(?:Error|Fatal): "|: started at .* failed at', text, re.M) is not None
+    fired = any("a_idle_contract" in x and mr.FIRED.search(x) for x in text.splitlines())  # the runner's error forms: Verilator's, VCS's and xsim's
     planted = f"[FAULT {4 if a.set_port == 0 else 8}]" in text
     print("\n".join(x for x in text.splitlines() if "a_idle_contract" in x or "FAULT" in x)[:2000])
     v = "CAUGHT" if fired and planted else ("SURVIVED" if planted else "OTHER")

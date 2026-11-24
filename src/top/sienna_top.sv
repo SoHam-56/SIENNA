@@ -36,7 +36,7 @@ module sienna_top #(
     parameter int LINK_STAGES       = 0,  // register stages on each pipeline's L0, L1, L3 and L9; L10 is not staged
     parameter int OUT_MAX           = 64,  // the most L9 credits a downstream consumer may grant per lane
     parameter int OUT_CRW           = 1,   // L9 credit width
-    parameter int LANE_OUT_SLOTS    = 16,  // the collector's L5 slots per lane
+    parameter int LANE_OUT_SLOTS    = 32,  // the collector's L5 slots per lane: one barrel group (gpnae's K)
     parameter int DIM_W             = 16   // width of the layer contract's configured sizes
 ) (
     input logic clk_i,

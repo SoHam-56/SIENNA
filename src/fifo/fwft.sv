@@ -23,6 +23,11 @@ module fwft #(
   logic [ADDR_WIDTH-1:0] wr_ptr;
   logic [ADDR_WIDTH-1:0] rd_ptr;
   logic [ADDR_WIDTH:0] count;
+  // The oldest word as a register (mem[rd_ptr] read through the depth's select was the reader's input path: FIFO2 -> maxpool's compare):
+  // each edge it loads the slot rd_ptr moves to, or the word written into that slot at the same edge.
+  logic [DATA_WIDTH-1:0] head;
+  logic [ADDR_WIDTH-1:0] rd_ptr_n;
+  wire wr_take;  // the write lands this edge
   // The reader's credits, and a write or a pop this cycle.
   logic [OCW-1:0] out_cnt;
   wire wr_fire;
@@ -46,7 +51,10 @@ module fwft #(
   assign rd_fire = (count != 0) && (out_cnt != 0);
 
   assign out.put  = rd_fire;
-  assign out.data = mem[rd_ptr];
+  assign out.data = head;
+  assign wr_take  = wr_fire && (count < FIFO_DEPTH || rd_fire);
+  assign rd_ptr_n = !rd_fire ? rd_ptr : (rd_ptr == ADDR_WIDTH'(FIFO_DEPTH - 1)) ? '0 : rd_ptr + 1'b1;
+  always_ff @(posedge clk_i) head <= (wr_take && wr_ptr == rd_ptr_n) ? in.data : mem[rd_ptr_n];  // no reset: read only with a put
   assign count_o  = count;
 
   // Input credits: one per free slot, FIFO_DEPTH after reset, then one per pop, at most one a cycle.
@@ -62,7 +70,7 @@ module fwft #(
     end else begin
       in_owed <= in_owed + (ADDR_WIDTH + 1)'(rd_fire) - (ADDR_WIDTH + 1)'(in_owed != '0);
       in_cr   <= in_owed != '0;
-      if (wr_fire && (count < FIFO_DEPTH || rd_fire)) begin
+      if (wr_take) begin
         mem[wr_ptr] <= in.data;
         if (wr_ptr == FIFO_DEPTH - 1) wr_ptr <= '0;
         else wr_ptr <= wr_ptr + 1'b1;
@@ -80,6 +88,8 @@ module fwft #(
   // A put needs a free slot: with FIFO_DEPTH words held no credit can be outstanding; nothing is overwritten any more.
   a_fifo_room: assert property (@(posedge clk_i) disable iff (!rstn_i) in.put |-> int'(count) < FIFO_DEPTH)
     else $error("fwft: a_fifo_room: put into a full FIFO (%0d words)", count);
+  a_head: assert property (@(posedge clk_i) disable iff (!rstn_i) out.put |-> head == mem[rd_ptr])
+    else $error("fwft: a_head: the registered head %h is not the oldest word %h (slot %0d)", head, mem[rd_ptr], rd_ptr);
 `endif
 
 endmodule

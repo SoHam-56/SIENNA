@@ -3,8 +3,8 @@
 Outside the GPNAE lanes (the mesh, the lane feed, the residual ADD, dropout) and inside them (gpnae) each set must be exactly the precision's.
 Args: --files (DESIGN_FILES and the package), --inc (the -I directories)."""
 import argparse
+import json
 import os
-import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -20,9 +20,10 @@ INT8 = {"int8Multiplier", "int16Multiplier", "int24Multiplier", "int32Adder", "i
 BF16 = {"bf16Multiplier", "bf16Adder", "bf16WideMultiplier", "fp32ToBf16"}
 FORBIDDEN = {"fp32": BF16 | INT8, "bf16": INT8, "int8": UNITS - INT8}  # another precision's units; bf16 builds keep fp32 sums and GPNAE's fp32 tail
 FORBIDDEN["default"] = FORBIDDEN["fp32"]
-EXPECTED = {  # outside the lanes: the mesh's product and sums (and narrowing), dropout's keep multiply, the lane feed's requantize and the ADD
+EXPECTED = {  # outside the lanes: the mesh's product and sums (and narrowing), the lane feed's requantize and the ADD; dropout's 2.0 keep scale is an
+    # exponent increment in both float formats since 833dee1 (G_POW2), so no float multiplier of its own
     "fp32": {"fp32Multiplier", "fp32Adder"},
-    "bf16": {"bf16WideMultiplier", "fp32Adder", "fp32ToBf16", "bf16Multiplier"},
+    "bf16": {"bf16WideMultiplier", "fp32Adder", "fp32ToBf16"},
     "int8": {"int8Multiplier", "int32Adder", "int8Requantizer", "int8QuantizedAdder"},
 }
 EXPECTED["default"] = EXPECTED["fp32"]  # no define elaborates fp32
@@ -35,12 +36,47 @@ LANE_EXPECTED["default"] = LANE_EXPECTED["fp32"]
 BENCH = {1: (0, "g_pipeline"), 0: (1, "g_layer")}  # TB_sienna's MODE and branch for the set and the layer contract; a top with interface ports cannot be elaborated
 
 
-def units_by_place(xml: str, top: str) -> tuple:
-    """(origNames of the cells under dut outside the GPNAE lanes, those inside them, those outside dut) from the XML's cell hierarchy."""
-    orig = {m.group(1): m.group(2) for m in re.finditer(r'<module\b[^>]*\bname="([^"]+)"[^>]*\borigName="([^"]+)"', xml)}
+def hier_cells(tree: dict, top: str) -> list:
+    """Every instance below the top module as (hierarchical name, origName of the module it instantiates), from Verilator's --json-only
+    tree: a MODULE holds its CELLs, inside any named generate block (GENBLOCK), and a CELL's modp names the MODULE it instantiates."""
+    modules = {m["addr"]: m for m in tree["modulesp"] if m.get("type") == "MODULE"}
+
+    def cells(node, path):  # the CELLs in a module's body with their generate-block path, not descending into another module
+        if isinstance(node, dict):
+            t = node.get("type")
+            if t == "CELL":
+                yield node, path
+                return
+            if t == "GENBLOCK" and node.get("name"):
+                path = f"{path}.{node['name']}"
+            for v in node.values():
+                if isinstance(v, (list, dict)):
+                    yield from cells(v, path)
+        elif isinstance(node, list):
+            for v in node:
+                yield from cells(v, path)
+
+    root = next((m for m in modules.values() if m.get("origName") == top), None)
+    if root is None:
+        raise RuntimeError(f"no {top} module in the JSON")
+    out, stack = [], [(root, top)]
+    while stack:
+        mod, path = stack.pop()
+        for body in (v for k, v in mod.items() if isinstance(v, (list, dict))):
+            for c, p in cells(body, path):
+                child = modules.get(c.get("modp"))
+                if child is None:
+                    continue
+                h = f"{p}.{c['origName']}"
+                out.append((h, child.get("origName", child["name"])))
+                stack.append((child, h))
+    return out
+
+
+def units_by_place(tree: dict, top: str) -> tuple:
+    """(origNames of the modules under dut outside the GPNAE lanes, those inside them, those outside dut)."""
     pipe, lanes, other = set(), set(), set()
-    for m in re.finditer(r'<cell\b[^>]*\bsubmodname="([^"]+)"[^>]*\bhier="([^"]+)"', xml):
-        u, h = orig.get(m.group(1), m.group(1)), m.group(2)
+    for h, u in hier_cells(tree, "TB_sienna"):
         if not h.startswith(f"{top}.dut."):
             other.add(u)
         elif ".gpnae." in h:
@@ -48,22 +84,23 @@ def units_by_place(xml: str, top: str) -> tuple:
         else:
             pipe.add(u)
     if not pipe:
-        raise RuntimeError(f"no cell under {top}.dut in the XML")
+        raise RuntimeError(f"no cell under {top}.dut in the JSON")
     return pipe & UNITS, lanes & UNITS, other & UNITS
 
 
-def elaborate(fmt: str, sp: int, files: list, inc: list, verilator: str, out: str) -> str:
+def elaborate(fmt: str, sp: int, files: list, inc: list, verilator: str, out: str) -> dict:
     d = [] if fmt == "default" else [f"+define+FMT_{fmt.upper()}"]
-    x = os.path.join(out, f"hier_{fmt}_sp{sp}.xml")
+    x = os.path.join(out, f"hier_{fmt}_sp{sp}.json")
     mode, _ = BENCH[sp]
-    cmd = [verilator, "--xml-only", "--xml-output", x, "--timing", "-Wno-fatal", "-Wno-lint", "-Wno-style", *d, *[f"-I{i}" for i in inc],
+    cmd = [verilator, "--json-only", "--json-only-output", x, "--json-only-meta-output", x[:-5] + ".meta.json", "--timing", "-Wno-fatal", "-Wno-lint", "-Wno-style", *d, *[f"-I{i}" for i in inc],
            "--top-module", "TB_sienna", f"-GMODE={mode}", "--Mdir", os.path.join(out, f"obj_{fmt}_sp{sp}"), *files,
            os.path.join(ROOT, "testbenches", "top", "TB_sienna.sv")]
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
         errs = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.startswith("%Error")]
         raise RuntimeError(f"{fmt} SET_PORT {sp}: verilator exit {r.returncode}: {' | '.join(errs[:3]) or (r.stdout + r.stderr)[-400:]}")
-    return open(x).read()
+    with open(x) as fh:
+        return json.load(fh)
 
 
 def judge(fmt: str, pipe: set, lanes: set, other: set) -> bool:
@@ -80,8 +117,8 @@ def main() -> int:
     os.makedirs(a.out, exist_ok=True)
     jobs = [(f, sp) for f in ("fp32", "bf16", "int8", "default") for sp in (1, 0)]
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as ex:  # one elaboration per core
-        xmls = dict(zip(jobs, ex.map(lambda j: elaborate(*j, a.files, a.inc, a.verilator, a.out), jobs)))
-    places = {j: units_by_place(x, f"TB_sienna.{BENCH[j[1]][1]}") for j, x in xmls.items()}
+        trees = dict(zip(jobs, ex.map(lambda j: elaborate(*j, a.files, a.inc, a.verilator, a.out), jobs)))
+    places = {j: units_by_place(x, f"TB_sienna.{BENCH[j[1]][1]}") for j, x in trees.items()}
     bad = 0
     for (f, sp), (pipe, lanes, other) in places.items():
         ok = judge(f, pipe, lanes, other)

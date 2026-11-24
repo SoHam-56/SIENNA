@@ -6,6 +6,7 @@ module dropout #(
     parameter int                    DATA_WIDTH        = sienna_fmt_pkg::DATA_WIDTH,
     parameter int                    DROPOUT_P_PERCENT = 50,
     parameter int                    LFSR_WIDTH        = 32,
+    parameter int                    SEED_LEAD         = 0,  // 2: seed_early_i carries the seed two cycles before reseed_i, and the reseed takes registers
     parameter logic [DATA_WIDTH-1:0] CONST_SCALE       = sienna_fmt_pkg::DROPOUT_KEEP_SCALE  // 2.0, 1/(1-p) at p = 50%
 ) (
     input wire clk,
@@ -16,6 +17,7 @@ module dropout #(
     input wire                  training_mode,
     input wire                  reseed_i,  // load seed_i into the LFSR; only between sets
     input wire [LFSR_WIDTH-1:0] seed_i,  // must be nonzero
+    input wire [LFSR_WIDTH-1:0] seed_early_i,  // SEED_LEAD 2: seed_i as it will be two cycles on (unused at SEED_LEAD 0)
     input wire [DATA_WIDTH-1:0] zero_point_i  // the dropped word where the format has a zero point (int8, D-5); floats ignore it
 );
   localparam bit SCALES = (sienna_fmt_pkg::DROPOUT_SCALE_LATENCY > 0);  // a kept word is multiplied; else it leaves as it came, in the same cycle
@@ -43,6 +45,11 @@ module dropout #(
   logic [LFSR_WIDTH-1:0] lfsr_n1, lfsr_n2;  // lfsr_next and lfsr_next2 as registers: each takes one advance per beat, and the flags compare a register (two advances into the compare were 1.12-1.28 ns)
   logic hi_gt, hi_eq, lo_ge;  // lfsr_next against DROPOUT_THRESHOLD by halves: the next beat's decision, kept with the state
   logic keep_next, keep_seed;  // the beat arriving now is kept; the seed's first draw is kept
+  // What a reseed loads: the seed advanced 0 to 3 words and the flags of the first two, from seed_i (SEED_LEAD 0) or from registers built
+  // from seed_early_i (SEED_LEAD 2: the advance, then the compare, a stage each; the advance, compare and select in the reseed's cycle were
+  // the tops' DROPOUT group, 1.03-1.08 ns).
+  logic [LFSR_WIDTH-1:0] rs_s0, rs_s1, rs_s2, rs_s3;
+  logic [2:0]            rs_f1, rs_f2;
   // Training: every beat takes the multiplier, and its keep/drop decision waits here for the product.
   logic keep_q[KQ_DEPTH];
   logic [$clog2(KQ_DEPTH)-1:0] kq_wr, kq_rd;
@@ -99,11 +106,10 @@ module dropout #(
   always_comb begin
     lfsr_next  = lfsr_n1;
     lfsr_next2 = lfsr_n2;
-    seed_next  = lfsr_adv(seed_i, ADV1);
+    seed_next  = rs_s1;
     // The decision for the beat arriving now: the flags hold lfsr_next >= DROPOUT_THRESHOLD by halves; a beat arriving as the LFSR reseeds
     // is the seed's first draw (the state advances from the seed for it).
-    keep_seed = (seed_next[LFSR_WIDTH-1:HW] > DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) ||
-                ((seed_next[LFSR_WIDTH-1:HW] == DROPOUT_THRESHOLD[LFSR_WIDTH-1:HW]) && (seed_next[HW-1:0] >= DROPOUT_THRESHOLD[HW-1:0]));
+    keep_seed = rs_f1[2] || (rs_f1[1] && rs_f1[0]);
     keep_next = reseed_i ? keep_seed : (hi_gt || (hi_eq && lo_ge));
   end
 
@@ -114,16 +120,43 @@ module dropout #(
       lfsr_n2    <= lfsr_step(lfsr_step('1));
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_step('1));  // the word after the reset state
     end else if (reseed_i) begin
-      lfsr_state <= in_valid ? seed_next : seed_i;
-      lfsr_n1    <= in_valid ? lfsr_adv(seed_i, ADV2) : seed_next;  // each straight from the seed: no advance waits on another
-      lfsr_n2    <= in_valid ? lfsr_adv(seed_i, ADV3) : lfsr_adv(seed_i, ADV2);
-      {hi_gt, hi_eq, lo_ge} <= above_by_halves(in_valid ? lfsr_adv(seed_i, ADV2) : seed_next);
+      lfsr_state <= in_valid ? rs_s1 : rs_s0;
+      lfsr_n1    <= in_valid ? rs_s2 : rs_s1;  // each straight from the seed: no advance waits on another
+      lfsr_n2    <= in_valid ? rs_s3 : rs_s2;
+      {hi_gt, hi_eq, lo_ge} <= in_valid ? rs_f2 : rs_f1;
     end else if (in_valid) begin
       lfsr_state <= lfsr_n1;
       lfsr_n1    <= lfsr_n2;
       lfsr_n2    <= lfsr_step(lfsr_n2);
       {hi_gt, hi_eq, lo_ge} <= above_by_halves(lfsr_n2);
     end
+  end
+
+  if (SEED_LEAD == 0) begin : G_SEED_NOW
+    assign {rs_s0, rs_s1, rs_s2, rs_s3} = {seed_i, lfsr_adv(seed_i, ADV1), lfsr_adv(seed_i, ADV2), lfsr_adv(seed_i, ADV3)};
+    assign {rs_f1, rs_f2} = {above_by_halves(rs_s1), above_by_halves(rs_s2)};
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic unused_early;
+    assign unused_early = ^seed_early_i;
+    /* verilator lint_on UNUSEDSIGNAL */
+  end else if (SEED_LEAD == 2) begin : G_SEED_EARLY
+    logic [LFSR_WIDTH-1:0] e0, e1, e2, e3;  // a cycle before the reseed: the seed and its advances
+    always_ff @(posedge clk) begin  // no reset: used only at the reseed, two cycles after seed_early_i
+      {e0, e1, e2, e3} <= {seed_early_i, lfsr_adv(seed_early_i, ADV1), lfsr_adv(seed_early_i, ADV2), lfsr_adv(seed_early_i, ADV3)};
+      {rs_s0, rs_s1, rs_s2, rs_s3} <= {e0, e1, e2, e3};
+      {rs_f1, rs_f2} <= {above_by_halves(e1), above_by_halves(e2)};
+    end
+`ifndef SYNTHESIS
+    a_seed_lead: assert property (@(posedge clk) disable iff (!rst_n) reseed_i |-> rs_s0 == seed_i)
+      else $error("dropout: a_seed_lead: the seed from seed_early_i, %h, is not seed_i, %h, at the reseed", rs_s0, seed_i);
+`else
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic unused_seed;
+    assign unused_seed = ^seed_i;
+    /* verilator lint_on UNUSEDSIGNAL */
+`endif
+  end else begin : G_BAD_SEED_LEAD
+    $fatal(1, "dropout: SEED_LEAD is %0d; 0 or 2", SEED_LEAD);
   end
 
   always_comb begin

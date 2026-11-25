@@ -259,7 +259,9 @@ module sienna_pipe #(
   logic [2*NUM_LANES-1:0][AM_AW-1:0] am_waddr, am_waddr_q;
   logic [2*NUM_LANES-1:0][DATA_WIDTH-1:0] am_wdata, am_wdata_q;
   logic bank_done_q, bank_sel_q;  // bank_done a cycle on, when its last word is in the bank
-  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;
+  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr;  // the current position's addresses (checked against the word read)
+  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr_n;  // next cycle's: the synchronous read's
+  logic                            am_re_n;  // the dispatcher reads next cycle
   logic [NUM_LANES-1:0][DATA_WIDTH-1:0] am_rdata;
   // ── The mesh's result beats and status ──
   logic [NUM_LANES-1:0][RESULT_DATA_WIDTH-1:0] wide_rd_data;  // a result beat: element k of lane k's block; int32 sums in int8, narrowed sums in floats
@@ -404,8 +406,11 @@ module sienna_pipe #(
   // The activation banks are one mem_array (act_mem: a module boundary, so synthesis can swap it for a macro): two banks of SRAM_DEPTH words,
   // a write port per lane for the fill or the requantized bypass beat and one per lane for the L5 collector, a combinational read port per
   // pooling lane.
-  mem_array #(.DEPTH(2 * SRAM_DEPTH), .WIDTH(DATA_WIDTH), .NW(2 * NUM_LANES), .NR(NUM_LANES), .SYNC_READ(1'b0)) act_mem (
-      .clk_i(clk_i), .we_i(am_we_q), .waddr_i(am_waddr_q), .wmask_i('1), .wdata_i(am_wdata_q), .re_i('1), .raddr_i(am_raddr), .rdata_o(am_rdata));
+  // A synchronous read (an SRAM's): the dispatcher presents next cycle's addresses (am_raddr_n), so each word is there the cycle its
+  // position is current, as the combinational read gave it (step C of the memory plan: no latency change).
+  mem_array #(.DEPTH(2 * SRAM_DEPTH), .WIDTH(DATA_WIDTH), .NW(2 * NUM_LANES), .NR(NUM_LANES), .SYNC_READ(1'b1)) act_mem (
+      .clk_i(clk_i), .we_i(am_we_q), .waddr_i(am_waddr_q), .wmask_i('1), .wdata_i(am_wdata_q), .re_i({NUM_LANES{am_re_n}}),
+      .raddr_i(am_raddr_n), .rdata_o(am_rdata));
   // The write ports a cycle on: a set's bank is done (L6) the cycle its last word lands.
   always_ff @(posedge clk_i or negedge rstn_i)
     if (!rstn_i) {am_we_q, bank_done_q} <= '0;
@@ -845,12 +850,61 @@ module sienna_pipe #(
       lane_in_img[L] = (ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS);
       am_raddr[L] = lane_in_img[L] ? AM_AW'(act_rd_base + ir * IN_COLS + ic) : '0;
     end
+  // The dispatcher's next position, as its update below makes it (a_disp_next ties the two), and the addresses read there.
+  always_comb begin
+    automatic logic adv_n, init_n, act_rd_n;
+    automatic logic [$clog2(POOL_H+1)-1:0] pr_n;
+    automatic logic [$clog2(POOL_W+1)-1:0] pc_n;
+    automatic logic g_step;
+    init_n   = (p_state == P_IDLE);
+    adv_n    = (p_state == P_DISPATCH) && !disp_done && disp_can_write;
+    act_rd_n = p_release ? ~act_rd : act_rd;
+    pr_n     = disp_pr;
+    pc_n     = disp_pc;
+    g_step   = 1'b0;
+    if (init_n) begin
+      pr_n = '0;
+      pc_n = '0;
+    end else if (adv_n) begin
+      if (disp_pc < POOL_W - 1) pc_n = disp_pc + 1;
+      else begin
+        pc_n = '0;
+        if (disp_pr < POOL_H - 1) pr_n = disp_pr + 1;
+        else begin
+          pr_n   = '0;
+          g_step = (disp_g < NUM_GROUPS - 1);
+        end
+      end
+    end
+    am_re_n = (p_state == P_DISPATCH) || p_accept;
+    for (int L = 0; L < NUM_LANES; L++) begin
+      automatic int r_n, c_n;
+      automatic logic signed [31:0] ir, ic;
+      r_n = init_n ? (L / POOL_OUT_COLS) : int'(lane_r[L]);
+      c_n = init_n ? (L % POOL_OUT_COLS) : int'(lane_c[L]);
+      if (g_step) begin
+        c_n = int'(lane_c[L]) + ADV_C;
+        r_n = int'(lane_r[L]) + ADV_R + ((c_n >= POOL_OUT_COLS) ? 1 : 0);
+        if (c_n >= POOL_OUT_COLS) c_n = c_n - POOL_OUT_COLS;
+      end
+      ir = signed'(r_n * STRIDE_ROWS + int'(pr_n)) - signed'(PADDING);
+      ic = signed'(c_n * STRIDE_COLS + int'(pc_n)) - signed'(PADDING);
+      am_raddr_n[L] = ((ir >= 0) && (ir < IN_ROWS) && (ic >= 0) && (ic < IN_COLS)) ? AM_AW'((act_rd_n ? SRAM_DEPTH : 0) + ir * IN_COLS + ic) : '0;
+    end
+  end
   always_comb
     for (int L = 0; L < NUM_LANES; L++) begin
       lane_active[L] = (lane_win[L] < MAXPOOL_OUT_COUNT);
       lane_val[L] = lane_in_img[L] ? am_rdata[L] : sienna_fmt_pkg::LOWEST_VALUE;  // the pad: -infinity in floats, -128 in int8
     end
 
+`ifndef SYNTHESIS
+  // The synchronous read's address is the position's: what was read last cycle (am_raddr_n) is what the current position addresses.
+  logic [NUM_LANES-1:0][AM_AW-1:0] am_raddr_q;
+  always_ff @(posedge clk_i) am_raddr_q <= am_raddr_n;
+  a_disp_next: assert property (@(posedge clk_i) disable iff (!rstn_i) p_state == P_DISPATCH && !disp_done |-> am_raddr_q == am_raddr)
+    else $error("sienna_top: a_disp_next: the act_mem read was addressed for another position than the dispatcher's");
+`endif
   // One active lane without an L7 credit (L9 with a 1x1 pool) stalls the whole group, which keeps every lane on the same element.
   always_comb begin
     disp_can_write = 1'b1;
